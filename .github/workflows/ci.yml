@@ -162,18 +162,13 @@ jobs:
       # Windows is the only place a CR can appear on its own, and both streams
       # are byte-identity surfaces: stdout carries the TSV, stderr the WARNING
       # lines the golden .err files pin.
+      #
+      # Measured through subprocess pipes, NOT shell redirection: PowerShell's
+      # `1>`/`2>` decode a native command's output and re-encode it with CRLF,
+      # so redirecting here reports a CR that the process never wrote.
       - name: No CR bytes on stdout OR stderr (acceptance check 4)
-        shell: pwsh
         run: |
-          python -m wmlst tests\data\example.fna 1> out.tsv 2> out.err
-          foreach ($f in @("out.tsv", "out.err")) {
-            $bytes = [System.IO.File]::ReadAllBytes((Resolve-Path $f))
-            if ($bytes -contains 13) {
-              Write-Error "a carriage return reached $f, a byte-identity surface"
-              exit 1
-            }
-          }
-          Write-Host "no CR bytes on either stream"
+          python -c "import subprocess, sys; p = subprocess.run([sys.executable, '-m', 'wmlst', 'tests/data/example.fna'], stdout=subprocess.PIPE, stderr=subprocess.PIPE); bad = [n for n, b in (('stdout', p.stdout), ('stderr', p.stderr)) if b'\r' in b]; sys.exit('::error::a carriage return reached %s, a byte-identity surface' % ', '.join(bad)) if bad else print('no CR bytes on either stream')"
 
       - name: Regenerate and verify the icon
         run: |
