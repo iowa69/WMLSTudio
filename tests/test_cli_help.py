@@ -180,3 +180,46 @@ def _main():
 
 if __name__ == "__main__":
     sys.exit(_main())
+
+
+# ---------------------------------------------------------------------------
+# The maintenance flags README and .github/workflows both invoke
+# ---------------------------------------------------------------------------
+
+MAINTENANCE_FLAGS = ("--update-db", "--check-only", "--make-blast-db",
+                     "--bootstrap-blast")
+
+
+def test_maintenance_flags_are_accepted():
+    """These four are promised by README and used by CI, so they must exist.
+
+    They were documented and wired into .github/workflows before cli.py grew
+    them, which turned every CI job red; this pins the three together.
+    """
+    help_text = _run("--help").stdout
+    for flag in MAINTENANCE_FLAGS:
+        assert flag in help_text, "%s is missing from --help" % flag
+
+
+def test_every_wmlst_flag_used_by_ci_and_readme_exists():
+    """Scan the workflows and README for `wmlst --flag` and check each one."""
+    import re
+
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    sources = [os.path.join(root, "README.md")]
+    wf = os.path.join(root, ".github", "workflows")
+    if os.path.isdir(wf):
+        sources += [os.path.join(wf, n) for n in sorted(os.listdir(wf))
+                    if n.endswith((".yml", ".yaml"))]
+
+    help_text = _run("--help").stdout
+    pattern = re.compile(r"wmlst(?:-cli\.exe)?\s+((?:--[a-z][a-z0-9-]*\s*)+)")
+    missing = set()
+    for path in sources:
+        with open(path, encoding="utf-8") as fh:
+            text = fh.read()
+        for run in pattern.findall(text):
+            for flag in run.split():
+                if flag.startswith("--") and flag not in help_text:
+                    missing.add((os.path.basename(path), flag))
+    assert not missing, "documented/invoked but not implemented: %s" % sorted(missing)

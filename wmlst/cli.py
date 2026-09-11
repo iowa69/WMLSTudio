@@ -240,6 +240,16 @@ def _opts():
              "Write the per-hit evidence table here"),
         _Opt("jobs=i", "jobs", 1, "Number of input files to analyse at once"),
         _Opt("gui!", "gui", False, "Launch the graphical interface"),
+        _Opt("update-db!", "update_db", False,
+             "Refresh the allele database from PubMLST and Institut Pasteur"),
+        _Opt("check-only!", "check_only", False,
+             "With --update-db, only report what is out of date"),
+        _Opt("rollback-db!", "rollback_db", False,
+             "Restore the database snapshot the last update kept"),
+        _Opt("make-blast-db!", "make_blast_db", False,
+             "Rebuild the derived BLAST index from db/pubmlst"),
+        _Opt("bootstrap-blast!", "bootstrap_blast", False,
+             "Download and verify NCBI BLAST+ into your user profile"),
         _Opt("blast-timeout=f", "blast_timeout_s", 900.0,
              "Seconds before a stuck blastn is killed"),
         _Opt("repair-locus-ids!", "repair_locus_ids", False,
@@ -910,6 +920,40 @@ def _run(cfg, argv) -> int:
     return 0
 
 
+def _forward(ns, flag, value, extra=()):
+    """Build an argv for one of the maintenance entry points (section 4.8)."""
+    argv = []
+    if value:
+        argv += [flag, value]
+    if getattr(ns, "quiet", False):
+        argv.append("--quiet")
+    argv += list(extra)
+    return argv
+
+
+def _bootstrap_blast(ns) -> int:
+    """``wmlst --bootstrap-blast``: install NCBI BLAST+ for this user.
+
+    Windows has no package manager we can rely on, so the download is part of
+    the product rather than a documented prerequisite.
+    """
+    from . import blastbin
+
+    def progress(done, total, phase):
+        if total:
+            Logger.msg("%s: %d%%" % (phase, round(100.0 * done / total)))
+        else:
+            Logger.msg(phase)
+
+    try:
+        tools = blastbin.bootstrap(progress=progress)
+    except WmlstError as exc:
+        Logger.notice("ERROR: %s" % (exc.user_message or exc))
+        return 1
+    Logger.notice("Installed blastn %s at %s" % (tools.version, tools.blastn))
+    return 0
+
+
 def _launch_gui(ns) -> int:
     """--gui: hand over to the Tkinter application (section 10)."""
     try:
@@ -956,6 +1000,23 @@ def main(argv=None) -> int:
 
         if ns.gui:
             return _launch_gui(ns)
+
+        # These three build or fetch what the engine needs, so they run before
+        # the dependency check that would otherwise reject a machine with no
+        # BLAST+ installed -- which is exactly when --bootstrap-blast is used.
+        if ns.bootstrap_blast:
+            return _bootstrap_blast(ns)
+        if ns.make_blast_db:
+            return main_make_blast_db(_forward(ns, "--dbdir", ns.datadir and
+                                               os.path.dirname(ns.datadir)))
+        if ns.rollback_db:
+            return main_update_db(_forward(
+                ns, "--dbdir", ns.datadir and os.path.dirname(ns.datadir),
+                extra=("--rollback",)))
+        if ns.update_db:
+            return main_update_db(_forward(
+                ns, "--dbdir", ns.datadir and os.path.dirname(ns.datadir),
+                extra=("--check",) if ns.check_only else ()))
 
         _dependency_check(ns)
 
