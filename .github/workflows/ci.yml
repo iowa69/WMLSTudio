@@ -94,22 +94,16 @@ jobs:
           blastn -version
           makeblastdb -version
 
-      # The index is derived from db/pubmlst and takes ~12 s to build, so it is
-      # keyed on the database snapshot date, not on the commit.
-      - name: Restore the derived BLAST index
-        id: blastcache
-        uses: actions/cache@v4
-        with:
-          path: db/blast
-          key: blastdb-${{ runner.os }}-${{ hashFiles('db/VERSION.txt') }}
 
       - name: Install WMLST
         run: |
           python -m pip install --upgrade pip
           python -m pip install -e ".[test]"
 
+      # Always rebuilt, never cached. It takes ~12 s, while shipping the 180 MB
+      # index to and from the cache takes longer than that -- and a cache entry
+      # written by an older build is a stale index that the suite then trips on.
       - name: Build the BLAST index
-        if: steps.blastcache.outputs.cache-hit != 'true'
         run: python -m wmlst --make-blast-db
 
       - name: pytest
@@ -147,12 +141,6 @@ jobs:
         with:
           python-version: "3.12"
 
-      - name: Restore the derived BLAST index
-        id: blastcache
-        uses: actions/cache@v4
-        with:
-          path: db/blast
-          key: blastdb-${{ runner.os }}-${{ hashFiles('db/VERSION.txt') }}
 
       - name: Install WMLST and the build extra
         run: |
@@ -162,8 +150,10 @@ jobs:
       - name: Bootstrap NCBI BLAST+ (downloads and MD5-verifies the NCBI archive)
         run: python -m wmlst --bootstrap-blast
 
+      # Always rebuilt, never cached. It takes ~12 s, while shipping the 180 MB
+      # index to and from the cache takes longer than that -- and a cache entry
+      # written by an older build is a stale index that the suite then trips on.
       - name: Build the BLAST index
-        if: steps.blastcache.outputs.cache-hit != 'true'
         run: python -m wmlst --make-blast-db
 
       - name: pytest
