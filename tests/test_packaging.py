@@ -530,7 +530,11 @@ def test_built_wheel_contains_the_alleles_and_not_the_index(tmp_path):
 
     Marked slow: it copies 116 MB. Skipped when `build` is not installed.
     """
-    pytest.importorskip("build", reason="pip install 'wmlst[build]'")
+    # Guard on build.__main__, not on `build`: a local `build/` directory (pip
+    # leaves one behind after an editable install, and it is gitignored) is
+    # importable as a namespace package, so importorskip("build") succeeds and
+    # the run then dies on "'build' is a package and cannot be directly executed".
+    pytest.importorskip("build.__main__", reason="pip install 'wmlst[build]'")
     out = tmp_path / "dist"
     result = subprocess.run(
         [sys.executable, "-m", "build", "--wheel", "--outdir", str(out), REPO_ROOT],

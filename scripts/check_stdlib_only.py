@@ -32,6 +32,20 @@ import sys
 #: The single sanctioned optional third-party import (section 2.1).
 OPTIONAL_ALLOWED = frozenset({"tkinterdnd2"})
 
+#: Stdlib packages that exist only on a NEWER Python than the 3.9 floor.
+#:
+#: ``sys.stdlib_module_names`` describes the interpreter running this script, so
+#: a module added after that version looks third-party here even though it ships
+#: with CPython. Checking on 3.14 would pass and on 3.12 would fail, which is how
+#: this rule first broke CI. These are stdlib, but because they are absent on the
+#: floor they must still sit behind ``try/except ImportError``.
+VERSIONED_STDLIB = {
+    "compression": (3, 14),   # compression.zstd
+    "tomllib": (3, 11),
+    "zoneinfo": (3, 9),
+    "graphlib": (3, 9),
+}
+
 #: Package roots that are first-party and therefore always fine.
 FIRST_PARTY = frozenset({"wmlst", "wmlst_db", "db"})
 
@@ -176,6 +190,21 @@ def check_file(path):
         for module in modules:
             root = _root_of(module)
             if not root or root in STDLIB or root in FIRST_PARTY:
+                continue
+            if root in VERSIONED_STDLIB:
+                if node in guarded:
+                    continue
+                major, minor = VERSIONED_STDLIB[root]
+                out.append(
+                    Violation(
+                        path,
+                        node.lineno,
+                        module,
+                        "stdlib only from Python %d.%d; must sit inside "
+                        "try/except ImportError to keep the 3.9 floor working"
+                        % (major, minor),
+                    )
+                )
                 continue
             if root in OPTIONAL_ALLOWED:
                 if node in guarded:
