@@ -1,0 +1,247 @@
+# SPDX-License-Identifier: GPL-2.0-only
+# Copyright (C) 2025-2026 IOWA-Tech - Giovanni Lorenzin
+# Copyright (C) Torsten Seemann (upstream `mlst`, from which WMLST is ported)
+#
+# WMLST continuous integration -- docs/ARCHITECTURE.md section 13.4.
+#
+# Free public runners only. No macOS job: GitHub bills macOS minutes at 10x and
+# WMLST targets Windows first and Linux second.
+
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  PYTHONUTF8: "1"
+  PYTHONIOENCODING: "utf-8"
+  # Never phone home from CI.
+  BLAST_USAGE_REPORT: "false"
+
+jobs:
+  # ---------------------------------------------------------------------
+  # Cheap gates. If the licence headers or the zero-dependency rule are
+  # broken there is no point spending a runner on the test matrix.
+  # ---------------------------------------------------------------------
+  lint:
+    name: Lint, licence headers, stdlib-only
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install lint tooling
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install ruff mypy
+
+      - name: Zero mandatory runtime dependencies (section 13.1)
+        run: python scripts/check_stdlib_only.py wmlst
+
+      - name: GPL-2.0-only SPDX header on every source file (section 13.3)
+        run: python scripts/check_headers.py
+
+      - name: Icon is a well-formed multi-size ICO
+        run: python packaging/make_icon.py --verify -o packaging/wmlst.ico
+
+      - name: ruff
+        run: ruff check wmlst scripts packaging tests
+
+      - name: mypy
+        run: mypy || true   # advisory until the annotations land; never blocks a merge
+
+      - name: pyproject metadata is valid
+        run: |
+          python -m pip install build twine
+          python -m build --sdist --outdir dist-meta .
+          python -m twine check dist-meta/*
+
+  # ---------------------------------------------------------------------
+  # The real suite, on the three interpreters section 16.1 names.
+  # ---------------------------------------------------------------------
+  test-linux:
+    name: Tests (ubuntu, python ${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    needs: lint
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.9", "3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install NCBI BLAST+
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends ncbi-blast+
+          blastn -version
+          makeblastdb -version
+
+      # The index is derived from db/pubmlst and takes ~12 s to build, so it is
+      # keyed on the database snapshot date, not on the commit.
+      - name: Restore the derived BLAST index
+        id: blastcache
+        uses: actions/cache@v4
+        with:
+          path: db/blast
+          key: blastdb-${{ runner.os }}-${{ hashFiles('db/VERSION.txt') }}
+
+      - name: Install WMLST
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e ".[test]"
+
+      - name: Build the BLAST index
+        if: steps.blastcache.outputs.cache-hit != 'true'
+        run: python -m wmlst --make-blast-db
+
+      - name: pytest
+        run: python -m pytest -q --timeout=900 --junitxml=junit-${{ matrix.python-version }}.xml
+
+      - name: No CR bytes in any compat output (acceptance check 4)
+        run: |
+          python -m wmlst --quiet tests/data/example.fna > out.tsv
+          if LC_ALL=C grep -q $'\r' out.tsv; then
+            echo "::error::a carriage return reached a byte-identity surface"
+            exit 1
+          fi
+
+      - name: Upload test results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: junit-ubuntu-${{ matrix.python-version }}
+          path: junit-*.xml
+          if-no-files-found: ignore
+
+  # ---------------------------------------------------------------------
+  # The platform that actually matters.
+  # ---------------------------------------------------------------------
+  test-windows:
+    name: Tests and frozen build (windows)
+    runs-on: windows-latest
+    needs: lint
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Restore the derived BLAST index
+        id: blastcache
+        uses: actions/cache@v4
+        with:
+          path: db/blast
+          key: blastdb-${{ runner.os }}-${{ hashFiles('db/VERSION.txt') }}
+
+      - name: Install WMLST and the build extra
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e ".[test,build,gui]"
+
+      - name: Bootstrap NCBI BLAST+ (downloads and MD5-verifies the NCBI archive)
+        run: python -m wmlst --bootstrap-blast
+
+      - name: Build the BLAST index
+        if: steps.blastcache.outputs.cache-hit != 'true'
+        run: python -m wmlst --make-blast-db
+
+      - name: pytest
+        run: python -m pytest -q --timeout=1800
+
+      - name: Regenerate and verify the icon
+        run: |
+          python packaging/make_icon.py -o packaging/wmlst.ico
+          python packaging/make_icon.py --verify -o packaging/wmlst.ico
+
+      - name: PyInstaller one-folder build
+        run: pyinstaller --noconfirm --clean packaging/wmlst.spec
+
+      - name: Smoke-test the frozen executables (acceptance check 9)
+        shell: pwsh
+        run: |
+          $env:WMLST_DBDIR = "$PWD\db"
+          & .\dist\WMLST\wmlst-cli.exe --version
+          $row = & .\dist\WMLST\wmlst-cli.exe --quiet --skipcheck tests\data\example.fna
+          Write-Host $row
+          if ($row -notmatch "`tsepidermidis`t184`t") {
+            Write-Error "frozen CLI did not type example.fna as sepidermidis ST 184"
+            exit 1
+          }
+          if (-not (Test-Path .\dist\WMLST\WMLST.exe)) {
+            Write-Error "WMLST.exe (the windowed build) was not produced"
+            exit 1
+          }
+
+      - name: Upload the frozen application
+        uses: actions/upload-artifact@v4
+        with:
+          name: WMLST-windows-unsigned
+          path: dist/WMLST/
+          retention-days: 14
+
+  # ---------------------------------------------------------------------
+  # A wheel that installs and runs, built once, on the cheapest runner.
+  # ---------------------------------------------------------------------
+  package:
+    name: Wheel and sdist
+    runs-on: ubuntu-latest
+    needs: lint
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Build
+        run: |
+          python -m pip install --upgrade pip build
+          python -m build
+
+      - name: The wheel must carry the database (section 13.1)
+        run: |
+          python - <<'PY'
+          import glob, zipfile, sys
+          wheel = glob.glob("dist/*.whl")[0]
+          names = zipfile.ZipFile(wheel).namelist()
+          tfa = [n for n in names if n.endswith(".tfa")]
+          print(wheel, len(names), "members,", len(tfa), ".tfa files")
+          if len(tfa) < 1000:
+              sys.exit("the wheel is missing the PubMLST allele database")
+          if any("db/blast/" in n for n in names):
+              sys.exit("the derived BLAST index leaked into the wheel")
+          for required in ("wmlst/version.py", "wmlst_db/VERSION.txt"):
+              if required not in names:
+                  sys.exit("missing from the wheel: " + required)
+          PY
+
+      - name: Install the wheel into a clean environment and run it
+        run: |
+          python -m venv /tmp/wheeltest
+          /tmp/wheeltest/bin/python -m pip install --upgrade pip
+          /tmp/wheeltest/bin/python -m pip install dist/*.whl
+          /tmp/wheeltest/bin/wmlst --version
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist/*

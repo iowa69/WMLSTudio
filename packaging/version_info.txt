@@ -1,0 +1,44 @@
+# PyInstaller VSVersionInfo resource for WMLST.exe / wmlst-cli.exe
+# docs/ARCHITECTURE.md section 13.1
+#
+# The four-part tuples MUST track wmlst/version.py.
+# tests/test_packaging.py::test_version_is_in_sync fails the build otherwise.
+# This file is a Python literal evaluated by PyInstaller; it is not shipped.
+VSVersionInfo(
+  ffi=FixedFileInfo(
+    filevers=(1, 0, 0, 0),
+    prodvers=(1, 0, 0, 0),
+    mask=0x3f,
+    flags=0x0,
+    OS=0x40004,          # VOS_NT_WINDOWS32
+    fileType=0x1,        # VFT_APP
+    subtype=0x0,
+    date=(0, 0),
+  ),
+  kids=[
+    StringFileInfo(
+      [
+        StringTable(
+          '040904B0',    # US English, Unicode
+          [
+            StringStruct('CompanyName', 'IOWA-Tech'),
+            StringStruct('FileDescription', 'WMLST - MLST typing for Windows'),
+            StringStruct('FileVersion', '1.0.0.0'),
+            StringStruct('InternalName', 'wmlst'),
+            StringStruct(
+              'LegalCopyright',
+              'Copyright (C) 2025-2026 IOWA-Tech - Giovanni Lorenzin. '
+              'GPL-2.0-only. Derived from mlst by Torsten Seemann.'
+            ),
+            StringStruct('OriginalFilename', 'WMLST.exe'),
+            StringStruct('ProductName', 'WMLST'),
+            StringStruct('ProductVersion', '1.0.0.0'),
+            StringStruct('Comments',
+              'Allele data from PubMLST - cite Jolley, Bray & Maiden (2018), PMID 30345391.'),
+          ]
+        )
+      ]
+    ),
+    VarFileInfo([VarStruct('Translation', [1033, 1200])])
+  ]
+)

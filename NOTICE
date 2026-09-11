@@ -1,0 +1,163 @@
+WMLST — MLST typing for Windows
+Copyright (C) 2025-2026 IOWA-Tech — Giovanni Lorenzin
+
+This product is licensed under the GNU General Public License, version 2 only
+(SPDX: GPL-2.0-only). The full licence text is in the file LICENSE, which is
+distributed with every source tree, every wheel, every portable zip and every
+installed copy. See the "Source code offer" section at the end of this file.
+
+================================================================================
+1. DERIVATION — WMLST IS A DERIVATIVE WORK, NOT AN ORIGINAL ONE
+================================================================================
+
+WMLST is a port to Python/Windows of:
+
+    mlst 2.35.0
+    Copyright (C) Torsten Seemann
+    https://github.com/tseemann/mlst
+    Licensed under the GNU General Public License version 2, June 1991,
+    WITHOUT an "or (at your option) any later version" clause.
+
+A port is a translation. Under GPLv2 section 0 a translation is a modification,
+so WMLST is unambiguously a work based on the Program. Under GPLv2 section 2(b)
+the derivative must be licensed as a whole at no charge under the same terms.
+WMLST therefore is, and can only be, GPL-2.0-only. It is not dual-licensed; the
+newly written parts are not MIT; "GPLv2 for the ported parts" is not a thing.
+
+The following modules are direct, line-by-line translations of upstream Perl and
+carry an SPDX header naming the upstream file and line range they came from:
+
+    wmlst/engine.py     <- bin/mlst, perl5/MLST/*.pm
+    wmlst/schemes.py    <- perl5/MLST/Scheme.pm, perl5/MLST/SchemeDb.pm
+    wmlst/any2fasta.py  <- any2fasta 0.9.0 by Torsten Seemann (GPL-3.0 upstream;
+                           see section 5 below for why this is compatible here)
+    the BLAST database builder in wmlst/updatedb.py
+                        <- scripts/mlst-make_blast_db
+
+Please cite the original author first. Without Torsten Seemann's work there is
+nothing here to port.
+
+    Seemann T, mlst, https://github.com/tseemann/mlst
+
+================================================================================
+2. ALLELE DATA — PubMLST AND INSTITUT PASTEUR
+================================================================================
+
+The database shipped in db/pubmlst/ (162 schemes, 1,108 locus files, 225,777
+allele records, snapshot 2025-12-29) was retrieved from the public, anonymous
+REST endpoints of:
+
+    PubMLST                 https://rest.pubmlst.org
+    BIGSdb Pasteur          https://bigsdb.pasteur.fr/api
+
+The allele sequences and sequence-type profiles are the property of their
+respective curators and depositors and are redistributed here unmodified, byte
+for byte, under the terms those sites publish for anonymous access. They are
+DATA, not part of the Program, and are not covered by the GPL.
+
+If you use WMLST, or this data, in work you publish, you MUST cite:
+
+    Jolley KA, Bray JE, Maiden MCJ (2018)
+    "Open-access bacterial population genomics: BIGSdb software, the PubMLST.org
+    website and their applications."
+    Wellcome Open Research 3:124.
+    doi:10.12688/wellcomeopenres.14826.1   PMID: 30345391
+
+Individual schemes may carry their own curator-requested citation; see the
+"description" and "API" fields of db/pubmlst/<scheme>/<scheme>_info.json.
+
+================================================================================
+3. NCBI BLAST+ — NOT BUNDLED IN THE SOURCE TREE
+================================================================================
+
+WMLST calls blastn and makeblastdb from NCBI BLAST+ 2.17.0.
+
+    NCBI BLAST+ is a "United States Government Work". It is in the PUBLIC DOMAIN
+    within the United States and carries no copyright restriction. NCBI makes no
+    warranty as to its accuracy or fitness for any purpose.
+    https://blast.ncbi.nlm.nih.gov/
+    Altschul SF, Gish W, Miller W, Myers EW, Lipman DJ (1990)
+    "Basic local alignment search tool." J Mol Biol 215:403-410.
+
+The git repository does NOT contain BLAST+ binaries. On Windows, `wmlst
+--bootstrap-blast` (or the GUI's first-run prompt) downloads the official NCBI
+archive over HTTPS, verifies its MD5, and extracts only blastn.exe,
+makeblastdb.exe and nghttp2.dll into
+
+    %LOCALAPPDATA%\IOWA-Tech\WMLST\blast\
+
+Because BLAST+ is public domain, distributing those binaries alongside a GPLv2
+program raises no licence conflict; they are also merely invoked as separate
+processes, never linked.
+
+The Windows installer and the portable zip produced by packaging/wmlst.iss and
+packaging/wmlst.spec DO include those three files together with the NCBI LICENSE
+and BLAST_PRIVACY notices, which are installed into {app}\blast\.
+
+================================================================================
+4. OTHER COMPONENTS
+================================================================================
+
+tkinterdnd2 (OPTIONAL, GUI drag-and-drop only)
+    MIT licence. Imported behind a try/except ImportError; WMLST degrades to a
+    Browse button when it is absent. MIT is GPLv2-compatible.
+
+PyInstaller (BUILD TIME ONLY, never shipped as a library)
+    GPLv2 with the standard bootloader exception, which explicitly permits
+    freezing applications of any licence. Only the bootloader it generates is
+    redistributed, under that exception.
+
+Inno Setup (BUILD TIME ONLY)
+    Its own permissive licence; the generated installer imposes no terms.
+
+Python standard library
+    PSF Licence Agreement, GPL-compatible.
+
+WMLST has ZERO mandatory third-party runtime dependencies, and that is a licence
+decision as much as a packaging one: a GPLv2 program cannot link an Apache-2.0
+library, because Apache 2.0's patent-termination clause imposes a restriction
+GPLv2 section 6 forbids. Adding any runtime dependency to this project therefore
+requires a licence review, and scripts/check_stdlib_only.py enforces the rule in
+CI.
+
+================================================================================
+5. A NOTE ON any2fasta
+================================================================================
+
+Upstream mlst shells out to any2fasta 0.9.0, a separate GPL-3.0 program by the
+same author. WMLST does not ship, link to, or execute that program: wmlst/
+any2fasta.py is an independent Python implementation of the same conversions,
+written against the documented behaviour and the observable output, and carries
+the GPL-2.0-only header of this project like every other file. No GPL-3.0 code
+is incorporated, so no GPLv2/GPLv3 incompatibility arises.
+
+================================================================================
+6. NO WARRANTY — AND A RESEARCH-USE CAVEAT
+================================================================================
+
+As stated in sections 11 and 12 of the GPL, WMLST comes with ABSOLUTELY NO
+WARRANTY. In addition, and independently of the licence:
+
+    WMLST IS FOR RESEARCH USE ONLY. It is not a medical device, it is not
+    IVDR/FDA cleared, and it must not be used as the sole basis for a clinical,
+    diagnostic, epidemiological or regulatory decision.
+
+================================================================================
+7. SOURCE CODE OFFER (GPLv2 sections 3(a) and 3(b))
+================================================================================
+
+Complete corresponding source for every released binary, including the exact
+commit, the build workflow and the public build log, is available at:
+
+    https://github.com/iowa69/WMLST
+
+Every release is published from a public tagged commit and its GitHub Actions
+build log is linked from the release body, which satisfies section 3(a). If you
+received a binary without that link, write to IOWA-Tech and you will be sent the
+source on a physical medium for no more than the cost of distribution, which
+satisfies section 3(b).
+
+--------------------------------------------------------------------------------
+WMLST — IOWA-Tech - Giovanni Lorenzin.
+Port of mlst 2.35.0 by Torsten Seemann (GPL-2.0-only).
+Allele data (c) PubMLST / Institut Pasteur - cite Jolley, Bray & Maiden (2018).

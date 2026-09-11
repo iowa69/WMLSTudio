@@ -1,0 +1,58 @@
+WMLST -- before you install
+IOWA-Tech - Giovanni Lorenzin
+
+
+THIS INSTALLER IS NOT CODE-SIGNED, AND WE ARE NOT GOING TO PRETEND IT IS.
+
+The first time you run it, Windows SmartScreen will very likely show a blue
+box that says:
+
+    "Windows protected your PC"
+    "Microsoft Defender SmartScreen prevented an unrecognised app from
+     starting."
+
+That is NOT a virus warning. SmartScreen is a reputation service: it has
+simply never seen this file before, because it is a new release from a small
+publisher without a several-hundred-euro-a-year Authenticode certificate.
+
+To continue:
+
+    1. Click "More info".
+    2. Click "Run anyway".
+
+If you would rather verify the download yourself first -- and you are welcome
+to -- every WMLST release publishes:
+
+    * SHA256SUMS.txt next to the installer. Check it in PowerShell with
+          Get-FileHash .\WMLST-1.0.0-win64-setup.exe -Algorithm SHA256
+      and compare the value.
+
+    * A public GitHub Actions build log, linked from the release notes, showing
+      exactly which commit produced exactly this file.
+
+We will never ask you to turn off SmartScreen or Defender, and we will never
+ask you to edit the registry. If any page claiming to be about WMLST tells you
+to do either of those things, it is not us.
+
+
+WHAT GETS INSTALLED
+
+    WMLST.exe          the graphical application
+    wmlst-cli.exe      the command line, output-compatible with mlst 2.35.0
+    _internal\db\      162 PubMLST typing schemes, 1,108 loci, 225,777 alleles
+    LICENSE.txt        GNU General Public License, version 2
+    NOTICE.txt         attribution, citations and the source-code offer
+
+NCBI BLAST+ is downloaded separately on first use (about 143 MB, verified by
+MD5) into your own user profile. No administrator rights are needed at any
+point.
+
+
+LICENCE AND ATTRIBUTION IN ONE PARAGRAPH
+
+WMLST is GPL-2.0-only. It is a port of "mlst" by Torsten Seemann
+(https://github.com/tseemann/mlst) -- please cite that first. The allele data
+comes from PubMLST; if you publish, cite Jolley, Bray & Maiden (2018),
+Wellcome Open Research 3:124, PMID 30345391. Full details are in NOTICE.txt.
+
+WMLST is for research use only. It is not a medical device.

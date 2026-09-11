@@ -1,0 +1,34 @@
+# sdist contents — docs/ARCHITECTURE.md section 13.1
+# GPLv2 section 3(a) is satisfied by shipping the complete corresponding source,
+# so LICENSE and NOTICE are included unconditionally and must never be pruned.
+
+include LICENSE
+include NOTICE
+include README.md
+include CHANGELOG.md
+include CONTRIBUTING.md
+include CODE_OF_CONDUCT.md
+include CITATION.cff
+include pyproject.toml
+include .gitattributes
+
+recursive-include docs *.md
+recursive-include docs/img *.png
+recursive-include scripts *.py *.sh
+recursive-include packaging *.py *.spec *.iss *.txt *.ico
+recursive-include tests *.py
+recursive-include tests/data *
+recursive-include tests/golden *
+
+# The database is the product. 162 schemes, 1,108 locus files, byte-frozen.
+include db/VERSION.txt
+include db/scheme_species_map.tab
+include db/schemes.manifest.tsv
+include db/__init__.py
+include db/pubmlst/__init__.py
+recursive-include db/pubmlst *.tfa *.txt *.json
+
+# Derived, rebuildable, ~180 MB. Never in an sdist or a wheel.
+prune db/blast
+recursive-exclude db *.staging
+global-exclude *.py[cod] __pycache__/* .DS_Store Thumbs.db *.bls

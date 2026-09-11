@@ -1,0 +1,2 @@
+ERROR: The input appears to be empty
+ERRPR: COMMAND FAILED: any2fasta -q null\.fa > /tmp/zDtzusOSTN/mlst.fna

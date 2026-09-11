@@ -1,0 +1,185 @@
+# WMLST packaging manifest — docs/ARCHITECTURE.md section 13.1
+# SPDX-License-Identifier: GPL-2.0-only
+# Copyright (C) 2025-2026 IOWA-Tech - Giovanni Lorenzin
+# Copyright (C) Torsten Seemann (upstream `mlst`, from which WMLST is ported)
+
+[build-system]
+requires = ["setuptools>=77", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "wmlst"
+dynamic = ["version"]
+description = "MLST typing for Windows - a native port of tseemann/mlst with the PubMLST database bundled"
+readme = { file = "README.md", content-type = "text/markdown" }
+requires-python = ">=3.9"
+license = "GPL-2.0-only"
+license-files = ["LICENSE", "NOTICE"]
+authors = [{ name = "Giovanni Lorenzin", email = "sintetico87@gmail.com" }]
+maintainers = [{ name = "IOWA-Tech" }]
+keywords = [
+    "MLST", "multilocus-sequence-typing", "bacterial-genomics",
+    "PubMLST", "BLAST", "genomics", "bioinformatics", "windows",
+]
+classifiers = [
+    "Development Status :: 5 - Production/Stable",
+    "Environment :: Console",
+    "Environment :: Win32 (MS Windows)",
+    "Environment :: X11 Applications",
+    "Intended Audience :: Science/Research",
+    "Intended Audience :: Healthcare Industry",
+    "Natural Language :: English",
+    "Operating System :: Microsoft :: Windows :: Windows 10",
+    "Operating System :: Microsoft :: Windows :: Windows 11",
+    "Operating System :: POSIX :: Linux",
+    "Operating System :: MacOS :: MacOS X",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Scientific/Engineering :: Bio-Informatics",
+    "Topic :: Scientific/Engineering :: Medical Science Apps.",
+]
+
+# SECTION 13.1: this list is EMPTY and stays EMPTY.
+# It is a licensing constraint, not a taste one: WMLST is GPL-2.0-only and a
+# GPLv2 work cannot link an Apache-2.0 library (the patent-termination clause is
+# a further restriction, which GPLv2 section 6 forbids). Any addition here needs
+# a licence review. scripts/check_stdlib_only.py enforces it in CI.
+dependencies = []
+
+[project.optional-dependencies]
+# Drag-and-drop in the GUI. Absent -> the Browse button still works (MIT licence).
+gui = ["tkinterdnd2>=0.3.0"]
+# Build-time only; never imported by wmlst/ at runtime.
+build = ["pyinstaller>=6.6", "build>=1.2", "twine>=5.0"]
+test = ["pytest>=7.0", "pytest-timeout>=2.1", "tomli>=2.0; python_version < '3.11'", "PyYAML>=6.0"]
+lint = ["ruff>=0.4", "mypy>=1.9"]
+dev = [
+    "wmlst[gui,build,test,lint]",
+]
+
+[project.urls]
+Homepage = "https://github.com/iowa69/WMLST"
+Repository = "https://github.com/iowa69/WMLST"
+Documentation = "https://github.com/iowa69/WMLST/blob/main/docs/ARCHITECTURE.md"
+Changelog = "https://github.com/iowa69/WMLST/blob/main/CHANGELOG.md"
+Issues = "https://github.com/iowa69/WMLST/issues"
+"Upstream (tseemann/mlst)" = "https://github.com/tseemann/mlst"
+"Allele data (PubMLST)" = "https://pubmlst.org"
+
+# Four console entry points and ONE gui entry point. The split matters on
+# Windows: setuptools binds a [project.scripts] name to python.exe (a console
+# window appears) and a [project.gui-scripts] name to pythonw.exe (none does).
+# WMLST.exe must never flash a console, so wmlst-gui lives below, not here.
+[project.scripts]
+wmlst = "wmlst.cli:main"
+wmlst-update-db = "wmlst.cli:main_update_db"
+wmlst-make-blast-db = "wmlst.cli:main_make_blast_db"
+wmlst-show-seqs = "wmlst.cli:main_show_seqs"
+
+[project.gui-scripts]
+wmlst-gui = "wmlst.gui:main"
+
+# ---------------------------------------------------------------------------
+# setuptools configuration
+# ---------------------------------------------------------------------------
+[tool.setuptools]
+zip-safe = false
+include-package-data = false
+# Explicit, because two package-dir roots disable auto-discovery. The 162 scheme
+# directories under db/pubmlst/ are NOT packages; they arrive via package-data.
+# `wmlst_db.pubmlst` is deliberately NOT a declared package even though it
+# carries the __init__.py section 13.1 asks for: declaring it would make Python
+# import it and drop a __pycache__ directory into db/pubmlst, which every
+# scheme enumerator (schemes.SchemeCatalog.names, updatedb._scheme_names) would
+# then count as a 163rd scheme and put into --list, --longlist and --info.
+packages = ["wmlst", "wmlst_db"]
+
+[tool.setuptools.dynamic]
+version = { attr = "wmlst.version.__version__" }
+
+# db/ is mapped into the importable package `wmlst_db` rather than declared as
+# data_files. data_files installs relative to sys.prefix, which is wrong under a
+# PyInstaller bundle and wrong inside a venv; a package is found with
+# importlib.resources from anywhere, frozen or not.
+[tool.setuptools.package-dir]
+wmlst = "wmlst"
+wmlst_db = "db"
+
+[tool.setuptools.package-data]
+wmlst = ["py.typed", "assets/*"]
+wmlst_db = [
+    "VERSION.txt",
+    "scheme_species_map.tab",
+    "schemes.manifest.tsv",
+    "pubmlst/__init__.py",
+    "pubmlst/*/*.tfa",
+    "pubmlst/*/*.txt",
+    "pubmlst/*/*.json",
+]
+
+# ---------------------------------------------------------------------------
+# pytest — the marker vocabulary is shared by every test module (section 13.4)
+# ---------------------------------------------------------------------------
+[tool.pytest.ini_options]
+minversion = "7.0"
+testpaths = ["tests"]
+addopts = "-ra --strict-markers --strict-config"
+markers = [
+    "golden: byte-for-byte comparison against real Perl mlst 2.35.0 output",
+    "needs_blast: requires a working blastn/makeblastdb on PATH or bootstrapped",
+    "needs_db: requires the committed PubMLST database in db/pubmlst",
+    "windows: only meaningful on Windows (skipped elsewhere)",
+    "gui: drives tkinter; skipped without a display",
+    "network: talks to PubMLST/Pasteur/NCBI; skipped unless WMLST_TEST_NETWORK=1",
+    "slow: takes more than ~10 s",
+]
+
+# ---------------------------------------------------------------------------
+# ruff / mypy — lint only, never a runtime dependency
+# ---------------------------------------------------------------------------
+[tool.ruff]
+line-length = 100
+target-version = "py39"
+extend-exclude = ["db", "tests/golden", "tests/data"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP", "B", "C4", "RUF"]
+ignore = [
+    "E501",    # long lines are checked by line-length, not twice
+    "UP006",   # PEP 585 generics break the 3.9 floor
+    "UP007",   # X | Y in annotations breaks the 3.9 floor
+    "UP035",   # collections.abc / builtins re-exports, same 3.9 floor
+    "UP045",   # Optional[X] -> X | None, same 3.9 floor as UP007
+    # int() here is Perl's int(): explicit truncation toward zero, and the
+    # 986-row scoring table in tests/golden/scores.tsv depends on it. Never
+    # "simplify" one of these away.
+    "RUF046",
+    # %-formatting is the deliberate house style: it is what the ported Perl
+    # uses, it keeps the translated lines readable next to their originals, and
+    # it works identically on every interpreter from the 3.9 floor upwards.
+    "UP030", "UP031", "UP032",
+    "B905",    # zip(strict=) is 3.10+
+    "RUF001",  # the em dash and the upstream typos are deliberate
+    "RUF002",
+    "RUF003",
+]
+
+[tool.ruff.lint.per-file-ignores]
+# engine.py is split into a frozen type contract (section A) and the algorithm
+# (section B); section B's imports deliberately sit after the frozen block so
+# the contract can be read, and diffed, on its own.
+"wmlst/engine.py" = ["E402"]
+# A test module imports after a sys.path / environment shim, by design.
+"tests/*" = ["E402"]
+
+[tool.mypy]
+python_version = "3.9"
+files = ["wmlst"]
+ignore_missing_imports = true
+warn_unused_configs = true
+no_implicit_optional = true

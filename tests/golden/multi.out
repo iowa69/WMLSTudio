@@ -1,0 +1,3 @@
+FILE	SCHEME	ST	STATUS	SCORE	ALLELES
+example.fna	sepidermidis	184	PERFECT	100	arcC(16);aroE(1);gtr(2);mutS(1);pyrR(2);tpiA(1);yqiL(1)
+novel.fa	mgenitalium	-	NOVEL	90	MLST_adk(7);MLST_atpA(1);MLST_gmk(1);MLST_gyrB(1);MLST_pgm(3);MLST_ppa(1)

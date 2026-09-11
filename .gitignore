@@ -1,0 +1,75 @@
+# ---------------------------------------------------------------------------
+# WMLST — IOWA-Tech / Giovanni Lorenzin
+# docs/ARCHITECTURE.md section 13.2 (repository hygiene)
+#
+# READ THIS BEFORE ADDING A RULE:
+#   db/pubmlst/ is COMMITTED ON PURPOSE (116 MB raw, ~5.8 MB of git objects).
+#   It is the allele database the golden corpus was generated against; removing
+#   it from version control changes every result. Never add it here, never move
+#   it to git-lfs, never archive it.
+#   tests/test_packaging.py::test_db_is_tracked fails the build if it vanishes.
+# ---------------------------------------------------------------------------
+
+# Derived BLAST index: ~180 MB, rebuildable in ~12 s with `wmlst --make-blast-db`.
+db/blast/
+db/pubmlst/*/database_version.txt
+db/.backup/
+db/*.staging/
+
+# Python bytecode / caches
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# Build artefacts
+build/
+dist/
+sdist/
+wheels/
+*.egg-info/
+*.egg
+.eggs/
+pip-wheel-metadata/
+MANIFEST
+
+# PyInstaller / Inno Setup output
+packaging/build/
+packaging/dist/
+packaging/Output/
+packaging/*.manifest
+*.spec.bak
+SHA256SUMS.txt
+
+# Test / lint caches
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.tox/
+.nox/
+.coverage
+.coverage.*
+htmlcov/
+coverage.xml
+junit*.xml
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# Editors / OS noise
+.vscode/
+.idea/
+*.swp
+*~
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Scratch output produced by a local run
+*.bls
+mlst.fna
+wmlst-report.html
+/tmp-wmlst/

@@ -1,0 +1,254 @@
+# SPDX-License-Identifier: GPL-2.0-only
+# Copyright (C) 2025-2026 IOWA-Tech - Giovanni Lorenzin
+# Copyright (C) Torsten Seemann (upstream `mlst`, from which WMLST is ported)
+#
+# WMLST release pipeline -- docs/ARCHITECTURE.md sections 13.1 and 13.4.
+#
+# Triggered by a tag of the form v1.2.3. The full test suite is a GATE, not a
+# formality: nothing is built until it is green, because the build log of this
+# very run is the provenance record a release body points at, and it is also
+# what GPLv2 section 3(a) leans on.
+#
+# Publishing to PyPI is NOT here. It stays a deliberate, manual step run by a
+# maintainer from a clean checkout (section 13.4).
+
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag to build (for a dry run)"
+        required: false
+        default: ""
+
+permissions:
+  contents: write   # required to create the Release and attach assets
+
+env:
+  PYTHONUTF8: "1"
+  BLAST_USAGE_REPORT: "false"
+
+jobs:
+  # ---------------------------------------------------------------------
+  gate:
+    name: Gate - full suite must pass before anything is built
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install NCBI BLAST+
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends ncbi-blast+
+
+      - name: Install WMLST
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e ".[test]"
+
+      - run: python scripts/check_stdlib_only.py wmlst
+      - run: python scripts/check_headers.py
+      - run: python packaging/make_icon.py --verify -o packaging/wmlst.ico
+      - run: python -m wmlst --make-blast-db
+      - run: python -m pytest -q --timeout=1800
+
+      - name: The tag must match wmlst/version.py
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          tag="${GITHUB_REF_NAME#v}"
+          ver="$(python -c 'import wmlst.version as v; print(v.__version__)')"
+          echo "tag=$tag version.py=$ver"
+          test "$tag" = "$ver" || {
+            echo "::error::tag $GITHUB_REF_NAME does not match wmlst/version.py ($ver)"
+            exit 1
+          }
+
+  # ---------------------------------------------------------------------
+  sdist-wheel:
+    name: Wheel and sdist
+    runs-on: ubuntu-latest
+    needs: gate
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: |
+          python -m pip install --upgrade pip build twine
+          python -m build
+          python -m twine check dist/*
+      - uses: actions/upload-artifact@v4
+        with:
+          name: python-dist
+          path: dist/*
+
+  # ---------------------------------------------------------------------
+  windows:
+    name: Windows executables, portable zip and installer
+    runs-on: windows-latest
+    needs: gate
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install WMLST and the build extra
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e ".[test,build,gui]"
+
+      - name: Bootstrap NCBI BLAST+ and stage it into the bundle
+        shell: pwsh
+        run: |
+          python -m wmlst --bootstrap-blast
+          # The spec picks up packaging\payload\blast automatically, so the
+          # installed application works offline on first run.
+          $src = Join-Path $env:LOCALAPPDATA "IOWA-Tech\WMLST\blast"
+          if (Test-Path $src) {
+            New-Item -ItemType Directory -Force -Path packaging\payload\blast | Out-Null
+            Copy-Item "$src\*" packaging\payload\blast -Recurse -Force
+            Get-ChildItem packaging\payload\blast | Select-Object Name, Length
+          } else {
+            Write-Warning "BLAST+ was not bootstrapped; the build will rely on runtime download"
+          }
+
+      - name: Build the icon and the frozen application
+        run: |
+          python packaging/make_icon.py -o packaging/wmlst.ico
+          python packaging/make_icon.py --verify -o packaging/wmlst.ico
+          pyinstaller --noconfirm --clean packaging/wmlst.spec
+
+      - name: Smoke-test the frozen executables
+        shell: pwsh
+        run: |
+          $env:WMLST_DBDIR = "$PWD\db"
+          & .\dist\WMLST\wmlst-cli.exe --version
+          & .\dist\WMLST\wmlst-cli.exe --make-blast-db
+          $row = & .\dist\WMLST\wmlst-cli.exe --quiet --skipcheck tests\data\example.fna
+          if ($row -notmatch "`tsepidermidis`t184`t") {
+            Write-Error "frozen CLI mistyped example.fna"; exit 1
+          }
+
+      - name: Portable zip
+        shell: pwsh
+        run: |
+          $v = python -c "import wmlst.version as v; print(v.__version__)"
+          New-Item -ItemType Directory -Force -Path release | Out-Null
+          Copy-Item LICENSE   dist\WMLST\LICENSE.txt -Force
+          Copy-Item NOTICE    dist\WMLST\NOTICE.txt -Force
+          Copy-Item README.md dist\WMLST\README.md -Force
+          Copy-Item packaging\SMARTSCREEN.txt dist\WMLST\SMARTSCREEN.txt -Force
+          Compress-Archive -Path dist\WMLST\* -DestinationPath "release\WMLST-$v-win64-portable.zip" -CompressionLevel Optimal
+
+      - name: Inno Setup installer
+        shell: pwsh
+        run: |
+          # Inno Setup 6 is preinstalled on windows-latest images; install it if
+          # the image ever stops shipping it.
+          $iscc = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
+          if (-not (Test-Path $iscc)) {
+            choco install innosetup --no-progress -y
+            $iscc = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
+          }
+          & $iscc packaging\wmlst.iss
+          Copy-Item packaging\Output\*.exe release\ -Force
+          Get-ChildItem release
+
+      - name: SHA256SUMS - the only provenance an unsigned build has
+        shell: pwsh
+        run: |
+          Push-Location release
+          Get-ChildItem -File | ForEach-Object {
+            $h = (Get-FileHash $_.FullName -Algorithm SHA256).Hash.ToLower()
+            "$h  $($_.Name)"
+          } | Set-Content -Encoding ascii SHA256SUMS.txt
+          Get-Content SHA256SUMS.txt
+          Pop-Location
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows-release
+          path: release/*
+
+  # ---------------------------------------------------------------------
+  publish:
+    name: Publish the GitHub Release
+    runs-on: ubuntu-latest
+    needs: [sdist-wheel, windows]
+    if: startsWith(github.ref, 'refs/tags/v')
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Collect assets and re-hash everything together
+        run: |
+          mkdir -p release
+          find artifacts -type f \( -name '*.exe' -o -name '*.zip' -o -name '*.whl' -o -name '*.tar.gz' \) \
+            -exec cp {} release/ \;
+          cd release
+          sha256sum * > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+
+      - name: Extract this version's section from CHANGELOG.md
+        id: notes
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          python - "$version" <<'PY' > RELEASE_BODY.md
+          import re, sys, pathlib
+          version = sys.argv[1]
+          text = pathlib.Path("CHANGELOG.md").read_text(encoding="utf-8")
+          pattern = re.compile(
+              r"^##\s*\[?%s\]?.*?$(.*?)(?=^##\s|\Z)" % re.escape(version),
+              re.M | re.S,
+          )
+          match = pattern.search(text)
+          body = match.group(1).strip() if match else "See CHANGELOG.md."
+          print(body)
+          print()
+          print("---")
+          print()
+          print("### Verifying this download")
+          print()
+          print("These binaries are **not code-signed**. SmartScreen will show")
+          print('*"Windows protected your PC"* the first time you run the installer.')
+          print("That is a reputation signal, not a virus detection: click")
+          print("**More info -> Run anyway**. Do not disable SmartScreen or Defender.")
+          print()
+          print("`SHA256SUMS.txt` is attached, and the public build log for this exact")
+          print("commit is at the Actions run linked above. Those two things are the")
+          print("provenance record.")
+          print()
+          print("### Licence and attribution")
+          print()
+          print("WMLST is **GPL-2.0-only**, a port of [`mlst`](https://github.com/tseemann/mlst)")
+          print("by **Torsten Seemann** - please cite that first. Allele data from")
+          print("**PubMLST**: cite Jolley, Bray & Maiden (2018), *Wellcome Open Res* 3:124,")
+          print("PMID 30345391. Packaged for Windows by **IOWA-Tech - Giovanni Lorenzin**.")
+          print()
+          print("Research use only. Not a medical device.")
+          PY
+          echo "body<<WMLSTEOF" >> "$GITHUB_OUTPUT"
+          cat RELEASE_BODY.md >> "$GITHUB_OUTPUT"
+          echo "WMLSTEOF" >> "$GITHUB_OUTPUT"
+
+      - name: Create the Release
+        uses: softprops/action-gh-release@v2
+        with:
+          name: WMLST ${{ github.ref_name }}
+          body: ${{ steps.notes.outputs.body }}
+          files: release/*
+          draft: false
+          prerelease: ${{ contains(github.ref_name, 'rc') || contains(github.ref_name, 'beta') }}
+          fail_on_unmatched_files: true

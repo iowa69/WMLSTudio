@@ -1,0 +1,87 @@
+cff-version: 1.2.0
+message: >-
+  If you use WMLST, please cite the PubMLST database paper and Torsten Seemann's
+  original mlst first, then this port.
+title: "WMLST: a Windows-native port of mlst for MLST typing of bacterial assemblies"
+abbreviation: WMLST
+version: "1.0.0"
+date-released: "2026-09-11"
+type: software
+license: GPL-2.0-only
+url: "https://github.com/iowa69/WMLST"
+repository-code: "https://github.com/iowa69/WMLST"
+keywords:
+  - MLST
+  - multilocus sequence typing
+  - bacterial genomics
+  - PubMLST
+  - BLAST
+  - Windows
+  - bioinformatics
+authors:
+  - family-names: Lorenzin
+    given-names: Giovanni
+    affiliation: IOWA-Tech
+contact:
+  - name: IOWA-Tech
+    website: "https://github.com/iowa69/WMLST"
+references:
+  - type: software
+    title: "mlst: scan contig files against traditional PubMLST typing schemes"
+    version: "2.35.0"
+    license: GPL-2.0-only
+    url: "https://github.com/tseemann/mlst"
+    repository-code: "https://github.com/tseemann/mlst"
+    notes: >-
+      WMLST is a derivative port of this program. Cite it first.
+    authors:
+      - family-names: Seemann
+        given-names: Torsten
+  - type: article
+    title: >-
+      Open-access bacterial population genomics: BIGSdb software, the PubMLST.org
+      website and their applications
+    year: 2018
+    journal: "Wellcome Open Research"
+    volume: 3
+    start: 124
+    doi: 10.12688/wellcomeopenres.14826.1
+    notes: "PMID 30345391. The source of every allele sequence shipped in db/pubmlst/."
+    authors:
+      - family-names: Jolley
+        given-names: Keith A.
+      - family-names: Bray
+        given-names: James E.
+      - family-names: Maiden
+        given-names: Martin C. J.
+  - type: article
+    title: "Basic local alignment search tool"
+    year: 1990
+    journal: "Journal of Molecular Biology"
+    volume: 215
+    start: 403
+    end: 410
+    doi: 10.1016/S0022-2836(05)80360-2
+    notes: "NCBI BLAST+ is the search engine WMLST drives. Public domain (US Government Work)."
+    authors:
+      - family-names: Altschul
+        given-names: Stephen F.
+      - family-names: Gish
+        given-names: Warren
+      - family-names: Miller
+        given-names: Webb
+      - family-names: Myers
+        given-names: Eugene W.
+      - family-names: Lipman
+        given-names: David J.
+preferred-citation:
+  type: software
+  title: "WMLST: a Windows-native port of mlst for MLST typing of bacterial assemblies"
+  version: "1.0.0"
+  year: 2026
+  license: GPL-2.0-only
+  url: "https://github.com/iowa69/WMLST"
+  authors:
+    - family-names: Lorenzin
+      given-names: Giovanni
+      affiliation: IOWA-Tech

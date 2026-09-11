@@ -1,0 +1,61 @@
+# ---------------------------------------------------------------------------
+# WMLST — docs/ARCHITECTURE.md section 13.2
+#
+# THIS FILE IS LOAD-BEARING, NOT COSMETIC.
+# A contributor with core.autocrlf=true would otherwise have git rewrite the
+# allele FASTA line endings on checkout. Every allele's MD5 would change, so
+# every --novel identifier would change, and BLAST would score different hits.
+# The database, the fixtures and the golden corpus are therefore declared
+# NOT TEXT so git never touches a byte of them.
+# ---------------------------------------------------------------------------
+
+# Sane default for everything not named below.
+* text=auto eol=lf
+
+# --- byte-frozen payloads: git must never normalise these -----------------
+db/pubmlst/**          -text -eol
+db/scheme_species_map.tab  -text -eol
+db/VERSION.txt         -text -eol
+db/schemes.manifest.tsv    -text -eol
+tests/data/**          -text -eol
+tests/golden/**        -text -eol
+
+# --- binary by nature ------------------------------------------------------
+*.tfa   binary
+*.ico   binary
+*.png   binary
+*.jpg   binary
+*.gif   binary
+*.gz    binary
+*.bz2   binary
+*.zip   binary
+*.exe   binary
+*.dll   binary
+*.pdf   binary
+
+# --- explicit text with a forced line ending -------------------------------
+*.py    text eol=lf
+*.pyi   text eol=lf
+*.md    text eol=lf
+*.toml  text eol=lf
+*.cfg   text eol=lf
+*.yml   text eol=lf
+*.yaml  text eol=lf
+*.cff   text eol=lf
+*.sh    text eol=lf
+*.spec  text eol=lf
+LICENSE text eol=lf
+NOTICE  text eol=lf
+
+# Inno Setup and the PyInstaller VSVersionInfo are consumed by Windows tools
+# that are happier with CRLF, and nothing hashes them.
+*.iss   text eol=crlf
+packaging/version_info.txt  text eol=crlf
+*.bat   text eol=crlf
+*.ps1   text eol=crlf
+
+# --- GitHub linguist: do not let 116 MB of alleles decide the repo language -
+db/pubmlst/**      linguist-generated=true
+tests/golden/**    linguist-generated=true
+tests/data/**      linguist-generated=true
+docs/ARCHITECTURE.md  linguist-documentation=true

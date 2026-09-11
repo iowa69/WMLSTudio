@@ -1,0 +1,17 @@
+[
+   {
+      "alleles" : {
+         "mutS" : "1",
+         "aroE" : "1",
+         "pyrR" : "2",
+         "tpiA" : "1",
+         "arcC" : "16",
+         "gtr" : "2",
+         "yqiL" : "1"
+      },
+      "sequence_type" : "184",
+      "filename" : "example.fna",
+      "scheme" : "sepidermidis",
+      "id" : "example.fna"
+   }
+]

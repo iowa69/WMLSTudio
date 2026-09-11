@@ -1,0 +1,2 @@
+BLAST engine error: Warning: Sequence contains no data 
+ERRPR: COMMAND FAILED:  blastn -query /tmp/F2fVBbWCsk/mlst.fna -out /tmp/F2fVBbWCsk/mlst.bls -db \/home\/iowa\/Desktop\/wmlst\/db\/blast\/mlst\.fa -num_threads 1 -ungapped -dust no -word_size 32 -max_target_seqs 100000 -perc_identity 95 -evalue 1E-20 -outfmt '6 sseqid slen length nident qseqid qstart qend qseq sstrand'
