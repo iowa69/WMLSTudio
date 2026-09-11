@@ -3456,6 +3456,8 @@ class WmlstApp:
         # at 120 ms, so the race was always lost and the user got a spurious
         # "BLAST is missing" download modal): _apply_env / _task_failed drain them.
         self._argv_files: List[str] = []
+        #: One-shot: the first launch after an install builds the index itself.
+        self._auto_index_build_tried = False
         self._bootstrap: Optional[BootstrapDialog] = None
         self._failed_count = 0
         self._build()
@@ -3598,8 +3600,21 @@ class WmlstApp:
             self.status.set(env.db_error or "The MLST database could not be found.",
                             "bad", resting=True)
         elif env.index_stale:
-            self.status.set("The search index is older than the allele files — "
-                            "rebuild it from the Database tab.", "warn", resting=True)
+            # A fresh install ships the allele files but not the 180 MB derived
+            # index, so the very first launch always lands here. Telling a novice
+            # to go and find the Database tab is not an answer: the rebuild needs
+            # no download, no consent and no decision, so just do it and show
+            # progress. Once only -- if it fails, say so rather than looping,
+            # because the task's own completion re-probes the environment.
+            if env.blast_ok and not self._auto_index_build_tried:
+                self._auto_index_build_tried = True
+                self.status.set("Preparing the search index — this happens once, "
+                                "and takes about a minute.", "info", resting=True)
+                self.rebuild_index()
+            else:
+                self.status.set("The search index is older than the allele files — "
+                                "rebuild it from the Database tab.", "warn",
+                                resting=True)
         elif env.blast_ok:
             self.status.set("Ready. Drop a FASTA file on the box above."
                             if self.dnd_enabled else
@@ -3616,6 +3631,12 @@ class WmlstApp:
         """Hand any command-line files to the drop handler, once the environment
         probe has answered.  Runs at most once per batch of argv files."""
         if not self._argv_files:
+            return
+        # Hold them back while the first-run index build is in flight: starting a
+        # search against a half-built index fails, and the failure looks like a
+        # missing search engine rather than "wait a moment". The rebuild's own
+        # completion re-probes the environment, which calls this again.
+        if self.env.index_stale and self._auto_index_build_tried:
             return
         pending, self._argv_files = self._argv_files, []
         self.root.after(1, lambda: self.analyse_view.handle_paths(pending))

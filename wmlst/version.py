@@ -8,7 +8,7 @@ Keeping UPSTREAM_MLST_VERSION here documents exactly which upstream release
 the byte-compatibility contract in docs/ARCHITECTURE.md was verified against.
 """
 
-__version__ = "1.0.0"
+__version__ = "1.0.1"
 
 #: The tseemann/mlst release whose output WMLST reproduces byte-for-byte.
 UPSTREAM_MLST_VERSION = "2.35.0"

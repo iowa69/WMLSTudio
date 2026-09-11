@@ -14,6 +14,25 @@ independently of the software version. Both appear in every JSON and HTML report
 
 Nothing yet.
 
+## [1.0.1] - 2026-09-11
+
+### Fixed
+
+- **First launch after an install now works with no intervention.** The installer
+  ships the allele files but not the 180 MB derived BLAST index, so the first
+  start always found it missing. WMLST asked the user to go and rebuild it from
+  the Database tab; it now builds the index itself, with progress, and says so.
+- **A missing index is no longer misreported as a missing BLAST+ installation.**
+  `blastn` runs with the database directory as its working directory, so when
+  that directory did not exist the launch failed with a bare "No such file or
+  directory" attributed to the `blastn` path. On first run that surfaced as
+  *"WMLST needs its search engine"* and offered a 137 MB download that would not
+  have fixed anything. `run_blastn` now checks the index first and raises a
+  `DatabaseMissingError` that names the real problem.
+- **Files passed on the command line no longer race the first-run index build.**
+  `wmlst-gui sample.fna` began analysing before the index finished building and
+  failed with the misleading error above. They are now held until it is ready.
+
 ## [1.0.0] - 2026-09-11
 
 First public release. A complete Windows-native port of

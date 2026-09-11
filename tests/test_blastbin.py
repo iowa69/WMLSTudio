@@ -893,3 +893,42 @@ def _main():
 
 if __name__ == "__main__":
     sys.exit(_main())
+
+
+# ---------------------------------------------------------------------------
+# A missing index must be diagnosed as a missing index
+# ---------------------------------------------------------------------------
+
+def test_missing_index_is_a_database_error_not_a_missing_blast_error():
+    """A fresh install has alleles but no derived index (section 8.6).
+
+    cwd for blastn is the database directory, so when it does not exist Popen
+    fails with a bare "No such file or directory: <db dir>" attributed to the
+    blastn path.  That reads as "BLAST is not installed" and sent the GUI on to
+    offer a 137 MB download that would not have fixed anything.
+    """
+    from wmlst.engine import BlastNotFoundError, DatabaseMissingError
+
+    tools = _tools()
+    with tempfile.TemporaryDirectory() as tmp:
+        query = os.path.join(tmp, "q.fna")
+        with open(query, "w", newline="\n") as fh:
+            fh.write(">c1\n" + "ACGT" * 40 + "\n")
+
+        missing_dir = os.path.join(tmp, "nope", "mlst.fa")
+        try:
+            blastbin.run_blastn(tools, query=query, out=os.path.join(tmp, "o.bls"),
+                                blastdb=missing_dir, threads=1, minid=95.0)
+        except DatabaseMissingError as exc:
+            assert "index" in exc.user_message.lower()
+            assert "rebuild" in exc.user_message.lower()
+        except BlastNotFoundError as exc:
+            raise AssertionError(
+                "a missing index was reported as a missing BLAST installation"
+            ) from exc
+        else:
+            raise AssertionError("no error for a missing index directory")
+
+        # A directory that exists but holds a bad database is blastn's own
+        # diagnosis (exit 2 with a clear message), which the engine already
+        # handles -- see test_bad_database_name_is_exit_2. Not pre-empted here.

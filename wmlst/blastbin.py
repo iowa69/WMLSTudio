@@ -707,6 +707,17 @@ def run_blastn(
     exit-code interpretation is the engine's job (section 8.6).
     """
     db_dir = os.path.dirname(os.path.abspath(blastdb)) or os.curdir
+    # Diagnose a missing index HERE, while we still know what is missing. cwd is
+    # the database directory, so if it does not exist Popen fails with a bare
+    # "No such file or directory: <db dir>" attributed to the blastn path -- which
+    # reads as "BLAST is not installed" and sends the user off to download 137 MB
+    # that will not help. The index is derived and rebuildable; say so.
+    if not os.path.isdir(db_dir):
+        raise _exc("DatabaseMissingError")(
+            "the BLAST index directory does not exist: %s" % db_dir,
+            user_message=("The search index has not been built yet. WMLST can "
+                          "rebuild it from the allele files."),
+        )
     argv = blastn_argv(
         tools,
         query=query,

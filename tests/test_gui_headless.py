@@ -17,6 +17,7 @@ Runnable as ``python -m pytest tests/test_gui_headless.py`` and as
 
 from __future__ import annotations
 
+import dataclasses
 import json
 import os
 import sys
@@ -1198,3 +1199,71 @@ def _run_all() -> int:
 
 if __name__ == "__main__":
     sys.exit(_run_all())
+
+
+# ---------------------------------------------------------------------------
+# First run after an install: the index builds itself, and nothing races it
+# ---------------------------------------------------------------------------
+
+class _FakeStatus:
+    def __init__(self):
+        self.messages = []
+
+    def set(self, text, kind="info", **kw):
+        self.messages.append((kind, text))
+
+
+class _FirstRunApp:
+    """The slice of WmlstApp that _start_argv_files and the auto-build touch."""
+
+    _start_argv_files = gui.WmlstApp._start_argv_files
+    _auto_index_build_tried = False
+
+    def __init__(self, env):
+        self.env = env
+        self._argv_files = ["sample.fna"]
+        self.started = []
+        self.analyse_view = type("V", (), {
+            "handle_paths": staticmethod(lambda paths: self.started.append(list(paths)))
+        })()
+        # after() fires immediately here; the real one defers by 1 ms.
+        self.root = type("R", (), {"after": staticmethod(lambda ms, fn: fn())})()
+
+
+def _env(**kw):
+    base = {"db_ok": True, "blast_ok": True, "index_stale": False}
+    base.update(kw)
+    return gui.Environment(**{k: v for k, v in base.items()
+                              if k in {f.name for f in
+                                       dataclasses.fields(gui.Environment)}})
+
+
+def test_argv_files_wait_for_the_first_run_index_build():
+    """Files named on the command line must not be analysed mid-rebuild.
+
+    A search against a half-built index fails, and the failure surfaced as
+    "WMLST could not start blastn" -- a missing-search-engine dialog on the very
+    first launch, when the search engine was fine and only the index was absent.
+    """
+    app = _FirstRunApp(_env(index_stale=True))
+    app._auto_index_build_tried = True          # the rebuild is in flight
+    app._start_argv_files()
+    assert app.started == [], "argv files were started while the index was building"
+    assert app._argv_files == ["sample.fna"], "the queued files were dropped"
+
+
+def test_argv_files_run_once_the_index_is_ready():
+    """The rebuild's completion re-probes the environment, which releases them."""
+    app = _FirstRunApp(_env(index_stale=False))
+    app._auto_index_build_tried = True
+    app._start_argv_files()
+    assert app.started == [["sample.fna"]], "argv files were never started"
+    assert app._argv_files == [], "the queue was not drained"
+
+
+def test_argv_files_are_not_held_when_no_rebuild_was_attempted():
+    """A stale index with no BLAST to rebuild it must not hang the queue open."""
+    app = _FirstRunApp(_env(index_stale=True, blast_ok=False))
+    app._auto_index_build_tried = False
+    app._start_argv_files()
+    assert app.started == [["sample.fna"]]
