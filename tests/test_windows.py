@@ -59,15 +59,36 @@ def _need_db():
         raise unittest.SkipTest("db/blast/mlst.fa index not built")
 
 
+#: A symbolic link is never an acceptable way to stage a BLAST index on Windows.
+#: It is a reparse point whose OWN directory entry is zero bytes long, and the
+#: directory-entry APIs (FindFirstFileA / GetFileAttributesEx) report that zero
+#: rather than the target's length -- which is exactly what blastn.exe asks for
+#: before it memory-maps .nsq/.nin/.nhr.  It then maps a database it believes is
+#: empty and dereferences the null that comes back: exit 0xC0000005 with no
+#: stdout and no stderr at all, the "truncated index" access violation of
+#: docs/ARCHITECTURE.md 8.6.  A real "C:\Program Files" database is real
+#: files, so hardlink-or-copy is both the faithful staging and the working one.
+#: POSIX stat() follows links, so there the cheap symlink stays.
+_STAGE_ATTEMPTS = ((os.link, shutil.copy) if os.name == "nt"
+                   else (os.symlink, os.link, shutil.copy))
+
+
 def _link_index(dest_dir):
-    """Make the 12 .n* index files visible in `dest_dir` as cheaply as possible."""
+    """Stage the 12 .n* index files into `dest_dir` as cheaply as is SAFE.
+
+    See :data:`_STAGE_ATTEMPTS`: cheapest first, but never a Windows symlink.
+    Every staged file is size-checked against its source afterwards, so a short
+    write turns into a named failure here instead of an opaque access violation
+    inside blastn.exe half a test later.
+    """
     os.makedirs(dest_dir, exist_ok=True)
+    staged = []
     for name in sorted(os.listdir(os.path.dirname(BLASTDB))):
         if not name.startswith(os.path.basename(BLASTDB) + "."):
             continue  # mlst.fa itself is deliberately not shipped (C10)
         src = os.path.join(os.path.dirname(BLASTDB), name)
         dst = os.path.join(dest_dir, name)
-        for attempt in (os.symlink, os.link, shutil.copy):
+        for attempt in _STAGE_ATTEMPTS:
             try:
                 attempt(src, dst)
                 break
@@ -75,7 +96,24 @@ def _link_index(dest_dir):
                 continue
         else:  # pragma: no cover
             raise unittest.SkipTest("cannot stage the BLAST index")
+        staged.append((src, dst))
+    assert staged, "no index files to stage"
+    bad = [os.path.basename(dst) for src, dst in staged
+           if os.path.getsize(dst) != os.path.getsize(src)
+           or (os.name == "nt" and os.path.islink(dst))]
+    assert not bad, "staged index is not a faithful copy: %s" % (bad,)
     return os.path.join(dest_dir, os.path.basename(BLASTDB))
+
+
+def _native_newlines(lf_bytes):
+    r"""What a C++ ofstream in text mode writes for `lf_bytes` on THIS platform.
+
+    blastn.exe opens -out in text mode, so every \n it writes lands as \r\n; the
+    goldens are recorded on Linux and are pure LF.  Translating the GOLDEN (never
+    the observed output) keeps the comparison an exact byte comparison on both
+    platforms -- a stray \r anywhere else, or a lost one, still fails.
+    """
+    return lf_bytes.replace(b"\n", b"\r\n") if os.name == "nt" else lf_bytes
 
 
 def _blast_to_string(tools, query_src, db, threads=1, query_name="mlst.fna"):
@@ -85,7 +123,8 @@ def _blast_to_string(tools, query_src, db, threads=1, query_name="mlst.fna"):
         any2fasta.convert_to_file(query_src, fna)
         proc = blastbin.run_blastn(tools, query=fna, out=bls, blastdb=db,
                                    threads=threads)
-        assert proc.returncode == 0, proc.stderr
+        assert proc.returncode == 0, "blastn exit %s (0x%08X): %r" % (
+            proc.returncode, proc.returncode & 0xFFFFFFFF, proc.stderr)
         with open(bls, "rb") as fh:
             return fh.read()
 
@@ -279,9 +318,14 @@ def test_database_directory_containing_a_space():
         raise unittest.SkipTest("no golden BLAST output")
     with tempfile.TemporaryDirectory() as tmp:
         db = _link_index(os.path.join(tmp, "Program Files", "MLST db"))
+        assert " " in db
         got = _blast_to_string(tools, os.path.join(DATA, "example.fna"), db)
     with open(golden, "rb") as fh:
-        assert got == fh.read()
+        want = fh.read()
+    # Byte-exact, with the ONE difference the platform is allowed to make: the
+    # text-mode line terminator blastn.exe itself writes (section 8.4).  The
+    # engine reads mlst.bls back with newline=None, which undoes it again.
+    assert got == _native_newlines(want)
 
 
 def test_building_a_blast_db_under_a_path_containing_a_space():
@@ -333,19 +377,30 @@ def test_building_a_blast_db_under_a_path_containing_a_space():
 
 
 def test_path_rung_survives_the_st_mode_windows_synthesises():
-    """Windows reports 0o40777 for every writable directory (section 4.4).
+    r"""Windows reports 0o40777 for every writable directory (section 4.4).
 
     CPython's attributes_to_mode() makes st_mode a function of the file
     ATTRIBUTES, not of any ACL: a plain directory is 0o40777 and a read-only one
     0o40555.  Testing S_IWOTH there inverted the binary-planting guard and made
     the PATH rung -- the only rung a `pip install wmlst` user with NCBI's own
     BLAST+ can reach -- reject every ordinary install directory.
+
+    The PATH rung is the fifth of six, so reaching it means silencing the four
+    above it.  %LOCALAPPDATA% is one of them and is the easy one to forget: it
+    is not read directly but through install_root(), and on the Windows CI
+    runner the earlier `--bootstrap-blast` step has filled
+    %LOCALAPPDATA%\IOWA-Tech\WMLST\blast with a checksummed, INSTALL_OK-stamped
+    2.17.0+, so find_blast() returned origin "appdata" and never looked at PATH
+    at all.  Point LOCALAPPDATA at an empty directory for the duration, and
+    assert that the rung really is gone before relying on it being gone.
     """
     which = shutil.which("blastn")
     if not which:
         raise unittest.SkipTest("no blastn on PATH")
     bindir = os.path.dirname(os.path.realpath(which))
-    target = os.path.abspath(bindir)
+    # normcase(): NTFS is case-insensitive, so the same directory can reach the
+    # stub spelled either way and the S_IWOTH trap must still arm.
+    target = os.path.normcase(os.path.abspath(bindir))
 
     class _VersionPopen:
         def __init__(self, args, **kwargs):
@@ -361,14 +416,15 @@ def test_path_rung_survives_the_st_mode_windows_synthesises():
 
     def windows_stat(path, *a, **kw):
         st = real_stat(path, *a, **kw)
-        if os.path.abspath(path) == target:
+        if os.path.normcase(os.path.abspath(path)) == target:
             return os.stat_result([stat.S_IFDIR | 0o111 | 0o666, *tuple(st)[1:]])
         return st
 
     saved = (blastbin.IS_WINDOWS, blastbin._startupinfo, subprocess.Popen,
              blastbin.os.stat)
     saved_env = {k: os.environ.get(k)
-                 for k in ("PATH", "WMLST_BLAST_DIR", "CONDA_PREFIX")}
+                 for k in ("PATH", "WMLST_BLAST_DIR", "CONDA_PREFIX",
+                           "LOCALAPPDATA", "XDG_DATA_HOME")}
     try:
         blastbin.IS_WINDOWS = True
         blastbin._startupinfo = lambda: None
@@ -377,9 +433,16 @@ def test_path_rung_survives_the_st_mode_windows_synthesises():
         os.environ.pop("WMLST_BLAST_DIR", None)
         os.environ.pop("CONDA_PREFIX", None)
         os.environ["PATH"] = bindir
-        assert windows_stat(bindir).st_mode & stat.S_IWOTH  # the trap
-        assert not blastbin._is_world_writable(bindir)      # ... now disarmed
-        tools = blastbin.find_blast()
+        with tempfile.TemporaryDirectory() as empty:
+            # install_root() reads LOCALAPPDATA while IS_WINDOWS is forced on,
+            # on BOTH platforms; an empty one is a rung with no blastn in it.
+            os.environ["LOCALAPPDATA"] = empty
+            os.environ["XDG_DATA_HOME"] = empty
+            assert not os.path.isdir(os.path.join(blastbin.install_root(),
+                                                  "blast")), "appdata rung alive"
+            assert windows_stat(bindir).st_mode & stat.S_IWOTH  # the trap
+            assert not blastbin._is_world_writable(bindir)      # ... now disarmed
+            tools = blastbin.find_blast()
     finally:
         (blastbin.IS_WINDOWS, blastbin._startupinfo, subprocess.Popen,
          blastbin.os.stat) = saved
@@ -388,7 +451,11 @@ def test_path_rung_survives_the_st_mode_windows_synthesises():
                 os.environ.pop(key, None)
             else:
                 os.environ[key] = value
+    # Not just "it found something": it must have come off PATH, through the
+    # guard, with the synthesised 0o40777 st_mode in force.
     assert tools.origin == "path", tools.origin
+    assert os.path.normcase(
+        os.path.dirname(os.path.abspath(tools.blastn))) == target
 
 
 def test_query_filename_with_shell_metacharacters():

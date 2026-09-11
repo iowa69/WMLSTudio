@@ -110,7 +110,8 @@ InfoBeforeFile=SMARTSCREEN.txt
 Name: "english"; MessagesFile: "compiler:Default.isl"
 
 [Tasks]
-Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "{cm:AdditionalIcons}"; Flags: unchecked
+; Checked by default: the desktop shortcut is how most users will start WMLST.
+Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "{cm:AdditionalIcons}"
 Name: "addtopath"; Description: "Add the command-line tool (wmlst-cli.exe) to my PATH"; GroupDescription: "Command line"; Flags: unchecked
 
 [Files]

@@ -60,6 +60,36 @@ def _tools():
         raise unittest.SkipTest("no usable blastn: %s" % exc) from exc
 
 
+class _env:
+    """Set/clear environment variables for a block, restoring them exactly."""
+
+    def __init__(self, **values):
+        self._values = values
+        self._saved = {}
+
+    def __enter__(self):
+        for key, value in self._values.items():
+            self._saved[key] = os.environ.get(key)
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+        return self
+
+    def __exit__(self, *exc):
+        for key, value in self._saved.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+        return False
+
+
+def _has_space(path):
+    """True when `path` holds whitespace -- what makeblastdb cannot address."""
+    return any(ch.isspace() for ch in path)
+
+
 def _need_db():
     if not os.path.isfile(BLASTDB + ".nin"):
         raise unittest.SkipTest("db/blast/mlst.fa index not built")
@@ -70,13 +100,19 @@ def _need_db():
 # ---------------------------------------------------------------------------
 
 def test_blastn_argv_is_an_exact_transliteration():
+    # -query and -out are the two values that go through ansi_safe(), which
+    # absolutises: the POSIX spellings below come back as themselves on POSIX
+    # and as "<cwd drive>:\\tmp\\job\\mlst.fna" on Windows.  Everything else --
+    # argv[0] (launched, never opened), the bare -db basename, and every flag,
+    # in this order, with no quoting anywhere -- is pinned verbatim.
+    query, out = "/tmp/job/mlst.fna", "/tmp/job/mlst.bls"
     argv = blastbin.blastn_argv(
-        FAKE, query="/tmp/job/mlst.fna", out="/tmp/job/mlst.bls",
+        FAKE, query=query, out=out,
         db_basename="mlst.fa", threads=1, minid=95.0)
     assert argv == [
         "/opt/blast/bin/blastn",
-        "-query", "/tmp/job/mlst.fna",
-        "-out", "/tmp/job/mlst.bls",
+        "-query", os.path.abspath(query),
+        "-out", os.path.abspath(out),
         "-db", "mlst.fa",
         "-num_threads", "1",
         "-ungapped",
@@ -150,16 +186,22 @@ def test_argv0_is_never_put_through_the_ansi_gate():
     saved = blastbin.ansi_safe
     exes = (holed.blastn, holed.makeblastdb)
 
+    # A sentinel rather than a real path: it makes "went through the gate"
+    # observable in argv, on every platform, without dragging os.sep or the
+    # current drive letter into the assertion.
     def picky(path):  # what Windows/cp1252 does to that install root
-        return None if path in exes else os.path.abspath(path)
+        return None if path in exes else "GATED:" + path
 
     try:
         blastbin.ansi_safe = picky
         argv = blastbin.blastn_argv(
             holed, query="/tmp/q.fna", out="/tmp/o.bls", db_basename="mlst.fa",
             threads=1, minid=95.0)
+        # argv[0] is the raw exe: had it been gated, picky() would have
+        # returned None and _argv_path() would have raised instead.
         assert argv[0] == holed.blastn
-        assert argv[2] == "/tmp/q.fna" and argv[4] == "/tmp/o.bls"
+        # ... while -query/-out DID go through the gate.
+        assert argv[2] == "GATED:/tmp/q.fna" and argv[4] == "GATED:/tmp/o.bls"
         assert blastbin.makeblastdb_argv(holed, "mlst.fa")[0] == holed.makeblastdb
     finally:
         blastbin.ansi_safe = saved
@@ -520,32 +562,53 @@ def test_find_blast_explicit_file_and_directory():
 
 
 def test_find_blast_raises_when_nothing_is_installed():
-    saved_path = os.environ.get("PATH")
-    saved_dir = os.environ.get("WMLST_BLAST_DIR")
-    saved_conda = os.environ.get("CONDA_PREFIX")
-    os.environ["PATH"] = os.path.join(REPO, "no-such-dir")
-    os.environ.pop("WMLST_BLAST_DIR", None)
-    os.environ.pop("CONDA_PREFIX", None)
-    try:
-        try:
-            blastbin.find_blast("/definitely/not/here/blastn")
-        except BlastNotFoundError as exc:
-            assert "BLAST+" in exc.user_message
-        else:
-            raise AssertionError("no BlastNotFoundError")
-    finally:
-        if saved_path is not None:
-            os.environ["PATH"] = saved_path
-        if saved_dir is not None:
-            os.environ["WMLST_BLAST_DIR"] = saved_dir
-        if saved_conda is not None:
-            os.environ["CONDA_PREFIX"] = saved_conda
+    """Every rung of the ladder empty -> BlastNotFoundError, on both platforms.
+
+    The per-user install root is a rung too, and on a machine that has ever run
+    ``--bootstrap-blast`` it is populated (the Windows CI job does exactly that,
+    into ``%LOCALAPPDATA%\\IOWA-Tech\\WMLST\\blast``), so emptying PATH alone left
+    find_blast() returning an "appdata" install and the test asserting nothing.
+    install_root() reads LOCALAPPDATA on Windows and XDG_DATA_HOME elsewhere:
+    pointing both at an empty directory empties that rung the same way PATH is
+    emptied, rather than dropping the case the rung is there to cover.
+    """
+    with tempfile.TemporaryDirectory() as empty:
+        with _env(PATH=os.path.join(REPO, "no-such-dir"),
+                  WMLST_BLAST_DIR=None, CONDA_PREFIX=None,
+                  LOCALAPPDATA=empty, XDG_DATA_HOME=empty):
+            # The neutralisation must really have taken: if install_root() ever
+            # stops honouring these, fail here rather than silently finding the
+            # machine's own BLAST+ and calling the ladder exhausted.
+            assert not os.path.isdir(os.path.join(blastbin.install_root(), "blast"))
+            try:
+                blastbin.find_blast("/definitely/not/here/blastn")
+            except BlastNotFoundError as exc:
+                assert "BLAST+" in exc.user_message
+            else:
+                raise AssertionError("no BlastNotFoundError")
 
 
 def test_world_writable_guard():
+    """The binary-planting guard, as each platform must really behave.
+
+    POSIX: a world-writable directory on PATH is refused, a 0o755 one is not.
+
+    Windows: there are no POSIX mode bits to read.  CPython synthesises st_mode
+    from the file attributes (attributes_to_mode() in Python/fileutils.c), so
+    every directory that is not FILE_ATTRIBUTE_READONLY reports 0o40777 --
+    S_IWOTH set -- and os.chmod() cannot clear it.  The guard is a deliberate
+    no-op there, and the Windows branch below is what fails if that is ever
+    reverted: the first assertion shows the directory does report world-writable
+    and the second demands the guard pass it anyway, which is the only thing
+    keeping the PATH rung (the only rung a pip install on Windows can hit) alive.
+    """
     with tempfile.TemporaryDirectory() as tmp:
         os.chmod(tmp, 0o777)
-        assert blastbin._is_world_writable(tmp)
+        if blastbin.IS_WINDOWS:
+            assert os.stat(tmp).st_mode & stat.S_IWOTH  # synthesised, always
+            assert not blastbin._is_world_writable(tmp)
+        else:
+            assert blastbin._is_world_writable(tmp)
         os.chmod(tmp, 0o755)
         assert not blastbin._is_world_writable(tmp)
 
@@ -588,8 +651,17 @@ def test_path_rung_is_not_blocked_by_the_windows_st_mode():
             assert not blastbin._is_world_writable(tmp)
         finally:
             blastbin.IS_WINDOWS = saved
-        # ... while POSIX keeps its planting guard.
-        assert blastbin._is_world_writable(tmp)
+        # ... while the POSIX branch, run against that very same directory,
+        # DOES reject it: on POSIX because it really is mode 0o777, on Windows
+        # because the synthesised st_mode says 0o40777 for every writable
+        # directory.  That is precisely the hazard the short-circuit avoids, and
+        # asserting it here keeps the test meaningful on both platforms.
+        saved = blastbin.IS_WINDOWS
+        try:
+            blastbin.IS_WINDOWS = False
+            assert blastbin._is_world_writable(tmp)
+        finally:
+            blastbin.IS_WINDOWS = saved
 
 
 # ---------------------------------------------------------------------------
@@ -610,11 +682,22 @@ def test_real_blastn_reproduces_the_golden_output():
             tools, query=fna, out=bls, blastdb=BLASTDB, threads=1, minid=95.0)
         assert proc.returncode == 0, proc.stderr
         with open(bls, "rb") as fh:
-            got = fh.read()
+            raw = fh.read()
     with open(golden, "rb") as fh:
-        expected = fh.read()
+        expected = fh.read().replace(b"\r\n", b"\n")
+    # BLAST+ writes -out with the platform's line terminator, so the file is
+    # CRLF on Windows and LF on POSIX; engine.py reads it back through Python's
+    # universal newlines (newline=None), so LF-normalised bytes are the bytes
+    # the parser actually sees.  Compare those -- in full, every field of every
+    # row -- rather than the terminator the C runtime happened to pick.
+    got = raw.replace(b"\r\n", b"\n")
+    # Nothing but the terminators may differ: a stray CR left anywhere after
+    # this (a "plus\r" sstrand, a \r\r\n) is a real corruption, not a platform.
+    assert b"\r" not in got
     assert got.count(b"\n") == 1423
     assert got == expected
+    if blastbin.IS_WINDOWS:  # the terminator itself, pinned where it differs
+        assert raw.endswith(b"\r\n")
 
 
 def test_blast_exit_3_on_a_sequence_with_no_data():
@@ -715,15 +798,31 @@ def test_makeblastdb_build_dir_only_relocates_when_it_must():
         build, relocate = blastbin._makeblastdb_build_dir(plain)
         assert (build, relocate) == (os.path.abspath(plain), False)
 
+        # A destination with a space in it must be built somewhere makeblastdb
+        # can address.  WHERE depends on the platform: Windows can often name
+        # that very directory through its 8.3 alias (C:\\PROGRA~1\\blast), and
+        # then there is nothing to move; POSIX has no such alias and must stage
+        # the build in a whitespace-free scratch root.  Either way the build
+        # directory has no whitespace -- that is the invariant.
         spaced = os.path.join(tmp, "Program Files", "blast")
         os.makedirs(spaced)
         build, relocate = blastbin._makeblastdb_build_dir(spaced)
         try:
-            assert relocate is True
-            assert " " not in build and "\t" not in build
+            assert not _has_space(build)
             assert os.path.isdir(build)
+            alias = (blastbin._short_path(os.path.abspath(spaced))
+                     if blastbin.IS_WINDOWS else None)
+            if alias is not None and not _has_space(alias):
+                # The destination under its own short name: no copying.
+                assert relocate is False
+                assert os.path.samefile(build, spaced)
+            else:
+                # No whitespace-free way to name it: a scratch dir, to be moved.
+                assert relocate is True
+                assert not os.path.samefile(build, spaced)
         finally:
-            shutil.rmtree(build, ignore_errors=True)
+            if relocate:
+                shutil.rmtree(build, ignore_errors=True)
 
 
 def test_makeblastdb_failure_still_cleans_up_the_scratch_directory():
@@ -739,7 +838,7 @@ def test_makeblastdb_failure_still_cleans_up_the_scratch_directory():
 
         def spy(directory):
             build, relocate = real(directory)
-            seen["build"] = build
+            seen["build"], seen["relocate"] = build, relocate
             return build, relocate
 
         blastbin._makeblastdb_build_dir = spy
@@ -748,9 +847,23 @@ def test_makeblastdb_failure_still_cleans_up_the_scratch_directory():
         finally:
             blastbin._makeblastdb_build_dir = real
         assert proc.returncode != 0
-        assert not os.path.exists(seen["build"])
-        # A failed build must not litter the destination either.
-        assert os.listdir(blast_dir) == ["mlst.fa"]
+        if seen["relocate"]:
+            # A staged build: the scratch directory must be gone, and nothing
+            # from it may have been moved into the destination -- makeblastdb
+            # does leave partial index files behind when it fails, and the
+            # relocation step must not carry those over.
+            assert not os.path.exists(seen["build"])
+            assert os.listdir(blast_dir) == ["mlst.fa"]
+        else:
+            # Windows naming the destination through its 8.3 alias: there is no
+            # scratch directory to clean up, and makeblastdb's own partial
+            # .n* files land in the destination exactly as they would in any
+            # plain directory.  What WMLST still owes: it created nothing of its
+            # own there -- no staged copy of the FASTA, no scratch directory.
+            assert os.path.samefile(seen["build"], blast_dir)
+            strays = [name for name in os.listdir(blast_dir)
+                      if name != "mlst.fa" and not name.startswith("mlst.fa.")]
+            assert not strays, strays
 
 
 # ---------------------------------------------------------------------------

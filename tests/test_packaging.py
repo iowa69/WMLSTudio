@@ -591,12 +591,23 @@ def test_inno_setup_is_configured_the_way_13_1_requires():
     assert "[UninstallDelete]" in text
 
 
-def test_inno_setup_creates_a_start_menu_and_an_optional_desktop_shortcut():
+def test_inno_setup_creates_a_start_menu_and_a_default_desktop_shortcut():
+    """Start Menu always; desktop shortcut offered and ticked by default.
+
+    Double-clicking a desktop icon is how most people will start WMLST, so the
+    task is pre-selected -- but it stays a [Tasks] entry the user can untick,
+    never an unconditional [Icons] line they cannot refuse.
+    """
     text = _read(os.path.join("packaging", "wmlst.iss"))
     assert "{group}\\{#MyAppName}" in text, "no Start Menu entry"
     assert "{autodesktop}\\{#MyAppName}" in text, "no desktop shortcut"
-    assert re.search(r"Name:\s*\"desktopicon\".*Flags:\s*unchecked", text), (
-        "the desktop shortcut must be optional and off by default"
+    task = re.search(r'^Name:\s*"desktopicon".*$', text, re.M)
+    assert task, "the desktop shortcut must remain a deselectable [Tasks] entry"
+    assert "unchecked" not in task.group(0), (
+        "the desktop shortcut should be ticked by default"
+    )
+    assert re.search(r'Tasks:\s*desktopicon', text), (
+        "the desktop [Icons] line must be gated on the desktopicon task"
     )
 
 

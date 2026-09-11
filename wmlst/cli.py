@@ -137,14 +137,15 @@ def reconfigure_streams() -> None:
     Without this a non-cp1252 filename in the FILE column kills the run at the
     final print, after every expensive step has already succeeded.
     """
-    for stream, newline in ((sys.stdout, "\n"), (sys.stderr, None)):
+    # stderr gets LF too, not the platform default. It is a byte-identity
+    # surface: the tie WARNING and the msg() lines are part of the golden corpus,
+    # and leaving stderr on Windows' default put a CR on every one of them while
+    # stdout stayed clean -- the two streams of one run disagreeing.
+    for stream in (sys.stdout, sys.stderr):
         if stream is None or not hasattr(stream, "reconfigure"):
             continue
         try:
-            if newline is None:
-                stream.reconfigure(encoding="utf-8", errors="replace")
-            else:
-                stream.reconfigure(encoding="utf-8", errors="replace", newline=newline)
+            stream.reconfigure(encoding="utf-8", errors="replace", newline="\n")
         except (ValueError, AttributeError, OSError):  # pragma: no cover
             # A redirected or already-detached stream; nothing to reconfigure.
             pass

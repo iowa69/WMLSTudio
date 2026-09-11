@@ -603,6 +603,58 @@ def test_port04_stdout_is_lf_never_crlf():
     assert b"\r" not in proc.stdout
 
 
+def test_port04b_stderr_is_lf_never_crlf():
+    """Section 0: stderr is a byte-identity surface too, so it is LF as well.
+
+    ``wrn()``/``msg()`` lines are pinned by ``tests/golden/*.err``, so a CR on
+    stderr is the same release blocker as one on stdout (acceptance item 16.4).
+
+    This cannot be observed on POSIX, where the platform terminator is already
+    LF: ``reconfigure_streams()`` could skip stderr entirely and every Linux run
+    would stay green.  So drive the function against a stream that behaves the
+    way the real Windows ``sys.stderr`` does -- ``newline=None`` there makes the
+    text layer translate every ``"\n"`` into ``"\r\n"`` -- and require that
+    reconfiguring turns that translation OFF.  Reverting stderr to a
+    ``reconfigure()`` call that omits ``newline="\n"`` fails this on BOTH
+    platforms, which is the point: the bug was invisible to the Linux suite.
+    """
+    import io
+
+    from wmlst.cli import Logger, reconfigure_streams
+
+    def windows_like():
+        buf = io.BytesIO()
+        # newline="\r\n" reproduces the writenl the MS_WINDOWS branch of
+        # CPython's TextIOWrapper picks for newline=None. Same knob, testable here.
+        return buf, io.TextIOWrapper(buf, encoding="utf-8", newline="\r\n")
+
+    out_buf, out_stream = windows_like()
+    err_buf, err_stream = windows_like()
+    saved = (sys.stdout, sys.stderr)
+    try:
+        sys.stdout, sys.stderr = out_stream, err_stream
+        # Pre-flight: untouched, this stream really does emit CRLF -- otherwise
+        # the assertions below would pass no matter what the function did.
+        sys.stderr.write("probe\n")
+        sys.stderr.flush()
+        assert err_buf.getvalue() == b"probe\r\n"
+        err_buf.seek(0)
+        err_buf.truncate()
+
+        reconfigure_streams()
+        Logger.wrn("ecoli_achtman_4(131)==salmonella(3529) score=100 x.fa")
+        sys.stdout.write("FILE\tSCHEME\tST\n")
+        sys.stdout.flush()
+    finally:
+        sys.stdout, sys.stderr = saved
+
+    err = err_buf.getvalue()
+    assert err == (b"WARNING: ecoli_achtman_4(131)==salmonella(3529) "
+                   b"score=100 x.fa\n"), err
+    assert b"\r" not in err
+    assert out_buf.getvalue() == b"FILE\tSCHEME\tST\n"
+
+
 def test_port05_threads_do_not_change_the_answer():
     """--threads is a performance knob; it must not move a single byte."""
     need_blast()

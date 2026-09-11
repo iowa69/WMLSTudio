@@ -117,11 +117,13 @@ jobs:
 
       - name: No CR bytes in any compat output (acceptance check 4)
         run: |
-          python -m wmlst --quiet tests/data/example.fna > out.tsv
-          if LC_ALL=C grep -q $'\r' out.tsv; then
-            echo "::error::a carriage return reached a byte-identity surface"
-            exit 1
-          fi
+          python -m wmlst tests/data/example.fna > out.tsv 2> out.err
+          for f in out.tsv out.err; do
+            if LC_ALL=C grep -q $'\r' "$f"; then
+              echo "::error::a carriage return reached $f, a byte-identity surface"
+              exit 1
+            fi
+          done
 
       - name: Upload test results
         if: always()
@@ -166,6 +168,22 @@ jobs:
 
       - name: pytest
         run: python -m pytest -q --timeout=1800
+
+      # Windows is the only place a CR can appear on its own, and both streams
+      # are byte-identity surfaces: stdout carries the TSV, stderr the WARNING
+      # lines the golden .err files pin.
+      - name: No CR bytes on stdout OR stderr (acceptance check 4)
+        shell: pwsh
+        run: |
+          python -m wmlst tests\data\example.fna 1> out.tsv 2> out.err
+          foreach ($f in @("out.tsv", "out.err")) {
+            $bytes = [System.IO.File]::ReadAllBytes((Resolve-Path $f))
+            if ($bytes -contains 13) {
+              Write-Error "a carriage return reached $f, a byte-identity surface"
+              exit 1
+            }
+          }
+          Write-Host "no CR bytes on either stream"
 
       - name: Regenerate and verify the icon
         run: |
