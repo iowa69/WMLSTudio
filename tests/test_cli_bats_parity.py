@@ -873,6 +873,221 @@ def test_ext04_exit_codes_follow_section_14():
     assert run("--full", "example.fna").returncode == 0
 
 
+# ---------------------------------------------------------------------------
+# Regressions for the adversarial-review findings 7, 14, 15, 16, 17 and 22
+# ---------------------------------------------------------------------------
+def test_fix07_blastdb_does_not_move_the_database_root():
+    """Finding 7: --blastdb must not re-root the database (bin/mlst:471-472).
+
+    Upstream defaults --blastdb and --datadir independently off $MLST_DBDIR, so
+    naming a BLAST index somewhere else never makes the PubMLST folder move
+    with it.
+    """
+    import types
+
+    from wmlst import cli
+
+    with tempfile.TemporaryDirectory() as tmp:
+        stem = os.path.join(tmp, "bl", "mlst.fa")     # no pubmlst/ sibling
+        ns = types.SimpleNamespace(datadir="", blastdb=stem)
+        old = dict(os.environ)
+        try:
+            os.environ.pop("WMLST_DBDIR", None)
+            os.environ["MLST_DBDIR"] = DB
+            dbdir, datadir, blastdb = cli._resolve_db(ns)
+        finally:
+            os.environ.clear()
+            os.environ.update(old)
+    assert dbdir == os.path.abspath(DB)
+    assert datadir == os.path.join(os.path.abspath(DB), "pubmlst")
+    assert blastdb == os.path.abspath(stem)
+
+
+def test_fix07_datadir_does_not_move_the_blast_index():
+    """Finding 7, mirror case: --datadir must not drag the BLAST index along."""
+    import types
+
+    from wmlst import cli
+
+    with tempfile.TemporaryDirectory() as tmp:
+        pm = os.path.join(tmp, "pm")                  # no blast/ sibling
+        os.mkdir(pm)
+        ns = types.SimpleNamespace(datadir=pm, blastdb="")
+        old = dict(os.environ)
+        try:
+            os.environ.pop("WMLST_DBDIR", None)
+            os.environ["MLST_DBDIR"] = DB
+            dbdir, datadir, blastdb = cli._resolve_db(ns)
+        finally:
+            os.environ.clear()
+            os.environ.update(old)
+    assert dbdir == os.path.abspath(DB)
+    assert datadir == os.path.abspath(pm)
+    assert os.path.dirname(blastdb) != os.path.join(tmp, "blast")
+    assert blastdb == os.path.join(os.path.abspath(DB), "blast", "mlst.fa")
+
+
+def test_fix07_datadir_elsewhere_still_types_end_to_end():
+    """Finding 7 end to end: a --datadir outside $MLST_DBDIR must still run."""
+    need_blast()
+    with tempfile.TemporaryDirectory() as tmp:
+        pm = os.path.join(tmp, "pm")
+        os.mkdir(pm)
+        shutil.copytree(os.path.join(DB, "pubmlst", "sepidermidis"),
+                        os.path.join(pm, "sepidermidis"))
+        proc = run("--datadir", pm, "example.fna")
+    assert proc.returncode == 0, combined(proc)
+    assert proc.stdout.startswith("example.fna" + SEPI)
+
+
+def test_fix14_longlist_and_info_ignore_csv():
+    """Finding 14: bin/mlst:118 exits before `$OUTSEP = ',' if $csv` (line 136).
+
+    --list/--longlist/--info are therefore unconditionally tab separated.
+    """
+    need_catalog()
+    for flag in ("--longlist", "--info", "--list"):
+        plain = run(flag)
+        comma = run(flag, "--csv")
+        assert plain.returncode == 0, combined(plain)
+        assert comma.returncode == 0, combined(comma)
+        assert comma.stdout == plain.stdout, flag
+    info = run("--info", "--csv")
+    assert info.stdout.split("\n")[0] == \
+        "SCHEME\tLOCII\tTYPES\tALLELES\tDATE\tLOCII_NAMES"
+
+
+def test_fix15_unique_upstream_abbreviations_resolve():
+    """Finding 15: a prefix unique upstream keeps working despite the extras.
+
+    Getopt::Long's auto_abbrev accepts ``--t``/``--j``/``--e``/``--b``/``--h``;
+    the WMLST-only ``--tsv-evidence``/``--jobs``/``--evidence-tsv``/
+    ``--blast-timeout``/``--html*`` must not shadow them.
+    """
+    from wmlst.cli import _expand_abbrevs, build_parser
+
+    parser = build_parser()
+    cases = {
+        "--h": "--help", "--t": "--threads", "--j": "--json",
+        "--e": "--exclude", "--b": "--blastdb", "--q": "--quiet",
+        "--sc": "--scheme",
+    }
+    for short, full in cases.items():
+        assert _expand_abbrevs([short], parser) == [full], short
+    # `name=value` keeps its value, exact spellings are untouched, and the
+    # WMLST extras are still reachable by their own unambiguous prefixes.
+    assert _expand_abbrevs(["--t=4"], parser) == ["--threads=4"]
+    assert _expand_abbrevs(["--jobs", "2"], parser) == ["--jobs", "2"]
+    assert _expand_abbrevs(["--ts"], parser) == ["--tsv-evidence"]
+    assert _expand_abbrevs(["--", "--t"], parser) == ["--", "--t"]
+
+
+def test_fix15_abbreviated_help_prints_the_help():
+    """Finding 15, through the real CLI: `--h` is `--help`, not an error."""
+    proc = run("--h", raw=True)
+    assert proc.returncode == 0, combined(proc)
+    assert proc.stdout == golden("help.txt")
+
+
+def test_fix15_ambiguous_prefix_uses_getopt_long_wording():
+    """Finding 15: `--l` is ambiguous upstream too, and says so the same way."""
+    proc = run("--l", raw=True)
+    assert proc.returncode == 1
+    assert proc.stderr.rstrip("\n").endswith(
+        "Option l is ambiguous (label, legacy, list, longlist)")
+
+
+def test_fix16_input_files_may_follow_an_option():
+    """Finding 16: GetOptions permutes, so `mlst a --quiet b` types BOTH files."""
+    need_blast()
+    proc = run("example.fna", "--quiet", "issue146.fa", raw=True)
+    assert proc.returncode == 0, combined(proc)
+    rows = proc.stdout.rstrip("\n").split("\n")
+    assert len(rows) == 2, proc.stdout
+    assert rows[0].startswith("example.fna\t")
+    assert rows[1].startswith("issue146.fa\t")
+
+
+def test_fix16_permuted_files_reach_the_label_guard():
+    """Finding 16: the trailing file must be collected before the guard runs."""
+    proc = run("example.fna", "--label", "foo", "issue146.fa")
+    assert proc.returncode == 1
+    assert "Using --label when scanning multiple files" in proc.stderr
+
+
+def test_fix16_a_real_unknown_option_is_still_reported():
+    """Finding 16: permuting must not swallow a genuine unknown option."""
+    proc = run("example.fna", "--badopt", "issue146.fa")
+    assert proc.returncode == 1
+    assert proc.stderr.rstrip("\n").endswith("Unknown option: badopt")
+
+
+def test_fix17_engine_msg_lines_reach_stderr():
+    """Findings 17/22: `Found exact allele match ...` is msg(), bin/mlst:348."""
+    need_blast()
+    proc = run("--skipcheck", "--label", "FOO", "example.fna", raw=True)
+    assert proc.returncode == 0, combined(proc)
+    assert "Using label 'FOO' for file example.fna" in proc.stderr
+    exact = [ln for ln in proc.stderr.split("\n")
+             if ln.startswith("Found exact allele match ")]
+    assert len(exact) == 10, proc.stderr
+    assert "Found exact allele match sepidermidis.arcC-16" in exact
+    # ...and --quiet still hides every one of them (bin/mlst msg()).
+    quiet = run("--skipcheck", "example.fna")
+    assert "Found exact allele match" not in quiet.stderr
+
+
+def test_fix17_debug_emits_the_per_hit_and_score_lines():
+    """Finding 17: --debug must carry the engine's dbg() trace, not just phases."""
+    need_blast()
+    proc = run("--debug", "example.fna")
+    assert proc.returncode == 0, combined(proc)
+    hits = [ln for ln in proc.stderr.split("\n")
+            if re.match(r"^\[\d+\] \S+:\d+-\d+\(", ln)]
+    scores = [ln for ln in proc.stderr.split("\n") if ln.startswith("SCORE=")]
+    assert len(hits) > 1000, len(hits)
+    assert scores, proc.stderr[-2000:]
+    assert "SCORE=100\tsepidermidis\t184\t16/1/2/1/2/1/1\t(7 genes)" in scores
+
+
+def test_fix22_duplicate_exact_warning_is_printed_once_in_hit_order():
+    """Finding 22: the duplicate-exact notice is msg(), emitted exactly once.
+
+    ``bin/mlst:344`` prints it inline with the ``Found exact allele match``
+    lines, so it interleaves with them and ``--quiet`` hides it.
+    """
+    need_blast()
+    proc = run("--skipcheck", "mixed.fa.zip", raw=True)
+    assert proc.returncode == 0, combined(proc)
+    lines = [ln for ln in proc.stderr.split("\n") if "exact allele match" in ln]
+    assert lines == [
+        "Found exact allele match mgenitalium.MLST_pgm-3",
+        "Found exact allele match mgenitalium.MLST_atpA-1",
+        "Found exact allele match mgenitalium.MLST_gyrB-1",
+        "Found exact allele match mgenitalium.MLST_ppa-1",
+        "WARNING: found additional exact allele match mgenitalium.MLST_pgm-3",
+        "WARNING: found additional exact allele match mgenitalium.MLST_atpA-1",
+        "Found exact allele match mgenitalium.MLST_adk-7",
+        "WARNING: found additional exact allele match mgenitalium.MLST_gyrB-1",
+        "Found exact allele match mgenitalium.MLST_gmk-1",
+        "WARNING: found additional exact allele match mgenitalium.MLST_ppa-1",
+    ], proc.stderr
+    # msg(), so --quiet hides it and tests/golden/mixedzip.err stays empty.
+    assert run("mixed.fa.zip").stderr == ""
+
+
+def test_fix17_novel_count_is_announced_once_after_the_table():
+    """Findings 17/22: the engine's novel-allele msg() must not duplicate _run's."""
+    need_blast()
+    with tempfile.TemporaryDirectory() as tmp:
+        out = os.path.join(tmp, "novel.fa")
+        proc = run("--skipcheck", "--novel", out, "novel.fa", raw=True)
+    assert proc.returncode == 0, combined(proc)
+    counted = [ln for ln in proc.stderr.split("\n")
+               if re.match(r"^Found \d+ novel alleles$", ln)]
+    assert len(counted) == 1, proc.stderr
+
+
 # Markers come from pyproject's vocabulary (section 13.4). They are applied
 # programmatically so the module still imports without pytest.
 if pytest is not None:
@@ -928,3 +1143,83 @@ def _main():
 
 if __name__ == "__main__":
     sys.exit(_main())
+
+
+# ---------------------------------------------------------------------------
+# finding 25: the three Getopt::Long leniencies argparse has no equivalent for
+# ---------------------------------------------------------------------------
+def test_fix25_getopt_long_leniencies_are_reproduced():
+    """`bin/mlst:438` is a bare `use Getopt::Long;` - every default is live.
+
+    No `Getopt::Long::Configure` call exists anywhere in the Perl, so
+    single-dash long options, `ignore_case` and the hyphen-free `name!`
+    negation all work upstream.  Each spelling below was run against real
+    `mlst` 2.35.0 and produced the result asserted here.
+    """
+    from wmlst.cli import _expand_abbrevs, build_parser
+
+    parser = build_parser()
+    cases = {
+        # single-dash long options (Getopt::Long does not bundle by default)
+        "-csv": "--csv",
+        "-quiet": "--quiet",
+        "-novel": "--novel",
+        # ignore_case
+        "--CSV": "--csv",
+        "--Scheme": "--scheme",
+        "--NOVEL": "--novel",
+        "-CSV": "--csv",
+        # hyphen-free negation of a `name!` option
+        "--nocsv": "--no-csv",
+        "--noquiet": "--no-quiet",
+        "-nocsv": "--no-csv",
+        # ... and the spellings that already worked must not move
+        "--csv": "--csv",
+        "--no-csv": "--no-csv",
+    }
+    for given, want in cases.items():
+        assert _expand_abbrevs([given], parser) == [want], given
+
+    # a value glued on with `=` survives the rewrite, on both dash counts
+    assert _expand_abbrevs(["-scheme=bogus"], parser) == ["--scheme=bogus"]
+    assert _expand_abbrevs(["--Scheme=saureus"], parser) == ["--scheme=saureus"]
+
+
+def test_fix25_leniencies_never_swallow_the_things_that_must_stay_put():
+    """`-`, `--`, the real short flags and unknown names are all untouched."""
+    from wmlst.cli import _expand_abbrevs, build_parser
+
+    parser = build_parser()
+    # `-` is stdin, never an option; `-q`/`-h` are registered short flags;
+    # `nopath` and `novel` are options in their own right and must NOT be
+    # read as a negation of a `path`/`vel` option that does not exist.
+    for tok in ("-", "-q", "-h", "--nopath", "--novel", "-bogus", "--bogus"):
+        assert _expand_abbrevs([tok], parser) == [tok], tok
+    # nothing past `--` is rewritten, however Perl-ish it looks
+    assert _expand_abbrevs(["--", "-csv", "--CSV"], parser) == [
+        "--", "-csv", "--CSV"]
+
+
+def test_fix25_lenient_spellings_run_end_to_end():
+    """The rewrite reaches the real CLI, not just the helper."""
+    need_blast()
+    for flag in ("-csv", "--CSV"):
+        proc = run(flag, "example.fna")
+        assert proc.returncode == 0, combined(proc)
+        assert proc.stdout.startswith("example.fna,sepidermidis,184,"), flag
+    for flag in ("--nocsv", "--no-csv"):
+        proc = run("--csv", flag, "example.fna")
+        assert proc.returncode == 0, combined(proc)
+        assert SEPI in proc.stdout, flag
+    # `-scheme=bogus` is ACCEPTED as an option and then rejected on its value,
+    # which is upstream's behaviour (D3 turns ERRPR: into ERROR:).
+    proc = run("-scheme=bogus", "example.fna")
+    assert proc.returncode == 1
+    assert "Invalid --scheme 'bogus'" in combined(proc)
+
+
+def test_fix25_unknown_option_report_drops_the_glued_value():
+    """Getopt::Long names the option, never the value: `--bogus=1` -> `bogus`."""
+    proc = run("--bogus=1", "example.fna")
+    assert proc.returncode == 1
+    assert combined(proc).strip() == "Unknown option: bogus"

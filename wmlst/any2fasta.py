@@ -29,6 +29,7 @@ import re
 import sys
 import warnings
 import zipfile
+import zlib
 from collections.abc import Iterable, Iterator
 from typing import Callable, Dict, List, Optional, Tuple
 
@@ -129,6 +130,17 @@ def _sniff_stream(reader: io.BufferedReader) -> str:
     return "plain"
 
 
+def _close_all(objs: Iterable[object]) -> None:
+    """Close every object in `objs`, ignoring secondary failures."""
+    for obj in objs:
+        close = getattr(obj, "close", None)
+        if close is not None:
+            try:
+                close()
+            except Exception:
+                pass
+
+
 class _TextSource:
     """An iterator of decoded lines that owns and closes its whole stream stack."""
 
@@ -153,13 +165,7 @@ class _TextSource:
             self._text.detach()
         except Exception:
             pass
-        for obj in self._closers:
-            close = getattr(obj, "close", None)
-            if close is not None:
-                try:
-                    close()
-                except Exception:
-                    pass
+        _close_all(self._closers)
         self._closers = []
 
     def __enter__(self) -> _TextSource:
@@ -180,6 +186,36 @@ def _zstd_stream(binary):
             "decompress the file first (zstd -d) and try again"
         ) from exc
     return ZstdFile(binary, "rb")
+
+
+_DECOMP_ERRORS: Optional[Tuple[type, ...]] = None
+
+
+def _decompression_errors() -> Tuple[type, ...]:
+    """Exception classes a truncated or corrupt compressed stream can raise.
+
+    Built once, on first failure: ``compression.zstd`` is imported lazily (see
+    ``_zstd_stream``) so that the common case never pays for the extension.
+    ``gzip.BadGzipFile``, ``bz2``'s ``OSError`` and a missing/unreadable file
+    are deliberately absent — they are ``OSError``s, which callers already
+    report cleanly (engine.py, cli.py).
+    """
+    global _DECOMP_ERRORS
+    if _DECOMP_ERRORS is None:
+        errors: Tuple[type, ...] = (
+            EOFError,
+            zlib.error,
+            lzma.LZMAError,
+            zipfile.BadZipFile,
+        )
+        try:
+            from compression.zstd import ZstdError  # Python 3.14+
+        except ImportError:
+            pass
+        else:
+            errors += (ZstdError,)
+        _DECOMP_ERRORS = errors
+    return _DECOMP_ERRORS
 
 
 def open_text(path: str):
@@ -203,48 +239,57 @@ def open_text(path: str):
         closers.append(handle)
         raw = io.BufferedReader(handle)
         closers.insert(0, raw)
-    comp = _sniff_stream(raw)
+    # Everything opened from here on belongs to `closers`; if any step raises,
+    # the whole stack is closed before the exception leaves.  Letting it escape
+    # would leak the fd for the lifetime of the exception object, which
+    # engine.py stores on the failed SampleResult (its __traceback__ pins this
+    # frame, and with it `closers`) — a batch of bad inputs then exhausts the
+    # file-descriptor table instead of merely warning.
+    try:
+        comp = _sniff_stream(raw)
 
-    if comp == "plain":
-        stream = raw
-    elif comp == "gzip":
-        stream = gzip.GzipFile(fileobj=raw, mode="rb")
-        closers.insert(0, stream)
-    elif comp == "bzip2":
-        stream = bz2.BZ2File(raw, "rb")
-        closers.insert(0, stream)
-    elif comp == "xz":
-        stream = lzma.LZMAFile(raw, "rb")
-        closers.insert(0, stream)
-    elif comp == "zstd":
-        stream = _zstd_stream(raw)
-        closers.insert(0, stream)
-    elif comp == "zip":
-        if not raw.seekable():  # zipfile needs random access; a pipe has none
-            raw = io.BytesIO(raw.read())
-        zf = zipfile.ZipFile(raw)
-        names = zf.namelist()
-        if not names:
-            zf.close()
-            for obj in closers:
-                getattr(obj, "close", lambda: None)()
-            raise _exc("EmptyInputError")("The input appears to be empty")
-        if len(names) > 1:
-            warnings.warn(
-                "zip archive %r holds %d members; only %r is read"
-                % (path, len(names), names[0]),
-                RuntimeWarning,
-                stacklevel=2,
-            )
-        stream = zf.open(names[0], "r")
-        closers.insert(0, zf)
-        closers.insert(0, stream)
-    else:  # pragma: no cover - _MAGIC and this branch list are the same set
-        stream = raw
+        if comp == "plain":
+            stream = raw
+        elif comp == "gzip":
+            stream = gzip.GzipFile(fileobj=raw, mode="rb")
+            closers.insert(0, stream)
+        elif comp == "bzip2":
+            stream = bz2.BZ2File(raw, "rb")
+            closers.insert(0, stream)
+        elif comp == "xz":
+            stream = lzma.LZMAFile(raw, "rb")
+            closers.insert(0, stream)
+        elif comp == "zstd":
+            stream = _zstd_stream(raw)
+            closers.insert(0, stream)
+        elif comp == "zip":
+            if not raw.seekable():  # zipfile needs random access; a pipe has none
+                raw = io.BytesIO(raw.read())
+            zf = zipfile.ZipFile(raw)
+            closers.insert(0, zf)
+            names = zf.namelist()
+            if not names:
+                raise _exc("EmptyInputError")("The input appears to be empty")
+            if len(names) > 1:
+                warnings.warn(
+                    "zip archive %r holds %d members; only %r is read"
+                    % (path, len(names), names[0]),
+                    RuntimeWarning,
+                    stacklevel=2,
+                )
+            stream = zf.open(names[0], "r")
+            closers.insert(0, stream)
+        else:  # pragma: no cover - _MAGIC and this branch list are the same set
+            stream = raw
 
-    text = io.TextIOWrapper(
-        stream, encoding="utf-8-sig", errors="replace", newline=None
-    )
+        text = io.TextIOWrapper(
+            stream, encoding="utf-8-sig", errors="replace", newline=None
+        )
+    except BaseException:
+        # `raw` for path == '-' is the shared stdin singleton and is never in
+        # `closers`, so stdin is left open — which is what callers expect.
+        _close_all(closers)
+        raise
     return _TextSource(text, closers)
 
 
@@ -431,19 +476,32 @@ def convert(src: str, out) -> Tuple[int, int, str]:
     Raises ``EmptyInputError('The input appears to be empty')`` when there is no
     first line, and ``EmptyInputError("No sequences found in '<src>'")`` when the
     parser produced no records.  ``UnsupportedFormatError`` on an unknown first line.
+    A truncated or corrupt compressed input raises ``WmlstError`` ("Could not
+    read '<src>': ..."), never a bare EOFError/zlib.error/BadZipFile.
     """
-    with open_text(src) as fh:
-        lines = iter(fh)
-        try:
-            first = next(lines)
-        except StopIteration:
-            first = ""
-        # Perl tests `if (not $header)`, and the string "0" is false in Perl, so a
-        # file whose entire content is a bare `0` is reported as empty (any2fasta:135).
-        if first == "" or first == "0":
-            raise _exc("EmptyInputError")("The input appears to be empty")
-        fmt = detect_format(first)
-        count, total = _PARSERS[fmt](_prepend(first, lines), out)
+    try:
+        with open_text(src) as fh:
+            lines = iter(fh)
+            try:
+                first = next(lines)
+            except StopIteration:
+                first = ""
+            # Perl tests `if (not $header)`, and the string "0" is false in Perl, so a
+            # file whose entire content is a bare `0` is reported as empty (any2fasta:135).
+            if first == "" or first == "0":
+                raise _exc("EmptyInputError")("The input appears to be empty")
+            fmt = detect_format(first)
+            count, total = _PARSERS[fmt](_prepend(first, lines), out)
+    except _decompression_errors() as exc:
+        # A truncated .gz/.bz2/.xz/.zst, a damaged deflate stream or a headless
+        # .zip surfaces as EOFError/zlib.error/LZMAError/BadZipFile.  Those are
+        # not WmlstError or OSError, so without this they escape every handler
+        # in cli.py and engine.py and abort the whole batch with a traceback
+        # (docs/ARCHITECTURE.md D10: a per-file problem must stay per-file).
+        raise _exc("WmlstError")(
+            "Could not read '%s': %s" % (src, exc),
+            user_message="That file is truncated or corrupt.",
+        ) from exc
     if count == 0:
         raise _exc("EmptyInputError")("No sequences found in '%s'" % (src,))
     return count, total, fmt

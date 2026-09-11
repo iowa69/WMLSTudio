@@ -115,6 +115,34 @@ def test_h_neutralises_controls_but_keeps_tab_and_newline():
     assert report.h("a\tb\nc") == "a\tb\nc"
 
 
+def test_h_neutralises_lone_surrogates():
+    # Finding 9: a filename whose bytes are not valid UTF-8 comes back from
+    # os.fsdecode() carrying PEP 383 lone surrogates (b"\xff" -> U+DCFF). A str
+    # holding one cannot be encoded to UTF-8 at all, so leaving it in h()'s
+    # output aborted write_html() after the whole run had been paid for.
+    assert report.h("bad\udcff\udcfename.fna") == "bad\ufffd\ufffdname.fna"
+    assert report.h("\ud800") == "\ufffd"
+    assert report.h("\udfff") == "\ufffd"
+    report.h("x\udcffy").encode("utf-8")          # must not raise
+
+
+def test_report_of_an_undecodable_filename_is_written_as_utf8():
+    # Finding 9, end to end: render + write must succeed and leave a file that
+    # really is UTF-8, with no stray .tmp behind.
+    import tempfile
+    label = "bad\udcff\udcfename.fna"
+    result = mk_result([mk_sample(label, "saureus", "1", "PERFECT", 100, "arcC(1)")],
+                       RunConfig())
+    with tempfile.TemporaryDirectory() as tmp:
+        path = os.path.join(tmp, "r.html")
+        report.write_html(result, path)
+        assert not os.path.exists(path + ".tmp")
+        raw = open(path, "rb").read()
+    text = raw.decode("utf-8")                     # must not raise
+    assert "bad\ufffd\ufffdname.fna" in text
+    assert "\udcff" not in text
+
+
 def test_h_handles_none_and_non_strings():
     assert report.h(None) == ""
     assert report.h(17) == "17"

@@ -121,20 +121,15 @@ wmlst-cli --full C:\data\assemblies\*.fasta > results.tsv
 
 ## Screenshots
 
-<!-- SCREENSHOT PLACEHOLDER -->
-<!--
-  Replace these with real captures before tagging a release:
-    docs/img/screenshot-analyse.png   the Analyse tab with a finished 20-genome run
-    docs/img/screenshot-report.png    the exported self-contained HTML report
-    docs/img/screenshot-database.png  the Database tab mid-update
-  Capture at 100% DPI on Windows 11 light theme, 1280x800, then again on dark.
--->
+![The WMLST Analyse tab after typing four assemblies](docs/img/wmlst-gui.png)
 
-| Analyse | HTML report |
-| :-: | :-: |
-| ![The Analyse tab](docs/img/screenshot-analyse.png) | ![The HTML report](docs/img/screenshot-report.png) |
+*Four assemblies typed in one batch. Drop files on the box and analysis starts by
+itself; every row expands to show the individual loci and the BLAST hits behind
+each allele call. The footer always states which database and which search engine
+produced the result.*
 
-*(Screenshots pending for the 1.0.0 release — the images above are placeholders.)*
+Every call above matches `mlst` 2.35.0 exactly: `sepidermidis` ST 184, `hparasuis`
+with four inexact loci, `salmonella` ST 64, and `leptospira_2` at score 74.
 
 ---
 

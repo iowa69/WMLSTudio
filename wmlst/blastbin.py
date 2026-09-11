@@ -56,6 +56,7 @@ __all__ = [
     "makeblastdb_argv",
     "probe_version",
     "run_blastn",
+    "run_makeblastdb",
     "run_tool",
     "temp_root",
     "terminate_all",
@@ -522,7 +523,12 @@ def blastn_argv(
     never pass ``-task``, ``-mt_mode`` or ``-lcase_masking``.
     """
     return [
-        _argv_path(tools.blastn, "blastn"),
+        # argv[0] is handed to CreateProcessW (a wide API) and is never opened
+        # as a data file, so the CreateFileA-motivated ansi_safe() gate must NOT
+        # be applied to it (section 5.5 spells the argv out with a raw exe path).
+        # probe_version() already launches this very path raw; gating it here
+        # made discovery accept an install that every later search refused.
+        tools.blastn,
         "-query",
         _argv_path(query, "query"),
         "-out",
@@ -551,18 +557,136 @@ def makeblastdb_argv(tools: BlastTools, fasta: str) -> List[str]:
     """``scripts/mlst-make_blast_db:21``. The title is exactly ``PubMLST``.
 
     No vendor string: the title is embedded in the index bytes (section 4.2).
+
+    Only the BASENAME of `fasta` ever reaches the command line: makeblastdb
+    splits the ``-in`` value on whitespace exactly like blastn splits ``-db``
+    (an absolute ``C:\\Program Files\\...`` path exits 1 with "Please provide a
+    database name using -out"), so the caller MUST set ``cwd`` to the directory
+    that holds the FASTA.  That is necessary but NOT sufficient — see
+    :func:`run_makeblastdb`, which is what callers should use.
     """
     return [
-        _argv_path(tools.makeblastdb, "makeblastdb"),
+        # argv[0] raw: see blastn_argv(). CreateProcessW, not CreateFileA.
+        tools.makeblastdb,
         "-hash_index",
         "-in",
-        _argv_path(fasta, "input"),
+        os.path.basename(fasta),
         "-dbtype",
         "nucl",
         "-title",
         "PubMLST",
         "-parse_seqids",
     ]
+
+
+_WHITESPACE_RE = re.compile(r"\s")
+
+
+def _has_whitespace(path: str) -> bool:
+    return bool(_WHITESPACE_RE.search(path))
+
+
+def _scratch_root_without_whitespace() -> str:
+    """A writable scratch directory whose absolute path has no whitespace."""
+    candidates: List[str] = []
+    try:
+        root = temp_root()
+    except Exception:  # pragma: no cover - temp_root already explains itself
+        root = None
+    if root:
+        candidates.append(root)
+        if IS_WINDOWS:  # pragma: no cover - Windows-only API
+            short = _short_path(root)
+            if short:
+                candidates.append(short)
+    if IS_WINDOWS:  # pragma: no cover - Windows-only fallbacks
+        sysdrive = os.environ.get("SystemDrive", "C:")
+        candidates.append(os.path.join(sysdrive + os.sep, "WMLST-tmp"))
+    else:
+        candidates.append(tempfile.gettempdir())
+    for cand in candidates:
+        resolved = os.path.abspath(cand)
+        if _has_whitespace(resolved):
+            continue
+        if _usable_dir(resolved):
+            return resolved
+    raise _exc("WmlstError")(
+        "No whitespace-free temporary directory found (tried: %s)"
+        % (", ".join(candidates) if candidates else "nowhere",),
+        user_message="WMLST could not find a temporary folder without spaces in "
+        "its path, which makeblastdb needs. Set WMLST_TMPDIR to a folder such "
+        "as C:\\WMLST-tmp.",
+    )
+
+
+def _makeblastdb_build_dir(directory: str) -> Tuple[str, bool]:
+    """Where makeblastdb may run for an index destined for `directory`.
+
+    Returns ``(build_dir, relocate)``; when `relocate` is True the caller must
+    move the finished index files into `directory` itself.
+    """
+    resolved = os.path.abspath(directory)
+    if not _has_whitespace(resolved) and ansi_safe(resolved) is not None:
+        return resolved, False
+    if IS_WINDOWS:  # pragma: no cover - Windows-only API
+        short = _short_path(resolved)
+        if short and not _has_whitespace(short) and ansi_safe(short) is not None:
+            # The very same directory under its 8.3 alias: nothing to move.
+            return short, False
+    root = _scratch_root_without_whitespace()
+    return tempfile.mkdtemp(prefix="wmlst-mkdb-", dir=root), True
+
+
+def run_makeblastdb(
+    tools: BlastTools,
+    fasta: str,
+    *,
+    timeout: Optional[float] = None,
+    cancel: Optional[threading.Event] = None,
+) -> subprocess.CompletedProcess:
+    """Index `fasta` in place, next to itself, whatever its path (sections 4.9, 8.8).
+
+    makeblastdb splits on whitespace TWICE: once in the ``-in`` value, and again
+    in the absolute path under which it re-opens the database it has just built
+    for the metadata pass.  So under ``C:\\Program Files\\...`` an absolute ``-in``
+    exits 1 ("Please provide a database name using -out") and a bare ``-in``
+    with ``cwd`` set exits 2 ("No alias or index file found ... [C:\\Program]")
+    after writing 11 of the 12 files — the ``.njs`` is never produced.  Neither
+    ``-out``, nor dropping ``-parse_seqids``/``-hash_index``, rescues it: no argv
+    arrangement can write a database into a directory whose path has a space.
+
+    The index files are fully relocatable (section 8.8), so when the destination
+    cannot be indexed directly this builds under a whitespace-free scratch root
+    and moves the artifacts into place.  Returns the CompletedProcess unchanged;
+    exit-code interpretation stays the caller's job.
+    """
+    fasta = os.path.abspath(fasta)
+    directory = os.path.dirname(fasta) or os.curdir
+    name = os.path.basename(fasta)
+    build_dir, relocate = _makeblastdb_build_dir(directory)
+    argv = makeblastdb_argv(tools, name)
+    if not relocate:
+        return run_tool(argv, cwd=build_dir, env=child_env(build_dir),
+                        timeout=timeout, cancel=cancel)
+    _LOG.debug("makeblastdb staged into %r for %r", build_dir, directory)
+    try:
+        shutil.copyfile(fasta, os.path.join(build_dir, name))
+        completed = run_tool(argv, cwd=build_dir, env=child_env(build_dir),
+                             timeout=timeout, cancel=cancel)
+        if completed.returncode == 0:
+            for entry in sorted(os.listdir(build_dir)):
+                if entry == name or not entry.startswith(name + "."):
+                    continue
+                dest = os.path.join(directory, entry)
+                if os.path.lexists(dest):
+                    os.remove(dest)
+                shutil.move(os.path.join(build_dir, entry), dest)
+        return completed
+    finally:
+        try:
+            _rmtree(build_dir)
+        except Exception:  # pragma: no cover - cleanup must never raise
+            _LOG.warning("could not remove %s", build_dir, exc_info=True)
 
 
 def run_blastn(
@@ -761,6 +885,19 @@ def _frozen_bundle_dir() -> Optional[str]:
 
 
 def _is_world_writable(directory: str) -> bool:
+    """POSIX-only binary-planting guard for the PATH rung (section 4.4).
+
+    Windows has no POSIX mode bits: CPython synthesises them from the file
+    attributes (``attributes_to_mode()`` in Python/fileutils.c), so EVERY
+    directory without FILE_ATTRIBUTE_READONLY reports ``0o40777`` and every
+    read-only one reports ``0o40555``.  Testing S_IWOTH there does not measure
+    permissiveness at all — it inverts it, rejecting every ordinary BLAST+
+    install directory on PATH and accepting read-only ones.  Report False on
+    Windows and leave the (platform-neutral) CWD check to do the work; a real
+    Windows guard needs a DACL inspection, which belongs in its own function.
+    """
+    if IS_WINDOWS:
+        return False
     try:
         mode = os.stat(directory).st_mode
     except OSError:  # pragma: no cover

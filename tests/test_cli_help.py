@@ -143,6 +143,25 @@ def test_version_prints_wmlst_and_version_only():
     assert "2.35.0" not in proc.stdout  # C15: compat version never on this line
 
 
+def test_dash_dash_h_is_help_not_html():
+    """Finding 15: `--h` is unambiguous upstream, so --html must not shadow it.
+
+    Getopt::Long's auto_abbrev resolves `--h` to `--help` in `mlst` 2.35.0; the
+    WMLST-only `--html`/`--html-evidence` may not take that prefix away.
+    """
+    proc = _run("--h")
+    assert proc.returncode == 0
+    assert proc.stdout == cli.usage_text()
+
+
+def test_upstream_long_names_holds_exactly_the_upstream_table():
+    """Finding 15: the prefix-preference set must not creep to the extras."""
+    assert cli.UPSTREAM_LONG_NAMES >= set(UPSTREAM_OPTIONS)
+    for name in (*WMLST_OPTIONS, "blast-timeout", "html-evidence",
+                 "repair-locus-ids", "tsv-evidence"):
+        assert name not in cli.UPSTREAM_LONG_NAMES, name
+
+
 def _main():
     failures = 0
     for name, fn in sorted(globals().items()):

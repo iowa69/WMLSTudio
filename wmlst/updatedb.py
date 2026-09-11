@@ -37,6 +37,7 @@ import random
 import re
 import shutil
 import ssl
+import stat
 import sys
 import threading
 import time
@@ -108,6 +109,15 @@ READ_TIMEOUT = 120.0
 BREAKER_FAILURES = 10
 BREAKER_PAUSE = 60.0
 BREAKER_MAX_PAUSES = 3
+#: Every hop of every fetch must stay on one of these hosts, over https. A
+#: hostile or compromised API could otherwise redirect the run onto plaintext
+#: http, or hand back a ``loci`` list pointing at an internal service (D-note).
+ALLOWED_NETLOCS = frozenset(
+    urllib.parse.urlsplit(root).netloc for root in REST_ROOTS.values())
+#: Hard ceiling on one response body. The largest bundled payload is ~2.4 MB
+#: (``helicobacter/atpA.tfa``); this leaves ample headroom while keeping a
+#: server that streams forever from exhausting memory.
+MAX_BODY = 64 * 1024 * 1024
 
 # --------------------------------------------------------------------------
 # 6.x on-disk layout
@@ -122,6 +132,10 @@ SPECIES_MAP_FILE = "scheme_species_map.tab"
 JOURNAL_FILE = ".wmlst-update.jsonl"
 STAGING_DIRNAME = ".staging"
 ROLLBACK_DIRNAME = ".rollback"
+#: ``blast`` is installed by renaming a SIBLING directory over it, so a crash or
+#: a failed rename can never leave a half-replaced index behind (section 7.3).
+BLAST_STAGING_PREFIX = BLAST_DIRNAME + ".staging."
+BLAST_OLD_PREFIX = BLAST_DIRNAME + ".old."
 INFO_SUFFIX = "_info.json"
 PROFILE_SUFFIX = ".txt"
 ALLELE_SUFFIX = ".tfa"
@@ -144,13 +158,28 @@ PROFILE_NON_LOCUS = frozenset(
 NO_VERSION = "No version information available"
 
 #: NTFS-hostile characters. A ``:`` would silently create an alternate data stream.
-_FORBIDDEN_IN_LOCUS = set(':*?"<>|\\/')
+# Windows reserves these in a filename; NUL and the other control codes are
+# rejected too, because open() raises on an embedded NUL rather than returning a
+# clean error, and a control byte in a path is never a legitimate scheme name.
+_FORBIDDEN_IN_LOCUS = set(':*?"<>|\\/') | {chr(c) for c in range(0x20)} | {"\x7f"}
+
+# Windows refuses to create a file with one of these stems, with or without an
+# extension, so a scheme so named would fail only once it reached a real install.
+_RESERVED_WINDOWS_STEMS = frozenset(
+    ["CON", "PRN", "AUX", "NUL"]
+    + ["COM%d" % i for i in range(1, 10)]
+    + ["LPT%d" % i for i in range(1, 10)]
+)
 
 _API_RE = re.compile(
     r"^https://(?:rest\.pubmlst\.org|bigsdb\.pasteur\.fr/api)"
     r"/db/([^/]+)/schemes/(\d+)$", re.ASCII)
 
 _LOCUS_WORD_RE = re.compile(r"^\w+$", re.ASCII)
+
+#: A zip member such as ``C:/evil.txt`` is drive-relative on Windows and escapes
+#: any directory it is joined onto; ``C:\\Windows\\...`` is outright absolute.
+_DRIVE_RE = re.compile(r"^[A-Za-z]:", re.ASCII)
 
 #: The three documented dirname violations of the ``_N`` suffix rule (6.3).
 #: Hardcoded because they cannot be inferred; used only to build a manifest when
@@ -283,6 +312,45 @@ def stamp_db_version(dbdir: str, version: str) -> str:
     return version
 
 
+def _on_rm_error(func, path, _exc) -> None:
+    """Clear the read-only bit and retry: Windows refuses to unlink +R files.
+
+    A locked file (antivirus, backup agent, Explorer preview) usually frees up
+    within a few hundred milliseconds, so the retry loop is worth its cost.
+    """
+    for _ in range(5):
+        try:
+            os.chmod(path, stat.S_IWRITE | stat.S_IREAD)
+        except OSError:
+            pass
+        try:
+            func(path)
+            return
+        except OSError:
+            time.sleep(0.1)
+    log.warning("could not remove %s", path)
+
+
+def _rmtree(path: str, *, required: bool = False) -> None:
+    """``shutil.rmtree`` hardened for Windows (mirrors ``blastbin._rmtree``).
+
+    ``shutil.rmtree(..., ignore_errors=True)`` gives up on the first ``EACCES``
+    and says nothing, so a read-only or briefly locked survivor is silently
+    reused as if it were a fresh directory. With ``required=True`` a directory
+    that still exists afterwards is an actionable error instead.
+    """
+    if os.path.isdir(path):
+        if sys.version_info >= (3, 12):
+            shutil.rmtree(path, onexc=lambda f, p, e: _on_rm_error(f, p, e))
+        else:  # pragma: no cover - exercised on 3.9-3.11
+            shutil.rmtree(path, onerror=_on_rm_error)
+    if required and os.path.isdir(path):
+        raise UpdateError(
+            "Could not clear the staging folder %s. Close any program holding "
+            "files there (antivirus, backup, Explorer), clear the read-only "
+            "attribute, delete the folder and try again." % path)
+
+
 def _write_bytes(path: str, data: bytes) -> None:
     """Atomic-ish write: temp file in the same directory, then :func:`os.replace`."""
     directory = os.path.dirname(os.path.abspath(path))
@@ -322,6 +390,14 @@ def _tfa_names(scheme_dir: str):
     return tuple(sorted(
         (n for n in os.listdir(scheme_dir) if n.endswith(ALLELE_SUFFIX)),
         key=lambda s: s.encode("utf-8")))
+
+
+def _is_within(base: str, path: str) -> bool:
+    """True when ``path`` resolves inside ``base`` (never follows to a parent)."""
+    base = os.path.abspath(base)
+    path = os.path.abspath(path)
+    return path == base or path.startswith(base + os.sep) or (
+        os.altsep is not None and path.startswith(base + os.altsep))
 
 
 def _locus_of_url(url: str) -> str:
@@ -442,6 +518,30 @@ class _HostState:
         self.pauses = 0
 
 
+def check_fetch_url(url: str) -> str:
+    """Refuse any URL that is not https on a known BIGSdb host. -> ``url``.
+
+    Applied to the FIRST request and to every redirect hop, and to the ``loci``
+    URLs the scheme document hands back, which are attacker-controlled data:
+    without it an https fetch can finish over cleartext http, or on an internal
+    host of the server's choosing.
+    """
+    parts = urllib.parse.urlsplit(url)
+    if parts.scheme != "https" or parts.netloc not in ALLOWED_NETLOCS:
+        raise UpdateError(
+            "Refusing to fetch %s: only https on %s is allowed."
+            % (url, ", ".join(sorted(ALLOWED_NETLOCS))))
+    return url
+
+
+class _PinnedRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """Re-apply :func:`check_fetch_url` to every 30x target (section 7.4)."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        check_fetch_url(newurl)
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
 class _Fetcher:
     """Polite, retrying, cancellable HTTP GET pool (section 7.4).
 
@@ -469,7 +569,8 @@ class _Fetcher:
         else:
             context = ssl.create_default_context()
             self._opener = urllib.request.build_opener(
-                urllib.request.HTTPSHandler(context=context))
+                urllib.request.HTTPSHandler(context=context),
+                _PinnedRedirectHandler())
             self._opener.addheaders = []
 
     # -- internals ---------------------------------------------------------
@@ -512,15 +613,20 @@ class _Fetcher:
         log.warning("pausing %s for %.0f s after repeated failures", host, BREAKER_PAUSE)
 
     def _open(self, url: str) -> _Response:
+        check_fetch_url(url)
         request = urllib.request.Request(url, headers={
             "User-Agent": self.user_agent,
             "Accept": "*/*",
             "Accept-Encoding": "identity",
         })
         # urllib applies one timeout to connect and to each read; the read
-        # budget is the binding one (largest payload ~1.1 MB).
+        # budget is the binding one (largest payload ~2.4 MB).
         with self._opener.open(request, timeout=READ_TIMEOUT) as handle:
-            body = handle.read()
+            body = handle.read(MAX_BODY + 1)
+            if len(body) > MAX_BODY:
+                raise UpdateError(
+                    "%s returned more than %d bytes; refusing to buffer it."
+                    % (url, MAX_BODY))
             status = getattr(handle, "status", None) or handle.getcode()
             return _Response(int(status), dict(handle.headers), body, url)
 
@@ -814,6 +920,7 @@ def load_manifest(dbdir: str) -> tuple:
                     raise UpdateError(
                         "%s line %d is not a 6-column row." % (path, lineno))
                 name, source, db, scheme_id, nloci, alias = (p.strip() for p in parts)
+                _validate_scheme_name(name, "%s line %d" % (path, lineno))
                 try:
                     nloci_int = int(nloci) if nloci not in ("", "-") else 0
                 except ValueError as exc:
@@ -961,10 +1068,25 @@ def sweep_staging(dbdir: str) -> tuple:
     leaves the live directory missing; that case is repaired by renaming the
     ``.old`` copy back. -> the tuple of paths removed or restored.
     """
-    root = _pubmlst_dir(dbdir)
     touched = []
+    for entry in sorted(os.listdir(dbdir) if os.path.isdir(dbdir) else ()):
+        path = os.path.join(dbdir, entry)
+        if not os.path.isdir(path):
+            continue
+        if entry.startswith(BLAST_OLD_PREFIX):
+            live = os.path.join(dbdir, BLAST_DIRNAME)
+            if not os.path.isdir(live):
+                os.replace(path, live)
+                touched.append(live)
+            else:
+                _rmtree(path)
+                touched.append(path)
+        elif entry.startswith(BLAST_STAGING_PREFIX):
+            _rmtree(path)
+            touched.append(path)
+    root = _pubmlst_dir(dbdir)
     if not os.path.isdir(root):
-        return ()
+        return tuple(touched)
     for entry in sorted(os.listdir(root)):
         path = os.path.join(root, entry)
         if not os.path.isdir(path):
@@ -975,13 +1097,13 @@ def sweep_staging(dbdir: str) -> tuple:
                 os.replace(path, live)
                 touched.append(live)
             else:
-                shutil.rmtree(path, ignore_errors=True)
+                _rmtree(path)
                 touched.append(path)
     staging = os.path.join(root, STAGING_DIRNAME)
     if os.path.isdir(staging):
         for entry in sorted(os.listdir(staging)):
             target = os.path.join(staging, entry)
-            shutil.rmtree(target, ignore_errors=True)
+            _rmtree(target)
             touched.append(target)
     return tuple(touched)
 
@@ -1012,6 +1134,38 @@ def _validate_locus_name(locus: str) -> None:
             "(%s)." % (locus, "".join(sorted(bad))))
     if locus in (".", "..") or locus.startswith("."):
         raise UpdateError("Locus %r is not a usable file name." % locus)
+
+
+def _validate_scheme_name(name: str, where: str = "") -> None:
+    """Reject a scheme name that cannot be one safe path component (7.6).
+
+    The name becomes a directory under ``db/pubmlst`` and the stem of
+    ``<scheme>.txt`` / ``<scheme>_info.json``, so it is a path component in
+    everything :func:`_materialise` writes. ``db/schemes.manifest.tsv`` is an
+    ordinary user-writable file, and ``--dbdir`` / ``%WMLST_DBDIR%`` can point
+    at a tree the user did not author, so the NAME column is untrusted input.
+    """
+    prefix = ("%s: " % where) if where else ""
+    if not name:
+        raise UpdateError("%sa scheme with an empty name was supplied." % prefix)
+    bad = set(name) & _FORBIDDEN_IN_LOCUS
+    if bad:
+        raise UpdateError(
+            "%sscheme %r contains a character that is illegal in a Windows "
+            "filename (%s)." % (prefix, name, "".join(sorted(bad))))
+    if name.startswith(".") or name.startswith("_"):
+        raise UpdateError(
+            "%sscheme %r is not a usable directory name." % (prefix, name))
+    if os.path.isabs(name) or os.path.basename(name) != name:
+        raise UpdateError(
+            "%sscheme %r is not a single path component." % (prefix, name))
+    if name.split(".")[0].upper() in _RESERVED_WINDOWS_STEMS:
+        raise UpdateError(
+            "%sscheme %r is a reserved Windows device name." % (prefix, name))
+    if name.endswith((" ", ".")):
+        # Windows silently strips these, so two distinct names would collide.
+        raise UpdateError(
+            "%sscheme %r ends with a space or a dot." % (prefix, name))
 
 
 def validate_tfa(locus: str, response: _Response) -> None:
@@ -1275,12 +1429,12 @@ def _swap_dir(live: str, staged: str, backup: str | None) -> None:
     if os.path.isdir(live):
         if backup:
             if os.path.isdir(backup):
-                shutil.rmtree(backup, ignore_errors=True)
+                _rmtree(backup)
             os.makedirs(os.path.dirname(os.path.abspath(backup)), exist_ok=True)
             shutil.copytree(live, backup)
         old = "%s.old.%d" % (live, os.getpid())
         if os.path.isdir(old):
-            shutil.rmtree(old, ignore_errors=True)
+            _rmtree(old)
         os.replace(live, old)
     try:
         os.replace(staged, live)
@@ -1289,20 +1443,22 @@ def _swap_dir(live: str, staged: str, backup: str | None) -> None:
             os.replace(old, live)
         raise
     if old:
-        shutil.rmtree(old, ignore_errors=True)
+        _rmtree(old)
 
 
 def _materialise(dbdir: str, ref: SchemeRef, meta: dict, profiles: bytes,
                  alleles, digest: str, *, backup: bool, write_version_files: bool,
                  allow_shrink: bool) -> None:
     """Stage, validate and atomically commit one scheme directory (7.3, 7.6)."""
+    _validate_scheme_name(ref.name)
     root = _pubmlst_dir(dbdir)
     staging_root = os.path.join(root, STAGING_DIRNAME)
     staged = os.path.join(staging_root, "%s.%d" % (ref.name, os.getpid()))
-    if os.path.isdir(staged):
-        shutil.rmtree(staged, ignore_errors=True)
+    _rmtree(staged, required=True)
     os.makedirs(staged, exist_ok=True)
     live = os.path.join(root, ref.name)
+    if not (_is_within(root, live) and _is_within(staging_root, staged)):
+        raise UpdateError("Scheme %r would be written outside %s." % (ref.name, root))
     try:
         for locus in sorted(alleles, key=lambda s: s.encode("utf-8")):
             _validate_locus_name(locus)
@@ -1324,12 +1480,12 @@ def _materialise(dbdir: str, ref: SchemeRef, meta: dict, profiles: bytes,
                       if backup else None)
         _swap_dir(live, staged, backup_dir)
     finally:
-        if os.path.isdir(staged):
-            shutil.rmtree(staged, ignore_errors=True)
+        _rmtree(staged)
 
 
 def _touch_info(dbdir: str, ref: SchemeRef, meta: dict, digest: str) -> None:
     """``date-moved-content-identical``: refresh the ledger, rewrite nothing else."""
+    _validate_scheme_name(ref.name)
     info = dict(scheme_info(dbdir, ref.name))
     remote = _remote_date(meta)
     info.setdefault("name", ref.name)
@@ -1428,6 +1584,7 @@ def apply(dbdir: str, plan: UpdatePlan, chosen, *, backup: bool = True,
                     raise UpdateError("%s: upstream returned no loci." % source.name)
                 loci = {}
                 for url in locus_urls:
+                    check_fetch_url(str(url))
                     locus = _locus_of_url(url)
                     _validate_locus_name(locus)
                     loci[url + "/alleles_fasta"] = locus
@@ -1542,8 +1699,7 @@ def rollback(dbdir: str) -> str:
         staged = os.path.join(_pubmlst_dir(dbdir), STAGING_DIRNAME,
                               "%s.restore.%d" % (entry, os.getpid()))
         os.makedirs(os.path.dirname(staged), exist_ok=True)
-        if os.path.isdir(staged):
-            shutil.rmtree(staged, ignore_errors=True)
+        _rmtree(staged, required=True)
         shutil.copytree(path, staged)
         _swap_dir(live, staged, None)
         restored.append(entry)
@@ -1560,7 +1716,7 @@ def rollback(dbdir: str) -> str:
             meta = {}
     meta["restored_at"] = _now_iso()
     meta["restored"] = restored
-    shutil.rmtree(root, ignore_errors=True)
+    _rmtree(root)
     os.makedirs(root, exist_ok=True)
     _write_bytes(meta_path, (json.dumps(meta, indent=2, sort_keys=True) + "\n")
                  .encode("utf-8"))
@@ -1625,49 +1781,59 @@ def concat_fasta(dbdir: str, out_path: str, *, progress=None, cancel=None) -> in
 def build_blast_db(dbdir: str, tools=None, *, progress=None, cancel=None) -> str:
     """Rebuild ``db/blast/mlst.fa`` and its v5 index (section 4.9). -> the FASTA path.
 
-    Builds into ``blast/.staging/``, runs ``makeblastdb -hash_index -in <fa>
-    -dbtype nucl -title PubMLST -parse_seqids`` there, verifies all 12 ``.n*``
-    files, then swaps. The title is exactly ``PubMLST``; it is embedded in the
-    index bytes and a vendor string there would break byte-comparison with the
+    Builds into the sibling ``blast.staging.<pid>/``, runs ``makeblastdb
+    -hash_index -in <fa> -dbtype nucl -title PubMLST -parse_seqids`` there,
+    verifies all 12 ``.n*`` files, then installs the whole directory with ONE
+    rename: 13 individual renames could be interrupted half-way and leave a new
+    ``.nin`` indexing the old ``.nsq``, which types every sample as NONE without
+    any error. The title is exactly ``PubMLST``; it is embedded in the index
+    bytes and a vendor string there would break byte-comparison with the
     reference distribution.
     """
     blastbin = _blastbin()
     if tools is None:
         tools = blastbin.find_blast()
     blast_dir = os.path.join(dbdir, BLAST_DIRNAME)
-    staging = os.path.join(blast_dir, STAGING_DIRNAME)
-    if os.path.isdir(staging):
-        shutil.rmtree(staging, ignore_errors=True)
+    # A SIBLING of blast/, never a child: the install is then one directory
+    # rename instead of 13 file renames, so an interruption can never leave the
+    # new .nin indexing the old .nsq. The pid keeps two runs out of each
+    # other's way, and sweep_staging clears anything a crash leaves behind.
+    staging = os.path.join(dbdir, BLAST_STAGING_PREFIX + str(os.getpid()))
+    _rmtree(staging, required=True)
     os.makedirs(staging, exist_ok=True)
     staged_fa = os.path.join(staging, BLAST_FASTA)
     _emit(progress, 0.0, "Collecting alleles")
     records = concat_fasta(dbdir, staged_fa, progress=progress, cancel=cancel)
     if records == 0:
-        shutil.rmtree(staging, ignore_errors=True)
+        _rmtree(staging)
         raise UpdateError("No alleles were found in %s." % _pubmlst_dir(dbdir))
     _check_cancel(cancel)
     _emit(progress, 0.5, "Indexing %d alleles with makeblastdb" % records)
-    argv = [tools.makeblastdb, "-hash_index", "-in", staged_fa,
-            "-dbtype", "nucl", "-title", "PubMLST", "-parse_seqids"]
-    completed = blastbin.run_tool(argv, cwd=staging, cancel=cancel)
+    # NOT run_tool(makeblastdb ... -in <abs path>) directly: makeblastdb splits
+    # both the -in value and the absolute path it re-opens the finished database
+    # under on whitespace, so it cannot write an index into a directory such as
+    # C:\Program Files\... at all. run_makeblastdb() builds in a whitespace-free
+    # scratch directory when needed and moves the (relocatable) index into place.
+    completed = blastbin.run_makeblastdb(tools, staged_fa, cancel=cancel)
     if completed.returncode != 0:
         tail = completed.stderr
         if isinstance(tail, bytes):
             tail = tail.decode("utf-8", "replace")
-        shutil.rmtree(staging, ignore_errors=True)
+        _rmtree(staging)
         raise UpdateError("makeblastdb failed (exit %d): %s"
                           % (completed.returncode, (tail or "").strip()[-500:]))
     missing = [ext for ext in BLAST_INDEX_EXTENSIONS
                if not os.path.isfile(staged_fa + "." + ext)]
     if missing:
-        shutil.rmtree(staging, ignore_errors=True)
+        _rmtree(staging)
         raise UpdateError("makeblastdb produced an incomplete index (missing %s)."
                           % ", ".join(missing))
     _emit(progress, 0.95, "Installing the new search index")
     final_fa = os.path.join(blast_dir, BLAST_FASTA)
-    for name in sorted(os.listdir(staging)):
-        os.replace(os.path.join(staging, name), os.path.join(blast_dir, name))
-    shutil.rmtree(staging, ignore_errors=True)
+    try:
+        _swap_dir(blast_dir, staging, None)
+    finally:
+        _rmtree(staging)
     _emit(progress, 1.0, "Search index ready (%d alleles)" % records)
     return final_fa
 
@@ -1747,8 +1913,7 @@ def import_bundle(dbdir: str, path: str) -> str:
     staging_root = os.path.join(root, STAGING_DIRNAME)
     os.makedirs(staging_root, exist_ok=True)
     work = os.path.join(staging_root, "bundle.%d" % os.getpid())
-    if os.path.isdir(work):
-        shutil.rmtree(work, ignore_errors=True)
+    _rmtree(work, required=True)
     os.makedirs(work)
     try:
         with zipfile.ZipFile(path) as zf:
@@ -1761,9 +1926,17 @@ def import_bundle(dbdir: str, path: str) -> str:
                 name = member.filename
                 if member.is_dir():
                     continue
-                if name.startswith("/") or ".." in name.replace("\\", "/").split("/"):
+                # Normalise FIRST, then judge. Splitting the raw name on "/"
+                # leaves a Windows member such as C:\\Windows\\Temp\\evil.txt as a
+                # single component, and ntpath.join then returns it unchanged --
+                # an arbitrary absolute write outside the staging tree.
+                norm = name.replace("\\", "/")
+                if (norm.startswith("/") or ".." in norm.split("/")
+                        or _DRIVE_RE.match(norm)):
                     raise UpdateError("%s contains an unsafe path (%s)." % (path, name))
-                target = os.path.join(work, *name.split("/"))
+                target = os.path.join(work, *norm.split("/"))
+                if not _is_within(work, target):
+                    raise UpdateError("%s contains an unsafe path (%s)." % (path, name))
                 os.makedirs(os.path.dirname(target), exist_ok=True)
                 with zf.open(member) as src, open(target, "wb") as dst:
                     shutil.copyfileobj(src, dst)
@@ -1775,6 +1948,7 @@ def import_bundle(dbdir: str, path: str) -> str:
             source = os.path.join(staged_pubmlst, scheme)
             if not os.path.isdir(source):
                 continue
+            _validate_scheme_name(scheme, path)
             _swap_dir(os.path.join(root, scheme), source, None)
         for extra in (VERSION_FILE, MANIFEST_FILE, SPECIES_MAP_FILE):
             staged_extra = os.path.join(work, extra)
@@ -1782,7 +1956,7 @@ def import_bundle(dbdir: str, path: str) -> str:
                 with open(staged_extra, "rb") as fh:
                     _write_bytes(os.path.join(dbdir, extra), fh.read())
     finally:
-        shutil.rmtree(work, ignore_errors=True)
+        _rmtree(work)
     version = db_version(dbdir) or str(meta.get("db_version") or _today())
     _Journal(journal_path(dbdir), "import").record(
         "run_end", status="imported", db_version=version, bundle=os.path.basename(path))
@@ -1852,6 +2026,12 @@ def discover_new_schemes(dbdir: str, *, refs=None, progress=None, cancel=None,
                     DISCOVERY_LOCUS_RANGE[0] <= count <= DISCOVERY_LOCUS_RANGE[1]):
                 continue
             proposed = _derive_dirname(database, scheme_id)
+            try:
+                _validate_scheme_name(proposed)
+            except UpdateError as exc:
+                log.warning("skipping upstream scheme %s/%s: %s",
+                            database, scheme_id, exc)
+                continue
             candidate, suffix = proposed, 1
             while candidate in taken:
                 suffix += 1

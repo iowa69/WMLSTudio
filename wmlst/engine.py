@@ -204,6 +204,12 @@ class SampleResult:
     failed: bool = False
     error: Optional[WmlstError] = None
     error_text: str = ""
+    #: Loci of the winning scheme that had an EXACT hit, i.e. upstream's
+    #: ``$nov{$LABEL}{$sch}{$gene} = $SEEN`` sentinel (bin/mlst:352). Only
+    #: populated when ``--novel`` is in force; it exists so the run-level
+    #: merge can reproduce Perl's per-LABEL blocking across input files that
+    #: share a label. Never reported.
+    novel_seen: Tuple[str, ...] = ()
 
 
 # ---------------------------------------------------------------------------
@@ -742,13 +748,22 @@ def _score_one(scheme: Scheme, name: str, calls: Mapping[str, str],
 
 def _build_candidates(catalog: SchemeCatalog, res: Mapping[str, Mapping[str, str]],
                       excluded_res: Mapping[str, Mapping[str, str]],
-                      cfg: RunConfig, allele_cnt: int, dbg: WarnFn = None):
+                      cfg: RunConfig, allele_cnt: int, dbg: WarnFn = None,
+                      warn: WarnFn = None):
     """``-> (kept, all_rows)``. Steps 38-45.
 
     ``kept`` is upstream's ``@sig`` after the ``--minscore`` filter, sentinel
     first, then ``sorted(res)`` (D1/C8) -- so a stable sort on ``-score``
     makes the lexicographically smallest scheme name win a tie and lets the
     sentinel win a 0-0 tie.
+
+    Scheme names come from the BLAST index (the sseqid prefix) but the
+    :class:`~wmlst.schemes.Scheme` objects come from the datadir, so a
+    mismatched ``--blastdb``/``--datadir`` pair -- or a datadir caught
+    mid-update -- can name a scheme that has no profile. Such a name is
+    dropped with a warning (the same guard the excluded rows already use)
+    instead of raising ``KeyError`` out of the whole batch: D10 says a
+    per-file problem must not abort the run.
     """
     sentinel = SchemeScore(
         scheme=(cfg.scheme or "-"), st="-",
@@ -757,6 +772,14 @@ def _build_candidates(catalog: SchemeCatalog, res: Mapping[str, Mapping[str, str
     kept = [sentinel]           # type: List[SchemeScore]
     dropped = []                # type: List[SchemeScore]
     for name in sorted(res):
+        if name not in catalog:
+            line = ("WARNING: BLAST index names scheme '%s' which is not in %s"
+                    " - ignoring it" % (name, cfg.datadir or "the datadir"))
+            if warn is not None:
+                warn(line)
+            if dbg is not None:
+                dbg(line)
+            continue
         row = _score_one(catalog[name], name, res[name], cfg.minscore,
                          False, dbg)
         (dropped if row.below_minscore else kept).append(row)
@@ -1186,7 +1209,7 @@ class Engine:
         excluded_walk = _walk_hits(excluded_hits, capture_novel=False)
 
         kept_rows, dropped_rows, excluded_rows = _build_candidates(
-            catalog, walk.res, excluded_walk.res, cfg, allele_cnt, dbg)
+            catalog, walk.res, excluded_walk.res, cfg, allele_cnt, dbg, warn)
         kept_rows, all_rows = _order_candidates(kept_rows, dropped_rows,
                                                 excluded_rows)
 
@@ -1233,10 +1256,21 @@ class Engine:
                                       key=lambda h: h.index))))
 
         # Steps 49 + 5.17: prune novel alleles to the winning scheme.
+        # bin/mlst:233-241 walks `keys %{$nov{$fname}{$sch}}`, i.e. EVERY locus
+        # the BLAST index produced a full-length inexact hit for -- not only
+        # the loci the profile header lists. A locus present in the index but
+        # missing from the header (a custom --blastdb, or an upstream update
+        # that ships a .tfa before the profile catches up) still gets its
+        # novel sequence written. Header order first, then the extras sorted,
+        # so D7's deterministic record order survives.
         novel = []
+        novel_seen = ()
         if cfg.novel_path and winner.scheme != "-":
-            for gene in genes:
-                seq = walk.nov.get(winner.scheme, {}).get(gene)
+            nov_map = walk.nov.get(winner.scheme, {})
+            novel_seen = tuple(sorted(g for g in nov_map if nov_map[g] == SEEN))
+            extra = sorted(g for g in nov_map if g not in genes)
+            for gene in list(genes) + extra:
+                seq = nov_map.get(gene)
                 if seq is None or seq == SEEN:
                     continue
                 digest = hashlib.md5(seq.encode("ascii", "replace")).hexdigest()
@@ -1258,9 +1292,55 @@ class Engine:
             path=path, label=lbl, scheme=winner.scheme, st=winner.st,
             signature=signature, score=winner.score, status=status,
             alleles=tuple(alleles), candidates=all_rows, novel=tuple(novel),
+            novel_seen=novel_seen,
             warnings=tuple(warnings), n_contigs=n_contigs, total_bp=total_bp,
             hits_seen=seen, hits_kept=kept, elapsed_s=time.time() - t0,
             failed=False, error=None, error_text="")
+
+    @staticmethod
+    def _merge_novel(results) -> List[NovelAllele]:
+        """bin/mlst's per-LABEL %nov, collapsed across the run. See analyse()."""
+        live = [(i, r) for i, r in enumerate(results)
+                if r is not None and not r.failed]
+
+        # The last file to name a label decides which scheme survives its map.
+        final_scheme = {}
+        for _i, res in live:
+            final_scheme[res.label] = res.scheme
+
+        # Walk backwards: a file contributes only while it -- and every later
+        # file sharing its label -- won that surviving scheme.
+        contributes = {}
+        still_ok = {}
+        for i, res in reversed(live):
+            ok = (still_ok.get(res.label, True)
+                  and res.scheme != "-"
+                  and res.scheme == final_scheme[res.label])
+            contributes[i] = ok
+            still_ok[res.label] = ok
+
+        blocked = set()          # (label, locus) an exact hit closed off
+        for i, res in live:
+            if contributes[i]:
+                for locus in res.novel_seen:
+                    blocked.add((res.label, locus))
+
+        taken = set()            # (label, locus) already filled -- `||=`
+        seen_ids = set()         # $seen{$id}++
+        novel = []
+        for i, res in live:
+            if not contributes[i]:
+                continue
+            for allele in res.novel:
+                key = (res.label, allele.locus)
+                if key in blocked or key in taken:
+                    continue
+                taken.add(key)
+                if allele.fasta_id in seen_ids:
+                    continue
+                seen_ids.add(allele.fasta_id)
+                novel.append(allele)
+        return novel
 
     # -- the run ------------------------------------------------------------
     def analyse(self, *, progress: ProgressFn = None, warn: WarnFn = None,
@@ -1291,16 +1371,23 @@ class Engine:
                 results[i] = self.analyse_file(p, progress=progress, warn=warn,
                                                msg=msg, dbg=dbg, cancel=cancel)
 
-        # 5.17: dedup by fasta_id across files, first occurrence wins, in
-        # (sample argv index, scheme, gene order) -- D7.
-        seen_ids = set()
-        novel = []
-        for res in results:
-            for allele in res.novel:
-                if allele.fasta_id in seen_ids:
-                    continue
-                seen_ids.add(allele.fasta_id)
-                novel.append(allele)
+        # 5.17: collapse the per-sample novel maps the way bin/mlst does.
+        #
+        # Upstream's %nov is keyed by LABEL, not by file (bin/mlst:85, 362),
+        # so two inputs that share a label share ONE map, and:
+        #   * bin/mlst:170-172 deletes, after EVERY file, every scheme in that
+        #     label's map that is not that file's winning scheme -- so only
+        #     the trailing run of same-label files that all won the same
+        #     scheme can contribute anything;
+        #   * bin/mlst:352 stores the $SEEN sentinel unconditionally, so an
+        #     exact hit in ANY contributing file blocks that locus outright;
+        #   * bin/mlst:362 is `||=`, so among the contributors the FIRST
+        #     sequence for a locus wins;
+        #   * bin/mlst:240's `$seen{$id}++` then dedups identical sequences
+        #     across labels.
+        # Distinct labels (the normal case) are unaffected by all of this.
+        # Records stay in (sample argv index, scheme, gene) order -- D7.
+        novel = self._merge_novel(results)
         if cfg.novel_path and msg is not None:
             msg("Found %d novel alleles" % len(novel))
 

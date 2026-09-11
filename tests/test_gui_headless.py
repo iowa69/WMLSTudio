@@ -686,8 +686,20 @@ def test_the_whole_window_builds_and_shows_a_result():
         assert app.prefs.minid == 95.0 and app.prefs.minscore == 50.0
         app.settings_view.vars["scheme"].set("saureus")
         app.settings_view._changed()
-        assert app.prefs.scheme == "saureus" and app.prefs.minscore == 0.0
+        assert app.prefs.scheme == "saureus"
         assert str(app.settings_view.spin_minscore.cget("state")) == "disabled"
+        # the control displays 0 and the RUN uses 0 (bin/mlst:125, section 10.4)
+        assert app.settings_view.vars["minscore"].get() == "0"
+        assert app.prefs.to_runconfig(["a.fa"], app.env).minscore == 0.0
+        # ... but the displayed 0 is not the stored preference: releasing the
+        # scheme has to give the user their own minimum score back.
+        assert app.prefs.minscore == 50.0
+        app.settings_view.vars["scheme"].set("Automatic (recommended)")
+        app.settings_view._changed()
+        assert app.prefs.scheme is None and app.prefs.minscore == 50.0
+        assert app.settings_view.vars["minscore"].get() == "50"
+        app.settings_view.vars["scheme"].set("saureus")
+        app.settings_view._changed()
 
         # the drop zone repaints in every state without raising
         for state in ("idle", "hover", "dragover", "focus"):
@@ -815,6 +827,354 @@ def test_tab_order_reaches_every_control():
         except Exception:
             pass
 
+
+# ---------------------------------------------------------------------------
+# regressions: the single after() chain, the start-up race, task routing,
+# the settings round trip, Clear during a run, and the cancelled queue
+# ---------------------------------------------------------------------------
+def _app_on_display(*, withdraw: bool = True):
+    """Build the real window on whatever display is available, or skip."""
+    if not _display_available():
+        raise SkipTest("no display: run under xvfb-run to exercise real widgets")
+    import tkinter as tk
+
+    try:
+        root = tk.Tk()
+    except tk.TclError as exc:
+        raise SkipTest("Tk could not open a display: {}".format(exc)) from exc
+    if withdraw:
+        root.withdraw()
+    gui.apply_scaling(root)
+    gui.install_theme(root)
+    return root, gui.WmlstApp(root, gui.Prefs())
+
+
+def _settle(root, until, timeout: float = 5.0) -> None:
+    """Pump the real event loop until ``until()`` is true or time runs out."""
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        root.update()
+        if until():
+            return
+        time.sleep(0.01)
+
+
+def _ready_env() -> gui.Environment:
+    return gui.Environment(dbdir="/db", datadir="/db/pubmlst",
+                           blastdb="/db/blast/mlst.fa", db_ok=True, blast_ok=True,
+                           blast_path="/nowhere/blastn", db_version="2025-12-29",
+                           scheme_count=2, blast_version="2.17.0+",
+                           scheme_names=("saureus", "sepidermidis"))
+
+
+def test_the_poll_chain_is_rearmed_before_a_handler_can_block():
+    """A handler reached from pump() may open a modal and spin a nested event
+    loop (the first-run BLAST bootstrap does).  The next tick has to be armed
+    *before* pump() runs, or the one after() chain is dead for as long as the
+    modal is up and the dialog can never be fed or closed.
+    """
+    scheduler = FakeScheduler()
+    trace = []
+
+    def dispatch(msg):
+        # stand-in for ModalDialog + root.wait_window(): a nested event loop
+        # that runs whatever the scheduler already has pending.
+        trace.append(len(scheduler.pending))
+        for _ in range(3):
+            scheduler.run()
+        trace.append(len(scheduler.pending))
+
+    controller = gui.AnalysisController(schedule=scheduler, dispatch=dispatch)
+    controller.queue.put(gui.Msg("phase", 1, text="open a modal"))
+    controller.ensure_polling()
+    scheduler.run()
+    assert trace, "the message was never dispatched"
+    assert trace[0] == 1, "the tick must be re-armed BEFORE the handler can block"
+    assert trace[1] == 1, "the nested loop must carry exactly one chain onwards"
+    assert len(scheduler.pending) == 1, "the after() chain must neither die nor fork"
+
+
+def test_a_modal_opened_from_a_handler_still_gets_its_later_messages():
+    """End-to-end form of the same defect on a real Tk root: a dialog opened
+    from a dispatch handler is closed by a message that arrives afterwards.
+    """
+    root, _app = _app_on_display()
+    import tkinter as tk
+
+    try:
+        box = {}
+        seen = []
+
+        def dispatch(msg):
+            if msg.text == "open":
+                dialog = tk.Toplevel(root)
+                dialog.withdraw()
+                box["dialog"] = dialog
+                root.wait_window(dialog)          # nested event loop
+                seen.append("modal-returned")
+                root.quit()
+            elif msg.text == "close":
+                seen.append("close-delivered")
+                box["dialog"].destroy()
+
+        controller = gui.AnalysisController(
+            schedule=lambda ms, fn: root.after(ms, fn), dispatch=dispatch)
+        controller.queue.put(gui.Msg("phase", 1, text="open"))
+        controller.ensure_polling()
+        root.after(400, lambda: controller.queue.put(gui.Msg("phase", 1, text="close")))
+
+        def watchdog():
+            dialog = box.get("dialog")
+            if dialog is not None and dialog.winfo_exists():
+                seen.append("TIMED-OUT")
+                dialog.destroy()
+            root.quit()
+
+        root.after(6000, watchdog)
+        root.mainloop()
+        assert seen == ["close-delivered", "modal-returned"], seen
+        controller._schedule = lambda ms, fn: None   # stop the chain re-arming
+    finally:
+        try:
+            root.destroy()
+        except Exception:
+            pass
+
+
+def test_command_line_files_wait_for_the_environment_probe():
+    """``wmlst-gui FILE`` used to race the probe on a 120 ms timer and always
+    lose, so a healthy install was shown the 137 MB download modal and the file
+    was never analysed.  The files are handed over by _apply_env instead.
+    """
+    root, app = _app_on_display()
+    try:
+        started = []
+        app.analyse_view.handle_paths = lambda paths: started.append(list(paths))
+        app._argv_files = ["/tmp/from-argv.fa"]
+
+        app._apply_env(_ready_env())
+        assert started == [], "argv files must not be started synchronously"
+        _settle(root, lambda: started)
+        assert started == [["/tmp/from-argv.fa"]], started
+        assert app._argv_files == [], "the argv list must be drained exactly once"
+        assert app._bootstrap is None, "a healthy install must see no setup modal"
+
+        # a probe that fails must still route the files (to the real
+        # start_analysis, which then explains what is missing) and not drop them
+        app._argv_files = ["/tmp/again.fa"]
+        app._task_failed("env", gui.Friendly("nope", "the probe blew up"))
+        _settle(root, lambda: len(started) > 1)
+        assert started[-1] == ["/tmp/again.fa"], started
+    finally:
+        try:
+            root.destroy()
+        except Exception:
+            pass
+
+
+def test_a_finished_task_still_reaches_its_owner_and_is_never_dropped():
+    """The owner is popped out of _owners before routing, so _route must be
+    handed the owner it just removed; and a bootstrap result whose dialog has
+    gone must still be adopted rather than silently discarded.
+    """
+    root, app = _app_on_display()
+    try:
+        class Owner:
+            def __init__(self):
+                self.payload = None
+
+            def on_task_done(self, job, payload):
+                self.payload = payload
+                return True
+
+        owner = Owner()
+        app._owners[7] = owner
+        app._task_kinds[7] = "blast-bootstrap"
+        with app.controller._lock:
+            app.controller._task_results[7] = "TOOLS"
+        app.dispatch(gui.Msg("env", 7, text="blast-bootstrap"))
+        assert owner.payload == "TOOLS", "the popped owner must still be routed to"
+        assert 7 not in app._owners and 7 not in app._task_kinds
+
+        # no owner left at all: the install must still be adopted
+        adopted = []
+        app.adopt_tools = lambda tools: adopted.append(tools)
+        app._owners[8] = None
+        app._task_kinds[8] = "blast-bootstrap"
+        with app.controller._lock:
+            app.controller._task_results[8] = "TOOLS2"
+        app.dispatch(gui.Msg("env", 8, text="blast-bootstrap"))
+        assert adopted == ["TOOLS2"], adopted
+    finally:
+        try:
+            root.destroy()
+        except Exception:
+            pass
+
+
+def test_closing_the_bootstrap_modal_mid_download_cancels_it():
+    """Escape used to destroy the dialog and leave the 137 MB download running
+    unattended with nothing to delete the partial file (section 10.7).
+    """
+    root, app = _app_on_display()
+    try:
+        dialog = gui.BootstrapDialog(root, app)
+        app._bootstrap = dialog
+        root.update()
+        assert not dialog.cancel_event.is_set()
+
+        dialog.job = 99                   # pretend the download is in flight
+        dialog._downloading = True
+        dialog.close()
+        root.update()
+        assert dialog.winfo_exists(), "the modal must stay up until the worker stops"
+        assert dialog.cancel_event.is_set(), "closing mid-download must cancel it"
+
+        # once the worker has acknowledged, closing goes through as usual
+        dialog.on_task_failed(99, gui.Friendly("Stopped", "cancelled"))
+        dialog.close()
+        root.update()
+        assert not dialog.winfo_exists()
+    finally:
+        try:
+            root.destroy()
+        except Exception:
+            pass
+
+
+def test_a_scheme_override_never_poisons_the_saved_minimum_score():
+    """Forcing a scheme displays 0 (section 10.4) and runs at 0 (bin/mlst:125),
+    but returning to Automatic must give the user their own value back.
+    """
+    forced = gui.Prefs(minscore=50.0, scheme="saureus")
+    assert forced.normalised().minscore == 0.0
+    assert forced.normalised().exclude == ()
+    assert forced.normalised(force_scheme_rules=False).minscore == 50.0
+    assert forced.normalised(force_scheme_rules=False).exclude == gui.DEFAULT_EXCLUDE
+    assert forced.to_runconfig(["a.fa"], gui.Environment()).minscore == 0.0
+
+    root, app = _app_on_display()
+    try:
+        view = app.settings_view
+        view.set_scheme_choices(("saureus", "sepidermidis"))
+        assert app.prefs.minscore == 50.0
+
+        view.scheme_box.set("saureus")
+        view.scheme_box.event_generate("<<ComboboxSelected>>")
+        root.update()
+        assert view.vars["minscore"].get() == "0", "the control must display 0"
+        assert str(view.spin_minscore.cget("state")) == "disabled"
+        assert app.prefs.scheme == "saureus"
+        assert app.prefs.minscore == 50.0, "0 is a display, not the preference"
+        assert app.prefs.to_runconfig(["a.fa"], app.env).minscore == 0.0
+        assert app.prefs.to_runconfig(["a.fa"], app.env).exclude == frozenset()
+
+        view.scheme_box.set("Automatic (recommended)")
+        view.scheme_box.event_generate("<<ComboboxSelected>>")
+        root.update()
+        assert view.vars["minscore"].get() == "50"
+        assert app.prefs.scheme is None
+        assert app.prefs.minscore == 50.0, "the user's minimum score was destroyed"
+        assert app.prefs.exclude == gui.DEFAULT_EXCLUDE
+    finally:
+        try:
+            root.destroy()
+        except Exception:
+            pass
+
+
+def test_clear_results_refuses_while_a_worker_is_alive():
+    """Run > Clear results is not greyed out the way the Clear button is, and
+    dropping to IDLE mid-run also unlocked the database update path.
+    """
+    state = gui.AppState()
+    assert state.to(gui.RUNNING)
+    assert not state.to(gui.IDLE), "RUNNING may only be left through finish()"
+    assert state.finish("done")
+
+    root, app = _app_on_display()
+    try:
+        app.env = _ready_env()
+        app.controller._engine_factory = lambda cfg: FakeEngine(cfg, block=True)
+        app.start_analysis(["/tmp/A.fa"])
+        deadline = time.time() + 5.0
+        while time.time() < deadline and not app.controller.running:
+            root.update()
+            time.sleep(0.01)
+        assert app.controller.running
+
+        assert app.analyse_view.clear() is False
+        assert app.state.state == gui.RUNNING
+        assert app.controller.running
+        assert "Stop the analysis" in app.status.label.cget("text")
+
+        # ... and the database update guard keys off the worker, not the view
+        started = []
+        app.run_task = lambda kind, fn, **kw: started.append(kind)
+        app.state._state = gui.IDLE          # what Clear used to leave behind
+        app.database_view.check_updates()
+        assert started == [], "an update must not start while the engine is reading"
+    finally:
+        app.controller.request_cancel()
+        app.controller.shutdown(5.0)
+        try:
+            root.destroy()
+        except Exception:
+            pass
+
+
+def test_cancelling_says_what_happened_to_the_queued_files():
+    """Files dropped during a run are acknowledged as queued; cancelling drops
+    them, so it has to say so -- and must not resurrect them in a later batch.
+    """
+    root, app = _app_on_display()
+    try:
+        app.env = _ready_env()
+        engines = []
+
+        def blocking(cfg):
+            engine = FakeEngine(cfg, block=True)
+            engines.append(engine)
+            return engine
+
+        app.controller._engine_factory = blocking
+        app.start_analysis(["/tmp/A.fa"])
+        deadline = time.time() + 5.0
+        while time.time() < deadline and not app.controller.running:
+            root.update()
+            time.sleep(0.01)
+        app.start_analysis(["/tmp/B.fa"])
+        assert app.controller._pending == ["/tmp/B.fa"]
+
+        app.cancel_run()
+        deadline = time.time() + 15.0
+        while time.time() < deadline and app.state.running:
+            root.update()
+            time.sleep(0.01)
+        root.update()
+        assert app.state.state == gui.RESULTS and app.state.reason == "cancelled"
+        assert app.controller._pending == [], "the queue must not survive a cancel"
+        assert "not analysed" in app.status.label.cget("text"), \
+            app.status.label.cget("text")
+
+        # a later, unrelated run must not pick the cancelled file back up
+        engines.clear()
+        app.controller._engine_factory = lambda cfg: engines.append(
+            FakeEngine(cfg)) or engines[-1]
+        app.start_analysis(["/tmp/C.fa"])
+        deadline = time.time() + 15.0
+        while time.time() < deadline and app.state.running:
+            root.update()
+            time.sleep(0.01)
+        root.update()
+        assert [e.seen for e in engines] == [["/tmp/C.fa"]], [e.seen for e in engines]
+    finally:
+        app.controller.request_cancel()
+        app.controller.shutdown(5.0)
+        try:
+            root.destroy()
+        except Exception:
+            pass
 
 def _run_all() -> int:
     failures = 0

@@ -509,11 +509,17 @@ class Prefs:
             return False
 
     # -- derived ------------------------------------------------------------
-    def normalised(self) -> Prefs:
+    def normalised(self, *, force_scheme_rules: bool = True) -> Prefs:
         """Return a copy with every invariant of section 3.6.1 applied.
 
         ``scheme`` forces ``minscore`` to 0 and clears ``exclude``
         (``bin/mlst:125``); ``jobs * threads`` is clamped to the CPU count.
+
+        The Perl applies the scheme override per invocation, so it belongs to a
+        run, not to the saved preferences.  ``force_scheme_rules=False`` clamps
+        everything else but leaves ``minscore``/``exclude`` alone, which is what
+        the Settings tab persists -- otherwise picking a scheme and then going
+        back to Automatic would leave minscore permanently poisoned to 0.
         """
         p = dataclasses.replace(self)
         p.minid = clamp_float(p.minid, 0.0, 100.0, DEFAULT_MINID)
@@ -522,7 +528,7 @@ class Prefs:
         p.threads = clamp_int(p.threads, 1, max_threads(), 1)
         p.jobs = clamp_int(p.jobs, 1, max_threads(), 1)
         p.exclude = parse_exclude(p.exclude)
-        if p.scheme:
+        if p.scheme and force_scheme_rules:
             p.minscore = 0.0
             p.exclude = ()
         if p.jobs * p.threads > cpu_count():
@@ -1038,7 +1044,9 @@ IDLE, RUNNING, RESULTS = "IDLE", "RUNNING", "RESULTS"
 
 _ALLOWED_TRANSITIONS = {
     IDLE: frozenset({RUNNING, IDLE}),
-    RUNNING: frozenset({RESULTS, IDLE}),
+    # RUNNING is left only through finish() -> RESULTS.  Allowing RUNNING -> IDLE
+    # let "Clear results" strand a live worker behind an idle-looking window.
+    RUNNING: frozenset({RESULTS}),
     RESULTS: frozenset({RUNNING, IDLE, RESULTS}),
 }
 
@@ -1171,13 +1179,21 @@ class AnalysisController:
             self._schedule(self.POLL_MS, self._tick)
 
     def _tick(self) -> None:
+        # Re-arm BEFORE doing any work.  A handler reached from pump() may open a
+        # modal dialog (the first-run BLAST bootstrap does exactly that) and spin a
+        # nested event loop inside wait_window().  If the next tick were only armed
+        # after pump() returned, nothing would be pending while that nested loop ran,
+        # the single after() chain would be dead, and the dialog -- whose progress and
+        # self-close arrive purely through this chain -- would hang forever.
+        # Re-arming first keeps exactly one chain alive: the pending tick fires inside
+        # the nested loop and carries the chain from there.
+        self._schedule(self.POLL_MS, self._tick)
         self.pump()
         if self._on_tick is not None:
             try:
                 self._on_tick(self.elapsed, self.running)
             except Exception:
                 LOG.exception("tick handler failed")
-        self._schedule(self.POLL_MS, self._tick)
 
     def pump(self, limit: int = 400) -> int:
         """Drain the queue on the main thread. Returns how many messages went out."""
@@ -1258,7 +1274,7 @@ class AnalysisController:
                     self._put(Msg("cancelled", job, index=i - 1, total=total))
                     return
                 self._put(Msg("started", job, index=i, total=total, path=path,
-                              text="Reading {}…".format(os.path.basename(path))))
+                              text="Reading {}...".format(os.path.basename(path))))
                 try:
                     result = eng.analyse_file(
                         path,
@@ -1423,6 +1439,11 @@ def install_theme(root: tk.Misc) -> ttk.Style:
     style.configure("Surface.TFrame", background=surface)
     style.configure("CardBorder.TFrame", background=border)
     style.configure("Footer.TFrame", background=surface)
+    # The forced-scheme notice on the Analyse tab: a tinted band, never colour
+    # alone -- the text says what is pinned and the button undoes it.
+    style.configure("Notice.TFrame", background=c("warn"))
+    style.configure("Notice.TLabel", background=c("warn"), foreground=bg,
+                    font=F["body"])
 
     style.configure("TLabel", background=bg, foreground=text, font=F["body"])
     style.configure("Surface.TLabel", background=surface, foreground=text)
@@ -1714,7 +1735,7 @@ class DropZone(tk.Canvas):
         dragging = self.zone_state == "dragover"
         if not self._enabled:
             outline, width, fill = c("border"), px(2), c("bg")
-            headline, sub = "Working…", "Please wait for the current files to finish."
+            headline, sub = "Working...", "Please wait for the current files to finish."
         elif dragging:
             outline, width, fill = c("drop_hover"), px(3), c("accent_soft")
             headline, sub = "Release to analyse", self.subline
@@ -1856,6 +1877,20 @@ class AnalyseView(ttk.Frame):
         outer = ttk.Frame(self, style="TFrame")
         outer.pack(fill="both", expand=True, padx=px(PAD_L), pady=px(PAD_M))
 
+        # A forced scheme is sticky across sessions, and when it is the wrong one
+        # every file comes back NONE with no visible reason -- which reads as "the
+        # tool is broken" rather than "you pinned a scheme". Say so on this tab,
+        # where the result is, not only on the Settings tab the user has left.
+        self.scheme_notice = ttk.Frame(outer, style="Notice.TFrame")
+        self.scheme_notice_label = ttk.Label(
+            self.scheme_notice, style="Notice.TLabel", anchor="w", justify="left")
+        self.scheme_notice_label.pack(side="left", fill="x", expand=True,
+                                      padx=(px(PAD_M), px(PAD_S)), pady=px(PAD_S))
+        ttk.Button(self.scheme_notice, text="Use automatic",
+                   command=self._clear_forced_scheme).pack(side="right",
+                                                           padx=(0, px(PAD_M)),
+                                                           pady=px(PAD_S))
+
         self.dropzone = DropZone(
             outer, on_files=self.handle_paths, on_browse=self.browse_files,
             on_browse_folder=self.browse_folder, dnd=self.app.dnd_enabled)
@@ -1868,7 +1903,7 @@ class AnalyseView(ttk.Frame):
         self.progress_card = progress
         row = ttk.Frame(progress, style="Surface.TFrame")
         row.pack(fill="x", padx=px(PAD_M), pady=(px(PAD_M), px(PAD_S)))
-        self.progress_label = ttk.Label(row, text="Starting…", style="Heading.TLabel",
+        self.progress_label = ttk.Label(row, text="Starting...", style="Heading.TLabel",
                                         anchor="w")
         self.progress_label.pack(side="left", fill="x", expand=True)
         self.elapsed_label = ttk.Label(row, text="", style="SurfaceMuted.TLabel")
@@ -1956,11 +1991,11 @@ class AnalyseView(ttk.Frame):
         self.btn_html = ttk.Button(actions, text="Open report",
                                    style="Accent.TButton", command=self.open_html)
         self.btn_html.pack(side="left")
-        self.btn_tsv = ttk.Button(actions, text="Save table (TSV)…", command=self.save_tsv)
+        self.btn_tsv = ttk.Button(actions, text="Save table (TSV)...", command=self.save_tsv)
         self.btn_tsv.pack(side="left", padx=(px(PAD_S), 0))
-        self.btn_json = ttk.Button(actions, text="Save JSON…", command=self.save_json)
+        self.btn_json = ttk.Button(actions, text="Save JSON...", command=self.save_json)
         self.btn_json.pack(side="left", padx=(px(PAD_S), 0))
-        self.btn_novel = ttk.Button(actions, text="Save new alleles…",
+        self.btn_novel = ttk.Button(actions, text="Save new alleles...",
                                     command=self.save_novel)
         self.btn_novel.pack(side="left", padx=(px(PAD_S), 0))
         self.btn_copy = ttk.Button(actions, text="Copy row", command=self.copy_row)
@@ -1977,6 +2012,34 @@ class AnalyseView(ttk.Frame):
         ring.pack(fill="both", expand=True)
         self._set_actions_enabled(False)
         self.show_state(IDLE)
+
+    # -- forced-scheme notice ------------------------------------------------
+    def refresh_scheme_notice(self) -> None:
+        """Show or hide the banner that says a scheme is pinned (section 10.2).
+
+        Called on start-up and whenever settings change, because the preference
+        is persisted: a scheme pinned weeks ago is otherwise invisible here.
+        """
+        scheme = getattr(self.app.prefs, "scheme", None)
+        if scheme:
+            self.scheme_notice_label.configure(
+                text=("Scheme locked to \u201c%s\u201d. Every file is typed against "
+                      "this scheme only, and anything else reports no match."
+                      % scheme))
+            self.scheme_notice.pack(fill="x", pady=(0, px(PAD_S)), before=self.dropzone)
+        else:
+            self.scheme_notice.pack_forget()
+
+    def _clear_forced_scheme(self) -> None:
+        """The banner's 'Use automatic' button: unpin and let detection run."""
+        self.app.prefs.scheme = None
+        self.app.schedule_save()
+        settings = getattr(self.app, "settings_view", None)
+        if settings is not None:
+            settings.load_from(self.app.prefs)
+        self.refresh_scheme_notice()
+        self.app.status.set("Scheme detection is automatic again.", "ok",
+                            transient=True)
 
     # -- visibility ----------------------------------------------------------
     def show_state(self, state: str) -> None:
@@ -2113,7 +2176,7 @@ class AnalyseView(ttk.Frame):
         self._total = total
         self._current_pct = 0.0
         self.overall.configure(maximum=100.0 * max(1, total), value=0.0)
-        self.progress_label.configure(text="Preparing…")
+        self.progress_label.configure(text="Preparing...")
         self.progress_detail.configure(text="")
         self.elapsed_label.configure(text="")
         self.cancel_button.configure(state="normal", text="Cancel")
@@ -2305,8 +2368,19 @@ class AnalyseView(ttk.Frame):
         self.clipboard_append(text)
         self.app.status.set("Row copied to the clipboard.", "ok", transient=True)
 
-    def clear(self) -> None:
-        """Empty the result list and return to the idle drop target."""
+    def clear(self) -> bool:
+        """Empty the result list and return to the idle drop target.
+
+        Refuses (returning False) while a worker is still running: the Clear
+        *button* is greyed out during a run, but Run > Clear results is not, and
+        dropping back to IDLE mid-run hides the progress card, re-arms the drop
+        zone and -- worst of all -- unlocks the database update/atomic-swap path
+        that section 10.3 requires to be blocked while an analysis is in flight.
+        """
+        if self.app.controller.running:
+            self.app.status.set("Stop the analysis before clearing the results.",
+                                "warn", transient=True)
+            return False
         self.st_label.configure(text="—")
         self.summary_title.configure(text="")
         self.summary_status.configure(text="")
@@ -2322,6 +2396,7 @@ class AnalyseView(ttk.Frame):
         self.app.state.to(IDLE)
         self.show_state(IDLE)
         self.app.status.set("Ready.", resting=True)
+        return True
 
     def open_html(self) -> None:
         self.app.export("html")
@@ -2439,7 +2514,7 @@ class DatabaseView(ttk.Frame):
         if not env.db_ok:
             self.db_detail.configure(text=env.db_error or "The database is not available.")
             return
-        self.db_detail.configure(text="Reading the scheme catalogue…")
+        self.db_detail.configure(text="Reading the scheme catalogue...")
         datadir = env.datadir
 
         def load(progress: Callable[..., None], cancel: threading.Event) -> Any:
@@ -2468,8 +2543,8 @@ class DatabaseView(ttk.Frame):
                 "", "end", text=name,
                 values=(species or "scheme not mapped to a species",
                         db_cell(getattr(info, "locus", "")),
-                        db_cell(types) if deep else "…",
-                        db_cell(alleles) if deep else "…",
+                        db_cell(types) if deep else "...",
+                        db_cell(alleles) if deep else "...",
                         db_cell(getattr(info, "last_updated", ""))),
                 tags=() if species else ("muted",))
         self.count_label.configure(text=str(len(self._infos)))
@@ -2482,7 +2557,7 @@ class DatabaseView(ttk.Frame):
         if kind == "shallow":
             catalog, infos = payload
             self._fill(catalog, infos, deep=False)
-            self.db_detail.configure(text="Counting sequence types…")
+            self.db_detail.configure(text="Counting sequence types...")
             datadir = self.app.env.datadir
 
             def deep_load(progress: Callable[..., None], cancel: threading.Event) -> Any:
@@ -2532,7 +2607,9 @@ class DatabaseView(ttk.Frame):
 
     def check_updates(self) -> None:
         """Metadata-only pass; writes nothing (section 10.3)."""
-        if self.app.state.running:
+        # Key off the worker, not the view state: the view can be back at IDLE
+        # while the engine is still reading the database we are about to swap.
+        if self.app.controller.running or self.app.state.running:
             self.app.status.set(
                 "Wait for the current analysis to finish before updating.",
                 "warn", transient=True)
@@ -2543,7 +2620,7 @@ class DatabaseView(ttk.Frame):
                                 transient=True)
             return
         self._busy(True)
-        self.db_detail.configure(text="Contacting PubMLST…")
+        self.db_detail.configure(text="Contacting PubMLST...")
         self._cancel = threading.Event()
 
         def run(progress: Callable[..., None], cancel: threading.Event) -> Any:
@@ -2587,7 +2664,7 @@ class DatabaseView(ttk.Frame):
         dbdir = self.app.env.dbdir
         plan = self.plan
         self._busy(True)
-        self.db_detail.configure(text="Downloading…")
+        self.db_detail.configure(text="Downloading...")
         self._cancel = threading.Event()
 
         def run(progress: Callable[..., None], cancel: threading.Event) -> Any:
@@ -2617,7 +2694,7 @@ class DatabaseView(ttk.Frame):
         """Cancel is live and honoured between scheme commits (section 10.3)."""
         if self._cancel is not None:
             self._cancel.set()
-        self.db_detail.configure(text="Stopping…")
+        self.db_detail.configure(text="Stopping...")
 
 
 # ===========================================================================
@@ -2650,6 +2727,12 @@ class SettingsView(ttk.Frame):
         super().__init__(parent, style="TFrame")
         self.app = app
         self.vars: Dict[str, tk.Variable] = {}
+        # While a scheme is forced the minimum-score control *displays* 0
+        # (section 10.4) but that 0 is a display, not the user's preference:
+        # _minscore_saved holds the real value so returning to Automatic gives it
+        # back instead of persisting 0 forever.
+        self._minscore_forced = False
+        self._minscore_saved = _num(DEFAULT_MINSCORE)
         self._build()
         self.load_from(app.prefs)
 
@@ -2759,6 +2842,7 @@ class SettingsView(ttk.Frame):
         self.vars["exclude"].set(", ".join(prefs.exclude))
         self.vars["scheme"].set(prefs.scheme or "Automatic (recommended)")
         self._loading = False
+        self._minscore_forced = False   # re-capture the shadow from these values
         self._sync_scheme_lock()
 
     def set_scheme_choices(self, names: Sequence[str]) -> None:
@@ -2771,13 +2855,18 @@ class SettingsView(ttk.Frame):
         prefs = dataclasses.replace(self.app.prefs)
         prefs.minid = clamp_float(self.vars["minid"].get(), 0, 100, DEFAULT_MINID)
         prefs.mincov = clamp_float(self.vars["mincov"].get(), 0, 100, DEFAULT_MINCOV)
-        prefs.minscore = clamp_float(self.vars["minscore"].get(), 0, 100, DEFAULT_MINSCORE)
+        raw_minscore = (self._minscore_saved if self._minscore_forced
+                        else self.vars["minscore"].get())
+        prefs.minscore = clamp_float(raw_minscore, 0, 100, DEFAULT_MINSCORE)
         prefs.threads = clamp_int(self.vars["threads"].get(), 1, max_threads(), 1)
         prefs.jobs = clamp_int(self.vars["jobs"].get(), 1, max_threads(), 1)
         prefs.exclude = parse_exclude(self.vars["exclude"].get())
         chosen = self.vars["scheme"].get().strip()
         prefs.scheme = None if chosen.startswith("Automatic") or not chosen else chosen
-        return prefs.normalised()
+        # The scheme override (minscore 0, empty exclude) is applied per run by
+        # to_runconfig(); baking it into the saved preferences would destroy the
+        # user's own values the moment they picked a scheme.
+        return prefs.normalised(force_scheme_rules=False)
 
     def _clamp(self, key: str) -> None:
         """Clamp on focus-out, flash the field and explain (section 10.4)."""
@@ -2817,12 +2906,18 @@ class SettingsView(ttk.Frame):
         if spin is not None:
             spin.configure(state="disabled" if forced else "normal")
         if forced:
+            if not self._minscore_forced:
+                self._minscore_saved = self.vars["minscore"].get()
+                self._minscore_forced = True
             self.vars["minscore"].set("0")
             self.scheme_warning.configure(
                 text="⚠ Forcing a scheme sets the minimum score to 0 and ignores the "
                      "exclude list, exactly as mlst --scheme does. Every file will be "
                      "reported with this scheme even if it does not fit.")
         else:
+            if self._minscore_forced:
+                self.vars["minscore"].set(self._minscore_saved)
+                self._minscore_forced = False
             self.scheme_warning.configure(text="")
 
     def _changed(self) -> None:
@@ -2848,6 +2943,8 @@ class SettingsView(ttk.Frame):
         self.vars["jobs"].set("1")
         self.vars["exclude"].set(", ".join(DEFAULT_EXCLUDE))
         self.vars["scheme"].set("Automatic (recommended)")
+        self._minscore_forced = False   # these ARE the user's values now
+        self._minscore_saved = _num(DEFAULT_MINSCORE)
         self._changed()
         self.app.status.set(
             "Reference defaults restored: identity 95, coverage 50, score 50, "
@@ -3040,6 +3137,7 @@ class BootstrapDialog(ModalDialog):
         self.cancel_event = threading.Event()
         self.job: Optional[int] = None
         self.done = False
+        self._downloading = False
         try:
             from . import blastbin
             where = blastbin.install_root()
@@ -3076,7 +3174,7 @@ class BootstrapDialog(ModalDialog):
         self.path_var = tk.StringVar()
         ttk.Entry(picker, textvariable=self.path_var, width=44).pack(
             side="left", fill="x", expand=True)
-        ttk.Button(picker, text="Browse…", command=self._pick).pack(
+        ttk.Button(picker, text="Browse...", command=self._pick).pack(
             side="left", padx=(px(PAD_S), 0))
         ttk.Button(picker, text="Use this", command=self._use_existing).pack(
             side="left", padx=(px(PAD_S), 0))
@@ -3110,7 +3208,7 @@ class BootstrapDialog(ModalDialog):
         if not folder:
             return
         self.detail.pack(fill="x", pady=(px(PAD_S), 0))
-        self.detail.configure(text="Checking that folder…")
+        self.detail.configure(text="Checking that folder...")
 
         def probe() -> Any:
             from . import blastbin
@@ -3124,8 +3222,9 @@ class BootstrapDialog(ModalDialog):
         self.not_now.configure(state="disabled")
         self.progress.pack(fill="x", pady=(px(PAD_M), 0))
         self.detail.pack(fill="x", pady=(px(PAD_XS), 0))
-        self.detail.configure(text="Starting download…")
+        self.detail.configure(text="Starting download...")
         self.cancel_event = threading.Event()
+        self._downloading = True
 
         def run(progress: Callable[..., None], cancel: threading.Event) -> Any:
             from . import blastbin
@@ -3137,8 +3236,22 @@ class BootstrapDialog(ModalDialog):
     def cancel(self) -> None:
         """Cancelling deletes the partial download (blastbin honours the event)."""
         self.cancel_event.set()
-        self.detail.configure(text="Stopping…")
+        self.detail.configure(text="Stopping...")
         self.action.configure(state="disabled")
+
+    def close(self) -> None:
+        """Escape / the window X during a download means "cancel", not "abandon".
+
+        Without this the modal vanishes while the 137 MB download carries on
+        unattended, nothing deletes the partial file, and the finished install is
+        adopted by nobody.  The first close asks the worker to stop and keeps the
+        modal up; once it has acknowledged (on_task_failed clears self.job) a
+        further close goes through.
+        """
+        if self._downloading and not self.cancel_event.is_set():
+            self.cancel()
+            return
+        super().close()
 
     # -- task routing --------------------------------------------------------
     def on_progress(self, msg: Msg) -> bool:
@@ -3153,6 +3266,7 @@ class BootstrapDialog(ModalDialog):
         if self.job is None or job != self.job:
             return False
         self.done = True
+        self._downloading = False
         self.app.adopt_tools(payload)
         self.close()
         return True
@@ -3161,6 +3275,7 @@ class BootstrapDialog(ModalDialog):
         if self.job is None or job != self.job:
             return False
         self.job = None
+        self._downloading = False
         self.progress.configure(value=0.0)
         self.action.configure(text="Try again", command=self.start, state="normal")
         self.not_now.configure(state="normal")
@@ -3312,6 +3427,9 @@ def fallback_meta(cfg: RunConfig, env: Environment) -> RunMeta:
     )
 
 
+_NO_OWNER = object()   # "look the owner up yourself" marker for WmlstApp._route
+
+
 class WmlstApp:
     """Owns the root, the theme, the three tabs, the menubar, the status line
     and the footer (section 4.10)."""
@@ -3333,6 +3451,11 @@ class WmlstApp:
         self._analysis_job = 0
         self._save_after: Optional[str] = None
         self._queued_files: List[str] = []
+        # Files named on the command line.  They are NOT started on a timer racing
+        # the environment probe (the probe takes 250-450 ms, the first tick is due
+        # at 120 ms, so the race was always lost and the user got a spurious
+        # "BLAST is missing" download modal): _apply_env / _task_failed drain them.
+        self._argv_files: List[str] = []
         self._bootstrap: Optional[BootstrapDialog] = None
         self._failed_count = 0
         self._build()
@@ -3377,7 +3500,7 @@ class WmlstApp:
         ttk.Label(credit, text="{} {}  ·  {}".format(
             branding.APP_NAME, __version__, branding.ATTRIBUTION),
             style="Status.TLabel").pack(side="left", padx=px(PAD_M), pady=(0, px(PAD_S)))
-        self.footer_env = ttk.Label(credit, text="Starting…", style="Status.TLabel")
+        self.footer_env = ttk.Label(credit, text="Starting...", style="Status.TLabel")
         self.footer_env.pack(side="right", padx=px(PAD_M), pady=(0, px(PAD_S)))
 
         # LAST, on purpose: pack() serves children in call order, so the status
@@ -3397,17 +3520,17 @@ class WmlstApp:
     def _build_menu(self) -> None:
         menubar = tk.Menu(self.root)
         file_menu = tk.Menu(menubar, tearoff=0)
-        file_menu.add_command(label="Open files…", accelerator="Ctrl+O",
+        file_menu.add_command(label="Open files...", accelerator="Ctrl+O",
                               command=lambda: self.analyse_view.browse_files())
-        file_menu.add_command(label="Open folder…", accelerator="Ctrl+Shift+O",
+        file_menu.add_command(label="Open folder...", accelerator="Ctrl+Shift+O",
                               command=lambda: self.analyse_view.browse_folder())
         file_menu.add_separator()
         file_menu.add_command(label="Open report",
                               command=lambda: self.export("html"))
-        file_menu.add_command(label="Save table (TSV)…",
+        file_menu.add_command(label="Save table (TSV)...",
                               command=lambda: self.export("tsv"))
-        file_menu.add_command(label="Save JSON…", command=lambda: self.export("json"))
-        file_menu.add_command(label="Save new alleles…",
+        file_menu.add_command(label="Save JSON...", command=lambda: self.export("json"))
+        file_menu.add_command(label="Save new alleles...",
                               command=lambda: self.export("novel"))
         file_menu.add_separator()
         file_menu.add_command(label="Exit", accelerator="Ctrl+Q", command=self.on_close)
@@ -3455,6 +3578,7 @@ class WmlstApp:
         """Run 50 ms after the first paint: locate the database and the engine."""
         self.controller.ensure_polling()
         prefs = self.prefs
+        self.analyse_view.refresh_scheme_notice()
         self.run_task("env", lambda: probe_environment(prefs))
         if prefs.load_note:
             self.status.set(prefs.load_note, "warn", transient=True)
@@ -3482,10 +3606,19 @@ class WmlstApp:
                             "Ready. Click the box above to choose a FASTA file.",
                             resting=True)
         self._update_banner()
+        self._start_argv_files()
         if not env.blast_ok and not self.prefs.blast_prompt_shown:
             self.prefs.blast_prompt_shown = True
             self.schedule_save()
             self.offer_bootstrap()
+
+    def _start_argv_files(self) -> None:
+        """Hand any command-line files to the drop handler, once the environment
+        probe has answered.  Runs at most once per batch of argv files."""
+        if not self._argv_files:
+            return
+        pending, self._argv_files = self._argv_files, []
+        self.root.after(1, lambda: self.analyse_view.handle_paths(pending))
 
     def _update_banner(self) -> None:
         if self.env.blast_ok or self._bootstrap is not None:
@@ -3510,8 +3643,14 @@ class WmlstApp:
         self._task_kinds[job] = kind
         return job
 
-    def _route(self, msg: Msg, method: str, *args: Any) -> bool:
-        owner = self._owners.get(msg.job, None)
+    def _route(self, msg: Msg, method: str, *args: Any,
+               owner: Any = _NO_OWNER) -> bool:
+        # The caller may already have popped the owner out of self._owners (the
+        # terminal messages do exactly that), in which case it hands the owner in
+        # here.  Looking it up again would find nothing and the result would be
+        # routed to the fallbacks -- or dropped entirely.
+        if owner is _NO_OWNER:
+            owner = self._owners.get(msg.job, None)
         candidates = [owner] if owner is not None else []
         candidates.extend([self.database_view, self._bootstrap])
         for candidate in candidates:
@@ -3568,15 +3707,15 @@ class WmlstApp:
                         else Friendly("Something went wrong", msg.text))
             LOG.error("task %s failed: %s", kind, msg.text)
             self._task_kinds.pop(msg.job, None)
-            self._owners.pop(msg.job, None)
-            if not self._route(msg, "on_task_failed", msg.job, friendly):
+            owner = self._owners.pop(msg.job, None)
+            if not self._route(msg, "on_task_failed", msg.job, friendly, owner=owner):
                 self._task_failed(kind, friendly)
             return
         if msg.kind == "env":
             payload = self.controller.take_task_result(msg.job)
             self._task_kinds.pop(msg.job, None)
-            self._owners.pop(msg.job, None)
-            if not self._route(msg, "on_task_done", msg.job, payload):
+            owner = self._owners.pop(msg.job, None)
+            if not self._route(msg, "on_task_done", msg.job, payload, owner=owner):
                 self._task_done(kind, payload)
 
     def _task_done(self, kind: str, payload: Any) -> None:
@@ -3584,6 +3723,10 @@ class WmlstApp:
             self._apply_env(payload)
         elif kind.startswith("export-"):
             self._after_export(kind.split("-", 1)[1], str(payload or ""))
+        elif kind in ("blast-bootstrap", "blast-explicit"):
+            # The dialog that asked for it is gone (closed mid-download), but the
+            # engine really was installed -- keep it instead of staying degraded.
+            self.adopt_tools(payload)
         elif kind == "rebuild":
             self.status.set("The search index was rebuilt.", "ok", transient=True)
             self.run_task("env", lambda: probe_environment(self.prefs))
@@ -3591,6 +3734,7 @@ class WmlstApp:
     def _task_failed(self, kind: str, friendly: Friendly) -> None:
         if kind == "env":
             self.status.set(friendly.headline, "bad", resting=True)
+            self._start_argv_files()
             return
         self.show_friendly(friendly)
 
@@ -3637,7 +3781,7 @@ class WmlstApp:
         self.analyse_view.begin_run(len(files))
         self.controller.start(files, cfg)
         self._analysis_job = self.controller.job
-        self.status.set("Analysing {} file{}…".format(
+        self.status.set("Analysing {} file{}...".format(
             len(files), "" if len(files) == 1 else "s"), "info", resting=True)
         LOG.info("run started: %d file(s), threads=%d jobs=%d",
                  len(files), cfg.threads, cfg.jobs)
@@ -3647,8 +3791,8 @@ class WmlstApp:
         if self.controller.running:
             self.controller.request_cancel()
             self.analyse_view.cancel_button.configure(state="disabled",
-                                                      text="Stopping…")
-            self.status.set("Stopping after the current file…", "warn")
+                                                      text="Stopping...")
+            self.status.set("Stopping after the current file...", "warn")
 
     def rerun_all(self) -> None:
         """Re-run every file currently listed, with the current settings (F5)."""
@@ -3657,7 +3801,8 @@ class WmlstApp:
         if not paths:
             self.status.set("There is nothing to re-run yet.", "warn", transient=True)
             return
-        self.analyse_view.clear()
+        if not self.analyse_view.clear():
+            return
         self.settings_view.hide_rerun()
         self.start_analysis(paths)
 
@@ -3703,8 +3848,20 @@ class WmlstApp:
         elif reason == "done":
             self.status.set("Finished: {} analysed, {} failed.".format(
                 done, self._failed_count), "warn", resting=True)
+        # Always drain, even on a cancel: leaving the queue in the controller
+        # would resurrect the cancelled files at the end of some later, unrelated
+        # batch.  Cancelling drops them -- but says so, because the UI already
+        # promised "{n} more file(s) queued."
         pending = self.controller.pending_paths()
-        if pending and reason != "cancelled":
+        if reason == "cancelled":
+            if pending:
+                self.status.set(
+                    "Stopped. {} queued file{} not analysed — the results "
+                    "collected so far are still here.".format(
+                        len(pending), " was" if len(pending) == 1 else "s were"),
+                    "warn", resting=True)
+            return
+        if pending:
             self.start_analysis(pending)
 
     # -- errors --------------------------------------------------------------
@@ -3780,7 +3937,7 @@ class WmlstApp:
             return updatedb_mod.build_blast_db(dbdir, tools, progress=progress,
                                                cancel=cancel)
 
-        self.status.set("Rebuilding the search index…", "info")
+        self.status.set("Rebuilding the search index...", "info")
         self.run_task("rebuild", run, with_progress=True)
 
     # -- settings ------------------------------------------------------------
@@ -3793,6 +3950,7 @@ class WmlstApp:
         prefs.load_note = ""
         self.prefs = prefs
         self.schedule_save()
+        self.analyse_view.refresh_scheme_notice()
         if changed and self.analyse_view.results:
             self.settings_view.show_rerun()
 
@@ -3895,7 +4053,7 @@ class WmlstApp:
                                   report.HtmlOptions(evidence=evidence))
             return target
 
-        self.status.set("Saving…", "info")
+        self.status.set("Saving...", "info")
         self.run_task("export-" + kind, run)
 
     def _after_export(self, kind: str, path: str) -> None:
@@ -4036,9 +4194,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     set_window_icon(root)
     root.deiconify()
     root.update_idletasks()
-    root.after(50, app.post_start)
     if files:
-        root.after(120, lambda: app.analyse_view.handle_paths(files))
+        app._argv_files = list(files)   # drained once the env probe has answered
+    root.after(50, app.post_start)
     try:
         root.mainloop()
     except KeyboardInterrupt:  # pragma: no cover - console launch only

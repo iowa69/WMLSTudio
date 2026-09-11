@@ -30,7 +30,7 @@ if REPO not in sys.path:
     sys.path.insert(0, REPO)
 
 from wmlst import any2fasta
-from wmlst.engine import EmptyInputError, UnsupportedFormatError
+from wmlst.engine import EmptyInputError, UnsupportedFormatError, WmlstError
 
 DATA = os.path.join(REPO, "tests", "data")
 
@@ -188,6 +188,148 @@ def test_zip_reads_only_the_first_member_and_warns():
             any2fasta.convert(path, out)
         assert out.getvalue() == ">a\nACGT\n"
         assert any(issubclass(w.category, RuntimeWarning) for w in caught)
+
+
+# ---------------------------------------------------------------------------
+# Truncated / corrupt compressed input (finding 05, finding 18)
+# ---------------------------------------------------------------------------
+
+def _corrupt_inputs(tmp):
+    """name -> path, one per way a compressed stream can fail to decompress."""
+    import bz2 as _bz2
+    import gzip as _gzip
+    import lzma as _lzma
+    import zipfile as _zipfile
+    paths = {}
+
+    body = b">a\n" + b"ACGT" * 4096 + b"\n"
+
+    def _trunc(name, data, keep):
+        path = os.path.join(tmp, name)
+        with open(path, "wb") as fh:
+            fh.write(data[:keep])
+        paths[name] = path
+
+    _trunc("trunc.fa.gz", _gzip.compress(body), 40)
+    _trunc("trunc.fa.bz2", _bz2.compress(body), 60)
+    _trunc("trunc.fa.xz", _lzma.compress(body), 80)
+
+    zpath = os.path.join(tmp, "whole.zip")
+    with _zipfile.ZipFile(zpath, "w", _zipfile.ZIP_DEFLATED) as zf:
+        zf.writestr("a.fa", body)
+    with open(zpath, "rb") as fh:
+        _trunc("trunc.fa.zip", fh.read(), 60)
+
+    # A damaged deflate body: gzip's own header and CRC are intact enough that
+    # the failure comes out of zlib, not as gzip.BadGzipFile.
+    blob = bytearray(_gzip.compress(body))
+    blob[30] ^= 0xFF
+    path = os.path.join(tmp, "bad-deflate.fa.gz")
+    with open(path, "wb") as fh:
+        fh.write(bytes(blob))
+    paths["bad-deflate.fa.gz"] = path
+    return paths
+
+
+def test_truncated_or_corrupt_compressed_input_raises_wmlst_error():
+    # Finding 05: EOFError / zlib.error / lzma.LZMAError / zipfile.BadZipFile
+    # are neither WmlstError nor OSError, so if they escape convert() they kill
+    # the whole batch with a traceback instead of failing one file
+    # (docs/ARCHITECTURE.md D10, and the GUI shows the stack trace).
+    with tempfile.TemporaryDirectory() as tmp:
+        for name, path in sorted(_corrupt_inputs(tmp).items()):
+            try:
+                any2fasta.convert(path, io.StringIO())
+            except WmlstError as exc:
+                assert str(exc).startswith("Could not read '"), "%s: %r" % (name, str(exc))
+                assert exc.user_message == "That file is truncated or corrupt."
+            except Exception as exc:  # pragma: no cover - the bug being fixed
+                raise AssertionError(
+                    "%s escaped as %s: %s"
+                    % (name, type(exc).__name__, exc)) from exc
+            else:
+                raise AssertionError("%s did not raise" % name)
+
+
+def test_corrupt_input_still_fails_per_file_through_convert_to_file():
+    with tempfile.TemporaryDirectory() as tmp:
+        path = _corrupt_inputs(tmp)["trunc.fa.gz"]
+        dest = os.path.join(tmp, "mlst.fna")
+        try:
+            any2fasta.convert_to_file(path, dest)
+        except WmlstError:
+            pass
+        else:
+            raise AssertionError("no WmlstError")
+        # engine.py only catches WmlstError/OSError; the output handle must
+        # still have been closed, hence removable (section 5.4).
+        os.remove(dest)
+
+
+def _is_closed(obj):
+    closed = getattr(obj, "closed", None)
+    if closed is not None:
+        return bool(closed)
+    return getattr(obj, "fp", None) is None  # zipfile.ZipFile
+
+
+def _open_text_closers(exc):
+    """The `closers` list of the open_text frame in `exc`'s traceback."""
+    tb = exc.__traceback__
+    while tb is not None:
+        if tb.tb_frame.f_code.co_name == "open_text":
+            return tb.tb_frame.f_locals.get("closers")
+        tb = tb.tb_next
+    return None
+
+
+def test_open_text_closes_its_handles_when_it_raises():
+    # Finding 18: the raised exception is stored on the failed SampleResult
+    # (engine.py), and its __traceback__ pins open_text's frame -- so an
+    # unclosed handle in `closers` stays open for the whole run.
+    with tempfile.TemporaryDirectory() as tmp:
+        path = _corrupt_inputs(tmp)["trunc.fa.zip"]  # ZipFile() raises in open_text
+        try:
+            any2fasta.open_text(path)
+        except Exception as exc:
+            closers = _open_text_closers(exc)
+            assert closers, "open_text frame not found in the traceback"
+            assert all(_is_closed(o) for o in closers), (
+                "leaked: %r" % [o for o in closers if not _is_closed(o)])
+        else:
+            raise AssertionError("open_text did not raise")
+
+
+def test_open_text_closes_its_handles_when_zstd_is_unavailable():
+    # The branch that actually bites: on Python < 3.14 every .zst input raises
+    # UnsupportedFormatError, which the engine keeps -- 200 of them used to mean
+    # 200 held file descriptors.
+    def _boom(binary):
+        raise UnsupportedFormatError("zstd-compressed input needs Python 3.14 or newer")
+
+    with tempfile.TemporaryDirectory() as tmp:
+        path = os.path.join(tmp, "a.fa.zst")
+        with open(path, "wb") as fh:
+            fh.write(b"\x28\xb5\x2f\xfd" + b"\x00" * 32)
+        assert any2fasta.sniff_compression(path) == "zstd"
+        saved = any2fasta._zstd_stream
+        any2fasta._zstd_stream = _boom
+        try:
+            kept = []
+            for _ in range(20):
+                try:
+                    any2fasta.convert(path, io.StringIO())
+                except UnsupportedFormatError as exc:
+                    kept.append(exc)  # engine.py stores the exception; so do we
+            assert len(kept) == 20
+            for exc in kept:
+                closers = _open_text_closers(exc)
+                assert closers, "open_text frame not found in the traceback"
+                assert all(_is_closed(o) for o in closers)
+            if os.path.isdir("/proc/self/fd"):  # Linux: prove no accumulation
+                assert len(os.listdir("/proc/self/fd")) < 40
+        finally:
+            any2fasta._zstd_stream = saved
 
 
 # ---------------------------------------------------------------------------

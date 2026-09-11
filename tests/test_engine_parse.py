@@ -27,7 +27,9 @@ from wmlst.engine import (
     HIT_RE_REPAIR,
     SEEN,
     Engine,
+    NovelAllele,
     RunConfig,
+    SampleResult,
     build_signature,
     collect_calls,
     parse_blast,
@@ -621,6 +623,164 @@ def test_end_to_end_example_fna():
         "arcC(16);aroE(1);gtr(2);mutS(1);pyrR(2);tpiA(1);yqiL(1)")
     assert res.n_contigs == 42
     assert res.hits_seen == 1423 and res.hits_kept == 640
+
+
+# ---------------------------------------------------------------------------
+# 5.8 -- a BLAST index that names a scheme the datadir does not have
+# (finding 12: unguarded catalog[name] aborted the whole batch)
+# ---------------------------------------------------------------------------
+class _StubScheme:
+    """Just enough Scheme for _score_one."""
+
+    def __init__(self, name):
+        self.name = name
+        self.genes = ("a",)
+        self.num_genes = 1
+
+    def signature_of(self, calls):
+        return calls.get("a") or "-"
+
+    def sequence_type(self, sig):
+        return "-"
+
+
+def test_orphan_scheme_in_the_index_is_skipped_not_fatal():
+    """A --blastdb / --datadir mismatch must degrade, never raise KeyError."""
+    catalog = {"known": _StubScheme("known")}
+    res = {"known": {"a": "1"}, "orphan": {"a": "1"}}
+    warned = []
+    kept, dropped, excl = engine_mod._build_candidates(
+        catalog, res, {}, RunConfig(minscore=50.0, datadir="/nowhere"), 7,
+        None, warned.append)
+    kept, _all = engine_mod._order_candidates(kept, dropped, excl)
+    assert [c.scheme for c in kept] == ["known", "-"]
+    assert len(warned) == 1
+    assert "orphan" in warned[0] and warned[0].startswith("WARNING:")
+
+
+def test_orphan_scheme_needs_no_warn_sink():
+    """The guard must hold when nobody passes a warn callback (default None)."""
+    kept, dropped, excl = engine_mod._build_candidates(
+        {}, {"orphan": {"a": "1"}}, {}, RunConfig(minscore=50.0), 7)
+    kept, _all = engine_mod._order_candidates(kept, dropped, excl)
+    assert [c.scheme for c in kept] == ["-"]
+
+
+# ---------------------------------------------------------------------------
+# 5.17 -- --novel covers every locus the index hit, not just header loci
+# (finding 28: bin/mlst:233 walks keys %{$nov{...}}, not the profile header)
+# ---------------------------------------------------------------------------
+def _saureus_bls(extra_locus_seq="ACGTACGTAC"):
+    """Exact hits for the seven saureus loci plus one OFF-HEADER novel locus."""
+    lines = [_line("saureus.%s_1" % g, 10, 10, 10, qseq="ACGTACGTAC")
+             for g in ("arcC", "aroE", "glpF", "gmk", "pta", "tpi", "yqiL")]
+    lines.append(_line("saureus.zzzz_1", len(extra_locus_seq),
+                       len(extra_locus_seq), len(extra_locus_seq) - 1,
+                       qseq=extra_locus_seq))
+    return "\n".join(lines)
+
+
+def test_novel_capture_includes_a_locus_absent_from_the_profile_header():
+    assert "zzzz" not in CATALOG["saureus"].genes
+    res = _engine(novel_path="x.fa", mincov=0.0).analyse_blast_text(
+        "q.fa", _saureus_bls())
+    assert res.scheme == "saureus"
+    loci = [n.locus for n in res.novel]
+    assert loci == ["zzzz"], loci
+    assert res.novel[0].fasta_id.startswith("saureus.zzzz-")
+    assert res.novel[0].seq == "ACGTACGTAC"
+    # the seven header loci matched exactly -> the $SEEN sentinel, not a record
+    assert res.novel_seen == ("arcC", "aroE", "glpF", "gmk", "pta", "tpi",
+                              "yqiL")
+
+
+def test_header_loci_still_come_before_the_off_header_extras():
+    """D7: header order first, then the extras sorted."""
+    lines = [_line("saureus.zzzz_1", 10, 10, 9, qseq="AAAAAAAAAA"),
+             _line("saureus.aaaa_1", 10, 10, 9, qseq="CCCCCCCCCC"),
+             _line("saureus.arcC_1", 10, 10, 9, qseq="GGGGGGGGGG"),
+             _line("saureus.tpi_1", 10, 10, 9, qseq="TTTTTTTTTT")]
+    res = _engine(novel_path="x.fa", mincov=0.0,
+                  minscore=0.0).analyse_blast_text("q.fa", "\n".join(lines))
+    assert res.scheme == "saureus"
+    assert [n.locus for n in res.novel] == ["arcC", "tpi", "aaaa", "zzzz"]
+
+
+# ---------------------------------------------------------------------------
+# 5.17 -- %nov is keyed by LABEL, not by file
+# (finding 29: same-label inputs shared one map in Perl and must here too)
+# ---------------------------------------------------------------------------
+def _sample(label, scheme, novel=(), seen=()):
+    alleles = tuple(
+        NovelAllele(scheme=scheme, locus=locus, md5=md5, seq=md5,
+                    source_label=label,
+                    fasta_id="%s.%s-%s" % (scheme, locus, md5),
+                    nearest_allele="1", length_bp=len(md5))
+        for locus, md5 in novel)
+    return SampleResult(path=label, label=label, scheme=scheme, st="-",
+                        signature="-", score=1, status="OK",
+                        novel=alleles, novel_seen=tuple(seen))
+
+
+def _merged(*samples):
+    return [n.fasta_id for n in Engine._merge_novel(list(samples))]
+
+
+def test_same_label_same_scheme_keeps_only_the_first_sequence():
+    """bin/mlst:362 is `||=` over a per-LABEL map -- first file wins."""
+    a = _sample("x.fa", "hp", novel=[("atpD", "aaa"), ("mdh", "bbb")])
+    b = _sample("x.fa", "hp", novel=[("atpD", "ccc"), ("mdh", "ddd")])
+    assert _merged(a, b) == ["hp.atpD-aaa", "hp.mdh-bbb"]
+
+
+def test_distinct_labels_still_emit_both_sequences():
+    """The control: without a label collision nothing is suppressed."""
+    a = _sample("d1/x.fa", "hp", novel=[("atpD", "aaa")])
+    b = _sample("d2/x.fa", "hp", novel=[("atpD", "ccc")])
+    assert _merged(a, b) == ["hp.atpD-aaa", "hp.atpD-ccc"]
+
+
+def test_an_exact_hit_in_a_later_same_label_file_blocks_the_locus():
+    """bin/mlst:352 writes $SEEN unconditionally, so it wins over `||=`."""
+    a = _sample("x.fa", "hp", novel=[("atpD", "aaa"), ("mdh", "bbb")])
+    b = _sample("x.fa", "hp", novel=[("mdh", "ddd")], seen=["atpD"])
+    assert _merged(a, b) == ["hp.mdh-bbb"]
+
+
+def test_a_later_same_label_file_of_another_scheme_wipes_the_map():
+    """bin/mlst:170-172 deletes every scheme but the file's own winner."""
+    a = _sample("y.fa", "hp", novel=[("atpD", "aaa")])
+    b = _sample("y.fa", "mg")
+    assert _merged(a, b) == []
+
+
+def test_the_prune_runs_even_when_the_last_same_label_file_types_nothing():
+    """'-' matches no scheme name, so Perl's prune empties the label."""
+    a = _sample("y.fa", "hp", novel=[("atpD", "aaa")])
+    b = _sample("y.fa", "-")
+    assert _merged(a, b) == []
+
+
+def test_only_the_trailing_run_of_same_scheme_files_contributes():
+    a = _sample("y.fa", "hp", novel=[("atpD", "aaa")])
+    b = _sample("y.fa", "mg", novel=[("adk", "eee")])
+    c = _sample("y.fa", "hp", novel=[("atpD", "fff")])
+    assert _merged(a, b, c) == ["hp.atpD-fff"]
+
+
+def test_identical_sequences_under_different_labels_dedup_by_fasta_id():
+    """bin/mlst:240 $seen{$id}++ survives the per-label merge."""
+    a = _sample("one.fa", "hp", novel=[("atpD", "aaa")])
+    b = _sample("two.fa", "hp", novel=[("atpD", "aaa")])
+    assert _merged(a, b) == ["hp.atpD-aaa"]
+
+
+def test_a_failed_sample_never_prunes_a_sibling_label():
+    """A file that never reached find_mlst cannot have run Perl's prune."""
+    a = _sample("y.fa", "hp", novel=[("atpD", "aaa")])
+    b = SampleResult(path="y.fa", label="y.fa", scheme="-", st="-",
+                     signature="-", score=0, status="NONE", failed=True)
+    assert _merged(a, b) == ["hp.atpD-aaa"]
 
 
 if __name__ == "__main__":

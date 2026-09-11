@@ -19,6 +19,7 @@ import io
 import os
 import re
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
@@ -281,6 +282,113 @@ def test_database_directory_containing_a_space():
         got = _blast_to_string(tools, os.path.join(DATA, "example.fna"), db)
     with open(golden, "rb") as fh:
         assert got == fh.read()
+
+
+def test_building_a_blast_db_under_a_path_containing_a_space():
+    """C:\\Program Files is the DEFAULT Windows install location (sections 4.9, 8.8).
+
+    The sibling test above only LINKS a prebuilt index into a directory with a
+    space and queries it; it never runs makeblastdb, which is exactly why this
+    was invisible.  makeblastdb splits on whitespace twice -- in the -in value
+    (exit 1, "Please provide a database name using -out") and again in the
+    absolute path it re-opens the finished database under (exit 2, "No alias or
+    index file found ... [C:\\Program]", .njs never written) -- so updatedb goes
+    through blastbin.run_makeblastdb(), which builds in a whitespace-free
+    scratch directory and moves the relocatable index into place.
+    """
+    from wmlst import updatedb
+
+    tools = _tools()
+    with tempfile.TemporaryDirectory() as tmp:
+        dbdir = os.path.join(tmp, "Program Files", "MLST db")
+        scheme = os.path.join(dbdir, "pubmlst", "saureus")
+        os.makedirs(scheme)
+        assert " " in dbdir
+        with open(os.path.join(scheme, "arcC.tfa"), "w", newline="\n") as fh:
+            fh.write(">arcC_1\n" + "ACGTACGTAC" * 12 + "\n")
+        with open(os.path.join(scheme, "aroE.tfa"), "w", newline="\n") as fh:
+            fh.write(">aroE_1\n" + "TTGACCAGTC" * 12 + "\n")
+        with open(os.path.join(scheme, "saureus.txt"), "w", newline="\n") as fh:
+            fh.write("ST\tarcC\taroE\n1\t1\t1\n")
+
+        fasta = updatedb.build_blast_db(dbdir, tools)
+
+        assert os.path.isfile(fasta)
+        missing = [ext for ext in updatedb.BLAST_INDEX_EXTENSIONS
+                   if not os.path.isfile(fasta + "." + ext)]
+        assert not missing, missing
+        # The staging directory must be gone, not left in the destination.
+        assert not os.path.isdir(
+            os.path.join(dbdir, updatedb.BLAST_DIRNAME, updatedb.STAGING_DIRNAME))
+        # And the relocated index must answer a real query.
+        query = os.path.join(tmp, "q.fna")
+        shutil.copy(fasta, query)
+        with blastbin.job_dir() as jd:
+            out = os.path.join(jd, "q.bls")
+            run = blastbin.run_blastn(tools, query=query, out=out, blastdb=fasta)
+            assert run.returncode == 0, run.stderr
+            with open(out, encoding="utf-8") as fh:
+                hits = [line.split("\t")[0] for line in fh]
+    assert "saureus.arcC_1" in hits and "saureus.aroE_1" in hits
+
+
+def test_path_rung_survives_the_st_mode_windows_synthesises():
+    """Windows reports 0o40777 for every writable directory (section 4.4).
+
+    CPython's attributes_to_mode() makes st_mode a function of the file
+    ATTRIBUTES, not of any ACL: a plain directory is 0o40777 and a read-only one
+    0o40555.  Testing S_IWOTH there inverted the binary-planting guard and made
+    the PATH rung -- the only rung a `pip install wmlst` user with NCBI's own
+    BLAST+ can reach -- reject every ordinary install directory.
+    """
+    which = shutil.which("blastn")
+    if not which:
+        raise unittest.SkipTest("no blastn on PATH")
+    bindir = os.path.dirname(os.path.realpath(which))
+    target = os.path.abspath(bindir)
+
+    class _VersionPopen:
+        def __init__(self, args, **kwargs):
+            self.returncode = 0
+
+        def communicate(self, timeout=None):
+            return "blastn: 2.17.0+\n", ""
+
+        def poll(self):
+            return 0
+
+    real_stat = blastbin.os.stat
+
+    def windows_stat(path, *a, **kw):
+        st = real_stat(path, *a, **kw)
+        if os.path.abspath(path) == target:
+            return os.stat_result([stat.S_IFDIR | 0o111 | 0o666, *tuple(st)[1:]])
+        return st
+
+    saved = (blastbin.IS_WINDOWS, blastbin._startupinfo, subprocess.Popen,
+             blastbin.os.stat)
+    saved_env = {k: os.environ.get(k)
+                 for k in ("PATH", "WMLST_BLAST_DIR", "CONDA_PREFIX")}
+    try:
+        blastbin.IS_WINDOWS = True
+        blastbin._startupinfo = lambda: None
+        subprocess.Popen = _VersionPopen
+        blastbin.os.stat = windows_stat
+        os.environ.pop("WMLST_BLAST_DIR", None)
+        os.environ.pop("CONDA_PREFIX", None)
+        os.environ["PATH"] = bindir
+        assert windows_stat(bindir).st_mode & stat.S_IWOTH  # the trap
+        assert not blastbin._is_world_writable(bindir)      # ... now disarmed
+        tools = blastbin.find_blast()
+    finally:
+        (blastbin.IS_WINDOWS, blastbin._startupinfo, subprocess.Popen,
+         blastbin.os.stat) = saved
+        for key, value in saved_env.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+    assert tools.origin == "path", tools.origin
 
 
 def test_query_filename_with_shell_metacharacters():

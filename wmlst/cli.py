@@ -343,10 +343,11 @@ class WmlstArgumentParser(argparse.ArgumentParser):
             unknown = text.split(":", 1)[1].strip().split()[0]
         elif text.startswith("no such option:"):
             unknown = text.split(":", 1)[1].strip().split()[0]
-        elif text.startswith("ambiguous option:"):
-            unknown = text.split(":", 1)[1].strip().split()[0]
         if unknown is not None:
-            sys.stderr.write("Unknown option: %s\n" % unknown.lstrip("-"))
+            # Getopt::Long names the OPTION, never the value glued to it:
+            # `mlst --bogus=1` prints "Unknown option: bogus" (finding 25).
+            name = unknown.lstrip("-").partition("=")[0]
+            sys.stderr.write("Unknown option: %s\n" % name)
         else:
             sys.stderr.write("ERROR: %s\n" % text)
         self.exit(1)
@@ -365,7 +366,10 @@ def build_parser() -> WmlstArgumentParser:
     ``--no-quiet``, ``--no-full``, ... behave like Getopt::Long's ``name!``
     (test.sh:63,96).
     """
-    parser = WmlstArgumentParser(prog=EXE, add_help=False, allow_abbrev=True)
+    # allow_abbrev=False: prefix resolution is done by _expand_abbrevs()
+    # instead, because argparse has no way to make an upstream option win
+    # a prefix it shares with one of the WMLST extras (finding 15).
+    parser = WmlstArgumentParser(prog=EXE, add_help=False, allow_abbrev=False)
     parser.add_argument("--help", "-h", action=_HelpAction)
     parser.add_argument("--version", action=_VersionAction)
     for entry in OPTIONS:
@@ -391,6 +395,131 @@ def build_parser() -> WmlstArgumentParser:
                         help=argparse.SUPPRESS)
     parser.add_argument("files", nargs="*", metavar="FILE")
     return parser
+
+
+def _upstream_long_names():
+    """Every ``--name`` upstream's own @Options table defines (bin/mlst:440-473).
+
+    Includes the ``--no-<flag>`` spellings Getopt::Long's ``name!`` implies, so
+    that a prefix such as ``--no-q`` still resolves the upstream way.
+    """
+    names = {"help", "version"}
+    for entry in OPTIONS:
+        if isinstance(entry, str):
+            if entry == "WMLST EXTRAS":
+                break      # everything past this heading is WMLST-only
+            continue
+        names.add(entry.name)
+        if entry.kind == "bool":
+            names.add("no-" + entry.name)
+    return frozenset(names)
+
+
+#: Option names that exist in `mlst` 2.35.0 as well as in WMLST.
+UPSTREAM_LONG_NAMES = _upstream_long_names()
+
+
+def _ambiguous(name, hits) -> None:
+    """Getopt::Long's wording for an unresolvable prefix, then exit 1."""
+    sys.stderr.write("Option %s is ambiguous (%s)\n"
+                     % (name, ", ".join(sorted(hits))))
+    raise SystemExit(1)
+
+
+def _option_namespace(parser):
+    """Every option name Getopt::Long would answer to -> its argparse spelling.
+
+    ``bin/mlst:438`` is a bare ``use Getopt::Long;`` with no
+    ``Getopt::Long::Configure`` call anywhere in the file, so every default is
+    live.  Two of them widen the name space (finding 25):
+
+    * a ``name!`` option answers to the hyphen-free negation too, so ``csv!``
+      takes ``--nocsv`` as well as ``--no-csv``;
+    * ``ignore_case`` is on, so ``--CSV`` is ``--csv``.
+
+    The value of each entry is the canonical argparse flag name, which is what
+    gets substituted back into argv.
+    """
+    space = {}
+    for action in parser._actions:
+        for flag in action.option_strings:
+            if flag.startswith("--") and len(flag) > 2:
+                space[flag[2:]] = flag[2:]
+    # `no-csv` -> also reachable as `nocsv`; never overwrite a real option
+    # (`nopath` and `novel` are options in their own right).
+    for name in list(space):
+        if name.startswith("no-"):
+            space.setdefault(name.replace("-", "", 1), name)
+    return space
+
+
+def _resolve_long_name(name, space):
+    """Match one option name the way Getopt::Long does. -> canonical or None.
+
+    Exact first, then case-insensitively, then as a unique prefix.  A prefix
+    that is ambiguous exits 1 with upstream's wording; ``None`` means nothing
+    matched, which leaves the token alone so the ``Unknown option:`` path still
+    reports it.
+    """
+    if name in space:
+        return space[name]
+    lowered = name.lower()
+    for spelling, canonical in space.items():
+        if spelling.lower() == lowered:
+            return canonical
+    hits = sorted({canonical for spelling, canonical in space.items()
+                   if spelling.lower().startswith(lowered)})
+    # Upstream has no WMLST extras, so `--t`/`--j`/`--e`/`--b`/`--h` are
+    # unambiguous there and must stay unambiguous here: when a prefix matches
+    # exactly one upstream option, that option wins even though a WMLST-only
+    # option shares the prefix (`--threads` over `--tsv-evidence`, `--help`
+    # over `--html`).  A prefix that is ambiguous upstream too (`--l`) still
+    # fails, with upstream's message.
+    upstream = [n for n in hits if n in UPSTREAM_LONG_NAMES]
+    if len(upstream) == 1:
+        hits = upstream
+    if len(hits) == 1:
+        return hits[0]
+    if len(hits) > 1:
+        _ambiguous(name, hits)
+    return None
+
+
+def _expand_abbrevs(argv, parser):
+    """Rewrite argv into the spellings argparse knows (section 4.8, finding 25).
+
+    Covers the three Getopt::Long leniencies argparse has no equivalent for --
+    single-dash long options (``-csv``), case-insensitive names (``--CSV``) and
+    hyphen-free negation (``--nocsv``) -- plus ``auto_abbrev``.  Parsing stops
+    at ``--``, ``-`` (stdin) is never touched, and the registered short flags
+    ``-q``/``-h`` keep their own meaning.
+    """
+    space = _option_namespace(parser)
+    shorts = frozenset(flag for action in parser._actions
+                       for flag in action.option_strings
+                       if not flag.startswith("--"))
+    out = []
+    for i, tok in enumerate(argv):
+        if tok == "--":
+            out.extend(argv[i:])
+            return out
+        if tok.startswith("--") and len(tok) > 2:
+            lead = "--"
+        elif (tok.startswith("-") and len(tok) > 2
+              and not tok.startswith("--") and tok not in shorts):
+            # Getopt::Long is not bundling by default, so a multi-character
+            # single-dash token IS a long option: `-csv`, `-scheme=bogus`.
+            lead = "-"
+        else:
+            out.append(tok)
+            continue
+        name, sep, value = tok[len(lead):].partition("=")
+        if name:
+            canonical = _resolve_long_name(name, space)
+            if canonical is not None:
+                tok = "--" + canonical + (sep + value if sep else "")
+        out.append(tok)
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -424,13 +553,13 @@ def _resolve_db(ns):
     """Resolve dbdir/datadir/blastdb (steps 9, 11; sections 4.5, 3.6.1)."""
     from . import schemes  # local: keeps --help working without the whole stack
 
-    hint = None
-    if ns.datadir:
-        hint = os.path.dirname(os.path.abspath(ns.datadir))
-    elif ns.blastdb:
-        hint = os.path.dirname(os.path.dirname(os.path.abspath(ns.blastdb)))
+    # bin/mlst:471-472 defaults --blastdb and --datadir INDEPENDENTLY off
+    # $MLST_DBDIR, so supplying one of them never moves the other (nor the
+    # root itself, which bin/mlst:78 tests unconditionally). Deriving a dbdir
+    # "hint" from either flag made `--blastdb /elsewhere/blast/mlst.fa` look
+    # for pubmlst/ next to it and abort.
     try:
-        dbdir = schemes.resolve_dbdir(hint)
+        dbdir = schemes.resolve_dbdir(None)
     except WmlstError as exc:
         Logger.err(str(exc))
         raise  # pragma: no cover - err() never returns
@@ -621,13 +750,16 @@ def _listing(ns, cfg) -> bool:
     from . import report
 
     catalog = _catalog_for(cfg.datadir)
-    sep = "," if cfg.csv else "\t"
+    # Upstream's listing block ends in exit(0) at bin/mlst:118, twenty lines
+    # BEFORE `$OUTSEP = ',' if $csv` at bin/mlst:136 - so --csv never reaches
+    # --longlist/--info and these two surfaces are unconditionally tab
+    # separated (and print_row therefore never quotes a bare comma).
     if ns.list:
         report.write_list(catalog, sys.stdout)
     elif ns.longlist:
-        report.write_longlist(catalog, sys.stdout, sep)
+        report.write_longlist(catalog, sys.stdout, "\t")
     else:
-        report.write_info(catalog, sys.stdout, sep)
+        report.write_info(catalog, sys.stdout, "\t")
     sys.stdout.flush()
     return True
 
@@ -651,18 +783,22 @@ def _emit_warning(text) -> None:
     """Route one engine warning the way upstream routed it.
 
     ``bin/mlst:344`` announces a duplicate exact allele through ``msg()``, so
-    ``--quiet`` hides it and ``tests/golden/mixedzip.err`` is empty. The
-    equal-score tie at ``bin/mlst:405`` goes through ``wrn()``, which ``--quiet``
-    must NOT hide - ``tests/golden/equality.err`` holds that line even though the
-    golden was generated with ``--quiet``. Both arrive here already carrying the
-    ``WARNING: `` prefix, so the text itself is the only discriminator.
+    ``--quiet`` hides it and ``tests/golden/mixedzip.err`` is empty; that line
+    now reaches stderr through :func:`_msg_sink`, in hit order, and is dropped
+    here. The equal-score tie at ``bin/mlst:405`` goes through ``wrn()``, which
+    ``--quiet`` must NOT hide - ``tests/golden/equality.err`` holds that line
+    even though the golden was generated with ``--quiet``. Both arrive here
+    already carrying the ``WARNING: `` prefix, so the text itself is the only
+    discriminator.
     """
     text = str(text)
     body = text[9:] if text.startswith("WARNING: ") else text
     if body.startswith(_DUPLICATE_EXACT):
-        Logger.msg("WARNING: " + body)
-    else:
-        Logger.wrn(body)
+        # Already printed by _msg_sink, in hit order, from walk.messages - the
+        # engine appends this one line to BOTH messages and warnings, so
+        # emitting it here as well would double it.
+        return
+    Logger.wrn(body)
 
 
 def _make_warn_sink():
@@ -686,6 +822,25 @@ def _drain_warnings(result, seen) -> None:
             _emit_warning(text)
 
 
+#: The engine announces the novel-allele count too (engine.py:1305); upstream
+#: emits it exactly once and AFTER the result table (bin/mlst:247), which is
+#: where :func:`_run` emits it, so the engine's copy is dropped here.
+_ENGINE_NOVEL_RE = re.compile(r"^Found \d+ novel alleles$", re.ASCII)
+
+
+def _msg_sink(text) -> None:
+    """Route one engine ``msg()`` line, upstream's way (bin/mlst:344-349).
+
+    ``Found exact allele match ...`` and ``WARNING: found additional exact
+    allele match ...`` both leave upstream through ``msg()``, in hit order, so
+    ``--quiet`` hides them and they interleave exactly as Perl prints them.
+    """
+    text = str(text)
+    if _ENGINE_NOVEL_RE.match(text):
+        return
+    Logger.msg(text)
+
+
 def _progress_sink(event) -> None:
     """Render engine progress at debug level only (section 5.16, C17)."""
     Logger.dbg("%s %5.1f%% %s" % (event.phase, event.percent, event.text))
@@ -702,7 +857,8 @@ def _run(cfg, argv) -> int:
     eng = engine_mod.Engine(cfg)
     warn_sink, seen = _make_warn_sink()
     try:
-        result = eng.analyse(progress=_progress_sink, warn=warn_sink)
+        result = eng.analyse(progress=_progress_sink, warn=warn_sink,
+                             msg=_msg_sink, dbg=Logger.dbg)
     finally:
         close = getattr(eng, "close", None)
         if close is not None:
@@ -783,7 +939,16 @@ def main(argv=None) -> int:
 
     try:
         parser = build_parser()
-        ns = parser.parse_args(argv)
+        # Upstream calls GetOptions() with no Getopt::Long::Configure, i.e. in
+        # default PERMUTE mode: `mlst a.fna --quiet b.fna` collects BOTH files.
+        # argparse stops the positional run at the first option, so gather the
+        # leftovers and put them back in argv order (finding 16).
+        ns, extra = parser.parse_known_args(_expand_abbrevs(argv, parser))
+        for token in extra:
+            if token.startswith("-") and token != "-":
+                # A real unknown option still dies the upstream way.
+                parser.error("unrecognized arguments: %s" % token)
+        ns.files = list(ns.files) + list(extra)
 
         Logger.configure(quiet=ns.quiet, debug=ns.debug)
         _banner()

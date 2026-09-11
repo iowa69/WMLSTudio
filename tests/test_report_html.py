@@ -630,6 +630,32 @@ def test_write_html_is_atomic_utf8_lf():
     assert raw.decode("utf-8").startswith("<!DOCTYPE html>")
 
 
+def test_write_html_keeps_the_previous_report_when_the_rename_fails():
+    # Finding 26: a failed write must not destroy the file the user already
+    # had, and must not leave the staging file behind.
+    result = one_result()
+    real_replace = os.replace
+
+    def boom(src, dst):
+        raise OSError(27, "File too large")
+
+    with tempfile.TemporaryDirectory() as tmp:
+        path = os.path.join(tmp, "report.html")
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write("PREVIOUS-HTML")
+        report.os.replace = boom
+        try:
+            report.write_html(result, path)
+        except OSError:
+            pass
+        else:
+            raise AssertionError("write_html swallowed the failure")
+        finally:
+            report.os.replace = real_replace
+        assert open(path, encoding="utf-8").read() == "PREVIOUS-HTML"
+        assert not os.path.exists(path + ".tmp"), "stray .tmp left behind"
+
+
 def test_evidence_mode_none_drops_the_evidence_columns():
     html = report.render_html(one_result(), report.HtmlOptions(evidence="none"))
     assert "contig_00001" not in html

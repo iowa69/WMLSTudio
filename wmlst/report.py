@@ -37,9 +37,11 @@ from . import branding as _branding
 from .engine import RunResult, out_sep
 from .version import __version__
 
+# Sorted for RUF022 (constants, then the HTML report class, then the
+# interpolators and the byte-identity / GUI-shared writers), which is
+# why the old per-group comments are gone: the sort interleaves them.
 __all__ = [
     "CONTRAST_PAIRS",
-    # constants
     "CSS_TEXT",
     "JS_TEXT",
     "LOGO_SVG_DATA_URI",
@@ -47,16 +49,14 @@ __all__ = [
     "SYMBOL_INFO",
     "TOKENS_DARK",
     "TOKENS_LIGHT",
-    # section 11 -- the HTML report
     "HtmlOptions",
     "attr",
-    # the only sanctioned interpolators
+    "evidence_tsv_text",
     "h",
     "js_json",
-    # section 12 -- byte-identity surfaces
+    "novel_fasta_text",
     "print_row",
     "render_html",
-    # helpers the GUI shares
     "species_label_for",
     "tsv_text",
     "write_evidence_tsv",
@@ -224,6 +224,33 @@ def json_text(result: RunResult) -> str:
     ) + "\n"
 
 
+def _atomic_write(path: str, text: str, errors: str = "replace") -> None:
+    """Write ``text`` to ``path`` via a same-directory temp file and a rename.
+
+    A failed write -- ENOSPC, EDQUOT, an exhausted ``RLIMIT_FSIZE`` -- must
+    never destroy the file the user already had, and must never leave a
+    half-written report standing in its place. Everything is staged in
+    ``path + ".tmp"`` and only :func:`os.replace` publishes it; the temp file
+    is unlinked on any failure so nothing is left behind either.
+
+    ``errors`` is deliberately never ``"strict"``. A filename that is not valid
+    UTF-8 comes back from :func:`os.fsdecode` carrying PEP 383 lone surrogates,
+    and a strict encoder would raise ``UnicodeEncodeError`` after the whole run
+    has already been paid for.
+    """
+    tmp = path + ".tmp"
+    try:
+        with open(tmp, "w", encoding="utf-8", errors=errors, newline="\n") as fh:
+            fh.write(text)
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
 def write_json(result: RunResult, path: str) -> None:
     """Write the ``--json`` file (section 12.4).
 
@@ -231,9 +258,25 @@ def write_json(result: RunResult, path: str) -> None:
     LF, no BOM and a single trailing LF, as Perl emits. Key order is fixed by WMLST
     to id, filename, scheme, sequence_type, alleles (D2); upstream's is a
     randomised Perl hash. ``alleles`` is JSON ``null`` when no scheme matched.
+
+    Staged and renamed like every other report file: upstream's
+    ``path($json_fn)->spew(...)`` is atomic too (``Path::Tiny``), so this costs
+    no fidelity.
     """
-    with open(path, "w", encoding="utf-8", newline="\n") as fh:
-        fh.write(json_text(result))
+    _atomic_write(path, json_text(result))
+
+
+def novel_fasta_text(result: RunResult) -> str:
+    """The exact bytes :func:`write_novel_fasta` would emit, as a ``str``."""
+    seen = set()
+    out = io.StringIO()
+    for allele in result.novel:
+        if allele.fasta_id in seen:
+            continue
+        seen.add(allele.fasta_id)
+        out.write(">{0} {1}\n{2}\n".format(
+            allele.fasta_id, allele.source_label, allele.seq))
+    return out.getvalue()
 
 
 def write_novel_fasta(result: RunResult, path: str) -> None:
@@ -243,15 +286,13 @@ def write_novel_fasta(result: RunResult, path: str) -> None:
     sequence line, description is the LABEL and not the path, deduplicated by
     the full id with first occurrence winning. An empty file is still created
     when there are no novel alleles.
+
+    ``errors="surrogateescape"`` rather than the usual ``"replace"``: this is a
+    compat surface, and upstream's ``path($novel)->spew(\\@new)`` writes the
+    raw bytes of a non-UTF-8 label back out unchanged. The handler is a no-op
+    for every string that is valid text.
     """
-    seen = set()
-    with open(path, "w", encoding="utf-8", newline="\n") as fh:
-        for allele in result.novel:
-            if allele.fasta_id in seen:
-                continue
-            seen.add(allele.fasta_id)
-            fh.write(">{0} {1}\n{2}\n".format(
-                allele.fasta_id, allele.source_label, allele.seq))
+    _atomic_write(path, novel_fasta_text(result), errors="surrogateescape")
 
 
 EVIDENCE_COLUMNS = (
@@ -261,6 +302,62 @@ EVIDENCE_COLUMNS = (
 )
 
 
+def _sheet_safe(value) -> str:
+    """Defuse a spreadsheet formula in an attacker-controlled evidence field.
+
+    A contig id or a label that begins with ``=``, ``+``, ``-``, ``@``, tab or
+    CR is evaluated as a formula when the table is opened in Excel or
+    LibreOffice. The quoting :func:`print_row` adds is not a mitigation: a
+    spreadsheet consumes it *as* quoting and then parses the remainder as a
+    formula. A leading apostrophe forces the cell to stay a literal string.
+
+    WMLST-only. This must never be applied inside :func:`print_row` or on the
+    ``--csv`` / ``--full`` / ``--legacy`` / ``--novel`` paths, which are
+    byte-locked to ``bin/mlst:417-428`` (section 12.1); only the additive
+    ``--evidence-tsv`` writer (D14) may differ.
+    """
+    text = "" if value is None else str(value)
+    return "'" + text if text[:1] in ("=", "+", "-", "@", "\t", "\r") else text
+
+
+def evidence_tsv_text(result: RunResult) -> str:
+    """The exact bytes :func:`write_evidence_tsv` would emit, as a ``str``."""
+    out = io.StringIO()
+    print_row(EVIDENCE_COLUMNS, "\t", out)
+    for sample in result.samples:
+        label = _sheet_safe(sample.label)
+        if sample.failed:
+            print_row(
+                [label, "-", "-", "-", "failed", "-",
+                 _sheet_safe(sample.error_text or "failed"),
+                 "", "", "", "", "", "", "", ""],
+                "\t", out,
+            )
+            continue
+        for call in sample.alleles:
+            if not call.hits:
+                print_row(
+                    [label, sample.scheme, call.locus, call.code,
+                     call.symbol, "-", "", "", "", "", "", "", "", "", ""],
+                    "\t", out,
+                )
+                continue
+            for hit in call.hits:
+                print_row(
+                    [
+                        label, sample.scheme, call.locus, hit.allele,
+                        hit.call_kind,
+                        "yes" if _is_best(call, hit) else "no",
+                        _sheet_safe(hit.qseqid), hit.qstart, hit.qend, hit.sstrand,
+                        hit.nident, hit.length, hit.slen,
+                        _pct_text(hit.pct_identity, hit.call_kind == "exact"),
+                        _pct_text(hit.pct_coverage, hit.call_kind == "exact"),
+                    ],
+                    "\t", out,
+                )
+    return out.getvalue()
+
+
 def write_evidence_tsv(result: RunResult, path: str) -> None:
     """Write the WMLST-only long-format hit dump (section 12.7).
 
@@ -268,38 +365,11 @@ def write_evidence_tsv(result: RunResult, path: str) -> None:
     Unlike the compat surfaces this includes ``failed=True`` samples, which
     contribute a single row recording the failure. Never affects a compat
     output.
+
+    The three fields an attacker can steer -- LABEL, CONTIG and the failure
+    text -- go through :func:`_sheet_safe` first.
     """
-    with open(path, "w", encoding="utf-8", newline="\n") as fh:
-        print_row(EVIDENCE_COLUMNS, "\t", fh)
-        for sample in result.samples:
-            if sample.failed:
-                print_row(
-                    [sample.label, "-", "-", "-", "failed", "-",
-                     sample.error_text or "failed", "", "", "", "", "", "", "", ""],
-                    "\t", fh,
-                )
-                continue
-            for call in sample.alleles:
-                if not call.hits:
-                    print_row(
-                        [sample.label, sample.scheme, call.locus, call.code,
-                         call.symbol, "-", "", "", "", "", "", "", "", "", ""],
-                        "\t", fh,
-                    )
-                    continue
-                for hit in call.hits:
-                    print_row(
-                        [
-                            sample.label, sample.scheme, call.locus, hit.allele,
-                            hit.call_kind,
-                            "yes" if _is_best(call, hit) else "no",
-                            hit.qseqid, hit.qstart, hit.qend, hit.sstrand,
-                            hit.nident, hit.length, hit.slen,
-                            _pct_text(hit.pct_identity, hit.call_kind == "exact"),
-                            _pct_text(hit.pct_coverage, hit.call_kind == "exact"),
-                        ],
-                        "\t", fh,
-                    )
+    _atomic_write(path, evidence_tsv_text(result))
 
 
 def write_list(catalog, out) -> None:
@@ -337,10 +407,14 @@ def write_info(catalog, out, sep: str = "\t") -> None:
 # Section 11.1 -- the only sanctioned interpolators
 # =============================================================================
 
-#: C0 and C1 controls except tab and newline, plus the two line separators that
-#: terminate a JavaScript string literal.
+#: C0 and C1 controls except tab and newline, the two line separators that
+#: terminate a JavaScript string literal, and the surrogate block. Lone
+#: surrogates are not controls but they reach us the same way a control does:
+#: ``os.fsdecode`` maps every undecodable byte of a filename to U+DCxx (PEP
+#: 383), and a str carrying one cannot be encoded to UTF-8 at all, so leaving
+#: them in would abort the write of an otherwise finished report.
 _CONTROL_RE = re.compile(
-    "[\x00-\x08\x0b-\x1f\x7f-\x9f\u2028\u2029]"
+    "[\x00-\x08\x0b-\x1f\x7f-\x9f\u2028\u2029\ud800-\udfff]"
 )
 
 _ESCAPE_MAP = {
@@ -1775,11 +1849,8 @@ def write_html(result: RunResult, path: str, opts: Optional[HtmlOptions] = None,
     """Render and write the HTML report atomically; return the final path (4.7).
 
     Writes ``path + ".tmp"`` in the same directory and then :func:`os.replace`,
-    so a half-written report can never be opened. UTF-8, LF, no BOM.
+    so a half-written report can never be opened and a failed write leaves both
+    the previous report and the directory untouched. UTF-8, LF, no BOM.
     """
-    text = render_html(result, opts, branding)
-    tmp = path + ".tmp"
-    with open(tmp, "w", encoding="utf-8", newline="\n") as fh:
-        fh.write(text)
-    os.replace(tmp, path)
+    _atomic_write(path, render_html(result, opts, branding))
     return path

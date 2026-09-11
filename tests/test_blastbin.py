@@ -116,12 +116,53 @@ def test_perc_identity_is_stringified_like_perl():
 
 def test_makeblastdb_argv():
     argv = blastbin.makeblastdb_argv(FAKE, "/db/blast/mlst.fa")
+    # -in is the BARE BASENAME: makeblastdb splits the -in value on whitespace
+    # exactly like blastn splits -db, so an absolute "C:\\Program Files\\..."
+    # path exits 1 with "Please provide a database name using -out".  The caller
+    # sets cwd; run_makeblastdb() is what gets the whole dance right.
     assert argv == [
-        "/opt/blast/bin/makeblastdb", "-hash_index", "-in", "/db/blast/mlst.fa",
+        "/opt/blast/bin/makeblastdb", "-hash_index", "-in", "mlst.fa",
         "-dbtype", "nucl", "-title", "PubMLST", "-parse_seqids",
     ], argv
     # The title is embedded in the index bytes: no vendor string (section 4.2).
     assert "IOWA" not in " ".join(argv)
+    # argv[0] goes to CreateProcessW, never CreateFileA: it is NOT ansi_safe()d.
+    assert argv[0] == FAKE.makeblastdb
+
+
+def test_argv0_is_never_put_through_the_ansi_gate():
+    """The exe path is launched, not opened as a data file (section 5.5).
+
+    ansi_safe() exists because blastn.exe opens -query/-out/-db through
+    CreateFileA.  Applying it to argv[0] made every search abort with
+    "blastn path cannot be passed to blastn" for an install under a non-ACP
+    profile path (C:\\Users\\<cyrillic>\\AppData\\Local\\...  with 8.3 names off)
+    -- an install probe_version() had just accepted by launching that very same
+    raw path, and it killed the whole batch, not one file, because
+    blastn_argv() is called outside engine.analyse_file()'s try.
+    """
+    holed = BlastTools(
+        blastn="/opt/\u041e\u043b\u044c\u0433\u0430/blastn",
+        makeblastdb="/opt/\u041e\u043b\u044c\u0433\u0430/makeblastdb",
+        blastdbcmd=None, version="2.17.0+", version_tuple=(2, 17, 0),
+        origin="explicit",
+    )
+    saved = blastbin.ansi_safe
+    exes = (holed.blastn, holed.makeblastdb)
+
+    def picky(path):  # what Windows/cp1252 does to that install root
+        return None if path in exes else os.path.abspath(path)
+
+    try:
+        blastbin.ansi_safe = picky
+        argv = blastbin.blastn_argv(
+            holed, query="/tmp/q.fna", out="/tmp/o.bls", db_basename="mlst.fa",
+            threads=1, minid=95.0)
+        assert argv[0] == holed.blastn
+        assert argv[2] == "/tmp/q.fna" and argv[4] == "/tmp/o.bls"
+        assert blastbin.makeblastdb_argv(holed, "mlst.fa")[0] == holed.makeblastdb
+    finally:
+        blastbin.ansi_safe = saved
 
 
 def test_child_env():
@@ -509,6 +550,48 @@ def test_world_writable_guard():
         assert not blastbin._is_world_writable(tmp)
 
 
+def test_world_writable_guard_is_posix_only():
+    """Windows has no mode bits, so S_IWOTH must not gate the PATH rung.
+
+    CPython synthesises st_mode from the file attributes
+    (attributes_to_mode() in Python/fileutils.c): every directory without
+    FILE_ATTRIBUTE_READONLY reports 0o40777 and every read-only one 0o40555,
+    so the POSIX test used to reject EVERY ordinary BLAST+ directory on PATH
+    (and accept read-only ones) -- fatal for a pip install on Windows, where
+    PATH is the only rung that can hit.
+    """
+    windows_dir_mode = stat.S_IFDIR | 0o111 | 0o666  # what Windows reports
+    assert windows_dir_mode & stat.S_IWOTH
+    saved = blastbin.IS_WINDOWS
+    try:
+        blastbin.IS_WINDOWS = True
+        with tempfile.TemporaryDirectory() as tmp:
+            os.chmod(tmp, 0o777)
+            assert not blastbin._is_world_writable(tmp)
+    finally:
+        blastbin.IS_WINDOWS = saved
+
+
+def test_path_rung_is_not_blocked_by_the_windows_st_mode():
+    """The PATH rung is the ONLY rung a pip install on Windows can hit.
+
+    A wheel ships no BLAST payload, so a user with NCBI's own BLAST+ on PATH
+    depends on this rung; the S_IWOTH test rejected every ordinary directory
+    there.  find_blast() under a Windows-shaped st_mode is exercised
+    end-to-end in tests/test_windows.py; here we pin the guard itself.
+    """
+    with tempfile.TemporaryDirectory() as tmp:
+        os.chmod(tmp, 0o777)
+        saved = blastbin.IS_WINDOWS
+        try:
+            blastbin.IS_WINDOWS = True
+            assert not blastbin._is_world_writable(tmp)
+        finally:
+            blastbin.IS_WINDOWS = saved
+        # ... while POSIX keeps its planting guard.
+        assert blastbin._is_world_writable(tmp)
+
+
 # ---------------------------------------------------------------------------
 # 5.5 — the real thing, against the golden BLAST output
 # ---------------------------------------------------------------------------
@@ -580,6 +663,91 @@ def test_makeblastdb_builds_a_usable_index():
         with open(out, encoding="utf-8") as fh:
             row = fh.readline().rstrip("\r\n").split("\t")
         assert len(row) == 9 and row[0] == "saureus.arcC_1" and row[8] == "plus"
+
+
+def test_makeblastdb_builds_into_a_directory_whose_path_has_a_space():
+    """C:\\Program Files is the DEFAULT Windows install location (section 8.8).
+
+    makeblastdb splits on whitespace twice -- in the -in value (exit 1,
+    "Please provide a database name using -out") and again in the absolute path
+    it re-opens the finished database under for the metadata pass (exit 2, "No
+    alias or index file found ... [C:\\Program]", .njs never written).  No argv
+    arrangement survives it, so run_makeblastdb() builds elsewhere and moves the
+    relocatable index in.  The 12 extensions are updatedb.BLAST_INDEX_EXTENSIONS.
+    """
+    tools = _tools()
+    extensions = ("ndb", "nhd", "nhi", "nhr", "nin", "njs",
+                  "nog", "nos", "not", "nsq", "ntf", "nto")
+    with tempfile.TemporaryDirectory() as tmp:
+        blast_dir = os.path.join(tmp, "Program Files", "MLST db", "blast")
+        os.makedirs(blast_dir)
+        assert " " in blast_dir
+        fa = os.path.join(blast_dir, "mlst.fa")
+        with open(fa, "w", newline="\n") as fh:
+            fh.write(">saureus.arcC_1\n" + "ACGTACGTAC" * 12 + "\n")
+        proc = blastbin.run_makeblastdb(tools, fa, timeout=300)
+        assert proc.returncode == 0, proc.stderr
+        missing = [ext for ext in extensions
+                   if not os.path.isfile(fa + "." + ext)]
+        assert not missing, missing
+        # Nothing may be left behind in the scratch root.
+        assert sorted(os.listdir(blast_dir)) == sorted(
+            ["mlst.fa"] + ["mlst.fa." + ext for ext in extensions])
+        # ... and the relocated index must actually answer a query.
+        query = os.path.join(tmp, "q.fna")
+        out = os.path.join(tmp, "q.bls")
+        shutil.copy(fa, query)
+        run = blastbin.run_blastn(tools, query=query, out=out, blastdb=fa)
+        assert run.returncode == 0, run.stderr
+        with open(out, encoding="utf-8") as fh:
+            row = fh.readline().rstrip("\r\n").split("\t")
+        assert len(row) == 9 and row[0] == "saureus.arcC_1"
+
+
+def test_makeblastdb_build_dir_only_relocates_when_it_must():
+    """A whitespace-free destination is indexed in place -- no copying."""
+    with tempfile.TemporaryDirectory() as tmp:
+        plain = os.path.join(tmp, "blast")
+        os.makedirs(plain)
+        build, relocate = blastbin._makeblastdb_build_dir(plain)
+        assert (build, relocate) == (os.path.abspath(plain), False)
+
+        spaced = os.path.join(tmp, "Program Files", "blast")
+        os.makedirs(spaced)
+        build, relocate = blastbin._makeblastdb_build_dir(spaced)
+        try:
+            assert relocate is True
+            assert " " not in build and "\t" not in build
+            assert os.path.isdir(build)
+        finally:
+            shutil.rmtree(build, ignore_errors=True)
+
+
+def test_makeblastdb_failure_still_cleans_up_the_scratch_directory():
+    tools = _tools()
+    with tempfile.TemporaryDirectory() as tmp:
+        blast_dir = os.path.join(tmp, "Program Files", "blast")
+        os.makedirs(blast_dir)
+        fa = os.path.join(blast_dir, "mlst.fa")
+        with open(fa, "w", newline="\n") as fh:
+            fh.write(">a\nACGT\n>a\nACGT\n")  # duplicate seq id -> exit != 0
+        seen = {}
+        real = blastbin._makeblastdb_build_dir
+
+        def spy(directory):
+            build, relocate = real(directory)
+            seen["build"] = build
+            return build, relocate
+
+        blastbin._makeblastdb_build_dir = spy
+        try:
+            proc = blastbin.run_makeblastdb(tools, fa, timeout=300)
+        finally:
+            blastbin._makeblastdb_build_dir = real
+        assert proc.returncode != 0
+        assert not os.path.exists(seen["build"])
+        # A failed build must not litter the destination either.
+        assert os.listdir(blast_dir) == ["mlst.fa"]
 
 
 # ---------------------------------------------------------------------------

@@ -48,8 +48,12 @@ class _FakeHandle:
         self.headers = headers
         self._body = body
 
-    def read(self):
-        return self._body
+    def read(self, amount=-1):
+        # http.client.HTTPResponse.read(n) is what _Fetcher calls, so the stub
+        # has to honour the size argument or the MAX_BODY cap goes untested.
+        if amount is None or amount < 0:
+            return self._body
+        return self._body[:amount]
 
     def getcode(self):
         return self.status
@@ -863,6 +867,325 @@ def test_import_rejects_a_traversal_path():
             U.import_bundle(os.path.join(tmp, "db"), path)
 
 
+@pytest.mark.parametrize("member", [
+    "../escape.txt",                 # POSIX traversal
+    "..\\escape.txt",                # Windows traversal, one component
+    "/etc/evil.txt",                 # rooted, POSIX
+    "\\evil.txt",                    # rooted on the db drive under ntpath
+    "C:/evil.txt",                   # drive-relative: escapes any join
+    "C:\\Windows\\Temp\\evil2.txt",   # absolute, and ONE component after split("/")
+    "pubmlst/../../evil.txt",
+])
+def test_import_rejects_every_shape_of_zip_slip(member):
+    """Finding 10: normalise the member name BEFORE judging it, not after.
+
+    ``C:\\Windows\\Temp\\evil2.txt`` survives ``name.split("/")`` as a single
+    component, so ``ntpath.join(work, that)`` returns it unchanged - an
+    arbitrary absolute write outside the staging tree.
+    """
+    import zipfile
+    with tempfile.TemporaryDirectory() as tmp:
+        path = os.path.join(tmp, "x.zip")
+        with zipfile.ZipFile(path, "w") as zf:
+            zf.writestr(U._BUNDLE_MANIFEST, json.dumps({"db_version": "x"}))
+            zf.writestr("pubmlst/tiny/tiny.txt", "ST\tabc\n1\t1\n")
+            zf.writestr(member, "PWNED")
+        dbdir = os.path.join(tmp, "db")
+        os.makedirs(os.path.join(dbdir, "pubmlst"))
+        with pytest.raises(UpdateError) as excinfo:
+            U.import_bundle(dbdir, path)
+        assert "unsafe path" in str(excinfo.value)
+        # nothing at all was installed, and no payload survives anywhere
+        assert os.listdir(os.path.join(dbdir, "pubmlst")) in ([], [".staging"])
+        for root, _dirs, files in os.walk(tmp):
+            for name in files:
+                with open(os.path.join(root, name), "rb") as fh:
+                    assert b"PWNED" not in fh.read(64), os.path.join(root, name)
+
+
+def test_import_rejects_a_dot_prefixed_scheme_directory():
+    """Finding 4/10: a bundle cannot install a scheme whose name is not a name."""
+    import zipfile
+    with tempfile.TemporaryDirectory() as tmp:
+        path = os.path.join(tmp, "x.zip")
+        with zipfile.ZipFile(path, "w") as zf:
+            zf.writestr(U._BUNDLE_MANIFEST, json.dumps({"db_version": "x"}))
+            zf.writestr("pubmlst/.rollback/x.txt", "nope")
+        dbdir = os.path.join(tmp, "db")
+        os.makedirs(os.path.join(dbdir, "pubmlst"))
+        with pytest.raises(UpdateError):
+            U.import_bundle(dbdir, path)
+
+
+# ---------------------------------------------------------------------------
+# 7.6 the scheme-name gate (finding 4)
+# ---------------------------------------------------------------------------
+
+HOSTILE_NAMES = [
+    "../../ESCAPED", "../VICTIM", "..\\VICTIM", "a/b", "a\\b",
+    "/abs", "C:evil", ".", "..", ".hidden", "_private", "",
+]
+
+
+@pytest.mark.parametrize("name", HOSTILE_NAMES)
+def test_the_scheme_name_gate_rejects_anything_that_is_not_one_component(name):
+    with pytest.raises(UpdateError):
+        U._validate_scheme_name(name)
+
+
+@pytest.mark.parametrize("name", ["tiny", "ecoli_2", "mgenitalium", "diphtheria_3"])
+def test_the_scheme_name_gate_accepts_real_scheme_names(name):
+    U._validate_scheme_name(name)
+
+
+@pytest.mark.parametrize("name", ["../../ESCAPED", "../VICTIM", "..\\VICTIM"])
+def test_materialise_refuses_to_write_a_scheme_outside_the_tree(name):
+    """Finding 4: the NAME becomes a directory, a .txt stem and a .json stem."""
+    with tempfile.TemporaryDirectory() as tmp:
+        dbdir = os.path.join(tmp, "deep", "db")
+        os.makedirs(os.path.join(dbdir, "pubmlst"))
+        ref = U.SchemeRef(name, "pubmlst", "pubmlst_x_seqdef", "1", 1, None)
+        with pytest.raises(UpdateError):
+            U._materialise(dbdir, ref, {"locus_count": 1, "last_updated": "2026-01-01"},
+                           b"ST\tabc\n1\t1\n", {"abc": b">abc_1\nACGT\n"}, "deadbeef",
+                           backup=False, write_version_files=False, allow_shrink=True)
+        escaped = [os.path.join(root, f)
+                   for root, _d, files in os.walk(tmp) for f in files
+                   if not os.path.abspath(os.path.join(root, f)).startswith(
+                       os.path.abspath(dbdir) + os.sep)]
+        assert escaped == []
+
+
+def test_a_poisoned_manifest_name_is_rejected_with_its_line_number():
+    """Finding 4: db/schemes.manifest.tsv is an ordinary user-writable file."""
+    with tempfile.TemporaryDirectory() as tmp:
+        dbdir = _tiny_db(tmp)
+        with open(U.manifest_path(dbdir), "w", encoding="utf-8") as fh:
+            fh.write(U.MANIFEST_HEADER + "\n")
+            fh.write("\t".join(["../../OUTSIDE", "pubmlst", DB, "1", "2", "-"]) + "\n")
+        with pytest.raises(UpdateError) as excinfo:
+            U.load_manifest(dbdir)
+        assert "line 2" in str(excinfo.value)
+        with pytest.raises(UpdateError):
+            U.check(dbdir, fetcher=_fetcher(_routes(PROFILES_V2, ALLELES_V2)))
+
+
+def test_touch_info_also_gates_the_scheme_name():
+    with tempfile.TemporaryDirectory() as tmp:
+        dbdir = _tiny_db(tmp)
+        ref = U.SchemeRef("../../OUTSIDE", "pubmlst", DB, "1", 2, None)
+        with pytest.raises(UpdateError):
+            U._touch_info(dbdir, ref, {"last_updated": "2026-01-01"}, "deadbeef")
+
+
+# ---------------------------------------------------------------------------
+# 7.4 fetch pinning and the body cap (finding 23)
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize("url", [
+    "http://rest.pubmlst.org/db/x/schemes/1",       # cleartext downgrade
+    "https://evil.example/db/x/schemes/1",          # another host
+    "https://rest.pubmlst.org.evil.example/x",      # suffix trick
+    "file:///etc/hostname",
+    "ftp://rest.pubmlst.org/x",
+])
+def test_only_https_on_a_known_bigsdb_host_is_fetched(url):
+    with pytest.raises(UpdateError):
+        U.check_fetch_url(url)
+    fetcher = U._Fetcher(opener=FakeOpener({url: (200, "text/plain", b"x")}),
+                         delay=0.0, sleep=lambda s: None)
+    with pytest.raises(UpdateError):
+        fetcher.get(url)
+    assert fetcher._opener.calls == []
+
+
+@pytest.mark.parametrize("url", [
+    "https://rest.pubmlst.org/db/x/schemes/1",
+    "https://bigsdb.pasteur.fr/api/db/x/schemes/1",
+])
+def test_the_two_real_roots_are_allowed(url):
+    assert U.check_fetch_url(url) == url
+
+
+def test_a_redirect_off_the_allowlist_is_refused():
+    """Finding 23: an https fetch must not be allowed to finish over http."""
+    handler = U._PinnedRedirectHandler()
+    request = urllib.request.Request("https://rest.pubmlst.org/db/x/schemes/1")
+    with pytest.raises(UpdateError):
+        handler.redirect_request(request, io.BytesIO(b""), 302, "Found", {},
+                                 "http://rest.pubmlst.org/db/x/schemes/1")
+    with pytest.raises(UpdateError):
+        handler.redirect_request(request, io.BytesIO(b""), 302, "Found", {},
+                                 "https://evil.example/steal")
+
+
+def test_a_server_chosen_locus_url_may_not_leave_the_allowlist():
+    """Finding 23: meta['loci'] is attacker-controlled data, not a trusted URL."""
+    with tempfile.TemporaryDirectory() as tmp:
+        dbdir = _tiny_db(tmp)
+        doc = json.loads(_scheme_doc().decode("utf-8"))
+        doc["loci"] = ["http://127.0.0.1:9/loci/abc", "%s/db/%s/loci/def" % (ROOT, DB)]
+        routes = _routes(PROFILES_V2, ALLELES_V2)
+        routes[API] = (200, "application/json", json.dumps(doc).encode("utf-8"))
+        fetcher = _fetcher(routes)
+        plan = U.check(dbdir, fetcher=fetcher)
+        with pytest.raises(UpdateError) as excinfo:
+            U.apply(dbdir, plan, None, fetcher=fetcher, tools=_FakeTools())
+        assert "Refusing to fetch" in str(excinfo.value)
+        assert not any(c.startswith("http://") for c in fetcher._opener.calls)
+
+
+def test_an_oversized_response_body_is_refused(monkeypatch):
+    monkeypatch.setattr(U, "MAX_BODY", 16)
+    url = "https://rest.pubmlst.org/x"
+    fetcher = _fetcher({url: (200, "text/plain", b"A" * 17)})
+    with pytest.raises(UpdateError) as excinfo:
+        fetcher.get(url)
+    assert "refusing to buffer" in str(excinfo.value)
+    assert _fetcher({url: (200, "text/plain", b"A" * 16)}).get(url).body == b"A" * 16
+
+
+# ---------------------------------------------------------------------------
+# 7.3 staging hygiene (findings 6 and 13)
+# ---------------------------------------------------------------------------
+
+def _file_digests(path):
+    """-> ``{name: sha256}`` for the plain files directly inside ``path``."""
+    import hashlib
+    out = {}
+    for name in sorted(os.listdir(path)):
+        full = os.path.join(path, name)
+        if os.path.isfile(full):
+            with open(full, "rb") as fh:
+                out[name] = hashlib.sha256(fh.read()).hexdigest()
+    return out
+
+
+def _make_readonly_windows(monkeypatch):
+    """Emulate the two Windows delete rules that ignore_errors=True hides."""
+    import stat as _stat
+    monkeypatch.setattr(shutil, "_rmtree_impl", shutil._rmtree_unsafe, raising=False)
+    real_unlink = os.unlink
+
+    def win_unlink(path, *args, **kwargs):
+        try:
+            mode = os.stat(path).st_mode
+        except OSError:
+            mode = 0
+        if not mode & _stat.S_IWUSR:
+            raise PermissionError(13, "Access is denied")
+        return real_unlink(path, *args, **kwargs)
+
+    monkeypatch.setattr(os, "unlink", win_unlink)
+    monkeypatch.setattr(os, "remove", win_unlink)
+
+
+def test_rmtree_clears_the_read_only_bit_that_stops_a_windows_delete(monkeypatch):
+    """Finding 13: shutil.rmtree(ignore_errors=True) leaves the survivor behind."""
+    import stat as _stat
+    with tempfile.TemporaryDirectory() as tmp:
+        victim = os.path.join(tmp, "staged")
+        os.makedirs(victim)
+        stuck = os.path.join(victim, "abc.tfa")
+        with open(stuck, "wb") as fh:
+            fh.write(b"stale")
+        os.chmod(stuck, _stat.S_IRUSR)
+        _make_readonly_windows(monkeypatch)
+        shutil.rmtree(victim, ignore_errors=True)
+        assert os.path.isfile(stuck), "precondition: the old helper gives up here"
+        U._rmtree(victim, required=True)
+        assert not os.path.exists(victim)
+
+
+def test_rmtree_required_reports_a_staging_folder_it_could_not_clear(monkeypatch):
+    with tempfile.TemporaryDirectory() as tmp:
+        victim = os.path.join(tmp, "staged")
+        os.makedirs(victim)
+        monkeypatch.setattr(shutil, "rmtree", lambda *a, **k: None)
+        with pytest.raises(UpdateError) as excinfo:
+            U._rmtree(victim, required=True)
+        assert "staging folder" in str(excinfo.value)
+        U._rmtree(victim)          # without required= it still never raises
+
+
+def test_materialise_refuses_to_reuse_a_staging_dir_it_could_not_clear(monkeypatch):
+    with tempfile.TemporaryDirectory() as tmp:
+        dbdir = _tiny_db(tmp)
+        staged = os.path.join(dbdir, "pubmlst", U.STAGING_DIRNAME,
+                              "tiny.%d" % os.getpid())
+        os.makedirs(staged)
+        with open(os.path.join(staged, "ghi.tfa"), "wb") as fh:
+            fh.write(b">ghi_1\nACGT\n")
+        monkeypatch.setattr(shutil, "rmtree", lambda *a, **k: None)
+        ref = U.SchemeRef("tiny", "pubmlst", DB, "1", 2, None)
+        with pytest.raises(UpdateError) as excinfo:
+            U._materialise(dbdir, ref, {"locus_count": 2}, PROFILES_V1, ALLELES_V1,
+                           "deadbeef", backup=False, write_version_files=False,
+                           allow_shrink=True)
+        assert "staging folder" in str(excinfo.value)
+
+
+@pytest.mark.skipif(shutil.which("makeblastdb") is None,
+                    reason="makeblastdb is not on PATH")
+def test_the_index_is_installed_by_one_directory_rename(monkeypatch):
+    """Finding 6: 13 separate os.replace calls could leave a mixed index."""
+    with tempfile.TemporaryDirectory() as tmp:
+        dbdir = _tiny_db(tmp)
+        U.build_blast_db(dbdir, _FakeTools())
+        blast = os.path.join(dbdir, "blast")
+        before = _file_digests(blast)
+        assert len(before) == len(U.BLAST_INDEX_EXTENSIONS) + 1
+        # change the alleles so a successful rebuild would differ, then make the
+        # install rename fail the way a Windows sharing violation does.
+        with open(os.path.join(dbdir, "pubmlst", "tiny", "abc.tfa"), "ab") as fh:
+            fh.write(b">abc_2\nACGTACGTAC\n")
+        real_replace = os.replace
+
+        def flaky(src, dst, **kwargs):
+            if os.path.basename(str(src)).startswith(U.BLAST_STAGING_PREFIX):
+                raise PermissionError(13, "used by another process")
+            return real_replace(src, dst, **kwargs)
+
+        monkeypatch.setattr(os, "replace", flaky)
+        with pytest.raises(PermissionError):
+            U.build_blast_db(dbdir, _FakeTools())
+        monkeypatch.undo()
+        assert _file_digests(blast) == before          # old index, whole and coherent
+        assert not os.path.isdir(os.path.join(blast, U.STAGING_DIRNAME))
+        U.sweep_staging(dbdir)
+        assert sorted(n for n in os.listdir(dbdir)
+                      if n.startswith(U.BLAST_DIRNAME)) == [U.BLAST_DIRNAME]
+
+
+def test_sweep_restores_a_blast_directory_renamed_aside():
+    """Finding 6: a crash between _swap_dir's two renames must be repairable."""
+    with tempfile.TemporaryDirectory() as tmp:
+        dbdir = _tiny_db(tmp)
+        blast = os.path.join(dbdir, "blast")
+        os.makedirs(blast)
+        with open(os.path.join(blast, "mlst.fa"), "wb") as fh:
+            fh.write(b">tiny.abc_1\nACGT\n")
+        os.rename(blast, os.path.join(dbdir, U.BLAST_OLD_PREFIX + "4242"))
+        assert not os.path.isdir(blast)
+        U.sweep_staging(dbdir)
+        assert os.path.isfile(os.path.join(blast, "mlst.fa"))
+        assert not os.path.isdir(os.path.join(dbdir, U.BLAST_OLD_PREFIX + "4242"))
+
+
+def test_sweep_removes_an_orphaned_blast_staging_and_old_copy():
+    with tempfile.TemporaryDirectory() as tmp:
+        dbdir = _tiny_db(tmp)
+        blast = os.path.join(dbdir, "blast")
+        os.makedirs(blast)
+        orphans = [os.path.join(dbdir, U.BLAST_STAGING_PREFIX + "77"),
+                   os.path.join(dbdir, U.BLAST_OLD_PREFIX + "88")]
+        for path in orphans:
+            os.makedirs(path)
+        U.sweep_staging(dbdir)
+        assert os.path.isdir(blast)
+        assert not any(os.path.exists(p) for p in orphans)
+
+
 # ---------------------------------------------------------------------------
 # live tests (skipped when the APIs are unreachable)
 # ---------------------------------------------------------------------------
@@ -1005,3 +1328,41 @@ _install_fake_blastbin()
 
 if __name__ == "__main__":
     raise SystemExit(pytest.main([os.path.abspath(__file__), "-q"]))
+
+
+# ---------------------------------------------------------------------------
+# Scheme-name hardening (section 7.6)
+# ---------------------------------------------------------------------------
+
+def test_scheme_name_rejects_windows_hostile_and_control_names():
+    """A scheme name becomes a path component, so it must survive Windows.
+
+    NUL and the other control codes matter because ``open()`` raises on an
+    embedded NUL instead of returning a clean error; the device stems and the
+    trailing space/dot matter because Windows rewrites or refuses them, so two
+    distinct upstream names could silently collide on disk.
+    """
+    hostile = [
+        "sch\x00eme", "a\tb", "\x1fx",          # control codes
+        "CON", "con.txt", "NUL", "LPT1", "aux",  # reserved device stems
+        "name ", "name.",                        # silently stripped by Windows
+        "../../etc/passwd", "..\\..\\win", "/abs", "C:\\x", "a/b",
+        "", ".", "..",
+    ]
+    for name in hostile:
+        try:
+            U._validate_scheme_name(name)
+        except UpdateError:
+            continue
+        raise AssertionError("accepted a hostile scheme name: %r" % (name,))
+
+
+def test_scheme_name_still_accepts_every_bundled_scheme():
+    """The hardening must not reject any of the 162 real schemes."""
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    pubmlst = os.path.join(root, "db", "pubmlst")
+    names = [n for n in sorted(os.listdir(pubmlst))
+             if os.path.isdir(os.path.join(pubmlst, n))]
+    assert len(names) == 162, names[:5]
+    for name in names:
+        U._validate_scheme_name(name)
