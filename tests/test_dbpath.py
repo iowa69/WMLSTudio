@@ -22,6 +22,7 @@ import json
 import os
 import sys
 import tempfile
+import time
 
 import pytest
 
@@ -284,3 +285,63 @@ def test_index_is_stale_on_an_empty_tree_rather_than_raising():
 
 if __name__ == "__main__":
     raise SystemExit(pytest.main([os.path.abspath(__file__), "-q"]))
+
+
+# ---------------------------------------------------------------------------
+# Staleness must survive mtime churn (section 4.9)
+# ---------------------------------------------------------------------------
+
+def _tiny_index_tree(tmp):
+    """A db/ with one scheme and a stamped, fingerprint-matching index."""
+    pub = os.path.join(tmp, "pubmlst", "tiny")
+    os.makedirs(pub)
+    with open(os.path.join(pub, "abc.tfa"), "w", newline="\n") as fh:
+        fh.write(">abc_1\nACGTACGTACGTACGTACGT\n")
+    with open(os.path.join(pub, "tiny.txt"), "w", newline="\n") as fh:
+        fh.write("ST\tabc\n1\t1\n")
+    blast = os.path.join(tmp, "blast")
+    os.makedirs(blast)
+    # Only .nsq's existence is consulted, so an empty marker is enough here.
+    open(os.path.join(blast, "mlst.fa.nsq"), "wb").close()
+    U.write_index_stamp(tmp)
+    return tmp
+
+
+def test_index_staleness_ignores_modification_times():
+    """A checkout, an actions/cache restore or a backup restore rewrites mtimes.
+
+    Before the fingerprint, any of those made a perfectly good index look stale,
+    and since the GUI now rebuilds a stale index by itself that cost the user a
+    needless rebuild on start-up. It also turned CI red on a cache hit.
+    """
+    with tempfile.TemporaryDirectory() as tmp:
+        dbdir = _tiny_index_tree(tmp)
+        assert U.index_is_stale(dbdir) is False
+
+        allele = os.path.join(dbdir, "pubmlst", "tiny", "abc.tfa")
+        future = time.time() + 7200
+        os.utime(allele, (future, future))
+        assert U.index_is_stale(dbdir) is False, (
+            "an allele newer than the index must not, by itself, mean stale")
+
+
+def test_index_staleness_still_catches_a_real_content_change():
+    """The fingerprint must not be so forgiving that a real update is missed."""
+    with tempfile.TemporaryDirectory() as tmp:
+        dbdir = _tiny_index_tree(tmp)
+        assert U.index_is_stale(dbdir) is False
+        with open(os.path.join(dbdir, "pubmlst", "tiny", "abc.tfa"), "a",
+                  newline="\n") as fh:
+            fh.write(">abc_2\nTTTTTTTTTTTTTTTTTTTT\n")
+        assert U.index_is_stale(dbdir) is True
+
+
+def test_index_without_a_stamp_falls_back_to_mtimes():
+    """An index built by an older WMLST has no stamp; keep the old behaviour."""
+    with tempfile.TemporaryDirectory() as tmp:
+        dbdir = _tiny_index_tree(tmp)
+        os.remove(U._stamp_path(dbdir))
+        allele = os.path.join(dbdir, "pubmlst", "tiny", "abc.tfa")
+        future = time.time() + 7200
+        os.utime(allele, (future, future))
+        assert U.index_is_stale(dbdir) is True

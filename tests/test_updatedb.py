@@ -1160,7 +1160,9 @@ def test_the_index_is_installed_by_one_directory_rename(monkeypatch):
         U.build_blast_db(dbdir, _FakeTools())
         blast = os.path.join(dbdir, "blast")
         before = _file_digests(blast)
-        assert len(before) == len(EXPECTED_INDEX_EXTENSIONS) + 1
+        # the .n* index files, plus mlst.fa, plus the build fingerprint
+        assert len(before) == len(EXPECTED_INDEX_EXTENSIONS) + 2
+        assert U.INDEX_STAMP in os.listdir(blast)
         # change the alleles so a successful rebuild would differ, then make the
         # install rename fail the way a Windows sharing violation does.
         with open(os.path.join(dbdir, "pubmlst", "tiny", "abc.tfa"), "ab") as fh:

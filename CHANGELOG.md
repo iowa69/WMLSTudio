@@ -14,6 +14,23 @@ independently of the software version. Both appear in every JSON and HTML report
 
 Nothing yet.
 
+## [1.0.2] - 2026-09-11
+
+### Fixed
+
+- **A restored or copied database no longer looks out of date.** Index staleness
+  was decided by comparing modification times, and mtimes do not survive a git
+  checkout, a CI cache restore, a backup restore, or a copy between filesystems.
+  Since 1.0.1 rebuilds a stale index automatically, a false positive cost the
+  user a needless one-minute rebuild on start-up. The index now records a
+  content fingerprint of the allele files it was built from, and staleness is
+  decided by comparing that. Modification times are still used as a fallback for
+  an index built by an older WMLST, and a genuine content change is still
+  detected.
+- A logger reference in the new stamp writer was misspelled and would have
+  raised `NameError` on a read-only installation, i.e. exactly where the
+  fallback it guards is needed.
+
 ## [1.0.1] - 2026-09-11
 
 ### Fixed

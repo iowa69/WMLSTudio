@@ -1853,12 +1853,68 @@ def build_blast_db(dbdir: str, tools=None, *, progress=None, cancel=None) -> str
         _swap_dir(blast_dir, staging, None)
     finally:
         _rmtree(staging)
+    # Record what this index was built from, so staleness never has to rely on
+    # modification times (which a checkout, a cache restore or a copy destroys).
+    write_index_stamp(dbdir)
     _emit(progress, 1.0, "Search index ready (%d alleles)" % records)
     return final_fa
 
 
+#: Name of the fingerprint written beside the index by :func:`build_blast_db`.
+INDEX_STAMP = ".wmlst-index-stamp"
+
+
+def allele_fingerprint(dbdir: str) -> str:
+    """A cheap, mtime-free fingerprint of the allele inputs (section 4.9).
+
+    Scheme, locus, and byte size of every ``.tfa``, hashed. Content-derived on
+    purpose: modification times do not survive a git checkout, an
+    ``actions/cache`` restore, a backup restore, or a copy between filesystems,
+    and a false "stale" now costs the user a needless rebuild on start-up.
+    """
+    digest = hashlib.sha256()
+    try:
+        schemes = _scheme_names_on_disk(dbdir)
+    except DatabaseMissingError:
+        return ""
+    for scheme in sorted(schemes):
+        scheme_dir = os.path.join(_pubmlst_dir(dbdir), scheme)
+        try:
+            entries = sorted(_tfa_names(scheme_dir))
+        except OSError:
+            continue
+        for filename in entries:
+            try:
+                size = os.path.getsize(os.path.join(scheme_dir, filename))
+            except OSError:
+                continue
+            digest.update(("%s/%s:%d\n" % (scheme, filename, size)).encode("utf-8"))
+    return digest.hexdigest()
+
+
+def _stamp_path(dbdir: str) -> str:
+    return os.path.join(dbdir, BLAST_DIRNAME, INDEX_STAMP)
+
+
+def write_index_stamp(dbdir: str) -> str:
+    """Record the fingerprint the index was built from. -> the fingerprint."""
+    value = allele_fingerprint(dbdir)
+    path = _stamp_path(dbdir)
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w", encoding="utf-8", newline="\n") as handle:
+            handle.write(value + "\n")
+    except OSError:  # a read-only install: fall back to the mtime comparison
+        log.debug("could not write %s", path, exc_info=True)
+    return value
+
+
 def index_is_stale(dbdir: str) -> bool:
-    """True when the BLAST index is missing or older than the newest ``.tfa`` (4.9).
+    """True when the BLAST index is missing or older than the alleles (4.9).
+
+    Prefers the content fingerprint written at build time; only where no stamp
+    exists (an index built by an older WMLST) does it fall back to comparing
+    modification times.
 
     The engine MUST refuse to type with an actionable message when this is True.
     """
@@ -1867,6 +1923,13 @@ def index_is_stale(dbdir: str) -> bool:
         index_mtime = os.path.getmtime(nsq)
     except OSError:
         return True
+    try:
+        with open(_stamp_path(dbdir), encoding="utf-8") as handle:
+            stamped = handle.read().strip()
+    except OSError:
+        stamped = ""
+    if stamped:
+        return stamped != allele_fingerprint(dbdir)
     try:
         schemes = _scheme_names_on_disk(dbdir)
     except DatabaseMissingError:
