@@ -21,7 +21,9 @@ import glob
 import io
 import json
 import os
+import re
 import shutil
+import subprocess
 import sys
 import tempfile
 import urllib.error
@@ -725,8 +727,32 @@ def test_a_staging_directory_is_invisible_to_the_scheme_list():
 # 4.9 build_blast_db / index_is_stale
 # ---------------------------------------------------------------------------
 
+def _local_makeblastdb_version():
+    """Version tuple of whatever makeblastdb is on PATH, or None.
+
+    The suite must pass against any BLAST+ from BLAST_MIN_VERSION up, and the
+    set of index files depends on it: .njs only exists from 2.13 (Debian and
+    Ubuntu still ship 2.12).
+    """
+    exe = shutil.which("makeblastdb")
+    if not exe:
+        return None
+    try:
+        out = subprocess.run([exe, "-version"], stdout=subprocess.PIPE,
+                             stderr=subprocess.STDOUT, timeout=60).stdout
+    except (OSError, subprocess.SubprocessError):
+        return None
+    m = re.search(rb"(\d+)\.(\d+)\.(\d+)", out or b"")
+    return tuple(int(g) for g in m.groups()) if m else None
+
+
 class _FakeTools:
     makeblastdb = shutil.which("makeblastdb") or "makeblastdb"
+    version_tuple = _local_makeblastdb_version()
+
+
+#: Index files to expect from the makeblastdb this run will actually use.
+EXPECTED_INDEX_EXTENSIONS = U._expected_index_extensions(_FakeTools.version_tuple)
 
 
 def test_concat_fasta_rewrites_headers_and_orders_deterministically():
@@ -797,7 +823,7 @@ def test_build_blast_db_produces_a_complete_v5_index():
         dbdir = _tiny_db(tmp)
         fasta = U.build_blast_db(dbdir, _FakeTools())
         assert fasta == os.path.join(dbdir, "blast", "mlst.fa")
-        for ext in U.BLAST_INDEX_EXTENSIONS:
+        for ext in EXPECTED_INDEX_EXTENSIONS:
             assert os.path.isfile(fasta + "." + ext), ext
         assert not os.path.isdir(os.path.join(dbdir, "blast", U.STAGING_DIRNAME))
         assert U.index_is_stale(dbdir) is False
@@ -1134,7 +1160,7 @@ def test_the_index_is_installed_by_one_directory_rename(monkeypatch):
         U.build_blast_db(dbdir, _FakeTools())
         blast = os.path.join(dbdir, "blast")
         before = _file_digests(blast)
-        assert len(before) == len(U.BLAST_INDEX_EXTENSIONS) + 1
+        assert len(before) == len(EXPECTED_INDEX_EXTENSIONS) + 1
         # change the alleles so a successful rebuild would differ, then make the
         # install rename fail the way a Windows sharing violation does.
         with open(os.path.join(dbdir, "pubmlst", "tiny", "abc.tfa"), "ab") as fh:
@@ -1366,3 +1392,34 @@ def test_scheme_name_still_accepts_every_bundled_scheme():
     assert len(names) == 162, names[:5]
     for name in names:
         U._validate_scheme_name(name)
+
+
+# ---------------------------------------------------------------------------
+# BLAST index validation must track the makeblastdb version
+# ---------------------------------------------------------------------------
+
+def test_njs_is_only_required_from_blast_2_13():
+    """Debian and Ubuntu ship BLAST+ 2.12, which never writes a .njs file.
+
+    WMLST declares BLAST_MIN_VERSION 2.9.0, so demanding .njs unconditionally
+    made `wmlst --make-blast-db` fail on every apt-installed BLAST — which is
+    exactly how this broke CI on ubuntu-latest.
+    """
+    old = U._expected_index_extensions((2, 12, 0))
+    new = U._expected_index_extensions((2, 17, 0))
+    assert "njs" not in old
+    assert "njs" in new
+    # everything else is demanded of both
+    assert set(old) == set(U.BLAST_INDEX_REQUIRED)
+    assert set(new) - set(old) == {"njs"}
+
+
+def test_unknown_blast_version_still_requires_njs():
+    """With no version to go on, keep the stricter rule.
+
+    On Windows the .njs doubles as the completion sentinel for a database path
+    containing a space, so it must not be dropped just because discovery could
+    not parse a version.
+    """
+    assert "njs" in U._expected_index_extensions(None)
+    assert "njs" in U._expected_index_extensions(())

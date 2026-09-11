@@ -146,9 +146,27 @@ MANIFEST_HEADER = "#SCHEME\tSOURCE\tDB\tSCHEME_ID\tNLOCI\tALIAS_OF"
 #: Written into a manifest row whose upstream identity could not be established.
 UNRESOLVED = "unresolved"
 
-#: The 12 files a v5 ``makeblastdb -hash_index -parse_seqids`` run must produce.
-BLAST_INDEX_EXTENSIONS = ("ndb", "nhd", "nhi", "nhr", "nin", "njs",
-                          "nog", "nos", "not", "nsq", "ntf", "nto")
+#: The files a v5 ``makeblastdb -hash_index -parse_seqids`` run must produce on
+#: every supported BLAST+ (BLAST_MIN_VERSION is 2.9.0).
+BLAST_INDEX_REQUIRED = ("ndb", "nhd", "nhi", "nhr", "nin",
+                        "nog", "nos", "not", "nsq", "ntf", "nto")
+
+#: ``.njs`` is the JSON metadata file, written by a separate pass at the end of
+#: makeblastdb. It only exists from 2.13 onwards -- Debian and Ubuntu still ship
+#: 2.12, which produces a perfectly good index and no ``.njs`` at all. Where it
+#: IS expected it doubles as a completion sentinel: on Windows, a database path
+#: containing a space fails that final pass after writing every other file.
+BLAST_NJS_SINCE = (2, 13, 0)
+
+#: Every file a current makeblastdb writes; kept for callers that enumerate them.
+BLAST_INDEX_EXTENSIONS = tuple(sorted((*BLAST_INDEX_REQUIRED, "njs")))
+
+
+def _expected_index_extensions(version_tuple=None):
+    """Index files to insist on, given the makeblastdb version (section 4.9)."""
+    if version_tuple and tuple(version_tuple) < BLAST_NJS_SINCE:
+        return BLAST_INDEX_REQUIRED
+    return (*BLAST_INDEX_REQUIRED, "njs")
 
 #: The six non-locus column names of a profile header (MLST/Scheme.pm:46).
 PROFILE_NON_LOCUS = frozenset(
@@ -1822,7 +1840,8 @@ def build_blast_db(dbdir: str, tools=None, *, progress=None, cancel=None) -> str
         _rmtree(staging)
         raise UpdateError("makeblastdb failed (exit %d): %s"
                           % (completed.returncode, (tail or "").strip()[-500:]))
-    missing = [ext for ext in BLAST_INDEX_EXTENSIONS
+    expected = _expected_index_extensions(getattr(tools, "version_tuple", None))
+    missing = [ext for ext in expected
                if not os.path.isfile(staged_fa + "." + ext)]
     if missing:
         _rmtree(staging)

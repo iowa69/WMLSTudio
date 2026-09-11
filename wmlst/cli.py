@@ -731,6 +731,12 @@ def _dependency_check(ns) -> None:
         Logger.err(str(exc))
         return  # pragma: no cover - err() never returns
     Logger.msg("Found blastn - %s (%s)" % (tools.blastn, tools.version))
+    if tools.version != blastbin.BLAST_PINNED_VERSION:
+        # Worth saying, but only through Logger.msg: as a logging warning from
+        # blastbin it survived --quiet and broke stderr byte-parity on every
+        # distro-packaged BLAST. Supported, simply not the pinned build.
+        Logger.msg("  (WMLST is validated against %s; %s is supported)"
+                   % (blastbin.BLAST_PINNED_VERSION, tools.version))
     Logger.msg("any2fasta is built in - no external copy needed")
     if ns.check:
         _check_report(ns, tools)

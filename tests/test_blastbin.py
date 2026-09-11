@@ -673,11 +673,14 @@ def test_makeblastdb_builds_into_a_directory_whose_path_has_a_space():
     it re-opens the finished database under for the metadata pass (exit 2, "No
     alias or index file found ... [C:\\Program]", .njs never written).  No argv
     arrangement survives it, so run_makeblastdb() builds elsewhere and moves the
-    relocatable index in.  The 12 extensions are updatedb.BLAST_INDEX_EXTENSIONS.
+    relocatable index in.  Which files to expect depends on the makeblastdb
+    version: .njs only exists from 2.13, and Debian/Ubuntu still ship 2.12.
     """
+    from wmlst import updatedb
+
     tools = _tools()
-    extensions = ("ndb", "nhd", "nhi", "nhr", "nin", "njs",
-                  "nog", "nos", "not", "nsq", "ntf", "nto")
+    extensions = updatedb._expected_index_extensions(
+        getattr(tools, "version_tuple", None))
     with tempfile.TemporaryDirectory() as tmp:
         blast_dir = os.path.join(tmp, "Program Files", "MLST db", "blast")
         os.makedirs(blast_dir)

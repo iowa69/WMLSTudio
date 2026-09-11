@@ -856,7 +856,12 @@ def _tools_from_blastn(blastn: str, origin: str) -> Optional[BlastTools]:
         )
         return None
     if version != BLAST_PINNED_VERSION:
-        _LOG.warning(
+        # Informational, not a warning: any build at or above BLAST_MIN_VERSION
+        # is supported, and the one below rejects anything older. As a warning it
+        # survived --quiet and broke stderr byte-parity with upstream on every
+        # distro-packaged BLAST -- Debian and Ubuntu ship 2.12, not the pinned
+        # 2.17.0+. The neighbouring "Found blastn" line is already an info line.
+        _LOG.info(
             "blastn %s found at %s; WMLST is validated against %s",
             version,
             blastn,
