@@ -11,7 +11,10 @@ download. Every scheme and every allele is already inside.
 
 ## Download
 
-**[⬇ Download WMLST for Windows](https://iowa69.github.io/WMLST/)**
+**[⬇ Download WMLST for Windows](https://github.com/iowa69/WMLST/releases/latest)**
+
+Take the file ending `-win64-portable.zip`. There is also a
+[one-click download page](https://iowa69.github.io/WMLST/) if you prefer.
 
 You get a single `.zip`. Unzip it anywhere you like — your Documents folder, a network
 share, a USB stick — and run `WMLST.exe` from inside the folder. Nothing is written to
@@ -86,6 +89,43 @@ individual loci and the evidence behind each allele call.
 
 WMLST sizes itself to your computer automatically — on a 16-core machine it analyses four
 assemblies at a time.
+
+---
+
+## Comparing isolates: the Tree page
+
+Type two or more isolates of the same species and the **Tree** tab draws a minimum
+spanning tree of how closely related they are. Every line is labelled with the number of
+loci that differ between the two isolates it joins, so `0` means an identical profile and
+`1` means a single-locus variant.
+
+There are two views of the same tree.
+
+### Clonality
+
+![The clonality view](docs/img/screen-tree-clonality.png)
+
+Dots are coloured by **clonal group** — isolates no more than one locus apart — and sized
+by how many isolates share that sequence type. Isolates that belong to no group are shown
+in grey as singletons. This is the view for answering *"is this an outbreak?"* at a glance:
+in the picture above, ten isolates form one tight red cluster while ten others are
+unrelated singletons.
+
+### Labelled tree
+
+![The labelled view](docs/img/screen-tree-labelled.png)
+
+The same tree with **every isolate named and its sequence type shown**, coloured by ST.
+This is the view for reading and for putting in a report — each dot can be traced back to
+the file it came from.
+
+Common to both: choose the scheme if your run mixed species, zoom and pan, click any dot
+to see that isolate's full allele profile and its nearest neighbours, and **Save image
+(PNG)** to export the picture.
+
+The header states how many isolates and how many loci were compared. Only isolates typed
+with the same scheme are compared, and a locus missing from either isolate is left out of
+the count rather than treated as a difference.
 
 ---
 
