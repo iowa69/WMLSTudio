@@ -17,6 +17,7 @@ from typing import Callable
 
 import ahocorasick
 
+from . import __version__
 from .sequence import (
     CancelCallback,
     QCAccumulator,
@@ -414,5 +415,5 @@ def call_assembly(
         "parameters": {"method": "exact-nucleotide", "strands": "both",
                        "index": "seed-verified" if len(scheme.loci) > 30 else "full-allele",
                        "coordinates": "1-based inclusive", "evidence_limit_per_locus": 50},
-        "engine_version": "0.1.0",
+        "engine_version": __version__,
     }

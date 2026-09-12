@@ -5,6 +5,7 @@ import random
 
 import pytest
 
+from wmlstudio import __version__
 from wmlstudio.sequence import AnalysisCancelled, SequenceError
 from wmlstudio.typing import SchemeError, call_assembly, load_scheme, reverse_complement
 
@@ -46,6 +47,7 @@ def test_known_st_forward_and_reverse_with_exact_coordinates(tmp_path, schema_pa
     path = assembly(tmp_path, "NNN" + ARC1 + "NNNNN" + reverse_complement(GYR1) + "NN")
     result = call_assembly(path, load_scheme(schema_path))
     assert result["status"] == "complete"
+    assert result["engine_version"] == __version__
     assert result["st"] == "1"
     assert result["alleles"] == {"arcA": "1", "gyrB": "1"}
     assert result["input_sha256"] == hashlib.sha256(path.read_bytes()).hexdigest()
