@@ -1,6 +1,7 @@
 import gzip
 import hashlib
 import json
+import random
 
 import pytest
 
@@ -142,6 +143,26 @@ def test_match_across_internal_processing_chunk(tmp_path, schema_path):
     assert result["st"] == "1"
     assert result["calls"][0]["hits"][0]["start"] == len(prefix) + 1
     assert result["calls"][0]["hits"][0]["end"] == len(prefix) + len(ARC1)
+
+
+def test_large_schema_seed_matches_are_verified_as_full_alleles(tmp_path):
+    rng = random.Random(501)
+    root = tmp_path / 'large'
+    root.mkdir()
+    sequences = [''.join(rng.choice('ACGT') for _ in range(101)) for _ in range(31)]
+    # Equal central seed, different complete sequence: not shared-locus evidence.
+    sequences[1] = 'A' * 35 + sequences[0][35:66] + 'C' * 35
+    for index, sequence in enumerate(sequences):
+        (root / f'locus{index:02}.fa').write_text(f'>locus{index:02}_1\n{sequence}\n')
+    prefix = 'N' * (65536 - 60)
+    path = assembly(tmp_path, prefix + reverse_complement(sequences[0]))
+    result = call_assembly(path, load_scheme(root))
+    assert result['parameters']['index'] == 'seed-verified'
+    assert result['alleles']['locus00'] == '1'
+    assert result['alleles']['locus01'] is None
+    assert sum(value is not None for value in result['alleles'].values()) == 1
+    hit = result['calls'][0]['hits'][0]
+    assert (hit['start'], hit['end'], hit['strand']) == (len(prefix) + 1, len(prefix) + 101, '-')
 
 
 def test_empty_profile_directory_supports_cgmlst(tmp_path, schema_path):

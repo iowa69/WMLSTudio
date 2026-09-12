@@ -1,4 +1,4 @@
-param([string]$SchemeSource = "", [switch]$SkipTests)
+param([string]$SchemeSource = "", [string]$HydraSource = "", [string]$SkesaSource = "", [switch]$SkipTests)
 $ErrorActionPreference = "Stop"
 $projectRoot = Split-Path -Parent $PSScriptRoot
 Push-Location $projectRoot
@@ -14,6 +14,16 @@ try {
         & uv run python studio_scripts/stage_schemes.py --download
     }
     if ($LASTEXITCODE -ne 0) { throw "Scheme staging failed" }
+    if ($HydraSource) {
+        & uv run python studio_packaging/stage_bio_tools.py --platform windows-x64 --hydra-source $HydraSource
+    } else {
+        & uv run python studio_packaging/stage_bio_tools.py --platform windows-x64 --download-hydra-starter
+    }
+    if ($LASTEXITCODE -ne 0) { throw "Native BLAST tool staging failed" }
+    $skesaArguments = @("studio_packaging/stage_bio_tools.py", "--platform", "windows-x64", "--require-skesa")
+    if ($SkesaSource) { $skesaArguments += @("--skesa-source", $SkesaSource) }
+    & uv run python @skesaArguments
+    if ($LASTEXITCODE -ne 0) { throw "A verified native SKESA bundle is required. Supply -SkesaSource from the Windows SKESA workflow artifact." }
     & uv run python studio_packaging/stage_notices.py
     if ($LASTEXITCODE -ne 0) { throw "License text staging failed" }
     if (-not $SkipTests) {

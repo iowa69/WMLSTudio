@@ -95,6 +95,8 @@ results/**
 !results/**/README.md
 !results/lab_notebook.md
 src/wmlstudio/resources/schemes/
+src/wmlstudio/resources/tools/
+src/wmlstudio/resources/hydra/
 studio_packaging/payload/
 studio_packaging/generated_notices/
 *.wmlstudio

@@ -94,6 +94,43 @@ def test_invalid_sample_does_not_stop_next_sample(qtbot, tmp_path):
     assert signals["progress"][-1] == [100, "Analysis finished"]
 
 
+def test_per_sample_unknown_and_manual_no_scheme_do_not_force_global_typing(qtbot, tmp_path, scheme_path):
+    unknown = sample(tmp_path, 'unknown.fa', f'>a\n{ARC1}\n>b\n{GYR1}\n', 'unknown')
+    unknown['metadata'] = {'workflow': {'typing_mode': 'unknown'}}
+    manual = sample(tmp_path, 'manual.fa', f'>a\n{ARC1}\n>b\n{GYR1}\n', 'manual')
+    manual['metadata'] = {'organism': {'genus': 'Staphylococcus', 'species': 'epidermidis'},
+                          'workflow': {'typing_mode': 'manual', 'scheme_path': None}}
+    signals = run_worker(qtbot, jobs.AnalysisWorker([unknown, manual], scheme_path), ANALYSIS_SIGNALS)
+    assert signals['sample_failed'] == []
+    results = dict(signals['sample_finished'])
+    assert results['unknown']['status'] == 'qc_only'
+    assert results['manual']['status'] == 'qc_only'
+    assert results['manual']['organism_assignment'] == 'user supplied'
+    assert results['manual']['organism']['species'] == 'epidermidis'
+
+
+def test_per_sample_full_cds_and_exact_route_explicitly(qtbot, tmp_path, scheme_path, monkeypatch):
+    import copy
+    calls = []
+    real = jobs.call_assembly
+    def cg(path, scheme, cancelled, progress, genetic_code):
+        calls.append('full_cds')
+        assert callable(cancelled)
+        assert genetic_code == 11
+        return real(path, scheme, cancelled=cancelled, progress=progress)
+    monkeypatch.setattr(jobs, 'call_cgassembly', cg)
+    first = sample(tmp_path, 'sample.fa', f'>a\n{ARC1}\n>b\n{GYR1}\n', 'first')
+    first['metadata'] = {'workflow': {'typing_mode': 'manual', 'scheme_path': str(scheme_path),
+                                     'calling_mode': 'full_cds'}}
+    second = copy.deepcopy(first)
+    second['id'] = 'second'
+    second['metadata']['workflow']['calling_mode'] = 'exact'
+    signals = run_worker(qtbot, jobs.AnalysisWorker([first, second]), ANALYSIS_SIGNALS)
+    assert signals['sample_failed'] == []
+    assert calls == ['full_cds']
+    assert [result['st'] for _, result in signals['sample_finished']] == ['7', '7']
+
+
 def test_scheme_failure_does_not_prevent_read_quality(qtbot, tmp_path):
     assembly = sample(tmp_path, "assembly.fasta", ">a\nACGT\n", "assembly")
     reads = sample(tmp_path, "reads.fastq", "@r\nACGT\n+\nIIII\n", "reads")

@@ -173,8 +173,11 @@ def load_scheme(path: str | Path, cancelled: CancelCallback = None) -> Scheme:
         except (UnicodeDecodeError, csv.Error) as error:
             raise SchemeError(f"Cannot read potential profile file {file.name}: {error}") from error
         header = [value.strip() for value in header]
+        profile_fields = {"st", "sequence_type", "sequence type"}
+        if isinstance(metadata.get("profile_field"), str):
+            profile_fields.add(metadata["profile_field"].casefold())
         st_columns = [index for index, value in enumerate(header)
-                      if value.lower() in {"st", "sequence_type", "sequence type"}]
+                      if value.lower() in profile_fields]
         if st_columns:
             if len(st_columns) != 1 or len(set(header)) != len(header):
                 raise SchemeError(f"{file.name}: duplicate or ambiguous profile columns.")
@@ -188,6 +191,8 @@ def load_scheme(path: str | Path, cancelled: CancelCallback = None) -> Scheme:
     loci = tuple(sorted(alleles, key=_natural_key))
     profiles: dict[tuple[str, ...], tuple[str, ...]] = {}
     notes: list[str] = []
+    if metadata.get("access_notice"):
+        notes.append(str(metadata["access_notice"]))
     if ambiguous_references:
         notes.append(
             f"Excluded {len(ambiguous_references)} reference alleles with ambiguous DNA from "
@@ -261,9 +266,16 @@ def _automaton(scheme: Scheme, cancelled: CancelCallback, progress: ProgressCall
             reverse = reverse_complement(sequence)
             strands = [(sequence, "both")] if reverse == sequence else [(sequence, "+"), (reverse, "-")]
             for word, strand in strands:
-                values = automaton.get(word, [])
-                values.append((locus, allele, strand, len(sequence)))
-                automaton.add_word(word, values)
+                if len(scheme.loci) > 30:
+                    offset = max(0, (len(word) - 31) // 2)
+                    seed = word[offset:offset + 31]
+                    values = automaton.get(seed, [])
+                    values.append((locus, allele, strand, len(sequence), word, offset))
+                    automaton.add_word(seed, values)
+                else:
+                    values = automaton.get(word, [])
+                    values.append((locus, allele, strand, len(sequence)))
+                    automaton.add_word(word, values)
         if progress:
             progress(index, len(scheme.loci), f"Indexing locus {locus}")
     if not len(automaton):
@@ -344,11 +356,23 @@ def call_assembly(
                     if hit_number % 4096 == 0:
                         check_cancelled(cancelled)
                     shared = len({value[0] for value in values}) > 1
-                    for locus, allele, strand, length in values:
+                    for value in values:
+                        locus, allele, strand, length = value[:4]
+                        hit_start, hit_end = end - length + 2, end + 1
+                        reference_shared = shared
+                        if len(value) == 6:
+                            full_sequence, offset = value[4:]
+                            seed_length = min(31, length)
+                            start_zero = end - seed_length + 1 - offset
+                            if start_zero < 0 or not record.sequence.startswith(full_sequence, start_zero):
+                                continue
+                            hit_start, hit_end = start_zero + 1, start_zero + length
+                            reference_shared = shared and any(
+                                other[0] != locus and other[4] == full_sequence for other in values)
                         matches[locus].append({
                             "allele": allele, "contig": record.identifier,
-                            "start": end - length + 2, "end": end + 1,
-                            "strand": strand, "shared_reference": shared,
+                            "start": hit_start, "end": hit_end,
+                            "strand": strand, "shared_reference": reference_shared,
                         })
             if progress:
                 progress(contig_number, 0, f"Scanned contig {record.identifier}")
@@ -388,6 +412,7 @@ def call_assembly(
         "st": st, "status": status, "alleles": alleles, "calls": calls,
         "input_sha256": digest, "notes": notes,
         "parameters": {"method": "exact-nucleotide", "strands": "both",
+                       "index": "seed-verified" if len(scheme.loci) > 30 else "full-allele",
                        "coordinates": "1-based inclusive", "evidence_limit_per_locus": 50},
         "engine_version": "0.1.0",
     }

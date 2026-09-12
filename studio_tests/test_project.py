@@ -125,3 +125,59 @@ def test_rejects_corrupt_file_and_invalid_structure(tmp_path):
         connection.execute("CREATE TABLE samples (id TEXT)")
     with pytest.raises(ProjectError, match="missing required columns"):
         Project(malformed)
+
+
+def test_version_one_project_migrates_without_losing_original_mlst(tmp_path, sequence):
+    path = tmp_path / "legacy.wmlstudio"
+    with Project(path) as project:
+        sid = project.add_sample(sequence)
+        project.set_metadata(sid, {"ward": "A"})
+        project.set_result(sid, {"scheme": "MLST", "scheme_digest": "mlst-v1", "st": "131", "alleles": {"adk": "1"}})
+        project.set_setting("favorite", "retained")
+    with sqlite3.connect(path) as connection:
+        connection.execute("DROP TABLE history")
+        connection.execute("DROP TABLE analyses")
+        connection.execute("PRAGMA user_version = 1")
+    with Project(path) as project:
+        assert project.get_sample(sid)["metadata"] == {"ward": "A"}
+        assert project.get_setting("favorite") == "retained"
+        assert project.analysis_results(sid)[0]["st"] == "131"
+        project.set_analysis(sid, {"scheme": "cgMLST", "scheme_digest": "cgmlst-v1", "st": None,
+                                   "alleles": {"locus0001": "7"}})
+        assert project.get_sample(sid)["result"]["st"] == "131"
+        assert len(project.analysis_results(sid)) == 2
+        assert any(event["action"] == "schema_migrated" for event in project.history())
+    with Project(path) as project:
+        assert len(project.analysis_results(sid)) == 2
+        assert project.get_sample(sid)["result"]["st"] == "131"
+
+
+def test_profile_only_samples_need_no_fasta_and_keep_stable_ids(tmp_path):
+    path = tmp_path / "profiles.wmlstudio"
+    with Project(path) as project:
+        sid = project.add_profile("External A", {"scheme": "cgMLST", "scheme_digest": "external",
+                                                "kind": "profile", "status": "profile_imported", "alleles": {"l1": "7"}})
+        assert project.get_sample(sid)["profile_only"] is True
+        assert project.get_sample(sid)["missing_input"] is False
+        assert project.get_sample(sid)["input_path"] == ""
+    with Project(path) as project:
+        assert project.analysis_results(sid)[0]["alleles"] == {"l1": "7"}
+
+
+def test_collections_persist_and_do_not_delete_samples(tmp_path, sequence):
+    path = tmp_path / "study.wmlstudio"
+    with Project(path) as project:
+        ids = [project.add_sample(sequence) for _ in range(2)]
+        collection = project.create_collection("Ward A")
+        assert project.create_collection("ward a") == collection
+        project.set_collection_members(collection, ids)
+        project.set_collection_members(collection, [ids[0]], add=False)
+        project.rename_collection(collection, "Investigation 2026")
+        assert project.collections()[0]["sample_ids"] == [ids[1]]
+        with pytest.raises(KeyError):
+            project.set_collection_members(collection, ["missing"])
+    with Project(path) as project:
+        assert project.collections()[0]["name"] == "Investigation 2026"
+        project.delete_collection(collection)
+        assert len(project.samples()) == 2
+        assert project.collections() == []

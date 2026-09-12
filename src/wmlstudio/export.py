@@ -11,6 +11,7 @@ import html
 import json
 import math
 import os
+import re
 import tempfile
 from collections.abc import Iterable, Mapping
 from contextlib import contextmanager
@@ -19,10 +20,16 @@ from pathlib import Path
 from typing import Any, TextIO
 
 from wmlstudio import __version__
+from wmlstudio.sample_workflow import feature_fields, select_records
 
 _FIELDS = (
     "sample_id", "sample_name", "input_path", "kind", "job_status", "status", "scheme",
     "scheme_digest", "st", "input_sha256", "error", "notes", "metadata", "qc",
+    "genus", "species", "organism", "organism_source", "typing_mode", "amr_genes",
+    "amr_classes", "virulence_genes", "plasmid_replicons", "stress_genes",
+    "hydra_source_sample", "hydra_report_sha256", "cluster_label", "cluster_highlight",
+    "additional_profiles",
+    "hydra_evidence_status", "hydra_evidence_reason",
 )
 
 
@@ -34,9 +41,11 @@ def ensure_separate_destination(destination: str | Path, protected_paths: Iterab
             raise ValueError("Choose a different output file. This path belongs to an input or open project.")
 
 
-def _snapshot(records: Iterable[Mapping[str, Any]]) -> list[dict[str, Any]]:
+def _snapshot(
+    records: Iterable[Mapping[str, Any]], selected_ids=None, highlight_clusters=None,
+) -> list[dict[str, Any]]:
     rows = []
-    for record in records:
+    for record in select_records(records, selected_ids):
         if "result" in record:
             result = record.get("result")
             row = dict(result) if isinstance(result, Mapping) else {}
@@ -50,12 +59,26 @@ def _snapshot(records: Iterable[Mapping[str, Any]]) -> list[dict[str, Any]]:
                 "created_at": record.get("created_at", ""),
                 "updated_at": record.get("updated_at", ""),
                 "missing_input": bool(record.get("missing_input", False)),
+                "additional_profiles": record.get("analyses", []),
             })
         else:
             row = dict(record)
+        if "result" in record or "sample_name" in record:
+            sample_id = str(row.get("sample_id", ""))
+            row.update(feature_fields(record, (highlight_clusters or {}).get(sample_id)))
         rows.append(row)
     # Validate and detach nested data before opening any destination.
     return json.loads(json.dumps(rows, ensure_ascii=False, allow_nan=False))
+
+
+def _protected_paths(rows):
+    for row in rows:
+        yield row.get("input_path", "")
+        metadata = row.get("metadata", {})
+        if isinstance(metadata, dict):
+            workflow = metadata.get("workflow", {})
+            if isinstance(workflow, dict):
+                yield workflow.get("source_path", "")
 
 
 @contextmanager
@@ -98,9 +121,13 @@ def _csv_cell(value: Any) -> str | int | float:
     return text
 
 
-def _write_delimited(records: Iterable[Mapping[str, Any]], path: str | Path, delimiter: str) -> Path:
-    rows = _snapshot(records)
-    ensure_separate_destination(path, [row.get("input_path", "") for row in rows])
+def _write_delimited(
+    records: Iterable[Mapping[str, Any]], path: str | Path, delimiter: str,
+    selected_ids=None, highlight_clusters=None,
+) -> Path:
+    all_records = list(records)
+    ensure_separate_destination(path, _protected_paths(all_records))
+    rows = _snapshot(all_records, selected_ids, highlight_clusters)
     loci = sorted({str(locus) for row in rows for locus in row.get("alleles", {})})
     columns = [*_FIELDS, *(f"allele:{locus}" for locus in loci)]
     with _atomic_text(path, newline="") as handle:
@@ -114,23 +141,26 @@ def _write_delimited(records: Iterable[Mapping[str, Any]], path: str | Path, del
     return Path(path).expanduser().resolve()
 
 
-def write_csv(records: Iterable[Mapping[str, Any]], path: str | Path) -> Path:
+def write_csv(records: Iterable[Mapping[str, Any]], path: str | Path, *, selected_ids=None, highlight_clusters=None) -> Path:
     """Write Excel-friendly UTF-8 CSV with guarded textual formula cells."""
-    return _write_delimited(records, path, ",")
+    return _write_delimited(records, path, ",", selected_ids, highlight_clusters)
 
 
-def write_tsv(records: Iterable[Mapping[str, Any]], path: str | Path) -> Path:
-    return _write_delimited(records, path, "\t")
+def write_tsv(records: Iterable[Mapping[str, Any]], path: str | Path, *, selected_ids=None, highlight_clusters=None) -> Path:
+    return _write_delimited(records, path, "\t", selected_ids, highlight_clusters)
 
 
-def write_json(records: Iterable[Mapping[str, Any]], path: str | Path) -> Path:
-    rows = _snapshot(records)
-    ensure_separate_destination(path, [row.get("input_path", "") for row in rows])
+def write_json(records: Iterable[Mapping[str, Any]], path: str | Path, *, selected_ids=None, highlight_clusters=None) -> Path:
+    all_records = list(records)
+    ensure_separate_destination(path, _protected_paths(all_records))
+    rows = _snapshot(all_records, selected_ids, highlight_clusters)
     document = {
         "format_version": 1,
         "application": f"WMLSTudio {__version__}",
         "exported_at": datetime.now(timezone.utc).isoformat(),
         "samples": rows,
+        "report_scope": {"mode": "selected" if selected_ids is not None else "provided",
+                         "sample_ids": [row.get("sample_id") for row in rows]},
     }
     with _atomic_text(path) as handle:
         json.dump(document, handle, ensure_ascii=False, allow_nan=False, indent=2)
@@ -170,10 +200,11 @@ def _escape(value: Any) -> str:
     return html.escape(_display(value), quote=True)
 
 
-def write_html(records: Iterable[Mapping[str, Any]], path: str | Path) -> Path:
+def write_html(records: Iterable[Mapping[str, Any]], path: str | Path, *, selected_ids=None, highlight_clusters=None) -> Path:
     """Write an escaped, self-contained report that also prints without scripts."""
-    rows = _snapshot(records)
-    ensure_separate_destination(path, [row.get("input_path", "") for row in rows])
+    all_records = list(records)
+    ensure_separate_destination(path, _protected_paths(all_records))
+    rows = _snapshot(all_records, selected_ids, highlight_clusters)
     exported = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
     output = [
         '<!doctype html><html lang="en"><head><meta charset="utf-8">',
@@ -202,12 +233,14 @@ def write_html(records: Iterable[Mapping[str, Any]], path: str | Path) -> Path:
         '<div>Sequence typing report</div></header>',
         f'<p class="muted">{len(rows)} sample record(s) · Exported {_escape(exported)} · '
         f'Application {_escape(__version__)}</p>',
+        f'<p>Report scope: {"selected samples" if selected_ids is not None else "provided project records"}. '
+        'Highlighted groups are user-defined and do not establish transmission.</p>',
         '<p class="notice">Results describe the supplied sequence data and scheme snapshot. '
         'Missing, mixed, or ambiguous calls must not be treated as allele matches. '
         'Allele similarity alone does not establish an outbreak or transmission.</p>',
         '<section><h2>Sample overview</h2><div class="scroll"><table><thead><tr>'
         '<th>Sample</th><th>Job</th><th>Typing result</th><th>Scheme</th><th>ST</th>'
-        '<th>Known alleles</th></tr></thead><tbody>',
+        '<th>Known alleles</th><th>Organism</th><th>AMR genes</th><th>Group</th></tr></thead><tbody>',
     ]
     for row in rows:
         alleles = row.get("alleles", {})
@@ -215,8 +248,13 @@ def write_html(records: Iterable[Mapping[str, Any]], path: str | Path) -> Path:
         cells = (
             row.get("sample_name", ""), row.get("job_status", ""), row.get("status", ""),
             row.get("scheme", ""), row.get("st", ""), f"{called}/{len(alleles)}",
+            row.get("organism", ""), ", ".join(row.get("amr_genes", [])), row.get("cluster_label", ""),
         )
-        output.append("<tr>" + "".join(f"<td>{_escape(cell)}</td>" for cell in cells) + "</tr>")
+        color = row.get("cluster_color", "#2F8A78")
+        if not isinstance(color, str) or not re.fullmatch(r"#[0-9A-Fa-f]{6}", color):
+            color = "#2F8A78"
+        style = f' style="border-left:5px solid {color};background:#f1f7ed"' if row.get("cluster_highlight") else ""
+        output.append(f"<tr{style}>" + "".join(f"<td>{_escape(cell)}</td>" for cell in cells) + "</tr>")
     output.append("</tbody></table></div></section>")
     for row in rows:
         output.append(f'<section><h2>{_escape(row.get("sample_name", "Unnamed sample"))}</h2><dl>')
@@ -224,6 +262,11 @@ def write_html(records: Iterable[Mapping[str, Any]], path: str | Path) -> Path:
             ("Sample ID", "sample_id"), ("Input", "input_path"), ("Input SHA-256", "input_sha256"),
             ("Scheme", "scheme"), ("Scheme SHA-256", "scheme_digest"),
             ("Job state", "job_status"), ("Typing result", "status"), ("Sequence type", "st"),
+            ("Organism", "organism"), ("Organism source", "organism_source"),
+            ("AMR genes", "amr_genes"), ("Virulence genes", "virulence_genes"),
+            ("Plasmid replicons", "plasmid_replicons"), ("Group", "cluster_label"),
+            ("HYDRA sample", "hydra_source_sample"), ("HYDRA report SHA-256", "hydra_report_sha256"),
+            ("AMR evidence state", "hydra_evidence_status"), ("AMR evidence note", "hydra_evidence_reason"),
         ):
             output.append(f"<dt>{title}</dt><dd>{_escape(row.get(key)) or '—'}</dd>")
         output.append("</dl>")
@@ -233,7 +276,17 @@ def write_html(records: Iterable[Mapping[str, Any]], path: str | Path) -> Path:
         for title, key in (("Error", "error"), ("Notes", "notes"), ("Metadata", "metadata"),
                            ("Quality summary", "qc")):
             if row.get(key):
+                if key == "metadata" and row.get("hydra_evidence_status") == "stale":
+                    title = "Archived metadata (old AMR evidence, not current calls)"
                 output.append(f"<h3>{title}</h3><pre>{_escape(row[key])}</pre>")
+        additional = [profile for profile in row.get("additional_profiles", [])
+                      if profile.get("scheme_digest") != row.get("scheme_digest")]
+        if additional:
+            output.append("<h3>Additional typing snapshots</h3><p>These profiles do not replace the primary MLST result. Novel sequence identifiers are local evidence, not centrally registered allele numbers.</p>")
+            for profile in additional:
+                counts = profile.get("alleles", {})
+                output.append(f"<h4>{_escape(profile.get('scheme'))}</h4><p>Called {sum(value is not None for value in counts.values())}/{len(counts)} loci · {_escape(profile.get('status'))}<br>Scheme SHA-256: {_escape(profile.get('scheme_digest'))}</p>")
+                output.append("<details><summary>Complete stored profile and provenance</summary><pre>" + _escape(profile) + "</pre></details>")
         alleles = row.get("alleles", {})
         if alleles:
             statuses = {
@@ -257,6 +310,7 @@ def write_html(records: Iterable[Mapping[str, Any]], path: str | Path) -> Path:
 
 def export_results(
     records: Iterable[Mapping[str, Any]], destination: str | Path, format: str | None = None,
+    *, selected_ids=None, highlight_clusters=None,
 ) -> Path:
     """Export CSV, TSV, JSON, or HTML, inferring format from the suffix by default."""
     selected = (format or Path(destination).suffix.lstrip(".")).lower()
@@ -264,4 +318,5 @@ def export_results(
                "html": write_html, "htm": write_html}
     if selected not in writers:
         raise ValueError("Choose a CSV, TSV, JSON, or HTML export format.")
-    return writers[selected](records, destination)
+    return writers[selected](records, destination, selected_ids=selected_ids,
+                             highlight_clusters=highlight_clusters)

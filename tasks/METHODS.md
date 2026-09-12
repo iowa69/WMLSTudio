@@ -1,6 +1,43 @@
 # WMLSTudio methods and build record
 
-## 2026-09-12
+## Workbench 0.2 revision — 2026-09-12
+
+The current implementation and scientific boundaries are recorded in
+[MICROBIOLOGY_WORKFLOWS](../docs/MICROBIOLOGY_WORKFLOWS.md) and
+[STUDIO_CAPABILITIES](../docs/STUDIO_CAPABILITIES.md). The 0.1 methods below are
+historical, not the current execution scope.
+
+The revision adds native SKESA paired-read assembly, conservative automatic
+classical-panel discovery, exact-first CDS-validated cg/wgMLST and local ad-hoc
+schemes, immutable reference updates, dedicated upstream HYDRA execution and
+sample-linked evidence, managed storage, explicit comparison/report cohorts,
+cross-project profile reuse and a dark native workbench.
+
+Inputs are read-only. Assembly tests scan all paired FASTQ records, validate
+identifiers and qualities, retain original file hashes and persist launch plans,
+parameters, logs and output hashes. Managed copies and derived assemblies are
+separate from original sequence inputs. Unassembled read QC remains explicitly
+sampled, not a whole-file quality claim.
+
+HYDRA evidence is tied to the execution input hash where available. Stale results
+remain in history but do not populate current AMR calls. Explicitly mapped reports
+without verifiable hashes remain unverified. Full SHA allele tokens survive table
+round trips but do not acquire missing CDS validation; full profile bundles retain
+the richer evidence.
+
+Observed controls include real ST184 and three P. aeruginosa assemblies, a
+1,423-locus E. faecium snapshot, a synthetic ad-hoc CDS truth test, matched real
+HYDRA records across Linux/Windows binaries and complete assembly of 322,172
+S. aureus read pairs through Windows Python/SKESA under Wine. The latter recovered
+ST20 and the same canonical contig sequences as the Linux assembly baseline.
+These bounded controls do not establish population accuracy or clinical utility.
+
+Final release gates and artifact identity are recorded in SUMMARY.md and release
+notes. No cgMLST.org reference contents or local sequence-bearing validation
+artifacts are committed or included in the portable ZIP. The user confirmed
+non-commercial research use; this is not a redistribution-rights grant.
+
+## Historical 0.1 build — 2026-09-12
 
 Host: Linux x86_64. Workspace: `/home/iowa/Desktop/WMLSTudio`.
 Original HEAD: `6cad46f` from iowa69/WMLST. Legacy sources are already deleted.

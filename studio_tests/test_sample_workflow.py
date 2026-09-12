@@ -1,0 +1,193 @@
+import json
+
+import pytest
+
+from wmlstudio.export import export_results
+from wmlstudio.project import Project
+from wmlstudio.sample_workflow import (
+    combined_feature_rows,
+    current_hydra_evidence,
+    feature_fields,
+    hydra_evidence_status,
+    link_hydra,
+    set_cluster,
+    suggest_hydra_links,
+)
+
+
+def add(project, path, name):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(">a\nACGT\n")
+    return project.add_sample(path, name)
+
+
+def report(*names):
+    return {"import_provenance": {"sha256": "abc", "source_path": "hydra.json"},
+            "samples": [{"sample": name, "summary": {"amr_genes": 1}, "hits": [
+                {"gene": "blaKPC-2", "element_type": "AMR", "class": "BETA-LACTAM", "primary": True},
+                {"gene": "secondary", "element_type": "AMR", "primary": False},
+                {"gene": "blaKPC-2", "element_type": "AMR", "class": "BETA-LACTAM", "primary": True},
+            ]} for name in names]}
+
+
+def test_hydra_same_stems_require_explicit_disambiguation(tmp_path):
+    with Project(tmp_path / "study.wmlstudio") as project:
+        first = add(project, tmp_path / "a" / "same.fasta", "same")
+        second = add(project, tmp_path / "b" / "same.fasta", "same")
+        upstream = report("same", "missing")
+        suggestions = suggest_hydra_links(project, upstream)
+        assert suggestions["mapping"] == {}
+        assert set(suggestions["ambiguous"]["same"]) == {first, second}
+        assert suggestions["missing"] == ["missing"]
+        link_hydra(project, upstream, {"same": first})
+        assert project.get_sample(first)["metadata"]["hydra"]["source_sample"] == "same"
+        assert "hydra" not in project.get_sample(second)["metadata"]
+
+
+def test_hydra_invalid_mapping_cannot_partially_attach_evidence(tmp_path):
+    with Project(tmp_path / "study.wmlstudio") as project:
+        sid = add(project, tmp_path / "a.fasta", "a")
+        with pytest.raises(KeyError):
+            link_hydra(project, report("a", "b"), {"a": sid, "b": "missing-id"})
+        assert project.get_sample(sid)["metadata"] == {}
+        with pytest.raises(ValueError, match="Multiple"):
+            link_hydra(project, report("a", "b"), {"a": sid, "b": sid})
+
+
+def test_hydra_execution_provenance_survives_reopen_and_bundle(tmp_path):
+    from wmlstudio.library import export_bundle, import_bundle
+
+    project_path = tmp_path / "study.wmlstudio"
+    with Project(project_path) as project:
+        sid = add(project, tmp_path / "a.fasta", "a")
+        upstream = report("a")
+        upstream["execution_provenance"] = {
+            "tool_version": "1.0.0", "command": ["hydra", "run"],
+            "database_sha256": "database123", "inputs": [{"sha256": "input123"}],
+        }
+        link_hydra(project, upstream, {"a": sid})
+        upstream["execution_provenance"]["inputs"][0]["sha256"] = "mutated"
+    bundle = tmp_path / "portable.json"
+    with Project(project_path) as project:
+        assert project.get_sample(sid)["metadata"]["hydra"]["execution_provenance"]["inputs"][0]["sha256"] == "input123"
+        export_bundle(project, bundle)
+    with Project(tmp_path / "imported.wmlstudio") as project:
+        import_bundle(project, bundle)
+        evidence = project.get_sample(sid)["metadata"]["hydra"]
+        assert evidence["execution_provenance"]["database_sha256"] == "database123"
+
+
+@pytest.mark.parametrize("format", ["html", "json", "csv", "tsv"])
+def test_selected_report_contains_only_selected_evidence_and_highlights(tmp_path, format):
+    with Project(tmp_path / "study.wmlstudio") as project:
+        first = add(project, tmp_path / "first.fasta", "selected_isolate")
+        second = add(project, tmp_path / "second.fasta", "excluded_isolate")
+        project.set_metadata(first, {"organism": {"genus": "Klebsiella", "species": "pneumoniae"}})
+        link_hydra(project, report("selected_isolate"), {"selected_isolate": first})
+        set_cluster(project, [first], "Ward <A>", "#123456")
+        features = combined_feature_rows(project.samples(), selected_ids=[first])
+        assert features[0]["amr_genes"] == ["blaKPC-2"]
+        assert features[0]["organism"] == "Klebsiella pneumoniae"
+        assert features[0]["cluster_highlight"] is True
+        output = tmp_path / f"selected.{format}"
+        export_results(project.samples(), output, selected_ids=[first])
+        text = output.read_text(encoding="utf-8-sig")
+        assert "selected_isolate" in text and "excluded_isolate" not in text
+        assert "blaKPC-2" in text
+        if format == "html":
+            assert "Ward &lt;A&gt;" in text and "border-left:5px solid #123456" in text
+        elif format == "json":
+            assert json.loads(text)["report_scope"] == {"mode": "selected", "sample_ids": [first]}
+        assert second not in [row["sample_id"] for row in features]
+
+
+def test_unknown_selected_id_is_error_and_cannot_replace_existing_report(tmp_path):
+    path = tmp_path / "report.json"
+    path.write_text("keep")
+    with pytest.raises(KeyError):
+        export_results([{"sample_id": "one", "sample_name": "one"}], path, selected_ids=["two"])
+    assert path.read_text() == "keep"
+
+
+def test_managed_originals_are_protected_even_when_record_is_not_selected(tmp_path):
+    original = tmp_path / "original.fasta"
+    original.write_text(">original\nACGT\n")
+    records = [{"id": "one", "name": "one", "result": None, "input_path": "copy.fasta",
+                "metadata": {"workflow": {"source_path": str(original)}}},
+               {"id": "two", "name": "two", "result": None, "input_path": "other.fasta"}]
+    with pytest.raises(ValueError, match="different output"):
+        export_results(records, original, "html", selected_ids=["two"])
+    assert original.read_text() == ">original\nACGT\n"
+
+
+def test_hashed_hydra_becomes_archived_not_current_when_typing_input_changes(tmp_path):
+    with Project(tmp_path / 'study.sqlite') as project:
+        sid = add(project, tmp_path / 'assembly.fa', 'isolate')
+        project.set_result(sid, {'input_sha256': 'a' * 64, 'st': '7'})
+        upstream = report('isolate')
+        upstream['execution_provenance'] = {'inputs': [{'sha256': 'a' * 64}]}
+        link_hydra(project, upstream, {'isolate': sid})
+        sample = project.get_sample(sid)
+        assert hydra_evidence_status(sample)['status'] == 'current'
+        assert feature_fields(sample)['amr_genes'] == ['blaKPC-2']
+        project.set_result(sid, {'input_sha256': 'b' * 64, 'st': '8'})
+        sample = project.get_sample(sid)
+        assert hydra_evidence_status(sample)['status'] == 'stale'
+        assert current_hydra_evidence(sample) == {}
+        assert feature_fields(sample)['amr_genes'] == []
+        assert feature_fields(sample)['hydra_amr_genes'] is None
+        assert sample['metadata']['hydra']['hits'][0]['gene'] == 'blaKPC-2'
+        assert sample['result']['st'] == '8'
+
+
+def test_hashless_import_stays_unverified_even_with_matching_link_baseline(tmp_path):
+    with Project(tmp_path / 'study.sqlite') as project:
+        sid = add(project, tmp_path / 'assembly.fa', 'isolate')
+        project.set_result(sid, {'input_sha256': 'a' * 64})
+        link_hydra(project, report('isolate'), {'isolate': sid})
+        sample = project.get_sample(sid)
+        assert hydra_evidence_status(sample)['status'] == 'unverified'
+        assert hydra_evidence_status(sample)['evidence_input_sha256'] is None
+        assert sample['metadata']['hydra']['linked_input_sha256'] == 'a' * 64
+        assert feature_fields(sample)['amr_genes'] == ['blaKPC-2']
+        project.set_result(sid, {'input_sha256': 'b' * 64})
+        assert hydra_evidence_status(project.get_sample(sid))['status'] == 'stale'
+
+
+def test_multi_sample_report_does_not_assign_input_hashes_by_unverified_list_order(tmp_path):
+    with Project(tmp_path / 'study.sqlite') as project:
+        ids = [add(project, tmp_path / f'{name}.fa', name) for name in ('one', 'two')]
+        upstream = report('one', 'two')
+        upstream['execution_provenance'] = {'inputs': [{'sha256': 'a' * 64}, {'sha256': 'b' * 64}]}
+        for sid in ids:
+            project.set_result(sid, {'input_sha256': 'a' * 64})
+        link_hydra(project, upstream, dict(zip(('one', 'two'), ids)))
+        assert all(hydra_evidence_status(project.get_sample(sid))['status'] == 'unverified' for sid in ids)
+
+
+def test_current_assembly_hash_is_used_before_primary_typing_exists_and_old_amr_is_retained(tmp_path):
+    with Project(tmp_path / 'study.sqlite') as project:
+        sid = add(project, tmp_path / 'assembly.fa', 'isolate')
+        project.update_metadata(sid, {'assembly': {'provenance': {'assembly_sha256': 'a' * 64}}})
+        upstream = report('isolate')
+        upstream['execution_provenance'] = {'inputs': [{'sha256': 'a' * 64}]}
+        link_hydra(project, upstream, {'isolate': sid})
+        # The assembly hash agrees, but its typing job is still queued.
+        assert hydra_evidence_status(project.get_sample(sid))['status'] == 'unverified'
+        replacement = report('isolate')
+        replacement['import_provenance']['sha256'] = 'new-report'
+        link_hydra(project, replacement, {'isolate': sid})
+        archived = [event for event in project.history(sid) if event['action'] == 'hydra_superseded']
+        assert len(archived) == 1
+        assert archived[0]['details']['evidence']['execution_provenance']['inputs'][0]['sha256'] == 'a' * 64
+
+
+def test_failed_rerun_does_not_upgrade_saved_hash_match_to_current_evidence(tmp_path):
+    with Project(tmp_path / 'study.sqlite') as project:
+        sid = add(project, tmp_path / 'assembly.fa', 'isolate')
+        project.set_result(sid, {'input_sha256': 'a' * 64})
+        upstream = report('isolate')
+        upstream['execution_provenance'] = {'inputs': [{'sha256': 'a' * 64}]}
+        link_hydra(project, upstream, {'isolate': sid})
+        project.set_status(sid, 'failed', 'Current typing attempt failed')
+        assert hydra_evidence_status(project.get_sample(sid))['status'] == 'unverified'

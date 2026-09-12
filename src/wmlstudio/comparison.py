@@ -1,6 +1,7 @@
 """Conservative allele distances and deterministic minimum spanning forests.
 
-Distances count unequal *shared, unambiguous, known* alleles. Each edge carries
+Distances count unequal shared, unambiguous known or validated full-CDS novel
+alleles. Novel identities must be content-qualified full SHA-256 tokens. Each edge carries
 its denominator; a missing call is never silently counted as a match. These
 distances are descriptive and do not establish an outbreak or transmission.
 """
@@ -8,9 +9,12 @@ distances are descriptive and do not establish an outbreak or transmission.
 from __future__ import annotations
 
 import math
+import re
 from collections.abc import Iterable, Mapping
 from itertools import combinations
 from typing import Any
+
+from .sequence import check_cancelled
 
 _UNKNOWN = frozenset({"", "-", "?", "0", "na", "n/a", "none", "unknown", "missing", "novel"})
 _EXCLUDED_CALLS = frozenset({"mixed", "ambiguous", "missing", "unknown", "novel", "partial"})
@@ -30,10 +34,22 @@ def _known_calls(result: Mapping[str, Any]) -> dict[str, str]:
         if isinstance(call, Mapping) and str(call.get("status", "")).lower() in _EXCLUDED_CALLS
     }
     known = {}
+    validated_novel = {
+        str(call.get("locus")): call
+        for call in result.get("calls", [])
+        if isinstance(call, Mapping) and call.get("status") == "novel_validated"
+        and isinstance(call.get("cds_qc"), Mapping) and call["cds_qc"].get("valid") is True
+    }
     for locus, allele in result.get("alleles", {}).items():
         if str(locus) in excluded or allele is None or isinstance(allele, (list, dict, tuple, bool)):
             continue
         value = str(allele).strip()
+        if value.startswith("NOVEL_"):
+            evidence = validated_novel.get(str(locus), {})
+            if (not re.fullmatch(r"NOVEL_[0-9a-f]{64}", value)
+                    or evidence.get("sequence_sha256") != value.removeprefix("NOVEL_")
+                    or evidence.get("allele") != value):
+                continue
         if value.lower() in _UNKNOWN or any(separator in value for separator in (",", ";", "|", "/")):
             continue
         known[str(locus)] = value
@@ -41,7 +57,7 @@ def _known_calls(result: Mapping[str, Any]) -> dict[str, str]:
 
 
 def pairwise_distances(
-    results: Iterable[Mapping[str, Any]], min_overlap: float = 0.95,
+    results: Iterable[Mapping[str, Any]], min_overlap: float = 0.95, *, cancelled=None,
 ) -> list[dict[str, Any]]:
     """Return every unordered pair, including explicit non-comparable pairs.
 
@@ -56,6 +72,7 @@ def pairwise_distances(
     prepared = []
     seen = set()
     for result in results:
+        check_cancelled(cancelled)
         key = _sample_key(result)
         if key in seen:
             raise ValueError(f"Duplicate sample identifier in comparison: {key}")
@@ -66,7 +83,9 @@ def pairwise_distances(
         prepared.append((key, result, _known_calls(result)))
     prepared.sort(key=lambda entry: entry[0])
     pairs = []
-    for (left_id, left, left_calls), (right_id, right, right_calls) in combinations(prepared, 2):
+    for index, ((left_id, left, left_calls), (right_id, right, right_calls)) in enumerate(combinations(prepared, 2)):
+        if index % 32 == 0:
+            check_cancelled(cancelled)
         loci = set(map(str, left.get("alleles", {}))) | set(map(str, right.get("alleles", {})))
         shared = sorted(left_calls.keys() & right_calls.keys())
         overlap = len(shared) / len(loci) if loci else 0.0
@@ -106,7 +125,13 @@ def minimum_spanning_forest(
     Isolated samples remain in the caller's input; no fabricated zero-distance
     edges are added to connect them.
     """
-    pairs = pairwise_distances(results, min_overlap)
+    return forest_from_distances(pairwise_distances(results, min_overlap))
+
+
+def forest_from_distances(pairs: Iterable[Mapping[str, Any]], *, cancelled=None) -> list[dict[str, Any]]:
+    """Reuse precomputed pairwise rows without repeating O(samples² × loci) work."""
+    pairs = list(pairs)
+    check_cancelled(cancelled)
     parent = {item[key]: item[key] for item in pairs for key in ("source", "target")}
 
     def root(node: str) -> str:
@@ -120,7 +145,9 @@ def minimum_spanning_forest(
         (pair for pair in pairs if pair["comparable"]),
         key=lambda pair: (pair["distance"], pair["source"], pair["target"]),
     )
-    for pair in candidates:
+    for index, pair in enumerate(candidates):
+        if index % 256 == 0:
+            check_cancelled(cancelled)
         left, right = root(pair["source"]), root(pair["target"])
         if left != right:
             parent[right] = left

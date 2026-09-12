@@ -42,3 +42,58 @@ database content as MIT, BSD, or public domain.
 source, repository revision when available, per-file SHA-256 checksums, preserved
 scheme metadata, snapshot SHA-256, and archive SHA-256 for downloaded builds.
 The snapshot is static: the application makes no automatic database downloads.
+
+## Added native analysis components
+
+HYDRA 1.4.0 is bundled from the pinned source revision
+[`6d36c109491c16544e8919fe6962b4b62e97d3d7`](https://github.com/iowa69/hydra/tree/6d36c109491c16544e8919fe6962b4b62e97d3d7)
+under its MIT license. Its original assembly calling pipeline runs in the
+dedicated `WMLSTudio-HYDRA` process. pandas, NumPy, python-dateutil, six and
+archspec license texts, including applicable bundled-component notices from
+the target-platform wheels, are retained in `notices/licenses/packages`.
+
+Pyrodigal 3.7.1 is **GPL-3.0-or-later**, not MIT. Its exact provider-verified
+source distribution, including the underlying Prodigal sources and build
+configuration, is included at `notices/licenses/sources/pyrodigal-3.7.1.tar.gz`;
+the complete GPL text is retained with its package license. WMLSTudio's own
+source files retain their stated license, but the combined native distribution
+must not be represented as an MIT-only product. Preserve and provide the
+corresponding application/source/build materials and satisfy all applicable
+GPL requirements before further distribution. Public distribution still
+requires a review of the complete bundle and reference-data rights.
+The exact application/build sources are included in
+`notices/licenses/sources/wmlstudio-application-source.zip`; the pinned HYDRA
+source archive is beside it. These archives include source and build recipes,
+not raw sample files.
+
+Windows SKESA 2.4.0 is a native UCRT64 build of pinned NCBI source commit
+`c1413581e4f37211892d3c4310d01f3d9a9b3490`, with the reviewed portability patch.
+Its NCBI public-domain portions coexist with AGPL-3.0-or-later GATB portions;
+the upstream license and its stated exceptions remain authoritative. The
+complete modified corresponding source, build recipes, GNU AGPL text and
+native dependency licenses accompany `skesa.exe` in
+`wmlstudio/resources/tools/skesa`. Preserve this complete directory, not only
+the executable. Its manifest records compiler, build flags, source revision,
+CPU requirements, DLL dependencies and file checksums.
+
+The native BLAST+ 2.17.0 files are from the official
+[NCBI distribution](https://ftp.ncbi.nlm.nih.gov/blast/executables/blast+/2.17.0/).
+Their archive and extracted-file SHA-256 values are recorded in
+`Tools/blast/manifest.json`; `Tools/blast/LICENSE` and `BLAST_PRIVACY` travel
+with the binaries. NCBI's public-domain notice does not erase the separate
+licenses of bundled third-party components.
+
+The NCBI-only HYDRA starter contains the AMRFinderPlus nucleotide, protein and
+mutation reference data, with attribution to NCBI and Feldgarden et al.
+(2021), *Scientific Reports* 11:12728. It is not the AMRFinderPlus executable
+or a claim of identical AMRFinderPlus results. HYDRA's provider registry
+describes these NCBI resources as public domain; provider terms remain
+authoritative. No CARD, VFDB or other independently licensed provider data are
+silently included by the HYDRA starter-staging command. Its reference files,
+mutation companions, manifest and observed provider release are hashed in
+`wmlstudio/resources/hydra/starter/snapshot_provenance.json`.
+
+Database downloads/updates occur only after explicit user action and publish
+a new versioned snapshot. Existing reference snapshots are retained. Database
+access and software licensing must not be confused with clinical validation:
+gene/mutation evidence does not establish a susceptible/resistant phenotype.

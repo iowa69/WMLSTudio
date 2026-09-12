@@ -1,44 +1,52 @@
-# WMLSTudio 0.1.0 — development preview
+# WMLSTudio 0.2 — native research workbench
 
-Native Qt application implemented, including exact assembly typing, read QC,
-saved projects, interactive comparisons, reports and HYDRA result integration.
-No web UI, web server, WSL, or end-user Python installation is used by the frozen app.
+The revision implements native paired-read assembly, conservative automatic
+MLST discovery, additional cgMLST/wgMLST profiles and local ad-hoc schemes,
+actual HYDRA assembly analysis, managed storage, saved-library reuse, explicit
+comparison/report cohorts and a dark native Qt interface.
 
-## Observed validation
+No web server, WSL, Docker or end-user Python installation is required by the
+portable Windows package. Non-commercial research is the intended use.
+cgMLST.org database contents and local sequence inputs are not bundled.
 
-- Linux: **198 tests passed**, 18.14 seconds in the final full run.
-- Windows Python 3.12.10 / Qt 6.11.2 under Wine 11.17: **198 tests passed**, 85.54 seconds.
-- All **162** staged PubMLST schemas load. Reference inconsistencies are disclosed.
-- S. epidermidis assembly: expected and observed **ST184**, all seven loci exact.
-- Three P. aeruginosa assemblies: **ST155**, **ST2952**, **ST1858**; all allele calls
-  agree with WMLST 1.2.1 / BLAST 2.12.0 using the same reference snapshot.
-- Real compressed FASTQ: **10,000** records QC-checked, explicitly reported as a
-  prefix; the SHA-256 covers the entire compressed input.
-- Native desktop, compact layout, comparison graph and PDF inspected visually.
-- Source distribution built at `dist/source/wmlstudio-0.1.0.tar.gz`.
+## Observed scientific and engineering checks
 
-Exact commands and caveats: [methods](tasks/METHODS.md).
-Generated evidence: `results/2026-09-12_validation/`, Linux JUnit
-`artifacts/pytest-linux.xml`, Windows/Wine JUnit `artifacts/windows-wine-pytest.xml`.
-The source/environment manifest is `results/2026-09-12_validation/source-manifest.json`.
+- Final Linux core batch: **365 tests passed**, including real BLAST integration;
+  evidence: `artifacts/workbench-final-core.xml`.
+- S. epidermidis: ST184; three P. aeruginosa assemblies: ST155, ST2952 and
+  ST1858, with all 21 allele calls matching the preserved WMLST comparator.
+- Real E. faecium 1,423-locus control: 1,410 exact, one CDS-validated novel,
+  seven missing, four ambiguous and one mixed locus; mixed result excluded
+  from comparison. Novel sequence independently checked against coordinates.
+- HYDRA real-assembly control: all 14 complete hit records agreed between
+  Linux and native Windows Python/BLAST under Wine.
+- Full 322,172-pair S. aureus dataset through Windows Python/SKESA 2.4.0 under
+  Wine: ST20, exact 7/7 alleles, 20 contigs, 2,758,099 bp and N50 345,017 bp.
+  Canonical contig sequences matched the Linux SKESA baseline; originals
+  retained their hashes. Full pair validation and execution provenance retained.
+- Native Windows SKESA compilation, DLL closure and adapter smoke passed
+  [hosted Windows CI](https://github.com/iowa69/WMLSTudio/actions/runs/34710155127).
+- Linux and native Windows/Wine surface audits exercised 42 page transitions
+  each at 1380×940 and 1080×720. The audit also led to a reference-label cache
+  fix: routine progress refresh no longer repeatedly scans every scheme folder.
+- Targeted regressions cover stale AMR evidence, failed/stale profile reuse,
+  lossless-but-unverified SHA allele tables and SHA-guarded input relinking.
 
-## Remaining product work
+These are bounded software and scientific controls, not estimates of clinical
+sensitivity/specificity, a population-level validation or SeqSphere+ equivalence.
+The old 0.1 package and its 198-test record are historical; they do not describe
+the current runtime. Final package gates and SHA-256 appear in the
+[0.2 release notes](https://github.com/iowa69/WMLSTudio/releases/tag/v0.2.0-workbench.1).
 
-The Windows portable build is at
-[`dist/WMLSTudio-Windows-x64.zip`](dist/WMLSTudio-Windows-x64.zip), approximately
-46.3 MB compressed / 210 MB extracted. Frozen GUI startup and practice analysis
-passed on both offscreen and Windows Qt platforms under Wine; the frozen CLI
-typed the bundled positive control and the real ST184 assembly correctly.
-The final ZIP passed integrity checks and real ST184 typing after extraction into
-a directory containing spaces and `é`. SHA-256:
-`9470e4e1e27666eec42dfea83d5c09b71ada25b38933dc83bd4648cca34422f3`.
-Build context: `artifacts/windows-build-context.json`; native Windows Qt preview:
-`artifacts/frozen-windows-desktop.png`.
-**Clean Windows 11 acceptance has not been performed.** Wine success is a separate test.
+## Acceptance boundaries
 
-HYDRA integration currently imports and displays its JSON evidence with provenance;
-it does not execute HYDRA. Read assembly, approximate/novel allele inference,
-full cgMLST benchmark validation and broader MLSTudio/SeqSphere+ parity remain
-future work. This preview is not a production or diagnostic validation claim.
-See [the capability matrix](docs/STUDIO_CAPABILITIES.md) and
-[HYDRA integration](docs/HYDRA_INTEGRATION.md).
+Clean Windows 11/high-DPI/device acceptance is still required. Native hosted
+Windows CI and Windows binaries under Wine are separate evidence, not a
+substitute for that desktop test. The complete Kleborate/Kaptive,
+AMRFinderPlus, agr/SCCmec/spa, MOB-recon and abricate execution stack, independent
+species-complex confirmation, contamination assessment and broad clinical
+deployment remain unfinished.
+
+See [the capability audit](docs/STUDIO_CAPABILITIES.md),
+[microbiology workflow contract](docs/MICROBIOLOGY_WORKFLOWS.md),
+[build instructions](docs/STUDIO_WINDOWS.md) and [methods](tasks/METHODS.md).

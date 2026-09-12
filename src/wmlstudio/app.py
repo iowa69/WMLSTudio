@@ -8,7 +8,7 @@ import sys
 import tempfile
 from pathlib import Path
 
-from PySide6.QtCore import QEasingCurve, QLockFile, QPropertyAnimation, Qt, QTimer
+from PySide6.QtCore import QLockFile, Qt, QTimer
 from PySide6.QtGui import QAction, QColor, QKeySequence, QPageSize, QPdfWriter, QTextDocument
 from PySide6.QtWidgets import (
     QApplication,
@@ -17,7 +17,6 @@ from PySide6.QtWidgets import (
     QDoubleSpinBox,
     QFileDialog,
     QFrame,
-    QGraphicsOpacityEffect,
     QHBoxLayout,
     QHeaderView,
     QInputDialog,
@@ -69,7 +68,7 @@ def table(headers):
     return widget
 
 
-class MainWindow(QMainWindow):
+class BaseWindow(QMainWindow):
     def __init__(self, project_path=None, storage_root=None):
         super().__init__()
         self.root = Path(storage_root) if storage_root else data_root()
@@ -125,13 +124,11 @@ class MainWindow(QMainWindow):
         self.progress_bar = QProgressBar()
         self.progress_bar.hide()
         body.addWidget(self.progress_bar)
-        self.statusBar().showMessage("WMLSTudio 0.1 · Research preview")
+        self.statusBar().showMessage(f"WMLSTudio {__version__} · Research workbench")
         self.statusBar().addPermanentWidget(label("IOWA-BioTech", "small"))
-        self.animation_effect = QGraphicsOpacityEffect(self.pages)
-        self.pages.setGraphicsEffect(self.animation_effect)
-        self.fade = QPropertyAnimation(self.animation_effect, b"opacity", self)
-        self.fade.setDuration(160)
-        self.fade.setEasingCurve(QEasingCurve.Type.OutCubic)
+        # Native child viewports must paint directly. A full-stack opacity effect
+        # caches child surfaces and caused stale/blank pages on Windows.
+        self.pages.setAutoFillBackground(True)
         self.motion_enabled = bool(self.project.get_setting("motion", True))
         self.set_motion(self.motion_enabled)
         self.populate_schemes()
@@ -172,15 +169,22 @@ class MainWindow(QMainWindow):
             self.nav_buttons.append(item)
         layout.addStretch()
         tip, content = card()
+        self.sidebar_tip = tip
         content.setContentsMargins(13, 15, 13, 15)
         content.addWidget(label("First time here?", "cardTitle"))
         content.addWidget(label("Learn with a synthetic dataset.", "small", True))
         self.demo_button = button("Practice project", self.load_demo)
         content.addWidget(self.demo_button)
+        tip.setMinimumHeight(148)
         layout.addWidget(tip)
         layout.addSpacing(12)
         layout.addWidget(label("Built for discovery.\nDesigned for you.", "small"))
         outer.addWidget(sidebar)
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        if hasattr(self, "sidebar_tip"):
+            self.sidebar_tip.setVisible(self.height() >= 810)
 
     def page(self):
         widget = QWidget()
@@ -394,13 +398,16 @@ class MainWindow(QMainWindow):
         layout.addWidget(frame)
         guide = QTextBrowser()
         guide.setHtml("""<h2>From files to a comparison</h2>
-        <p><b>1. Import</b> a FASTA assembly or FASTQ read file. Files are read in place and are never modified.</p>
-        <p><b>2. Choose a scheme</b> matching the organism and scheme you intend to use. A wrong scheme can leave loci uncalled.</p>
-        <p><b>3. Analyse</b> and select a sample to inspect its QC, allele calls and provenance. Missing or mixed loci require review.</p>
-        <p><b>4. Compare</b> assemblies from the same scheme snapshot. Edges count differing exact alleles, with shared-locus coverage reported.</p>
+        <p><b>1. Import and assign</b> FASTA or FASTQ files. Choose automatic MLST evidence, a manual organism/scheme, or unknown for QC/AMR-only work. Managed storage and ST filename suffixes affect copies only.</p>
+        <p><b>2. Review the run plan</b> before analysis. Paired short reads can be validated and assembled with the installed native SKESA runtime. Unassembled reads receive clearly labelled sampled QC.</p>
+        <p><b>3. Analyse</b> using the per-sample workflow. Automatic MLST provides provisional organism evidence, not independent species confirmation. Optional HYDRA runs against an installed reference snapshot and links evidence to stable sample IDs.</p>
+        <p><b>4. Compare</b> an explicit cohort with one MLST/cgMLST/wgMLST snapshot. Additional profiles do not overwrite classical MLST. Change node colors, metadata groups, labels and layout without changing genetic distances.</p>
+        <p><b>5. Report and reuse</b> selected isolates, user-highlighted groups and linked features. Saved libraries and portable bundles let you reuse profiles without reanalysing genomes. History retains prior evidence and input provenance.</p>
         <h3>Understanding results</h3><p><b>Exact match:</b> every locus has one known allele and the profile has a registered ST. <b>New combination:</b> the known alleles form an unregistered profile; this is not a new allele. <b>Missing loci:</b> exact sequence evidence is absent. <b>Mixed alleles:</b> more than one allele was found.</p>
-        <h3>Current boundaries</h3><p>This research preview performs exact assembly typing and read QC. It does not assemble reads, infer new alleles, determine antimicrobial susceptibility, or replace epidemiological review. It has not yet established SeqSphere+ parity. HYDRA reports can be imported; its engines are not yet bundled.</p>
-        <p>Keyboard: Ctrl+O import · Ctrl+Shift+O open project · Ctrl+S save project copy.</p>""")
+        <h3>cgMLST and reference control</h3><p>Large schemes support exact-first, complete-CDS guarded novel calling. A local SHA-256 sequence identifier is not a registered allele number. Missing, duplicated, frame-disrupted or ambiguous loci require review. Local ad-hoc schemes are cohort-defined and cannot be treated as validated public nomenclature.</p>
+        <p>Use Data to inspect/install versioned schemes and AMR reference snapshots. Downloads never send sequences. Provider rights and authentication can limit availability; a public snapshot is not necessarily the complete current database.</p>
+        <h3>Current boundaries</h3><p>This is research software, not a validated diagnostic device or established SeqSphere+ equivalent. It does not predict measured susceptibility or prove transmission. Independent species confirmation, contamination quantification, direct-read AMR/pileup, long-read assembly and the full Kleborate/AMRFinderPlus/staphylococcal module stack are not validated here. Review biological quality, thresholds and database versions before interpreting a cluster.</p>
+        <p>Keyboard: Ctrl+O import · Ctrl+Shift+O open project · Ctrl+S save project copy · Ctrl+R analyse selected · Ctrl+K commands · Alt+1…7 workspace pages.</p>""")
         layout.addWidget(guide, 1)
 
     def add_shortcuts(self):
@@ -415,14 +422,12 @@ class MainWindow(QMainWindow):
         self.breadcrumb.setText("WORKSPACE  /  " + self.nav_names[index].upper())
         for i, item in enumerate(self.nav_buttons):
             item.setChecked(i == index)
-        if hasattr(self, "fade"):
-            self.fade.stop()
-            if self.motion_enabled:
-                self.fade.setStartValue(0.6)
-                self.fade.setEndValue(1.0)
-                self.fade.start()
-            else:
-                self.animation_effect.setOpacity(1)
+        page = self.pages.currentWidget()
+        if page:
+            page.update()
+            if isinstance(page, QScrollArea):
+                page.viewport().update()
+                page.widget().update()
         if index == 2:
             self.refresh_comparison()
 
@@ -722,11 +727,11 @@ class MainWindow(QMainWindow):
             except Exception as exc:
                 self.error(exc)
 
-    def write_pdf_report(self, path):
+    def write_pdf_report(self, path, samples=None):
         def escaped(value):
             return html.escape(str(value))
 
-        samples = self.project.samples()
+        samples = self.project.samples() if samples is None else samples
         sections = ["<html><body style='font-family: sans-serif; color: #203736'>",
                     "<h1 style='color: #187D6D'>WMLSTudio</h1><h2>Sequence typing report</h2>",
                     f"<p>{len(samples)} sample records · Application {__version__}</p>",
@@ -736,16 +741,42 @@ class MainWindow(QMainWindow):
             result = sample.get("result") or {}
             alleles = result.get("alleles", {})
             values = [sample["name"], STATUS_TEXT.get(sample["status"], sample["status"]), STATUS_TEXT.get(result.get("status"), result.get("status", "Not analysed")), result.get("st") or "Unassigned", f"{sum(v is not None for v in alleles.values())}/{len(alleles)}" if alleles else "Not typed"]
-            sections.append("<tr>" + "".join(f"<td>{escaped(v)}</td>" for v in values) + "</tr>")
+            highlight = sample.get("metadata", {}).get("cluster", {}).get("highlight")
+            sections.append(("<tr bgcolor='#FFF0CD'>" if highlight else "<tr>") + "".join(f"<td>{escaped(v)}</td>" for v in values) + "</tr>")
         sections.append("</table>")
         for sample in samples:
             result = sample.get("result") or {}
             sections.append(f"<h2 style='page-break-before: always; color: #187D6D'>{escaped(sample['name'])}</h2>")
+            group = sample.get("metadata", {}).get("cluster", {})
+            if group.get("highlight"):
+                sections.append(f"<p style='background-color: #FFF0CD'><b>Highlighted group: {escaped(group.get('label') or 'Selected group')}</b></p>")
             sections.append(f"<p><b>Input:</b> {escaped(sample['input_path'])}<br><b>Scheme:</b> {escaped(result.get('scheme') or 'Not used')}<br><b>Sequence type:</b> {escaped(result.get('st') or 'Unassigned')}<br><b>Job state:</b> {escaped(sample['status'])}</p>")
             if sample.get("error"):
                 sections.append(f"<p><b>Needs attention:</b> {escaped(sample['error'])}</p>")
-            if sample.get("metadata"):
-                sections.append("<h3>Sample metadata</h3><p>" + "<br>".join(f"<b>{escaped(k)}:</b> {escaped(v)}" for k, v in sample["metadata"].items()) + "</p>")
+            from wmlstudio.sample_workflow import current_hydra_evidence, hydra_evidence_status
+            from wmlstudio.ui_common import flattened_metadata, gene_names, organism_for
+            genus, species, organism_evidence = organism_for(sample)
+            amr_state = hydra_evidence_status(sample)
+            gene_summary = "Archived evidence — no current AMR result" if amr_state["status"] == "stale" else "No linked report" if amr_state["status"] == "missing" else "; ".join(gene_names(sample)) or "No primary AMR genes reported"
+            sections.append(f"<p><b>Organism:</b> {escaped(' '.join([genus, species]).strip() or 'Unknown')} ({escaped(organism_evidence)})<br><b>AMR genes:</b> {escaped(gene_summary)}</p>")
+            metadata = flattened_metadata(sample)
+            if metadata:
+                title = "Sample metadata (includes archived AMR fields, not current calls)" if amr_state["status"] == "stale" else "Sample annotations and workflow"
+                sections.append(f"<h3>{title}</h3><p>" + "<br>".join(f"<b>{escaped(k)}:</b> {escaped(v)}" for k, v in metadata.items()) + "</p>")
+            if amr_state["status"] in {"stale", "unverified"}:
+                sections.append(f"<p><b>AMR evidence: {escaped(amr_state['status'])}.</b> {escaped(amr_state['reason'])}</p>")
+            hydra = current_hydra_evidence(sample)
+            if hydra:
+                sections.append("<h3>Linked HYDRA evidence</h3><p>Sequence detections are not measured susceptibility. Secondary hits are retained in the exported JSON evidence, not counted twice as primary genes.</p><table width='100%' cellpadding='5' cellspacing='0' border='1'><tr><th>Gene</th><th>Element</th><th>Method</th><th>Identity / coverage</th></tr>")
+                for hit in hydra.get("hits", []):
+                    if hit.get("primary") is True:
+                        values = [hit.get("gene"), hit.get("element_type"), hit.get("method"), f"{hit.get('identity_pct', '—')} / {hit.get('coverage_pct', '—')}"]
+                        sections.append("<tr>" + "".join(f"<td>{escaped(value)}</td>" for value in values) + "</tr>")
+                sections.append("</table><p><b>HYDRA report SHA-256:</b><br>" + escaped(hydra.get("report_sha256", "Unknown")) + "</p>")
+            for profile in sample.get("analyses", []):
+                if profile.get("scheme_digest") != result.get("scheme_digest"):
+                    alleles = profile.get("alleles", {})
+                    sections.append(f"<h3>Additional profile · {escaped(profile.get('scheme'))}</h3><p>{sum(value is not None for value in alleles.values())}/{len(alleles)} loci called · {escaped(profile.get('status'))}<br>Scheme SHA-256: {escaped(profile.get('scheme_digest'))}</p><p>The complete additional locus matrix is retained in the JSON report and portable profile bundle.</p>")
             qc = result.get("qc", {})
             if qc:
                 sections.append("<h3>Sequence quality</h3><table width='100%' cellpadding='5' cellspacing='0'>")
@@ -938,7 +969,7 @@ class MainWindow(QMainWindow):
         if not report:
             self.hydra_table.setRowCount(0)
             self.hydra_summary.setText("No HYDRA report imported in this project.")
-            self.hydra_view.setHtml("<h2>More context for each genome</h2><p>Import a HYDRA JSON report to inspect its elements, sample summaries and provenance in this native application.</p><p>HYDRA analysis execution is not bundled in this preview. Its Windows dependencies need a separate port and validation.</p>")
+            self.hydra_view.setHtml("<h2>AMR evidence connected to each isolate</h2><p>Select assemblies in Samples, then use Run HYDRA to analyse them against an installed reference snapshot. You can also import an existing HYDRA JSON report and explicitly map its sample identities.</p><p>Linked genes and mutation evidence are available alongside typing, quality metrics, and annotations. Genotypic detections are not measured susceptibility.</p>")
             return
         samples = report["samples"]
         provenance = report.get("import_provenance", {})
@@ -1025,13 +1056,32 @@ class MainWindow(QMainWindow):
         event.accept()
 
 
+from wmlstudio.ui_compare import ComparisonWorkspaceMixin  # noqa: E402
+from wmlstudio.ui_reports import ReportWorkspaceMixin  # noqa: E402
+from wmlstudio.ui_workbench import WorkbenchMixin  # noqa: E402
+
+
+class MainWindow(WorkbenchMixin, ComparisonWorkspaceMixin, ReportWorkspaceMixin, BaseWindow):
+    """Native workbench composed from focused workflow controllers."""
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description="WMLSTudio native desktop")
     parser.add_argument("--project", type=Path)
     parser.add_argument("--demo", action="store_true")
     parser.add_argument("--smoke-test", action="store_true")
     parser.add_argument("--screenshot", type=Path)
+    parser.add_argument("--screenshot-page", type=int, choices=range(7), default=0,
+                        help="Workspace page index for reproducible screenshots (0–6)")
+    parser.add_argument("--window-size", default="1380x940", help="Desktop size WIDTHxHEIGHT")
+    parser.add_argument("--native-screenshot", action="store_true", help="Capture the native window surface, not an offscreen render")
     args = parser.parse_args(argv)
+    try:
+        width, height = map(int, args.window_size.lower().split("x"))
+        if not 1000 <= width <= 7680 or not 680 <= height <= 4320:
+            raise ValueError
+    except ValueError:
+        parser.error("--window-size must be WIDTHxHEIGHT, at least 1000x680 and at most 7680x4320")
     app = QApplication.instance() or QApplication(sys.argv[:1])
     app.setApplicationName("WMLSTudio")
     app.setOrganizationName("IOWA-BioTech")
@@ -1045,23 +1095,41 @@ def main(argv=None):
         if temp:
             temp.cleanup()
         return 1
+    window.resize(width, height)
     window.show()
     if args.demo:
         window.load_demo()
     if args.smoke_test or args.screenshot:
+        capture_prepared = False
         def finish():
-            if window.worker and window.worker.isRunning():
+            nonlocal capture_prepared
+            if window.worker_role or (window.worker and window.worker.isRunning()):
+                QTimer.singleShot(100, finish)
+                return
+            if not capture_prepared:
+                capture_prepared = True
+                window.navigate(args.screenshot_page)
+                window.set_motion(False)
+                QTimer.singleShot(300, finish)
+                return
+            if window._comparison_timer.isActive() or (window.comparison_worker and window.comparison_worker.isRunning()):
                 QTimer.singleShot(100, finish)
                 return
             if args.screenshot:
                 args.screenshot.parent.mkdir(parents=True, exist_ok=True)
                 # Capture the settled page even when an emulated/native animation
                 # clock delivers its first frame after the screenshot timer.
-                window.fade.stop()
-                window.animation_effect.setOpacity(1.0)
                 window.helix.timer.stop()
                 app.processEvents()
-                window.grab().save(str(args.screenshot))
+                if args.screenshot_page == 2:
+                    window.tree.fit_tree()
+                    app.processEvents()
+                capture = window.screen().grabWindow(window.winId()) if args.native_screenshot else window.grab()
+                if not capture.save(str(args.screenshot)):
+                    print("WMLSTudio: could not save the requested screenshot", file=sys.stderr)
+                    window.close()
+                    app.exit(1)
+                    return
             if args.smoke_test:
                 window.close()
                 app.quit()

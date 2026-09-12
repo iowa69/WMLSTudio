@@ -1,186 +1,205 @@
 # WMLSTudio
 
-**Your microbial genomics workspace for Windows.** Type assemblies, check sequence
-quality, compare isolates and explore HYDRA evidence in one native desktop application.
+A local microbial-genomics workbench for non-commercial research on Windows:
+import, assemble paired reads, type, investigate AMR evidence, compare saved
+isolates and report a defined cohort.
 
-No installation, separate Python, command line, browser or WSL required. The
-portable package includes the application, its runtime and 162 reference schemes;
-it does not download databases at startup.
+Native dark Qt desktop. No browser server, WSL, Docker or separate Python
+installation for the portable package.
 
 *IOWA-BioTech — Giovanni Lorenzin*
 
-## Download the preview
+## Download and retest
 
-### [⬇ Download WMLSTudio for Windows — portable ZIP](https://github.com/iowa69/WMLSTudio/releases/download/v0.1.0-preview.1/WMLSTudio-Windows-x64.zip)
+### [⬇ Download WMLSTudio — Windows portable ZIP](https://github.com/iowa69/WMLSTudio/releases/download/v0.2.0-workbench.1/WMLSTudio-Windows-x64.zip)
 
-**v0.1.0-preview.1 · Windows x64 · 46.3 MB download · approximately 210 MB extracted**
+**v0.2.0-workbench.1 · Windows x64 · Non-commercial research workbench**
 
-[Release notes and all downloads](https://github.com/iowa69/WMLSTudio/releases/tag/v0.1.0-preview.1)
-· [SHA-256 checksum](https://github.com/iowa69/WMLSTudio/releases/download/v0.1.0-preview.1/WMLSTudio-Windows-x64.zip.sha256)
-· [Build and test status](https://github.com/iowa69/WMLSTudio/actions/workflows/studio.yml)
+[Release notes](https://github.com/iowa69/WMLSTudio/releases/tag/v0.2.0-workbench.1)
+· [SHA-256 checksum](https://github.com/iowa69/WMLSTudio/releases/download/v0.2.0-workbench.1/WMLSTudio-Windows-x64.zip.sha256)
+· [Build/test results](https://github.com/iowa69/WMLSTudio/actions/workflows/studio.yml)
+· [Previous 0.1 release](https://github.com/iowa69/WMLSTudio/releases/tag/v0.1.0-preview.1)
 
-This repository is private. Sign in to GitHub with an account that has repository
-access before downloading; these links are not anonymous public downloads.
+This repository is private: sign in with an account that has access to download.
+The release notes distinguish observed Linux, native Windows CI and Wine checks
+from the still-required clean Windows 11 desktop acceptance test.
 
-> **Development preview, not a validated production release.** The target is
-> Windows 11, 64-bit. The ZIP was built with Windows Python and tested under Wine;
-> source tests and frozen builds also passed separately in GitHub Actions on Linux
-> and Windows. Clean Windows 11 desktop acceptance remains unfinished.
->
-> The application is unsigned, so Windows may show an unknown-publisher or
-> SmartScreen warning. Verify the source and checksum before deciding whether to
-> run it. Do not disable Defender or SmartScreen; a matching checksum confirms
-> file integrity, not that a program is safe.
+> Research software, not a validated diagnostic device or an established
+> SeqSphere+ equivalent. Review the [capability audit](docs/STUDIO_CAPABILITIES.md).
+> The application is unsigned. Check the source and checksum before deciding to
+> run it; do not disable Defender or SmartScreen. A checksum establishes file
+> integrity, not safety or clinical validity.
 
-<details>
-<summary>Verify your download in PowerShell</summary>
+## Three steps to the desktop
+
+### 1. Extract the entire folder
+
+Choose **Extract All**, use a writable folder such as Documents, then open
+`WMLSTudio/WMLSTudio.exe`. Keep every executable and the `_internal` folder
+together. Do not launch from inside the ZIP or move only the main executable.
+
+Keep your existing data backed up. Open a **copy** of an older project for the
+first retest: the workbench upgrades its project schema, and the old 0.1
+application cannot read the upgraded project.
+
+### 2. Explore the practice project
+
+Use **Help → Practice project**. Seven explicitly synthetic assemblies let you
+test navigation, sample selection, comparisons, graph options and reports.
+
+![Native WMLSTudio workbench with the synthetic practice cohort](docs/images/wmlstudio-workbench.png)
+
+*Native Windows application; synthetic demonstration data, not a clinical cohort.*
+
+### 3. Import and review your own samples
+
+Drop FASTA/FASTQ files or a folder into Overview. The import dialog supports:
+
+- Automatic classical-MLST discovery, manual organism/scheme, or unknown.
+- Per-file assignments and apply-to-selected/apply-to-all controls.
+- Optional local input copies, organism/ST organization and ST filename suffixes.
+
+On **Samples**, review the selection and choose **Analyse pending…** or
+**Analyse selected…**. The launch dialog explains the workflow and optional
+paired-short-read assembly and HYDRA analyses. Original input files stay unchanged.
+
+Accepted formats: `.fasta`, `.fa`, `.fna`, `.fastq`, `.fq`, including
+gzip and bzip2. Unassembled reads receive labelled sampled QC. The paired-read
+workflow validates every pair before native SKESA; mate records and read
+provenance remain linked to the resulting assembly.
+
+## One connected workflow
+
+| Workspace | What you can do |
+| --- | --- |
+| Overview | Browse the library by organism/ST, open projects and research saved isolates |
+| Samples | Assign workflows, select cohorts, inspect QC/typing, edit annotations, create collections and inspect history |
+| Compare | Choose a cohort and scheme snapshot, call additional cgMLST/wgMLST profiles, reuse saved profiles, style/export the minimum spanning forest |
+| Scheme library | Import local schemes, browse online catalogs, install versioned snapshots and create a local ad-hoc cohort scheme |
+| HYDRA insights | Run native assembly AMR searches, map external reports explicitly, inspect all features and primary-aware AMR matrices |
+| Reports | Include/exclude isolates, highlight investigation groups, export PDF/HTML/CSV/TSV/JSON and portable profile bundles |
+| Settings and help | Reduced motion, local data location, workflow guidance and scientific limitations |
+
+Menus provide the canonical actions; **Ctrl+K** opens command search.
+**Ctrl+R** analyses selected samples. **Alt+1…7** switches workspace pages.
+
+## Typing and comparison
+
+Classical STs require a complete, unambiguous registered profile. Automatic
+scheme matching is **provisional organism evidence**, not independent species
+confirmation or a contamination assessment.
+
+Additional cgMLST/wgMLST results do not overwrite classical MLST. Large schemes
+use exact-first matching with complete-CDS guarded novel calling. Novel sequences
+receive full SHA-256 identifiers; they are not silently assigned public allele
+numbers. Missing, mixed, duplicated and ambiguous loci remain explicit.
+
+Compare only the intended cohort against one identical scheme snapshot. Shared
+loci and excluded pairs remain visible. Graph options include metadata/manual
+colors, labels, draggable layout, identical-genotype pies and cluster halos.
+Export PNG, SVG, GraphML, MST-topology Newick, pairwise JSON or a distance-matrix TSV.
+A close edge is not proof of transmission.
+
+## HYDRA is an analysis engine, not just an imported page
+
+The portable assembly runtime uses pinned HYDRA 1.4.0 and native BLAST+ 2.17.0.
+An NCBI nucleotide/protein/mutation starter snapshot is supplied; additional
+databases require explicit installation and review of provider terms.
+
+Run-plan controls expose nucleotide identity/coverage, translated protein search,
+protein thresholds, CPU allocation and organism-specific mutation evidence.
+Protein “complete coverage” distinguishes complete from partial evidence; it
+does not discard every shorter hit. Unknown organisms do not silently receive a
+species-specific mutation catalog.
+
+Results join typing, QC and metadata through stable sample IDs. Ambiguous names
+in an imported report require explicit mapping. Primary/secondary detections
+are distinguished; “no report” is unknown, not a negative result.
+Gene/mutation evidence is not measured susceptibility.
+
+See the [engine integration and real-data checks](docs/HYDRA_INTEGRATION.md).
+
+## Reuse, storage and reports
+
+Projects save locally and automatically. Managed copies can be organized by
+organism and ST; optional ST suffixes apply to those copies, never originals.
+Read pairs retain both source records and the derived assembly's provenance.
+
+After moving an input, select its sample and use **Samples → Relink input
+(same bytes)…**. The complete file SHA-256 must match recorded evidence; profiles
+remain unchanged. Paths are not rewritten automatically when folders or drive
+letters change.
+
+**Research saved library** searches indexed projects without re-reading genomes.
+Bring selected frozen profiles into the active project, or import a collaborator's
+profile table/bundle. No FASTA is required to compare existing profiles.
+
+TSV preserves full-length `SHA256_`/`NOVEL_` identifiers, but imported hash IDs
+remain unverified: the table does not establish sequence or CDS validation.
+Use a full portable profile bundle for lossless transfer of validated novel-call
+evidence.
+
+Reports use an explicit cohort and optional highlighted groups. JSON and portable
+bundles retain full additional profiles and linked evidence. PDF summarizes
+additional schemes and AMR evidence. Back up the adjacent `Data` directory,
+project-specific managed-input folders and original sequences. Local storage is
+not an encrypted clinical-record system.
+
+## References and rights
+
+The classical reference cache contains 162 staged schemes; it is a snapshot, not
+a promise that every scheme is current. Online providers can require credentials
+or restrict access by submission date. Updates create new snapshots and retain
+old ones; analysis never silently downloads references or uploads genomes.
+
+**cgMLST.org database contents are not included in the ZIP.** Individual research
+downloads are subject to its [server policy](https://www.cgmlst.org/serverpolicy.html);
+database-driven product/service use requires permission. PubMLST has separate
+[terms](https://pubmlst.org/terms-conditions). Confirm rights for your actual use
+and sharing. Software licensing does not grant database redistribution rights.
+
+The complete Kleborate/Kaptive, AMRFinderPlus, agr/SCCmec/spa, MOB-recon and
+abricate execution stack, direct-read AMR/pileup, fastp/SPAdes, independent species
+confirmation and clinical validation remain unfinished. The
+[scientific workflow contract](docs/MICROBIOLOGY_WORKFLOWS.md) makes those gaps
+explicit.
+
+## Verify the download
 
 ```powershell
 Get-FileHash .\WMLSTudio-Windows-x64.zip -Algorithm SHA256
 ```
 
-Compare the result with the checksum asset above. For this preview it is:
-
-```text
-9470e4e1e27666eec42dfea83d5c09b71ada25b38933dc83bd4648cca34422f3
-```
-
-</details>
-
-## Three steps
-
-### 1. Extract and open
-
-Right-click the downloaded ZIP, choose **Extract All**, and extract into a writable
-folder such as Documents. Open the extracted `WMLSTudio` folder and double-click
-`WMLSTudio.exe`. Keep the entire folder together, including `_internal`; do not run
-the executable from inside the ZIP or move it on its own.
-
-### 2. Try the practice project
-
-Click **Practice project** in the lower-left corner. It creates and analyses seven
-clearly labelled synthetic assemblies, so you can explore without preparing data.
-Open **Samples** to inspect the calls, then **Compare** to explore their relationships.
-
-![WMLSTudio native Windows interface showing the synthetic practice project](docs/images/wmlstudio-preview.png)
-
-*Actual frozen Windows application under Wine; the displayed samples are synthetic.*
-
-### 3. Analyse your own sequences
-
-Create or open your own project, then drag in FASTA/FASTQ files or a folder. On
-**Samples**, select the correct organism's scheme and click **Analyse pending**.
-Select a sample to inspect its quality summary, allele evidence and provenance.
-
-Accepted: FASTA (`.fasta`, `.fa`, `.fna`) and FASTQ (`.fastq`, `.fq`), including
-gzip (`.gz`) and bzip2 (`.bz2`) compression. **Assemblies receive exact typing;
-FASTQ reads receive quality checks only.** This preview does not assemble reads.
-
-## Comparing isolates
-
-After typing two or more assemblies, open **Compare**. The interactive minimum
-spanning forest shows allele differences, with zoom, pan, draggable nodes and PNG
-export. Only profiles with compatible scheme fingerprints and sufficient shared
-loci are compared. Missing calls are not counted as matches; disconnected samples
-remain visible. Visual groups are an exploration aid, not an outbreak diagnosis.
-
-## HYDRA evidence
-
-Open **HYDRA insights → Import HYDRA JSON** to view previously computed resistance,
-virulence, mutation, plasmid and lineage evidence. The original report's parameters,
-database information and provenance are preserved. **This does not run HYDRA's
-analysis engines.** See [the integration assessment](docs/HYDRA_INTEGRATION.md).
-
-## Saving and sharing
-
-Projects save automatically. Use **Reports** for PDF/HTML reports and CSV/TSV/JSON
-exports. **Save project copy** carries results and metadata to another computer;
-the original sequence files remain separate and are needed to rerun an analysis.
-HYDRA insights also exports the complete imported evidence as JSON.
-
-Workspaces and imported schemes live under `Data` beside the executable. Back up
-that folder and your original sequence files. Original inputs are never edited,
-and exports refuse to replace sequence inputs or the current project.
-
-## What works in this preview
-
-- A native, animated Qt workspace with a compact-screen layout and reduced-motion setting.
-- Drag-and-drop sequence import; uncompressed/gzip/bzip2 FASTA and FASTQ.
-- Assembly QC and exact known-allele MLST, with 162 existing PubMLST schemes.
-- Local MLST/cgMLST scheme import with content fingerprints and background validation.
-- Bounded FASTQ QC, explicitly labelled as a sample of the file when appropriate.
-- Saved SQLite projects, sample metadata, cancellable jobs and interrupted-job recovery.
-- Interactive minimum spanning forests, shared-locus evidence and adjustable visual groups.
-- HYDRA JSON import: native AMR, virulence, mutation, plasmid and lineage evidence views.
-- PDF/HTML reports, CSV/TSV/JSON exports and full HYDRA evidence export.
-
-This is a research preview. It does **not** yet assemble raw reads, infer novel
-alleles, run HYDRA's engines, perform phenotype prediction, or establish SeqSphere+
-parity. Imported cgMLST uses exact known alleles; a missing match is not a novel
-allele call. See [the capability audit](docs/STUDIO_CAPABILITIES.md) and
-[HYDRA integration assessment](docs/HYDRA_INTEGRATION.md).
-
-Every typed result retains its input SHA-256, scheme fingerprint, parameters,
-software version and individual allele evidence. Closing during a job requests safe
-cancellation. Failed/interrupted samples can be retried. Two application windows
-cannot open the same project concurrently.
+Compare it with the checksum asset linked above.
 
 ## Develop and test
 
 ```bash
-uv sync --locked
-uv run python studio_scripts/stage_schemes.py --source ../wmlst/db/pubmlst
+uv sync --locked --group dev
+uv run python studio_scripts/stage_schemes.py --download
 uv run python -m wmlstudio
-```
-
-Alternatively stage the pinned source snapshot with `--download`. Without staged
-schemes, QC, custom scheme import and the practice project still work. This build
-does not download databases at application startup.
-
-```bash
 QT_QPA_PLATFORM=offscreen uv run pytest
 uv run ruff check src/wmlstudio studio_tests studio_scripts studio_packaging
-QT_QPA_PLATFORM=offscreen uv run python studio_scripts/capture_desktop.py
 ```
 
-On Windows, set `$env:QT_QPA_PLATFORM = "offscreen"` in PowerShell for headless
-tests, then `uv run pytest`. Unset that variable before using the GUI normally.
-Linux desktop development needs the standard Qt platform libraries, including
-`libxcb-cursor0` for X11. Headless tests use the offscreen platform.
+Native engine staging and Windows packaging are documented in
+[STUDIO_WINDOWS.md](docs/STUDIO_WINDOWS.md). On Windows use PowerShell's
+`$env:QT_QPA_PLATFORM = "offscreen"` for headless tests; unset it for normal use.
 
-The command-line companion uses the same engine:
+The source lives in `src/wmlstudio`; tests in `studio_tests`; reproducible build
+and validation drivers in `studio_packaging` and `studio_scripts`. Original
+sibling projects and local sequence-bearing artifacts are not committed.
 
-```bash
-uv run wmlstudio-cli type isolate.fasta --scheme path/to/scheme -o results.json
-uv run wmlstudio-cli qc reads.fastq.gz --max-reads 10000 -o quality.json
-uv run wmlstudio-cli check-pair isolate_R1.fastq.gz isolate_R2.fastq.gz
-uv run wmlstudio-cli compare results.json -o distances.json
-```
+## Credits and licenses
 
-See [Windows build instructions](docs/STUDIO_WINDOWS.md) for packaging and
-acceptance checks. The [initial Linux and Windows CI run](https://github.com/iowa69/WMLSTudio/actions/runs/34705226772)
-passed both test and frozen-build jobs; hosted Windows CI does not establish a
-successful clean Windows 11 desktop acceptance test.
+Built by Giovanni Lorenzin / IOWA-BioTech. Scientific baseline:
+[MLSTudio](https://github.com/iowa69/mlstudio); reference snapshot staging:
+[WMLST](https://github.com/iowa69/WMLST); AMR engine:
+[HYDRA](https://github.com/iowa69/hydra). Cite the original schemes and scientific
+tools used in your analyses.
 
-This repository contains the new native implementation in `src/wmlstudio`.
-Legacy WMLST source/history and reference databases are not included. Existing
-sibling projects are reference inputs only; schemes are staged explicitly using
-the commands above. Local sequence data and generated builds stay out of Git.
-
-## Environment
-
-Python 3.12, uv lockfile, PySide6 native widgets and pyahocorasick. Development and
-real-data validation run on Linux; Windows binaries are built with Windows Python.
-Database sources already present: `../wmlst/db/pubmlst` and MLSTudio local caches.
-
-## Layout
-
-- `src/wmlstudio`: application, analysis, project files and bundled demonstration.
-- `studio_tests`: scientific, persistence and GUI tests.
-- `studio_scripts`: build and reproducible validation drivers.
-- `tasks`: methods, decisions, outstanding work and test hypotheses.
-- `results`: generated local validation evidence, excluded from version control.
-
-Measured validation and exact commands are recorded in `tasks/METHODS.md`,
-`SUMMARY.md`, and the generated validation reports. Reference data and dependency
-terms are documented in `studio_packaging/THIRD_PARTY_NOTICES.md`.
+WMLSTudio's source retains its stated license. The combined portable distribution
+includes components under other terms, notably GPL Pyrodigal and AGPL-containing
+SKESA code. Corresponding source/build materials and notices accompany those
+components. See [third-party notices](studio_packaging/THIRD_PARTY_NOTICES.md);
+the complete binary package must not be described as MIT-only.

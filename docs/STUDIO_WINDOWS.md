@@ -1,75 +1,102 @@
 # Portable WMLSTudio for Windows 11
 
-WMLSTudio uses native Qt widgets. The portable folder includes the Python
-interpreter, Qt libraries, the compiled exact-match engine, and a static scheme
-snapshot. The end user does not install Python, WSL, Docker, Conda, or a browser
-server. Windows binaries require a Windows Python build runtime. The supported
-CI recipe runs on Windows; the same Windows runtime can be exercised under Wine
-for an experimental build. Linux or Wine success does not establish Windows 11
-compatibility.
+The portable Windows build contains native Qt, Python, the typing engine,
+Pyrodigal, a dedicated HYDRA worker, official Windows BLAST+, a verified native
+SKESA tool package, classical reference schemes and an NCBI AMR starter snapshot.
+No WSL, Docker, Conda, browser server or separately installed Python is required
+by the end user.
 
-## Running a Windows build
+This is a non-commercial research workbench. Windows 11 is the target platform;
+hosted Windows tests and Windows binaries under Wine are distinct from a clean
+Windows 11 desktop acceptance test. See the release's observed validation results.
 
-Extract the entire ZIP into a writable folder, such as
-`Documents\WMLSTudio`, then double-click `WMLSTudio.exe`. Keep `_internal` next
-to the executable. Do not run the executable inside the ZIP or move it alone.
-The frozen application stores its local workspace in the adjacent `Data`
-directory. Back up that directory and the original sequence files. Moving the
-application does not move external FASTA/FASTQ files referenced by a project.
+## Open and retest
 
-Import assembled FASTA files, select the correct organism's scheme, then run
-typing. FASTQ files receive a clearly labelled sampled quality summary and must
-be assembled before this engine can type them. HYDRA JSON import displays
-previously computed AMR/virulence evidence; it does not run HYDRA on Windows.
+Extract the entire ZIP to a writable folder such as `Documents\WMLSTudio`,
+then double-click `WMLSTudio.exe`. Keep all files and `_internal` together.
+The other executables are the optional command-line utility and internal HYDRA
+worker; normal users do not need to launch them.
 
-`WMLSTudio-CLI.exe --help` opens the optional command-line companion. Neither
-executable downloads references at runtime. The bundle's manifest records its
-reference snapshot so results can be tied to the data actually used.
+The local workspace is stored under adjacent `Data`. Back up that directory,
+your project-specific managed-input folders and original files. Project data
+save automatically. Open a copy of an old project for your first retest because
+the new schema cannot be opened by the 0.1 application.
 
-## Build on Windows
+Input paths are not automatically rewritten when files or an application/project
+folder move, including moves between drive letters. Frozen profiles remain usable
+if inputs are missing; rerunning requires the input bytes to be available.
 
-Developers need Git, Python 3.12, and [uv](https://docs.astral.sh/uv/). From the
-checked-out repository in PowerShell:
+To reconnect a moved input, select one sample and choose **Samples → Relink input
+(same bytes)…**, then select the relocated original or a byte-identical copy.
+WMLSTudio checks the entire file against its recorded SHA-256 before changing the
+path. Existing profiles and evidence stay unchanged; relinking does not retype
+the sample. A different hash or missing recorded fingerprint is rejected—import
+that file as a new sample instead. Recompression or edited headers can change the
+file hash even when sequence letters appear unchanged. A copy outside its known
+managed location is treated as an external input, not automatically made eligible
+for managed-file cleanup.
+
+Portable profile bundles intentionally carry results and metadata without
+sequence files; they do not locate or restore missing FASTA/FASTQ files.
+
+Use **Help → Practice project** for the synthetic demonstration. For real data,
+import and assign workflows, review the launch plan, and select optional paired
+read assembly/HYDRA. The SKESA build targets x64/SSE4.2. Its memory setting must
+exceed the engine's fixed reserve; the default is 8 GB. Do not allocate more
+memory/threads than the computer can reasonably supply.
+
+## Reproducible Windows build
+
+Developers need Git, Python 3.12, uv and a successfully validated native SKESA
+artifact. The dedicated **Native Windows SKESA** workflow builds the pinned
+source, applies the reviewed Windows compatibility patch, packages its DLL
+closure and corresponding source, then performs genuine assembly/adapter tests.
+
+The main `.github/workflows/studio.yml` invokes that reusable build before its
+native Windows test/freeze job. It downloads the verified tool artifact into
+the resource staging area; missing SKESA or starter references are build errors,
+not silently disabled features.
+
+For a local PowerShell build:
 
 ```powershell
-.\studio_packaging\build_windows.ps1
+.\studio_packaging\build_windows.ps1 -SkesaSource C:\validated-tools\skesa
 ```
 
-This installs dependencies from `uv.lock`, explicitly downloads the pinned WMLST
-reference snapshot, preserves version-matched dependency license texts, runs the
-test suite, freezes both entry points with
-PyInstaller, checks the frozen desktop and CLI, and creates
-`dist\WMLSTudio-Windows-x64.zip` with a SHA-256 displayed in the terminal.
-The data source is pinned to commit
-`6cad46ffd9dfddfaa55f7993cf391f80a70556d3`; no moving branch is used for downloads.
+See `Get-Help .\studio_packaging\build_windows.ps1` or the script parameters
+for local scheme and HYDRA reference cache options. Dependencies are installed
+from `uv.lock`. The reference staging command uses the pinned WMLST commit
+`6cad46ffd9dfddfaa55f7993cf391f80a70556d3`, preserves per-file hashes and
+refuses inconsistent staging directories.
 
-For an offline reference cache, while Python dependencies are already available:
+BLAST+ archives are SHA-256 pinned. An explicit build-time NCBI download records
+the provider version before/after download and all companion file hashes.
+Already-staged verified references can be reused. Runtime analysis never
+downloads databases; desktop reference updates require explicit user action.
 
-```powershell
-.\studio_packaging\build_windows.ps1 -SchemeSource C:\reference-data\pubmlst
-```
+The build preserves dependency notices, runs tests, freezes the desktop/CLI/HYDRA
+entry points, and checks actual frozen typing, HYDRA and SKESA execution before
+creating `dist/WMLSTudio-Windows-x64.zip`. Source/material provenance accompanies
+the native tools. A build recipe is not a claim that any particular run passed.
 
-The cache must contain one directory per scheme, with allele FASTA files and
-optional ST profile tables. This mode records the local source revision when
-available and hashes every copied file. An existing staging directory containing
-stale unrelated data is refused; use a fresh checkout or staging destination.
+## Validation gates
 
-The CI workflow `.github/workflows/studio.yml` runs on Ubuntu and Windows and
-attaches development packages and test reports as workflow artifacts. It does
-not create releases or publish a download site. An unsigned development package
-is not a code-signed production release.
+Required package checks include offline startup, native menu repainting,
+reference discovery, genuine positive-control typing/AMR, real native assembly,
+spaces/Unicode/comma paths, cancellation, complete-pair validation, interrupted
+jobs, input immutability, stale-evidence handling, sample selection and report scope.
 
-## Validation and distribution limits
+Local real-data checks and synthetic controls are kept distinct. A small number
+of successful assemblies or exact cross-platform calls do not establish clinical
+sensitivity, specificity, contamination detection or organism-module equivalence.
 
-The frozen smoke test covers launch, Qt resource discovery, screenshot generation,
-and clean exit; the test suite covers scientific edge cases and UI workflows.
-Release validation still requires a clean Windows 11 machine without Python,
-offline startup, paths containing spaces and non-ASCII characters, high-DPI
-displays, cancellation during large jobs, and recovery after interrupted jobs.
-Track performed checks in `artifacts`; do not substitute planned CI for observed
-Windows results.
+Clean Windows 11 acceptance still needs to cover high-DPI displays, ordinary
+restricted user accounts, drive relocation, storage failures and realistic larger
+cohorts without a development environment installed. The package is unsigned.
+Do not disable operating-system protections to run it.
 
-Read [the capability audit](STUDIO_CAPABILITIES.md) and
-[third-party notices](../studio_packaging/THIRD_PARTY_NOTICES.md). Reference-data
-redistribution rights must be established for a public release; preserved
-download metadata is provenance, not an independent license determination.
+Read the [capability audit](STUDIO_CAPABILITIES.md), [microbiology workflow
+contract](MICROBIOLOGY_WORKFLOWS.md), [HYDRA integration](HYDRA_INTEGRATION.md)
+and [third-party notices](../studio_packaging/THIRD_PARTY_NOTICES.md).
+cgMLST.org database contents are not redistributed in this package. Software
+licenses do not transfer database rights.

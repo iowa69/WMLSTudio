@@ -7,6 +7,8 @@ from pathlib import Path
 
 from PySide6.QtCore import QThread, Signal
 
+from wmlstudio.cgtyping import call_cgassembly
+from wmlstudio.identification import cached_scheme, identify_assembly
 from wmlstudio.sequence import AnalysisCancelled, SequenceReader, inspect_sequence
 from wmlstudio.typing import call_assembly, load_scheme
 
@@ -18,11 +20,13 @@ class AnalysisWorker(QThread):
     sample_cancelled = Signal(str)
     progress = Signal(int, str)
 
-    def __init__(self, samples, scheme_path=None, max_reads=100000, parent=None):
+    def __init__(self, samples, scheme_path=None, max_reads=100000, parent=None,
+                 installed_scheme_paths=None):
         super().__init__(parent)
         self.samples = samples
         self.scheme_path = scheme_path
         self.max_reads = max_reads
+        self.installed_scheme_paths = list(installed_scheme_paths or [])
         self.cancel_event = threading.Event()
 
     def cancel(self):
@@ -31,7 +35,15 @@ class AnalysisWorker(QThread):
     def run(self):
         scheme = None
         scheme_error = None
-        if self.scheme_path:
+        needs_global = False
+        for sample in self.samples:
+            metadata = sample.get('metadata') or {}
+            workflow = metadata.get('workflow') or {}
+            if (workflow.get('typing_mode', metadata.get('typing_mode', 'manual')) == 'manual'
+                    and 'scheme_path' not in workflow and 'scheme_path' not in metadata):
+                needs_global = True
+                break
+        if self.scheme_path and needs_global:
             self.progress.emit(0, "Preparing allele scheme…")
             try:
                 scheme = load_scheme(self.scheme_path, cancelled=self.cancel_event.is_set)
@@ -49,18 +61,63 @@ class AnalysisWorker(QThread):
             self.progress.emit(int(index / total * 100), f"Analysing {sample['name']} · {index + 1} of {total}")
             try:
                 path = Path(sample["input_path"])
+                metadata = sample.get("metadata") or {}
+                workflow = metadata.get("workflow") or {}
+                typing_mode = workflow.get("typing_mode", metadata.get("typing_mode"))
+                selected_path = workflow.get("scheme_path", metadata.get("scheme_path"))
+                selection_overridden = "scheme_path" in workflow or "scheme_path" in metadata
+                # Existing callers without per-sample metadata keep the legacy
+                # queue-level selection. New workspaces explicitly select auto.
+                if typing_mode is None:
+                    typing_mode = "manual" if selected_path or self.scheme_path else "unknown"
+                if typing_mode not in {"auto", "manual", "unknown"}:
+                    raise ValueError(f"Unknown typing assignment mode: {typing_mode}")
                 with SequenceReader(path, cancelled=self.cancel_event.is_set) as reader:
                     is_read = reader.kind == "fastq"
-                if not is_read and scheme_error:
+                if not is_read and typing_mode == "manual" and not selection_overridden and scheme_error:
                     raise ValueError(f"Scheme could not be loaded: {scheme_error}")
-                if not is_read and scheme is not None:
-                    result = call_assembly(path, scheme, cancelled=self.cancel_event.is_set)
-                else:
+                result = None
+                identification = None
+                if not is_read and typing_mode == "auto":
+                    locations = self.installed_scheme_paths or ([self.scheme_path] if self.scheme_path else [])
+                    identification = identify_assembly(
+                        path, locations, cancelled=self.cancel_event.is_set,
+                        progress=lambda current, count, message: self.progress.emit(
+                            int(index / total * 100), message),
+                    )
+                    result = identification.pop("typing_result", None)
+                elif not is_read and typing_mode == "manual":
+                    selected_scheme = (cached_scheme(selected_path, self.cancel_event.is_set)
+                                       if selected_path else None if selection_overridden else scheme)
+                    if selected_scheme is not None:
+                        cg_mode = workflow.get("calling_mode", metadata.get("calling_mode", "auto"))
+                        if cg_mode not in {'auto', 'exact', 'full_cds'}:
+                            raise ValueError(f'Unknown allele calling mode: {cg_mode}')
+                        use_cg = cg_mode == "full_cds" or (
+                            cg_mode == "auto" and (
+                                len(selected_scheme.loci) > 30
+                                or str(selected_scheme.metadata.get("type", "")).lower() == "cgmlst"))
+                        caller = call_cgassembly if use_cg else call_assembly
+                        kwargs = {'genetic_code': workflow.get('genetic_code',
+                                   selected_scheme.metadata.get('genetic_code', 11))} if use_cg else {}
+                        result = caller(path, selected_scheme, cancelled=self.cancel_event.is_set,
+                                        progress=lambda current, count, message: self.progress.emit(
+                                            int(index / total * 100), message), **kwargs)
+                if result is None:
                     result = inspect_sequence(path, max_reads=self.max_reads, cancelled=self.cancel_event.is_set)
                     result.update(status="qc_only", st=None, alleles={}, calls=[], scheme=None, scheme_digest=None)
                     result.setdefault("notes", []).append(
                         "Read quality only. Raw reads have not been assembled or typed." if is_read
                         else "Assembly quality only. Select an allele scheme to type this assembly.")
+                result["typing_mode"] = typing_mode
+                if identification is not None:
+                    result["identification"] = identification
+                    result.setdefault("notes", []).extend(identification["notes"])
+                    if identification["identification_status"] == "assigned":
+                        result["organism"] = dict(identification["organism"])
+                elif metadata.get("organism"):
+                    result["organism"] = dict(metadata["organism"])
+                    result["organism_assignment"] = "user supplied"
                 result["sample_name"] = sample["name"]
                 result["sample_id"] = sample_id
                 result["software"] = "WMLSTudio"

@@ -9,17 +9,21 @@ permissions:
   contents: read
 
 jobs:
+  skesa:
+    uses: ./.github/workflows/skesa-windows.yml
   native:
+    needs: [skesa]
     name: Test and freeze (${{ matrix.os }})
     strategy:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, windows-latest]
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 30
+    timeout-minutes: 45
     env:
       QT_QPA_PLATFORM: offscreen
       PYTHONUTF8: "1"
+      WMLSTUDIO_TEST_BLAST_DIR: ${{ github.workspace }}/src/wmlstudio/resources/tools/blast/bin
     steps:
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v6
@@ -33,6 +37,21 @@ jobs:
         run: uv sync --locked --group dev
       - name: Stage pinned reference data
         run: uv run python studio_scripts/stage_schemes.py --download
+      - name: Stage pinned native BLAST for Windows
+        if: runner.os == 'Windows'
+        run: uv run python studio_packaging/stage_bio_tools.py --platform windows-x64 --download-hydra-starter
+      - name: Stage pinned native BLAST for Linux
+        if: runner.os == 'Linux'
+        run: uv run python studio_packaging/stage_bio_tools.py --platform linux-x64 --download-hydra-starter
+      - name: Download verified native Windows assembler
+        if: runner.os == 'Windows'
+        uses: actions/download-artifact@v4
+        with:
+          name: SKESA-2.4.0-Windows-x64
+          path: src/wmlstudio/resources/tools/skesa
+      - name: Verify required Windows assembler and corresponding sources
+        if: runner.os == 'Windows'
+        run: uv run python studio_packaging/stage_bio_tools.py --platform windows-x64 --require-skesa
       - name: Preserve dependency license texts
         run: uv run python studio_packaging/stage_notices.py
       - name: Lint

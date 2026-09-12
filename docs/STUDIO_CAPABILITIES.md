@@ -1,4 +1,84 @@
-# WMLSTudio capability and acceptance audit
+# WMLSTudio 0.2 capability and acceptance audit
+
+Audit date: 2026-09-12. The current workbench implements the following workflows.
+This is not a production, clinical, or SeqSphere+ equivalence claim. See the
+[scientific product contract](MICROBIOLOGY_WORKFLOWS.md).
+
+| Workflow | Current implementation | Boundary |
+| --- | --- | --- |
+| Native desktop | Dark Qt widgets, menus, contextual dialogs, animated helix, direct viewport painting | No WebUI/browser server or full-page opacity cache |
+| Import / storage | Per-file/batch automatic, manual or unknown labels; hashed copies; optional organism/ST folders and ST suffixes | Original files never renamed or deleted |
+| Automatic MLST | Installed classical-panel search with full exact verification and tied/weak evidence handling | Provisional lineage, not independent species/purity confirmation |
+| Classical typing | Both-strand exact alleles and complete-profile lookup | No registered ST for missing/mixed loci or an unregistered combination |
+| cgMLST/wgMLST | Exact-first calling, native BLAST+, complete-CDS checks and full-SHA novel IDs | Local novel IDs are not centrally registered allele numbers |
+| Local ad-hoc scheme | Reference-anchored unique complete CDSs; explicit prevalence/identity/coverage | Cohort-defined research nomenclature |
+| Paired short reads | Reviewed pairing, complete pair/QC validation, cancellable native SKESA, atomic assembly/provenance | Native tool must pass its platform gate; no fastp/SPAdes/long-read pipeline |
+| Unassembled reads | Labelled bounded-prefix Phred+33 QC and full file-byte hash | Not complete-file quality or contamination validation |
+| Library | SQLite projects, collections/history, organism/ST/AMR and metadata research search; cross-project frozen-profile reuse | Index represents saved evidence, not automatic reanalysis |
+| Interoperability | Profile-only tables with missing-token validation; complete profile export and sequence-free bundles | Unverified external tables remain distinct snapshots |
+| Compare | Explicit cohort/scheme, shared-locus denominators, missing-data guards, minimum spanning forest | Same fingerprint required; 95% default overlap is not a universally validated cutoff |
+| Graph | Metadata/manual colors, editable labels/layout, identical-genotype pies, halos and persisted styles | Styling does not change distances; MST Newick is not a phylogenetic tree |
+| HYDRA | Pinned upstream assembly engine in a dedicated native process, BLAST+, NCBI starter | Not the AMRFinderPlus executable; direct-read/pileup and full lineage stack disabled |
+| Linked features | Stable-ID mapping, primary-aware AMR matrix, QC/typing/annotations | No report means unknown; gene evidence is not measured susceptibility |
+| Reports | Explicit cohort/highlights, PDF/HTML/CSV/TSV/JSON, additional-profile summaries and complete JSON evidence | User-defined groups do not establish transmission |
+| References | PubMLST/Pasteur catalogs, rights-gated cgMLST.org access, local import and immutable updates | Authentication, submission-date restrictions and provider rights limit availability |
+
+## Current observed validation
+
+- S. epidermidis positive-control assembly: ST184 and expected provisional lineage.
+- Three P. aeruginosa assemblies: ST155, ST2952 and ST1858; all 21 alleles agreed
+  with WMLST 1.2.1 / BLAST 2.12 using the same reference snapshot.
+- E. faecium GCA_043869095.1 with a 1,423-locus research snapshot: 1,410 exact,
+  one validated novel, seven missing, four ambiguous and one mixed locus. The
+  mixed result is conservatively excluded from comparison. The 1,614-nt novel
+  EFAU004_00165 CDS was independently checked against raw assembly coordinates.
+- HYDRA: all 14 complete hit records from one real S. epidermidis assembly were
+  identical on Linux and native Windows Python/BLAST under Wine.
+- Ad-hoc truth test: two assemblies differing at one internal codon yielded one
+  retained complete locus with distinct full-SHA alleles and exact recall.
+- Native SKESA 2.4.0 passed its [hosted Windows build and validation
+  gate](https://github.com/iowa69/WMLSTudio/actions/runs/34710155127): a 12,000-bp
+  synthetic reference yielded a matching 11,928-bp contig. The real Python
+  adapter also passed with Unicode/comma paths, and the executable launched
+  without MSYS2 on PATH.
+- Real S. aureus SRR12343864: Windows SKESA 2.4.0 and Windows Python under
+  Wine 11.17 completed all 322,172 read pairs, producing 20 contigs,
+  2,758,099 bp and N50 345,017 bp. Windows-native MLST calling returned ST20
+  with all seven loci matched. The strand-normalized contig sequences and
+  seven-locus profile were identical to the Linux SKESA 2.5.1 baseline;
+  original compressed-input SHA-256 hashes remained unchanged. The Linux
+  launcher was externally interrupted; its completed child output was
+  independently recovered and validated. The Windows adapter completed normally.
+
+These are bounded controls, not independent population-level sensitivity or
+specificity estimates. Local sequence-bearing artifacts remain ignored. The
+release notes record final observed build/test gates; a CI recipe alone is not
+evidence that a run passed. Clean Windows 11/high-DPI/device acceptance and
+independently labelled multi-species cohorts remain necessary.
+
+The hosted SKESA gate validates that component, not the final complete desktop
+release. Its success and the separate real-data Wine run do not constitute a
+clean Windows 11 acceptance test.
+
+## Remaining full-suite work and reference rights
+
+The complete Kleborate/Kaptive, AMRFinderPlus, agr/SCCmec/spa, MOB-recon and
+abricate execution stack is not included. Species-complex resolution,
+contamination quantification, long-read assembly, fastp preprocessing, validated
+phenotype flags and multi-user clinical deployment remain separate work.
+
+cgMLST.org data are **not bundled**. Its
+[server policy](https://www.cgmlst.org/serverpolicy.html) restricts use and requires
+permission for database-driven products/services. PubMLST has separate
+[submission-date-dependent terms](https://pubmlst.org/terms-conditions).
+Software licenses do not grant reference database rights.
+
+---
+
+## Historical 0.1 audit — superseded implementation scope
+
+The remainder records the earlier release for traceability. Statements below
+about absent execution/assembly/novel calling describe **0.1 only**, not 0.2.
 
 Audit date: 2026-09-12. This native desktop implementation is an initial,
 testable replacement foundation. It does not yet reproduce every MLSTudio

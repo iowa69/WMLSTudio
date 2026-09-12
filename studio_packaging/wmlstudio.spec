@@ -1,10 +1,14 @@
 # Build on the target OS: uv run pyinstaller --noconfirm studio_packaging/wmlstudio.spec
 import json
+import os
+import sys
 from pathlib import Path
 
-from PyInstaller.utils.hooks import copy_metadata
+from PyInstaller.utils.hooks import collect_data_files, copy_metadata
 
 root = Path(SPECPATH).parent
+sys.path.insert(0, str(root / "studio_packaging"))
+from stage_bio_tools import stage_hydra_database, verify_skesa_bundle
 schemes = root / "src/wmlstudio/resources/schemes"
 manifest = schemes / "manifest.json"
 if not manifest.is_file() or json.loads(manifest.read_text(encoding="utf-8"))["scheme_count"] == 0:
@@ -14,17 +18,40 @@ if not (notices / "manifest.json").is_file():
     raise SystemExit("Stage license texts with studio_packaging/stage_notices.py before packaging")
 
 datas = [
+    (str(root / "src/wmlstudio/resources/ui"), "wmlstudio/resources/ui"),
     (str(schemes), "wmlstudio/resources/schemes"),
     (str(root / "studio_packaging/THIRD_PARTY_NOTICES.md"), "notices"),
     (str(notices), "notices/licenses"),
     (str(root / "docs/STUDIO_WINDOWS.md"), "docs"),
     (str(root / "docs/STUDIO_CAPABILITIES.md"), "docs"),
     (str(root / "docs/HYDRA_INTEGRATION.md"), "docs"),
+    (str(root / "docs/MICROBIOLOGY_WORKFLOWS.md"), "docs"),
+    (str(root / "docs/WORKBENCH_DESIGN.md"), "docs"),
 ]
 if (root / "LICENSE").is_file():
     datas.append((str(root / "LICENSE"), "notices"))
 for package in ("wmlstudio", "PySide6-Essentials", "shiboken6", "pyahocorasick"):
     datas += copy_metadata(package)
+for package in ("hydra-amr", "numpy", "pandas", "python-dateutil", "six", "pyrodigal", "archspec"):
+    datas += copy_metadata(package)
+datas += collect_data_files("hydra_amr")
+datas += collect_data_files("archspec")
+tools = Path(os.environ.get("WMLSTUDIO_BLAST_ROOT", root / "src/wmlstudio/resources/tools/blast"))
+if not (tools / "manifest.json").is_file():
+    raise SystemExit("Stage native BLAST+ with studio_packaging/stage_bio_tools.py before packaging")
+platform = "windows-x64" if sys.platform == "win32" else "linux-x64"
+if json.loads((tools / "manifest.json").read_text())["platform"] != platform:
+    raise SystemExit("Staged BLAST+ archive does not match the target build platform")
+datas.append((str(tools), "Tools/blast"))
+hydra_database = root / "src/wmlstudio/resources/hydra/starter"
+if not (hydra_database / "manifest.json").is_file():
+    raise SystemExit("The all-in-one build requires the verified NCBI HYDRA starter snapshot")
+stage_hydra_database(hydra_database, hydra_database)
+datas.append((str(hydra_database), "wmlstudio/resources/hydra/starter"))
+if sys.platform == "win32":
+    skesa = root / "src/wmlstudio/resources/tools/skesa"
+    verify_skesa_bundle(skesa)
+    datas.append((str(skesa), "wmlstudio/resources/tools/skesa"))
 
 common = dict(
     pathex=[str(root / "src")],
@@ -49,7 +76,13 @@ cli_exe = EXE(
     name="WMLSTudio-CLI", debug=False, bootloader_ignore_signals=False,
     strip=False, upx=False, console=True,
 )
+hydra = Analysis([str(root / "studio_packaging/hydra_entry.py")], **common)
+hydra_exe = EXE(
+    PYZ(hydra.pure), hydra.scripts, [], exclude_binaries=True,
+    name="WMLSTudio-HYDRA", debug=False, bootloader_ignore_signals=False,
+    strip=False, upx=False, console=True,
+)
 COLLECT(
-    gui_exe, cli_exe, gui.binaries, gui.datas, cli.binaries, cli.datas,
+    gui_exe, cli_exe, hydra_exe, gui.binaries, gui.datas, cli.binaries, cli.datas, hydra.binaries, hydra.datas,
     strip=False, upx=False, name="WMLSTudio",
 )

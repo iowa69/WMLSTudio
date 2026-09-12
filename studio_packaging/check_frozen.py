@@ -3,13 +3,45 @@
 from __future__ import annotations
 
 import argparse
+import importlib.util
 import json
+import os
 import platform
 import subprocess
 import tempfile
 from pathlib import Path
 
+from wmlstudio.sequence import iter_sequences
 from wmlstudio.typing import load_scheme
+
+
+def check_hydra(bundle, root, suffix):
+    """Exercise the actual frozen worker, BLAST binaries and bundled references."""
+    database = bundle / "_internal/wmlstudio/resources/hydra/starter"
+    reference = next(iter_sequences(database / "nucl/ncbi/sequences.fna"))
+    sample = root / "synthetic_amr_positive.fasta"
+    sample.write_text(f">synthetic_reference_gene\n{reference.sequence}\n", encoding="utf-8")
+    destination = root / "hydra-smoke"
+    environment = os.environ.copy()
+    environment["PATH"] = str(bundle / "_internal/Tools/blast/bin") + os.pathsep + environment.get("PATH", "")
+    command = [str(bundle / f"WMLSTudio-HYDRA{suffix}"), "--upstream", "run",
+               "--db-dir", str(database), "--assembly", str(sample), "--db", "ncbi", "--db", "protein",
+               "--outdir", str(destination), "--tmpdir", str(root / "hydra-temporary"),
+               "--format", "json", "--prefix", "hydra", "--threads", "2", "--no-banner",
+               "--no-mlst", "--no-typing", "--no-heteroresistance", "--no-reads-mlst", "--no-reads-variants",
+               "--no-auto-organism", "--no-point-mutations"]
+    completed = subprocess.run(command, env=environment, text=True, capture_output=True, timeout=180)
+    if completed.returncode:
+        raise RuntimeError(f"Frozen HYDRA worker failed:\n{completed.stdout[-4000:]}\n{completed.stderr[-8000:]}")
+    report = json.loads((destination / "hydra.json").read_text(encoding="utf-8"))
+    hits = report["samples"][0]["hits"]
+    positives = [hit for hit in hits if float(hit.get("identity_pct", 0)) == 100
+                 and float(hit.get("coverage_pct", 0)) == 100]
+    if not positives:
+        raise ValueError("Frozen HYDRA did not recover its exact synthetic reference gene.")
+    return {"status": "passed", "control": "One synthetic sequence copied from the bundled NCBI catalog",
+            "reference_id": reference.name, "engine_version": report["hydra_version"],
+            "hits": hits, "database_versions": report["parameters"]["databases"]}
 
 
 def main() -> int:
@@ -42,6 +74,13 @@ def main() -> int:
         result = json.loads(destination.read_text(encoding="utf-8"))["samples"][0]
         if result["st"] != expected or result["status"] != "complete":
             raise ValueError(f"Frozen typing expected complete ST {expected}, observed {result['st']}")
+        hydra = check_hydra(bundle, root, suffix)
+        skesa = None
+        if suffix:
+            module_spec = importlib.util.spec_from_file_location("check_skesa", Path(__file__).with_name("check_skesa.py"))
+            module = importlib.util.module_from_spec(module_spec)
+            module_spec.loader.exec_module(module)
+            skesa = module.check(bundle / "_internal/wmlstudio/resources/tools/skesa/skesa.exe")
     args.output.parent.mkdir(parents=True, exist_ok=True)
     screenshot = args.output.with_suffix(".png").resolve()
     subprocess.run([str(gui), "--smoke-test", "--demo", "--screenshot", str(screenshot)],
@@ -54,6 +93,7 @@ def main() -> int:
         "control": "Synthetic assembly generated from one complete bundled profile",
         "expected_st": expected, "observed_st": result["st"],
         "typing": "passed", "desktop_demo": "passed", "screenshot": str(screenshot),
+        "hydra_frozen_worker": hydra, "native_skesa": skesa,
     }
     args.output.write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
     print(json.dumps(report, indent=2))
