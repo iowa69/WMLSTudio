@@ -12,6 +12,14 @@ stage = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(stage)
 
 
+def test_frozen_pyrodigal_explicitly_collects_namespace_implementations():
+    from PyInstaller.utils.hooks import collect_submodules
+    modules = collect_submodules("pyrodigal.impl")
+    assert "pyrodigal.impl" in modules and "pyrodigal.impl.generic" in modules
+    recipe = (SCRIPT.parent.parent / "studio_packaging/wmlstudio.spec").read_text()
+    assert 'collect_submodules("pyrodigal.impl")' in recipe
+
+
 def source_scheme(tmp_path):
     source = tmp_path / "source"
     directory = source / "tiny"

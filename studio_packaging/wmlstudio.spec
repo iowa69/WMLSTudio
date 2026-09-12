@@ -66,7 +66,8 @@ common = dict(
     pathex=[str(root / "src")],
     binaries=[],
     datas=datas,
-    hiddenimports=["ahocorasick", *collect_submodules("pyrodigal")],
+    # impl is a namespace package: collecting only 'pyrodigal' skips it.
+    hiddenimports=["ahocorasick", *collect_submodules("pyrodigal.impl")],
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
