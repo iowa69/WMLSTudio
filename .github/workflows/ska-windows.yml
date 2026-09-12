@@ -1,0 +1,44 @@
+name: Native SKA2 for Windows
+
+on:
+  workflow_call:
+  workflow_dispatch:
+  push:
+    paths:
+      - '.github/workflows/ska-windows.yml'
+      - 'studio_packaging/package_ska.py'
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: windows-latest
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+        with:
+          repository: bacpop/ska.rust
+          ref: fcf9413d2768dc6538d31f664a4bf310651449e7
+          path: ska-source
+      - uses: dtolnay/rust-toolchain@1.90.0
+      - name: Resolve and archive the exact dependency graph
+        working-directory: ska-source
+        run: |
+          cargo generate-lockfile
+          cargo vendor --locked vendor
+      - name: Build baseline x64 native binary with app-local C runtime
+        working-directory: ska-source
+        env:
+          RUSTFLAGS: '-C target-feature=+crt-static'
+        run: cargo build --release --locked
+      - name: Test and package with corresponding sources and dependency lock
+        env:
+          PYTHONUTF8: '1'
+        run: python studio_packaging/package_ska.py ska-source artifacts/SKA2-0.5.1-Windows-x64
+      - uses: actions/upload-artifact@v4
+        with:
+          name: SKA2-0.5.1-Windows-x64
+          path: artifacts/SKA2-0.5.1-Windows-x64
+          if-no-files-found: error
