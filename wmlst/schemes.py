@@ -17,6 +17,7 @@ typing rules; ``"2.002"`` and ``"007"`` are real shipped values).
 
 from __future__ import annotations
 
+import bisect
 import json
 import os
 import re
@@ -67,6 +68,11 @@ DB_VERSION_FALLBACK = BUNDLED_DB_VERSION
 #: -- `aphagocytophilum` really does get 8 "genes" out of this (section 5.19a).
 HEADER_EXCLUDE_RE = re.compile(
     r"^(ST|mlst_clade|clonal_complex|species|CC|Lineage)$", re.ASCII)
+
+#: ``>gapA_417`` / ``>penA-2.002``: the allele number at the end of a ``.tfa``
+#: header. Same separator class and same decimal allowance as the sseqid regex
+#: in ``engine.HIT_RE``; greedy ``.*`` so ``glmU_1_12`` yields ``12``.
+_TFA_HEADER_RE = re.compile(r"^>.*[_-](\d+(?:\.\d+)?)$", re.ASCII)
 
 #: Allowed characters in a `database_version.txt` date (Scheme.pm:30).
 _DATE_BAD_RE = re.compile(r"[^\d-]", re.ASCII)
@@ -277,6 +283,7 @@ class Scheme:
     """
 
     __slots__ = (
+        "_allele_index",
         "_genes",
         "_genotypes",
         "_last_updated",
@@ -292,6 +299,7 @@ class Scheme:
         self._genotypes = None      # type: Optional[Dict[str, str]]
         self._num_alleles = None    # type: Optional[int]
         self._last_updated = None   # type: Optional[str]
+        self._allele_index = None   # type: Optional[Dict[str, Tuple[float, ...]]]
 
     def __repr__(self) -> str:  # pragma: no cover - debugging aid
         return "Scheme(%r)" % (self.name,)
@@ -306,6 +314,10 @@ class Scheme:
     def tab_file(self) -> str:
         """``<dir>/<name>/<name>.txt`` (Scheme.pm:17)."""
         return os.path.join(self.dir, self.name, self.name + ".txt")
+
+    def locus_file(self, gene: str) -> str:
+        """``<dir>/<name>/<gene>.tfa`` -- one locus' allele FASTA."""
+        return os.path.join(self.dir, self.name, gene + ".tfa")
 
     @property
     def info_file(self) -> str:
@@ -444,6 +456,83 @@ class Scheme:
         except (OSError, ValueError):
             return {}
         return data if isinstance(data, dict) else {}
+
+    # -- allele registry depth (section 5.14a, tie-break only) --------------
+    @property
+    def allele_index(self) -> Dict[str, Tuple[float, ...]]:
+        """``gene -> sorted tuple of the allele numbers in <gene>.tfa``.
+
+        Read from the ``.tfa`` files, NOT from the profile table: the profile
+        only lists alleles that appear in some ST, while the ``.tfa`` is the
+        registry as PubMLST issued it. Numbering is NOT dense -- withdrawn
+        alleles leave holes (``ecoli_achtman_4.adk`` ships 1914 alleles whose
+        highest number is 2060) -- so the empirical rank over these numbers is
+        used rather than ``number / count``.
+
+        Loci with no ``.tfa`` are simply absent from the mapping; the only one
+        in the shipped DB is ``aphagocytophilum.MLST_cluster``, the pseudo-gene
+        section 5.19a deliberately keeps in the header. Unreadable files are
+        absent too -- this feeds a tie-break, never a call, so it degrades to
+        "no opinion" rather than raising.
+
+        Lazy and cached. Nothing reads it unless two schemes tie on score.
+        """
+        if self._allele_index is None:
+            index = {}  # type: Dict[str, Tuple[float, ...]]
+            for gene in self.genes:
+                nums = _read_allele_numbers(self.locus_file(gene))
+                if nums:
+                    index[gene] = nums
+            self._allele_index = index
+        return self._allele_index
+
+    def allele_percentile(self, gene: str, number: str) -> Optional[float]:
+        """Where ``number`` sits in ``gene``'s allele registry, in ``(0, 1]``.
+
+        ``bisect_right(ids, n) / len(ids)`` -- the fraction of the locus'
+        registered alleles numbered at or below this one. Allele numbers are
+        issued in order of first observation, so a LOW percentile means "an
+        allele this scheme's own species has been reporting since the scheme
+        opened" and a HIGH one means "a rare, recently registered variant".
+
+        ``None`` when the locus has no registry, or the code is not a number.
+        """
+        ids = self.allele_index.get(gene)
+        if not ids:
+            return None
+        try:
+            value = float(number)
+        except (TypeError, ValueError):
+            return None
+        return bisect.bisect_right(ids, value) / float(len(ids))
+
+
+def _read_allele_numbers(path: str) -> Tuple[float, ...]:
+    """Every allele number in one ``.tfa``, sorted ascending.
+
+    The header regex mirrors :data:`~wmlst.engine.HIT_RE`'s allele group
+    (``[_-]`` separator, one optional decimal point, ``re.ASCII``) so the
+    ``.tfa`` and the BLAST index agree on what an allele number is. Headers
+    that do not match are skipped, exactly as their BLAST hits would be
+    (section 5.6, the three unparseable loci).
+    """
+    out = []  # type: List[float]
+    try:
+        with open(path, encoding="utf-8", errors="replace", newline=None) as fh:
+            for line in fh:
+                if not line.startswith(">"):
+                    continue
+                match = _TFA_HEADER_RE.match(line.rstrip("\r\n"))
+                if match is None:
+                    continue
+                try:
+                    out.append(float(match.group(1)))
+                except ValueError:      # pragma: no cover - regex forbids it
+                    continue
+    except OSError:
+        return ()
+    out.sort()
+    return tuple(out)
 
 
 # ---------------------------------------------------------------------------

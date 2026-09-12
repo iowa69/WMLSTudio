@@ -1,0 +1,208 @@
+# SPDX-License-Identifier: GPL-2.0-only
+# Copyright (C) 2025-2026 IOWA-Tech - Giovanni Lorenzin
+# Copyright (C) Torsten Seemann (upstream `mlst`, from which WMLST is ported)
+#
+# Publish docs/ to GitHub Pages.
+#
+# The single purpose of the published page is to hand a non-technical user the
+# CURRENT portable zip in one click. The asset filename carries the version, so
+# it cannot be written into docs/index.html. It is stamped in HERE, at deploy
+# time, from the GitHub API -- which is why this workflow also runs on
+# `release: published`: the page is re-deployed within a couple of minutes of a
+# new release, and a nightly schedule catches anything that slipped through.
+#
+# Stamping was chosen over resolving the link purely in the browser because the
+# stamped page is plain static HTML: it needs no JavaScript, it cannot be
+# rate-limited (the unauthenticated GitHub API allows 60 requests per hour per
+# IP, which a university behind one NAT can exhaust), and the very first click
+# already goes straight to the zip. The page still carries a small script that
+# re-checks the API and quietly upgrades the link; if that fails, or JS is off,
+# the stamped href stands; and if stamping never ran at all the href falls back
+# to the releases page. Three layers, each independently sufficient.
+
+name: Pages
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "docs/**"
+      - ".github/workflows/pages.yml"
+  release:
+    types: [published]
+  schedule:
+    # 04:17 UTC daily - cheap insurance against a missed `release` event.
+    - cron: "17 4 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+# Never let two deploys race; never cancel one that is already publishing.
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: Build the site and stamp the current release in
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/configure-pages@v5
+
+      - name: Stage docs/ into _site
+        run: |
+          mkdir -p _site
+          cp -R docs/. _site/
+          # ARCHITECTURE.md is a 100 kB internal spec, not user documentation,
+          # and the site is a download page rather than a doc portal.
+          rm -f _site/ARCHITECTURE.md
+          ls -la _site
+
+      - name: Stamp the latest release into the download page
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPOSITORY: ${{ github.repository }}
+        run: |
+          python3 - <<'PY'
+          """Rewrite _site/index.html so the button points at the current zip.
+
+          Stdlib only, like everything else in this repository. Every sentinel
+          must be present exactly once: a page that silently stops being
+          stamped is worse than a failed deploy, because nobody notices until a
+          user downloads a build from six months ago.
+          """
+          import json
+          import os
+          import sys
+          import urllib.error
+          import urllib.request
+          from datetime import datetime
+
+          PAGE = "_site/index.html"
+          REPO = os.environ["GH_REPOSITORY"]
+          TOKEN = os.environ.get("GH_TOKEN", "")
+          API = "https://api.github.com/repos/%s/releases/latest" % REPO
+
+          MONTHS = ("January", "February", "March", "April", "May", "June",
+                    "July", "August", "September", "October", "November", "December")
+
+
+          def fail(message):
+              sys.stderr.write("pages: %s\n" % message)
+              print("::error title=Pages stamping::%s" % message)
+              sys.exit(1)
+
+
+          def warn(message):
+              sys.stderr.write("pages: %s\n" % message)
+              print("::warning title=Pages stamping::%s" % message)
+
+
+          def human_size(n):
+              mb = n / 1048576.0
+              return "%d MB" % round(mb) if mb >= 100 else "%.1f MB" % mb
+
+
+          def human_date(iso):
+              try:
+                  when = datetime.strptime(iso[:10], "%Y-%m-%d")
+              except (TypeError, ValueError):
+                  return None
+              return "%d %s %d" % (when.day, MONTHS[when.month - 1], when.year)
+
+
+          def fetch():
+              request = urllib.request.Request(API)
+              request.add_header("Accept", "application/vnd.github+json")
+              request.add_header("User-Agent", "wmlst-pages")
+              if TOKEN:
+                  request.add_header("Authorization", "Bearer %s" % TOKEN)
+              with urllib.request.urlopen(request, timeout=30) as response:
+                  return json.loads(response.read().decode("utf-8"))
+
+
+          def pick(assets, suffix):
+              for asset in assets:
+                  name = (asset.get("name") or "").lower()
+                  if name.endswith(suffix) and asset.get("browser_download_url"):
+                      return asset
+              return None
+
+
+          with open(PAGE, encoding="utf-8") as handle:
+              html = handle.read()
+
+          try:
+              release = fetch()
+          except urllib.error.HTTPError as exc:
+              if exc.code == 404:
+                  warn("no published release yet; the button keeps its "
+                       "releases-page fallback")
+                  sys.exit(0)
+              fail("GitHub API returned HTTP %d for %s" % (exc.code, API))
+          except OSError as exc:
+              fail("could not reach the GitHub API: %s" % exc)
+
+          assets = release.get("assets") or []
+          portable = pick(assets, "-win64-portable.zip")
+          installer = pick(assets, "-win64-setup.exe")
+
+          if portable is None:
+              fail("release %s has no *-win64-portable.zip asset; refusing to "
+                   "publish a download page that cannot deliver the portable "
+                   "build" % release.get("tag_name"))
+
+          swaps = [
+              ("https://github.com/iowa69/WMLST/releases/latest#portable",
+               portable["browser_download_url"]),
+              ('<span class="f-version">the latest release</span>',
+               '<span class="f-version">%s</span>' % release.get("tag_name", "latest")),
+              ('<span class="f-size">ZIP archive</span>',
+               '<span class="f-size">%s ZIP</span>' % human_size(portable.get("size") or 0)),
+          ]
+
+          published = human_date(release.get("published_at") or release.get("created_at"))
+          if published:
+              swaps.append(('<span class="f-date">published on GitHub</span>',
+                            '<span class="f-date">released %s</span>' % published))
+
+          if installer is not None:
+              swaps.append(("https://github.com/iowa69/WMLST/releases/latest#installer",
+                            installer["browser_download_url"]))
+          else:
+              warn("release %s has no *-win64-setup.exe asset; the secondary "
+                   "link keeps its releases-page fallback" % release.get("tag_name"))
+
+          for sentinel, replacement in swaps:
+              found = html.count(sentinel)
+              if found != 1:
+                  fail("sentinel %r occurs %d time(s) in docs/index.html, "
+                       "expected exactly 1" % (sentinel, found))
+              html = html.replace(sentinel, replacement, 1)
+              print("pages: stamped %s" % replacement)
+
+          with open(PAGE, "w", encoding="utf-8", newline="\n") as handle:
+              handle.write(html)
+
+          print("pages: %s now points at %s" % (PAGE, portable["name"]))
+          PY
+
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: _site
+
+  deploy:
+    name: Deploy to GitHub Pages
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4

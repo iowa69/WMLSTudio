@@ -501,11 +501,12 @@ def test_forced_scheme_widens_the_sentinel_signature():
     assert [a.code for a in res.alleles] == ["-"] * 8
 
 
-def test_tie_is_broken_by_the_lexicographically_smallest_scheme_name():
+def test_tie_falls_back_to_the_smallest_scheme_name_without_a_catalog():
     """C8 / D1 -- deterministic where upstream flips a coin.
 
-    Two schemes, identical perfect calls, identical scores: the smaller name
-    wins and BOTH tie warnings are emitted.
+    Section 5.14a's tie-break needs the catalogue to read allele registries.
+    With ``catalog=None`` the historical lexicographic order must survive, so
+    the ordering is never randomised even in the degraded path.
     """
     class _Fake:
         def __init__(self, name):
@@ -524,7 +525,7 @@ def test_tie_is_broken_by_the_lexicographically_smallest_scheme_name():
     cfg = RunConfig(minscore=50.0)
     kept, dropped, excl = engine_mod._build_candidates(
         fake_catalog, res, {}, cfg, 7)
-    kept, _all = engine_mod._order_candidates(kept, dropped, excl)
+    kept, _tied, _all = engine_mod._order_candidates(kept, dropped, excl)
     assert kept[0].scheme == "aaa"
     assert [c.scheme for c in kept] == ["aaa", "zzz", "-"]
 
@@ -652,7 +653,7 @@ def test_orphan_scheme_in_the_index_is_skipped_not_fatal():
     kept, dropped, excl = engine_mod._build_candidates(
         catalog, res, {}, RunConfig(minscore=50.0, datadir="/nowhere"), 7,
         None, warned.append)
-    kept, _all = engine_mod._order_candidates(kept, dropped, excl)
+    kept, _tied, _all = engine_mod._order_candidates(kept, dropped, excl)
     assert [c.scheme for c in kept] == ["known", "-"]
     assert len(warned) == 1
     assert "orphan" in warned[0] and warned[0].startswith("WARNING:")
@@ -662,7 +663,7 @@ def test_orphan_scheme_needs_no_warn_sink():
     """The guard must hold when nobody passes a warn callback (default None)."""
     kept, dropped, excl = engine_mod._build_candidates(
         {}, {"orphan": {"a": "1"}}, {}, RunConfig(minscore=50.0), 7)
-    kept, _all = engine_mod._order_candidates(kept, dropped, excl)
+    kept, _tied, _all = engine_mod._order_candidates(kept, dropped, excl)
     assert [c.scheme for c in kept] == ["-"]
 
 
@@ -795,3 +796,125 @@ if __name__ == "__main__":
                 print("FAIL %s: %s" % (name, exc))
     print("%s" % ("ALL PASS" if not failed else "%d FAILED" % failed))
     sys.exit(1 if failed else 0)
+
+
+# ---------------------------------------------------------------------------
+# 5.14a -- the allele-depth tie-break (D1)
+# ---------------------------------------------------------------------------
+def test_allele_percentile_uses_the_tfa_registry_not_the_profile():
+    """Numbering is NOT dense, so the statistic is an empirical rank.
+
+    ``ecoli_achtman_4.adk`` ships fewer alleles than its highest number, so
+    ``n / count`` and ``n / max`` would both be wrong.
+    """
+    adk = CATALOG["ecoli_achtman_4"].allele_index["adk"]
+    assert len(adk) < adk[-1], "adk numbering is expected to have holes"
+    assert CATALOG["ecoli_achtman_4"].allele_percentile("adk", "1") == 1 / len(adk)
+    assert CATALOG["ecoli_achtman_4"].allele_percentile("adk", str(adk[-1])) == 1.0
+
+
+def test_allele_index_skips_loci_with_no_tfa():
+    """`aphagocytophilum.MLST_cluster` is a profile-header pseudo-gene (5.19a)."""
+    scheme = CATALOG["aphagocytophilum"]
+    assert "MLST_cluster" in scheme.genes
+    assert "MLST_cluster" not in scheme.allele_index
+    assert scheme.allele_percentile("MLST_cluster", "1") is None
+
+
+def test_allele_depth_ranks_the_scheme_s_own_species_lower():
+    """The measured signal: a K. pneumoniae draft against both tied schemes."""
+    kleb = engine_mod.allele_depth(CATALOG["klebsiella"], "3/3/1/1/1/1/79")
+    ecoli = engine_mod.allele_depth(
+        CATALOG["ecoli_achtman_4"], "1769/1664/193/1804/986/745/866")
+    assert kleb < ecoli
+    assert kleb < 0.05 < 0.4 < ecoli
+
+
+def test_allele_depth_skips_nulls_instead_of_scoring_them_worst():
+    """One absent locus in the CORRECT scheme must not lose the tie."""
+    full = engine_mod.allele_depth(CATALOG["klebsiella"], "3/3/1/1/1/1/1")
+    holed = engine_mod.allele_depth(CATALOG["klebsiella"], "3/3/1/1/1/-/1")
+    nulled = engine_mod.allele_depth(CATALOG["klebsiella"], "3/3/1/1/1/0/1")
+    assert holed == nulled
+    assert abs(holed - full) < 0.01
+
+
+def test_allele_depth_reads_the_number_out_of_every_code_shape():
+    """``~5`` / ``5?`` / ``5,7`` all name the allele the call came from."""
+    plain = engine_mod.allele_depth(CATALOG["klebsiella"], "3/3/1/1/1/1/79")
+    for sig in ("3/3/1/1/1/1/~79", "3/3/1/1/1/1/79?", "3/3/1/1/1/1/79,400"):
+        assert engine_mod.allele_depth(CATALOG["klebsiella"], sig) == plain
+
+
+def test_allele_depth_is_inf_when_nothing_is_scorable():
+    assert engine_mod.allele_depth(CATALOG["klebsiella"], "-/-/-/-/-/-/-") == float("inf")
+
+
+def test_tie_is_broken_by_allele_depth_not_by_scheme_name():
+    """klebsiella must beat ecoli_achtman_4 despite sorting later."""
+    kept = [
+        engine_mod.SchemeScore("ecoli_achtman_4", "14464",
+                               "1769/1664/193/1804/986/745/866", 100, 7),
+        engine_mod.SchemeScore("klebsiella", "258", "3/3/1/1/1/1/79", 100, 7),
+    ]
+    ordered, tied, _all = engine_mod._order_candidates(kept, [], [], CATALOG)
+    assert ordered[0].scheme == "klebsiella"
+    assert [c.scheme for c in tied] == ["klebsiella", "ecoli_achtman_4"]
+
+
+def test_tie_break_never_promotes_a_lower_scoring_scheme():
+    """It applies ONLY to the block whose score equals the leader's."""
+    kept = [
+        engine_mod.SchemeScore("ecoli_achtman_4", "14464",
+                               "1769/1664/193/1804/986/745/866", 100, 7),
+        engine_mod.SchemeScore("klebsiella", "258", "3/3/1/1/1/1/79", 96, 7),
+    ]
+    ordered, tied, _all = engine_mod._order_candidates(kept, [], [], CATALOG)
+    assert ordered[0].scheme == "ecoli_achtman_4"
+    assert tied == ()
+
+
+def test_tie_break_is_total_and_falls_back_to_the_scheme_name():
+    """Depth-identical rows must still order deterministically (constraint 2)."""
+    a = engine_mod.SchemeScore("klebsiella", "258", "3/3/1/1/1/1/79", 100, 7)
+    b = engine_mod.SchemeScore("zzz_unknown", "1", "-/-/-/-/-/-/-", 100, 7)
+    c = engine_mod.SchemeScore("aaa_unknown", "1", "-/-/-/-/-/-/-", 100, 7)
+    for perm in ([a, b, c], [c, b, a], [b, a, c]):
+        ordered, _tied, _all = engine_mod._order_candidates(list(perm), [], [],
+                                                            CATALOG)
+        assert [x.scheme for x in ordered] == [
+            "klebsiella", "aaa_unknown", "zzz_unknown"]
+
+
+def test_sentinel_still_wins_a_zero_zero_tie_under_the_new_rule():
+    """Step 38: the sentinel has no alleles and would otherwise sort to inf."""
+    sentinel = engine_mod.SchemeScore("-", "-", "/".join(["-"] * 7), 0, 0,
+                                      n_missing=7)
+    other = engine_mod.SchemeScore("klebsiella", "-", "-/-/-/-/-/-/-", 0, 7)
+    ordered, _tied, _all = engine_mod._order_candidates(
+        [sentinel, other], [], [], CATALOG)
+    assert ordered[0].scheme == "-"
+
+
+def test_tied_alternatives_are_carried_on_the_sample_result():
+    """A tie is a scientific ambiguity: it must reach report.py and gui.py."""
+    lines = []
+    for gene, allele in zip(CATALOG["klebsiella"].genes, "3/3/1/1/1/1/79".split("/")):
+        lines.append(_line("klebsiella.%s_%s" % (gene, allele), 10, 10, 10))
+    for gene, allele in zip(CATALOG["ecoli_achtman_4"].genes,
+                            "1769/1664/193/1804/986/745/866".split("/")):
+        lines.append(_line("ecoli_achtman_4.%s_%s" % (gene, allele), 10, 10, 10))
+    res = Engine(RunConfig(minid=95.0, mincov=50.0, minscore=50.0),
+                 catalog=CATALOG).analyse_blast_text("k.fa", "\n".join(lines))
+    assert res.scheme == "klebsiella"
+    assert [(c.scheme, c.st) for c in res.tied] == [
+        ("klebsiella", "258"), ("ecoli_achtman_4", "14464")]
+    assert any("klebsiella(258)==ecoli_achtman_4(14464)" in w for w in res.warnings)
+
+
+def test_no_tie_means_an_empty_tied_tuple():
+    res = _engine().analyse_blast_text(
+        "x.fa", "\n".join(_line("saureus.%s_1" % g, 10, 10, 10)
+                          for g in CATALOG["saureus"].genes))
+    assert res.scheme == "saureus"
+    assert res.tied == ()

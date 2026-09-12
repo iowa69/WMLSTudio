@@ -1398,10 +1398,29 @@ def _badge(status: str) -> str:
 
 
 def _ties(sample) -> List[str]:
-    if not sample.candidates:
-        return []
-    top = sample.candidates[0]
-    return [c.scheme for c in sample.candidates[1:] if c.score == top.score]
+    """The equal-top candidates OTHER than the reported one, ``"name ST st"``.
+
+    Reads :attr:`~wmlst.engine.SampleResult.tied`, which the engine fills with
+    the whole tied block (winner first) whenever two schemes fit the assembly
+    equally well. Falls back to re-deriving the block from ``candidates`` for
+    results built before that field existed.
+    """
+    rows = getattr(sample, "tied", ())
+    if not rows:
+        if not sample.candidates:
+            return []
+        top = sample.candidates[0]
+        rows = [top] + [c for c in sample.candidates[1:] if c.score == top.score]
+        if len(rows) < 2:
+            return []
+    return [_scheme_st(c) for c in rows[1:]]
+
+
+def _scheme_st(cand) -> str:
+    """``"klebsiella ST 258"``, or ``"saureus (no ST)"`` for an unnamed profile."""
+    if cand.st in ("", "-"):
+        return "{0} (no ST)".format(cand.scheme)
+    return "{0} ST {1}".format(cand.scheme, cand.st)
 
 
 def _runner_up_table(sample, cfg) -> str:
@@ -1415,6 +1434,7 @@ def _runner_up_table(sample, cfg) -> str:
     out.write('<thead><tr><th scope="col">Scheme</th><th scope="col">ST</th>'
               '<th scope="col" class="num">Score</th><th scope="col" class="num">Loci</th>'
               '<th scope="col">Allele signature</th></tr></thead><tbody>')
+    tied = {(c.scheme, c.st) for c in getattr(sample, "tied", ())}
     for i, cand in enumerate(sample.candidates):
         classes = []
         if i == 0:
@@ -1425,6 +1445,8 @@ def _runner_up_table(sample, cfg) -> str:
         pills = ""
         if i == 0:
             pills += ' <span class="pill">reported</span>'
+        elif (cand.scheme, cand.st) in tied:
+            pills += ' <span class="pill">ties with the reported scheme</span>'
         if cand.below_minscore:
             pills += ' <span class="pill">below --minscore {0}</span>'.format(
                 h(_num(cfg.minscore)))
@@ -1537,10 +1559,18 @@ def _sample_card(sample, index: int, opts: HtmlOptions, dbdir: str, cfg) -> str:
     if ties:
         out.write(
             '<p class="notice"><strong><span aria-hidden="true">\u26a0</span> Tie:</strong> '
-            '{names} also scored {score}. {app} reports the alphabetically first scheme. '
-            'Confirm the species by another method before using this ST.</p>'.format(
-                names=h(", ".join(ties)), score=h(int(sample.score)),
-                app=h(_branding.APP_NAME))
+            '{n} schemes fit this assembly equally well at score {score} \u2014 '
+            '<span class="mono" translate="no">{reported}</span> (reported) and '
+            '<span class="mono" translate="no">{names}</span>. {app} reports the one whose '
+            'called alleles sit lowest in each locus\u2019 allele registry, because PubMLST '
+            'issues allele numbers in order of first observation, so a scheme\u2019s own '
+            'species matches its long-established alleles while an off-species match can only '
+            'hit rare, recently registered ones. This is a heuristic, not an identification: '
+            'confirm the species by another method before using this ST.</p>'.format(
+                n=h(len(ties) + 1), score=h(int(sample.score)),
+                reported=h(_scheme_st(sample.tied[0]) if sample.tied
+                           else "{0} ST {1}".format(sample.scheme, sample.st)),
+                names=h(", ".join(ties)), app=h(_branding.APP_NAME))
         )
     for warning in sample.warnings:
         out.write('<p class="notice small mono">{0}</p>'.format(h(warning)))

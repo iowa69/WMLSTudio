@@ -115,6 +115,7 @@ wmlst = ["py.typed", "assets/*"]
 wmlst_db = [
     "VERSION.txt",
     "scheme_species_map.tab",
+    "scheme_refs.tsv",
     "schemes.manifest.tsv",
     "pubmlst/__init__.py",
     "pubmlst/*/*.tfa",

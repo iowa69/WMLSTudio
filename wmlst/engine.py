@@ -14,6 +14,38 @@ loop and ``status_column``), with ``perl5/MLST/Scheme.pm`` reached through
 
 See docs/ARCHITECTURE.md sections 3 and 5 for the normative contract.
 
+**The allele-depth tie-break (section 5.14a, divergence D1).** Upstream's
+scheme scores are coarse -- a 7-locus scheme has 8 reachable values -- so two
+schemes reaching 100 on the same assembly is routine, not exotic: the Achtman
+*E. coli* scheme is built from housekeeping genes conserved across the whole
+Enterobacteriaceae and carries off-species alleles in its registry, so a
+*Klebsiella pneumoniae* draft scores 100 in both ``klebsiella`` and
+``ecoli_achtman_4``. Upstream resolves such a tie by Perl hash order, i.e. a
+coin flip; WMLST used to take the lexicographically smallest scheme name,
+which is reproducible but no more meaningful, and which called 17 of the 210
+genomes in the validation corpus as the wrong species.
+
+When -- and only when -- the top scores are equal, WMLST now prefers the
+scheme with the lowest **mean allele percentile**: for every called locus,
+``bisect_right(registered allele numbers, called number) / count`` from that
+locus' ``.tfa``, averaged over the loci that were called. PubMLST issues
+allele numbers in order of first observation, so a scheme's own species keeps
+matching the low, long-established alleles it has been depositing since the
+scheme opened, while an off-species coincidence can only match whichever rare,
+late-registered variants happen to be identical. Measured on the 210-genome
+labelled corpus: 17 ties, 17/17 resolved to the labelled species (the previous
+lexicographic rule resolved 0/17).
+
+Properties that matter here: the statistic is normalised per locus, so it is
+comparable between a young 3-locus scheme and a mature 7-locus one, which the
+raw sum / max / median of allele numbers are not; nulls (``-`` and the
+rewritten ``0``) are skipped rather than scored as "worst", so a missing locus
+in the correct scheme cannot lose the tie; and the scheme NAME remains the
+final key, so the ordering is total and deterministic -- upstream's randomised
+hash order is never reintroduced. The tie itself is a real scientific
+ambiguity: it stays on stderr as the upstream ``WARNING:`` line and is carried
+structurally in :attr:`SampleResult.tied` for ``report.py`` and ``gui.py``.
+
 >>> ------------------------------------------------------------------------
 >>> SECTION A: SHARED TYPE CONTRACT  --  FROZEN.
 >>> Every other module imports these. Changing a field name or type here is a
@@ -52,6 +84,7 @@ __all__ = [
     "UpdateError",
     "WmlstError",
     "allele_count",
+    "allele_depth",
     "classify",
     "out_sep",
 ]
@@ -194,6 +227,15 @@ class SampleResult:
     status: str          # PERFECT|NONE|NOVEL|MIXED|MISSING|BAD|OK
     alleles: Tuple[AlleleCall, ...] = ()
     candidates: Tuple[SchemeScore, ...] = ()
+    #: Every kept candidate whose score EQUALS the winner's, winner first,
+    #: in the order the section-5.14a tie-break put them. Empty when the
+    #: winner stands alone -- ``bool(result.tied)`` is the "this call is
+    #: ambiguous" flag. A tie is a real scientific ambiguity (two schemes fit
+    #: the assembly equally well) and MUST stay visible: it is warned about on
+    #: stderr and rendered by ``report.py`` and ``gui.py`` from this tuple.
+    #: The compat TSV/CSV/JSON rows are byte-identity surfaces and never
+    #: mention it (section 12).
+    tied: Tuple[SchemeScore, ...] = ()
     novel: Tuple[NovelAllele, ...] = ()
     warnings: Tuple[str, ...] = ()
     n_contigs: int = 0
@@ -370,8 +412,11 @@ import re
 import socket
 import threading
 import time
+import weakref
 from collections.abc import Iterable, Mapping, Sequence
+from concurrent.futures import CancelledError as _FutureCancelled
 from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import TimeoutError as _FutureTimeout
 from datetime import datetime, timezone
 from typing import Callable, Dict, List
 
@@ -405,6 +450,7 @@ __all__ += [
     "parse_blast_full",
     "revcom",
     "score_signature",
+    "shutdown_all",
     "sort_duplicate_codes",
     "status_column",
 ]
@@ -746,6 +792,94 @@ def _score_one(scheme: Scheme, name: str, calls: Mapping[str, str],
     )
 
 
+def allele_depth(scheme: Scheme, signature: str) -> float:
+    """Mean allele percentile of ``signature`` under ``scheme``. Section 5.14a.
+
+    For every locus that was actually called, ask the scheme's allele registry
+    where the called allele sits: ``bisect_right(ids, n) / len(ids)`` over the
+    numbers in that locus' ``.tfa`` (see
+    :meth:`wmlst.schemes.Scheme.allele_percentile`). The result is the mean of
+    those fractions, in ``(0, 1]``; lower means "this assembly matches the
+    alleles this scheme has been issuing since it opened", higher means "it
+    only matches rare, recently registered ones".
+
+    Skipped, never scored as 1.0:
+
+    * ``-`` (missing) and ``0`` (a null rewritten by the ``/-`` -> ``/0``
+      step 41) -- no allele was called, so the locus carries no evidence about
+      registry depth, and charging it the worst possible value would make one
+      absent locus in the CORRECT scheme lose the tie;
+    * loci with no ``.tfa`` registry (``aphagocytophilum.MLST_cluster``, or any
+      locus under a custom ``--blastdb`` whose datadir has no allele FASTA).
+
+    ``~5`` and ``5?`` contribute their number ``5``: an inexact hit still names
+    the allele it is nearest to, which is the registry position being asked
+    about. A ``5,7`` multiple contributes its FIRST component, the one that
+    produced the call (step 36).
+
+    Returns ``inf`` when nothing was scorable, so such a candidate loses the
+    tie-break and falls through to the scheme-name key. Pure, deterministic and
+    side-effect free apart from the scheme's own lazy ``.tfa`` cache; it is
+    evaluated ONLY for the rows of an actual tie.
+    """
+    genes = scheme.genes
+    total = 0.0
+    seen = 0
+    for i, code in enumerate(signature.split(SEP)):
+        if i >= len(genes):
+            break
+        number = _allele_number(code)
+        if number is None:
+            continue
+        pct = scheme.allele_percentile(genes[i], number)
+        if pct is None:
+            continue
+        total += pct
+        seen += 1
+    return (total / seen) if seen else float("inf")
+
+
+def _allele_number(code: str) -> Optional[str]:
+    """The allele number inside one signature field, or ``None`` for a null.
+
+    ``"5"`` -> ``"5"``; ``"~5"`` -> ``"5"``; ``"5?"`` -> ``"5"``;
+    ``"5,7"`` -> ``"5"``; ``"-"`` and ``"0"`` -> ``None``. Kept a ``str``
+    throughout, per the section-3 typing rule (``"2.002"`` is a real value).
+    """
+    if not code:
+        return None
+    first = code.split(",", 1)[0]
+    if first.startswith("~"):
+        first = first[1:]
+    if first.endswith("?"):
+        first = first[:-1]
+    if not first or first == "-" or not perl_truthy(first):
+        return None
+    return first
+
+
+def _tie_key(catalog: SchemeCatalog, row: SchemeScore):
+    """Total, deterministic ordering key for the rows of a tie. Section 5.14a.
+
+    ``(sentinel-last, allele depth, scheme name)``. The sentinel is pinned
+    first so it keeps winning a 0-0 tie (step 38) -- it has no scheme and no
+    alleles, so it would otherwise sort to ``inf``. The scheme NAME is the
+    final key, so the order is total even when two schemes are depth-identical
+    and upstream's randomised hash order is never reintroduced.
+
+    A scheme the catalogue cannot open (mid-update datadir, mismatched
+    ``--blastdb``) contributes ``inf`` rather than raising: D10 says a
+    per-file problem must not abort the run.
+    """
+    if row.num_loci == 0:                       # the sentinel, and only it
+        return (0, 0.0, "")
+    try:
+        depth = allele_depth(catalog[row.scheme], row.signature)
+    except (KeyError, WmlstError):              # pragma: no cover - defensive
+        depth = float("inf")
+    return (1, depth, row.scheme)
+
+
 def _build_candidates(catalog: SchemeCatalog, res: Mapping[str, Mapping[str, str]],
                       excluded_res: Mapping[str, Mapping[str, str]],
                       cfg: RunConfig, allele_cnt: int, dbg: WarnFn = None,
@@ -792,18 +926,39 @@ def _build_candidates(catalog: SchemeCatalog, res: Mapping[str, Mapping[str, str
 
 
 def _order_candidates(kept: List[SchemeScore], dropped: List[SchemeScore],
-                      excluded_rows: List[SchemeScore]):
-    """Step 46 plus the evidence tail.
+                      excluded_rows: List[SchemeScore],
+                      catalog: SchemeCatalog = None):
+    """Steps 46 + 46a plus the evidence tail. ``-> (kept, tied, all_rows)``.
 
-    Python's sort is stable, so the insertion order set up by
-    :func:`_build_candidates` breaks ties. Filtered and excluded rows are
+    Rows sort on ``-score`` first, exactly as upstream. Python's sort is
+    stable, so the insertion order set up by :func:`_build_candidates`
+    (sentinel, then ``sorted(res)``) already makes the ordering deterministic;
+    what it does NOT do is make it meaningful, so the block of rows that TIE
+    with the leader is then re-ordered by :func:`_tie_key` -- allele depth,
+    scheme name last (section 5.14a). Everything below the leader's score is
+    untouched: the tie-break is applied ONLY where scores are equal, and it
+    can never promote a lower-scoring scheme.
+
+    ``tied`` is that block when it holds more than one row, else ``()``.
+
+    ``catalog`` may be ``None``, which keeps the historical lexicographic
+    order; the engine always passes one. Filtered and excluded rows are
     appended AFTER every kept row so index 0 is always the winner -- a
     below-minscore row can out-score the sentinel and must never displace it.
     """
     kept = sorted(kept, key=lambda c: -c.score)
+    top = kept[0].score if kept else 0
+    n = 0
+    while n < len(kept) and kept[n].score == top:
+        n += 1
+    tied = ()                           # type: Tuple[SchemeScore, ...]
+    if n > 1:
+        if catalog is not None:
+            kept[:n] = sorted(kept[:n], key=lambda c: _tie_key(catalog, c))
+        tied = tuple(kept[:n])
     dropped = sorted(dropped, key=lambda c: -c.score)
     excluded_rows = sorted(excluded_rows, key=lambda c: -c.score)
-    return kept, tuple(kept) + tuple(dropped) + tuple(excluded_rows)
+    return kept, tied, tuple(kept) + tuple(dropped) + tuple(excluded_rows)
 
 
 # ---------------------------------------------------------------------------
@@ -840,6 +995,101 @@ def _utc_now():
 
 
 # ---------------------------------------------------------------------------
+# 4.6 / 9  Shutdown plumbing
+# ---------------------------------------------------------------------------
+#: How often a blocking wait inside the engine re-checks cancellation.
+_POLL_S = 0.2
+#: Upper bound on draining a finished/abandoned job pool. Never unbounded: a
+#: ``ThreadPoolExecutor`` worker is NOT a daemon thread, and
+#: ``concurrent.futures.thread`` registers an ``atexit`` hook that JOINS every
+#: worker, so a worker parked on a running ``blastn`` hangs the whole
+#: interpreter at exit -- the window closes and the process survives.
+_POOL_DRAIN_S = 30.0
+
+
+class _CancelGroup:
+    """An ``Event``-shaped view over several events: ``is_set()`` is ``any()``.
+
+    Everything downstream -- ``blastbin.run_tool``, ``schemes.info_all``,
+    :meth:`Engine._check_cancel` -- consults ``cancel.is_set()`` and nothing
+    else, so an object with this shape is a drop-in for a real ``Event``.
+
+    ``set()`` and ``clear()`` act on the group's OWN event and never on the
+    caller's: an engine-side abort (a run-fatal error releasing the other
+    workers) must not surface in the GUI as "the user pressed Cancel".
+    """
+
+    __slots__ = ("_others", "_own", "engine")
+
+    def __init__(self, engine, *events):
+        self.engine = engine
+        self._own = threading.Event()
+        self._others = tuple(ev for ev in events if ev is not None)
+
+    def is_set(self) -> bool:
+        if self._own.is_set():
+            return True
+        return any(ev.is_set() for ev in self._others)
+
+    def set(self) -> None:
+        self._own.set()
+
+    def clear(self) -> None:
+        self._own.clear()
+
+    def wait(self, timeout=None) -> bool:
+        """Poll until set or `timeout` elapses. -> the state on return."""
+        deadline = None if timeout is None else time.monotonic() + timeout
+        while not self.is_set():
+            if deadline is not None:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return False
+                time.sleep(min(_POLL_S, remaining))
+            else:
+                time.sleep(_POLL_S)
+        return True
+
+
+def _drain_pool(pool, timeout: float) -> bool:
+    """Cancel what is queued, then join the workers, bounded. -> drained?
+
+    ``cancel_futures`` landed in 3.9 (the floor), but an injected stand-in
+    executor may not take it, hence the ``TypeError`` fallback. The join runs
+    on a daemon thread so that a genuinely wedged worker costs `timeout`
+    seconds and not the rest of the session.
+    """
+    try:
+        pool.shutdown(wait=False, cancel_futures=True)
+    except TypeError:  # pragma: no cover - stand-in executor
+        pool.shutdown(wait=False)
+    if timeout <= 0:
+        return False
+    done = threading.Event()
+
+    def _join():
+        try:
+            pool.shutdown(wait=True)
+        finally:
+            done.set()
+
+    joiner = threading.Thread(target=_join, name="wmlst-pool-drain", daemon=True)
+    joiner.start()
+    return done.wait(timeout)
+
+
+#: Every live Engine, so the GUI can stop a run it did not construct itself
+#: (``analyse_files()`` builds its own). Weak, so it never keeps one alive.
+_ENGINES: weakref.WeakSet = weakref.WeakSet()
+_ENGINES_LOCK = threading.Lock()
+
+
+def _register_engine(engine) -> None:
+    with _ENGINES_LOCK:
+        _ENGINES.add(engine)
+
+
+# ---------------------------------------------------------------------------
 # 4.6  Engine
 # ---------------------------------------------------------------------------
 class Engine:
@@ -867,6 +1117,17 @@ class Engine:
         self._lock = threading.RLock()
         self._started = _utc_now()
         self._started_monotonic = time.time()
+
+        # Shutdown state (section 9). A SEPARATE, non-reentrant lock: `_lock`
+        # is held while `tools` probes BLAST+ (which launches a child), and
+        # shutdown() must never queue behind that.
+        self._shutdown_lock = threading.Lock()
+        self._shutdown_requested = False
+        #: Engine-owned cancel. Every run observes it through a _CancelGroup,
+        #: so shutdown() reaches runs whose caller passed no cancel Event.
+        self._cancel = threading.Event()
+        self._pool = None
+        _register_engine(self)
 
         # 3.6.1 -- programmer errors, not user errors.
         assert not (cfg.legacy and cfg.scheme is None), \
@@ -928,9 +1189,74 @@ class Engine:
             return self._tools
 
     def close(self) -> None:
-        """Release cached collaborators. Section 4.6."""
+        """Release cached collaborators. Section 4.6.
+
+        Does NOT cancel a running analysis -- that is :meth:`shutdown`.
+        """
+        with self._shutdown_lock:
+            pool, self._pool = self._pool, None
+        if pool is not None:
+            _drain_pool(pool, 0.0)
         with self._lock:
             self._catalog = None
+
+    # -- 9  shutdown --------------------------------------------------------
+    def _cancel_view(self, cancel):
+        """The cancel object a run observes: the caller's OR-ed with ours."""
+        if getattr(cancel, "engine", None) is self:
+            return cancel                      # already wrapped by this engine
+        group = _CancelGroup(self, self._cancel, cancel)
+        if self._shutdown_requested:
+            group.set()
+        return group
+
+    def shutdown(self, timeout: float = 5.0) -> bool:
+        """Stop this engine's work now, within `timeout`. -> stopped cleanly?
+
+        Safe from any thread, including the GUI thread while a worker is inside
+        :meth:`analyse`. In order: mark the engine cancelled (every in-flight
+        run sees it at its next check), kill every BLAST child through
+        ``blastbin.shutdown`` (which is what releases a worker parked on a
+        running ``blastn``), then cancel the queued jobs and join the pool.
+
+        Returns False when something is still running after `timeout`. The
+        caller -- the GUI, closing its window -- should then force the exit
+        (``os._exit``), because ``concurrent.futures``'s ``atexit`` hook joins
+        its non-daemon workers and would otherwise hang the process forever.
+
+        The engine stays cancelled afterwards: it is a teardown, not a pause.
+        """
+        deadline = time.monotonic() + max(0.0, float(timeout))
+        with self._shutdown_lock:
+            self._shutdown_requested = True
+            pool = self._pool
+        self._cancel.set()
+
+        clean = True
+        backend = self._backend
+        if backend is None:
+            try:
+                backend = _import_blastbin()
+            except ImportError:  # pragma: no cover - defensive
+                backend = None
+        stop = getattr(backend, "shutdown", None)
+        if callable(stop):
+            try:
+                clean = bool(stop(max(0.0, deadline - time.monotonic())))
+            except Exception:  # pragma: no cover - teardown must not raise
+                clean = False
+        else:  # an injected stand-in backend
+            killer = getattr(backend, "terminate_all", None)
+            if callable(killer):
+                try:
+                    killer()
+                except Exception:  # pragma: no cover
+                    clean = False
+
+        if pool is not None:
+            drained = _drain_pool(pool, max(0.0, deadline - time.monotonic()))
+            clean = drained and clean
+        return clean
 
     def __enter__(self):
         return self
@@ -1051,6 +1377,7 @@ class Engine:
         """
         cfg = self.cfg
         t0 = time.time()
+        cancel = self._cancel_view(cancel)
         lbl = self.label_for(path, label)
         allele_cnt = self._allele_cnt()
         self._check_cancel(cancel)
@@ -1210,8 +1537,8 @@ class Engine:
 
         kept_rows, dropped_rows, excluded_rows = _build_candidates(
             catalog, walk.res, excluded_walk.res, cfg, allele_cnt, dbg, warn)
-        kept_rows, all_rows = _order_candidates(kept_rows, dropped_rows,
-                                                excluded_rows)
+        kept_rows, tied_rows, all_rows = _order_candidates(
+            kept_rows, dropped_rows, excluded_rows, catalog)
 
         # Step 47: every equal-first, via wrn() -- NOT suppressed by --quiet.
         warnings = list(walk.warnings)
@@ -1291,7 +1618,8 @@ class Engine:
         return SampleResult(
             path=path, label=lbl, scheme=winner.scheme, st=winner.st,
             signature=signature, score=winner.score, status=status,
-            alleles=tuple(alleles), candidates=all_rows, novel=tuple(novel),
+            alleles=tuple(alleles), candidates=all_rows, tied=tied_rows,
+            novel=tuple(novel),
             novel_seen=novel_seen,
             warnings=tuple(warnings), n_contigs=n_contigs, total_bp=total_bp,
             hits_seen=seen, hits_kept=kept, elapsed_s=time.time() - t0,
@@ -1343,6 +1671,60 @@ class Engine:
         return novel
 
     # -- the run ------------------------------------------------------------
+    def _map_files(self, files, one, cancel):
+        """Run `one` over ``enumerate(files)`` on a ``cfg.jobs``-wide pool.
+
+        Deliberately NOT ``with ThreadPoolExecutor(...) as pool``: that
+        ``__exit__`` is ``shutdown(wait=True)``, an unbounded join of
+        non-daemon workers, so a cancelled run could not return until every
+        ``blastn`` had finished on its own. Here the pool is reachable from
+        :meth:`shutdown`, every wait is bounded, and the drain cancels what is
+        still queued.
+        """
+        pool = ThreadPoolExecutor(max_workers=self.cfg.jobs,
+                                  thread_name_prefix="wmlst-job")
+        with self._shutdown_lock:
+            stopping = self._shutdown_requested
+            if not stopping:
+                self._pool = pool
+        if stopping:
+            _drain_pool(pool, 0.0)
+            raise Cancelled("The run was cancelled")
+
+        results = [None] * len(files)   # type: List[Any]
+        ok = False
+        try:
+            try:
+                futures = [pool.submit(one, item) for item in enumerate(files)]
+            except RuntimeError as exc:  # shutdown() raced the submit
+                raise Cancelled("The run was cancelled") from exc
+            for fut in futures:
+                while True:
+                    try:
+                        i, res = fut.result(timeout=_POLL_S)
+                    except _FutureTimeout:
+                        self._check_cancel(cancel)
+                        continue
+                    except _FutureCancelled as exc:
+                        # shutdown() dropped the queued jobs under us. That is
+                        # a cancellation in WMLST's own vocabulary, and every
+                        # caller catches engine.Cancelled, not this one.
+                        raise Cancelled("The run was cancelled") from exc
+                    results[i] = res
+                    break
+            ok = True
+            return results
+        finally:
+            with self._shutdown_lock:
+                if self._pool is pool:
+                    self._pool = None
+            if not ok:
+                # Cancelled, or run-fatal: release the workers still sitting on
+                # a child instead of waiting out cfg.blast_timeout_s for each.
+                # Only the group's own event is set, never the caller's.
+                cancel.set()
+            _drain_pool(pool, _POOL_DRAIN_S)
+
     def analyse(self, *, progress: ProgressFn = None, warn: WarnFn = None,
                 msg: WarnFn = None, dbg: WarnFn = None, cancel=None) -> RunResult:
         """Every file in ``cfg.files``, then :class:`RunResult`. Section 4.6.
@@ -1355,6 +1737,8 @@ class Engine:
         self._started = _utc_now()
         t0 = time.time()
         files = list(cfg.files)
+        cancel = self._cancel_view(cancel)
+        self._check_cancel(cancel)
         results = [None] * len(files)   # type: List[Any]
 
         def one(i_path):
@@ -1363,9 +1747,7 @@ class Engine:
                                         msg=msg, dbg=dbg, cancel=cancel)
 
         if cfg.jobs > 1 and len(files) > 1:
-            with ThreadPoolExecutor(max_workers=cfg.jobs) as pool:
-                for i, res in pool.map(one, list(enumerate(files))):
-                    results[i] = res
+            results = self._map_files(files, one, cancel)
         else:
             for i, p in enumerate(files):
                 results[i] = self.analyse_file(p, progress=progress, warn=warn,
@@ -1413,6 +1795,33 @@ def analyse_file(path: str, cfg: RunConfig, catalog: SchemeCatalog = None,
                     converter=converter)
     return engine.analyse_file(path, label=label, progress=progress, warn=warn,
                                msg=msg, dbg=dbg, cancel=cancel)
+
+
+def shutdown_all(timeout: float = 5.0) -> bool:
+    """Stop every live :class:`Engine` and every BLAST child. -> clean?
+
+    The one call an application makes when it is closing (section 9). It works
+    even when the run was started through :func:`analyse_files`, which builds
+    an Engine the caller never sees.
+
+    False means something is still running after `timeout`; the caller should
+    then force the exit rather than return from ``main()``, because
+    ``concurrent.futures``' ``atexit`` hook joins its non-daemon worker threads
+    and a worker parked on a live ``blastn`` would hang the process for good.
+    """
+    deadline = time.monotonic() + max(0.0, float(timeout))
+    with _ENGINES_LOCK:
+        engines = list(_ENGINES)
+    clean = True
+    for engine in engines:
+        clean = engine.shutdown(max(0.0, deadline - time.monotonic())) and clean
+    try:
+        backend = _import_blastbin()
+    except ImportError:  # pragma: no cover - defensive
+        return clean
+    # Belt and braces: probe_version(), bootstrap() and updatedb's makeblastdb
+    # launch children through blastbin without going through an Engine.
+    return backend.shutdown(max(0.0, deadline - time.monotonic())) and clean
 
 
 def analyse_files(cfg: RunConfig, catalog: SchemeCatalog = None, *, tools=None,

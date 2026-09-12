@@ -312,8 +312,15 @@ class SampleResult:
     alleles:   tuple[AlleleCall, ...]    # EMPTY tuple when scheme == "-"
     # ---- evidence -------------------------------------------------------------
     candidates: tuple[SchemeScore, ...]  # every scored scheme incl. the winner and the sentinel,
-                                         # already sorted: -score, then scheme name. Index 0 is
-                                         # the winner.
+                                         # already sorted: -score, then (within the leading
+                                         # score only) the §5.14a tie-break, scheme name last.
+                                         # Index 0 is the winner.
+    tied:       tuple[SchemeScore, ...]  # the equal-top block, winner FIRST, when two or more
+                                         # schemes fit the assembly equally well; () otherwise,
+                                         # so bool(tied) is the "this call is ambiguous" flag.
+                                         # A tie is a real scientific ambiguity and MUST stay
+                                         # visible: report.py and gui.py render it from here.
+                                         # The compat TSV/CSV/JSON rows never mention it (§12).
     novel:      tuple[NovelAllele, ...]  # only populated when RunConfig.novel_path is set
     warnings:   tuple[str, ...]          # rendered warning text: the bin/mlst:344 duplicate-exact
                                          # msg() lines and the bin/mlst:405 tie wrn() lines
@@ -763,6 +770,20 @@ class Scheme:
     def num_alleles(self) -> int:
         """Count of distinct '<gene>_<value>' strings derived FROM THE SIGNATURES (Scheme.pm:74-86),
         not from the .tfa files. It therefore counts pseudo-alleles. Replicate literally."""
+    def locus_file(self, gene: str) -> str: ...   # <dir>/<name>/<gene>.tfa
+    @property
+    def allele_index(self) -> dict:
+        """dict[str, tuple[float, ...]]: gene -> the allele numbers in <gene>.tfa, SORTED.
+        Read from the .tfa files, NOT the profile: the profile lists only alleles that appear
+        in some ST, while the .tfa is the registry as PubMLST issued it. Numbering is NOT dense
+        (ecoli_achtman_4.adk: 1914 alleles, highest number 2060), which is why the consumer is an
+        empirical rank and never 'number / count'. Loci with no .tfa are ABSENT from the mapping
+        (aphagocytophilum.MLST_cluster is the only shipped one); an unreadable file is absent too,
+        because this feeds a TIE-BREAK, never a call. Lazy and cached: nothing reads it unless
+        two schemes tie on score (5.14a)."""
+    def allele_percentile(self, gene: str, number: str) -> "float | None":
+        """bisect_right(allele_index[gene], float(number)) / len(allele_index[gene]), in (0, 1].
+        None when the locus has no registry or the code is not a number. 5.14a."""
     @property
     def last_updated(self) -> str:
         """First line of <dir>/<name>/database_version.txt, chomped.
@@ -849,6 +870,11 @@ def score_signature(signature: str, num_loci: int, st: str) -> int:
     DO NOT use Decimal, Fraction, round(), math.floor(), '//', or algebraic simplification."""
 def status_column(st: str, score: int, codes) -> str:
     """EXACT port of bin/mlst:275-284. The ORDER OF THE TESTS IS THE SPECIFICATION."""
+def allele_depth(scheme: Scheme, signature: str) -> float:
+    """WMLST-only (5.14a). Mean Scheme.allele_percentile() over the loci that were actually
+    called; nulls ('-' and the rewritten '0') and loci without a .tfa registry are SKIPPED,
+    never charged 1.0. inf when nothing was scorable. Pure and deterministic; evaluated ONLY
+    for the rows of a score tie, never on the main path."""
 def sort_duplicate_codes(code: str) -> str:
     """bin/mlst:177-184. Applies only when ',' in code AND re.fullmatch(r'[\\d.,]+', code)."""
 def revcom(dna: str) -> str:    """re-exported from any2fasta for convenience"""
@@ -1328,11 +1354,16 @@ This is why `--minscore 50` admits up to three missing loci in a 7-locus scheme.
 
 ### 5.14 Choosing the winner (steps 46–48) — `bin/mlst:399-414`
 
-46. `candidates.sort(key=lambda c: c.score, reverse=True)` — Python's sort is stable, so insertion
-    order (sentinel first, then `sorted(res)`) breaks ties as the lexicographically smallest scheme
-    name. Upstream sorts on score only, over a randomised Perl hash iteration, so its tie winner is
-    a coin flip (verified: three consecutive runs over the same five keys produced three different
-    orders). This is divergence **D1/C8**.
+46. `candidates.sort(key=lambda c: -c.score)` — Python's sort is stable, so insertion order
+    (sentinel first, then `sorted(res)`) makes the ordering reproducible. Upstream sorts on score
+    only, over a randomised Perl hash iteration, so its tie winner is a coin flip (verified: three
+    consecutive runs over the same five keys produced three different orders). This is divergence
+    **D1/C8**.
+46a. **The allele-depth tie-break (§5.14a).** The block of rows whose score EQUALS
+    `candidates[0].score` — and only that block — is then re-ordered by
+    `engine._tie_key(catalog, row)`. Nothing below the leading score is touched, so the tie-break
+    can never promote a lower-scoring scheme. The tied block, winner first, is carried out on
+    `SampleResult.tied`.
 47. For every `i` in `1..len(candidates)-1` whose score equals `candidates[0].score`, emit
     ```
     WARNING: {c0.scheme}({c0.st})=={ci.scheme}({ci.st}) score={score} {path}
@@ -1341,6 +1372,109 @@ This is why `--minscore 50` admits up to three missing loci in a 7-locus scheme.
     it). `{path}` is the raw argv path, **not** the label. `{score}` is formatted `str(int(score))`,
     never a float repr.
 48. `winner = candidates[0]`. Under `--scheme`, assert `winner.scheme == cfg.scheme`.
+
+### 5.14a Breaking a score tie — allele registry depth (D1)
+
+**Why a tie-break is needed at all.** The §5.9 score is coarse: a 7-locus scheme has eight
+reachable values, so two schemes landing on the same number is routine. The Achtman *E. coli*
+scheme is built from housekeeping genes conserved across the whole Enterobacteriaceae and carries
+off-species alleles in its registry, so a *Klebsiella pneumoniae* draft scores a clean 100 in both
+`klebsiella` and `ecoli_achtman_4`. Upstream flips a coin. WMLST used to take the lexicographically
+smallest scheme name — reproducible, but no more meaningful: measured over the 210-genome labelled
+validation corpus (§5.14b), 17 genomes tied and the lexicographic rule called **0 of 17** as the
+labelled species, including five *K. pneumoniae* reported as `ecoli_achtman_4` ST 14464 instead of
+the carbapenem-resistant ST 258 / ST 11 clones.
+
+**The rule.** When, and only when, two kept candidates have equal scores, prefer the one with the
+lowest **mean allele percentile**:
+
+```python
+# engine.allele_depth(scheme, signature)
+for i, code in enumerate(signature.split("/")):
+    num = _allele_number(code)            # "~5"->"5", "5?"->"5", "5,7"->"5", "-"/"0"->None
+    if num is None:            continue   # a null carries no registry evidence
+    pct = scheme.allele_percentile(genes[i], num)
+    if pct is None:            continue   # locus has no .tfa registry
+    total += pct; seen += 1               # bisect_right(ids, n) / len(ids)
+return (total / seen) if seen else inf
+```
+
+`Scheme.allele_index` reads the allele numbers out of each locus' `<gene>.tfa` — the registry as
+PubMLST issued it, not the profile table, which lists only alleles that appear in some ST. The
+numbering is **not dense** (`ecoli_achtman_4.adk` ships 1914 alleles whose highest number is 2060),
+so the statistic is the empirical rank `bisect_right(ids, n) / len(ids)`, never `n / count`.
+
+**Why this statistic.** PubMLST issues allele numbers in order of first observation. A scheme's own
+species has been depositing into it since it opened, so its common isolates keep matching low,
+long-established alleles; an off-species genome can only match whichever rare, late-registered
+variants happen to be identical. Measured, on real ties: `klebsiella` 0.0039–0.0191 against
+`ecoli_achtman_4` 0.4050–0.5792; `ecloacae` 0.0016–0.0235 against `cronobacter` 0.3731–0.4880;
+`ecoli_achtman_4` 0.0075 against `cfreundii` 0.7363.
+
+Three properties make it preferable to the raw sum, maximum or median of the allele numbers, all of
+which also resolve 17/17 on this corpus:
+
+* **Normalised per locus**, so it is comparable between a young 3-locus scheme and a mature 7-locus
+  one. Raw sums and medians measure registry depth in absolute units and therefore reward young,
+  small schemes; raw sums are additionally incomparable across different locus counts.
+* **Robust.** It is a mean of `n` bounded quantities rather than an order statistic, so no single
+  recently-registered allele decides the call the way `max` does.
+* **Nulls are skipped, not scored as the worst value**, so one absent locus in the *correct* scheme
+  cannot lose the tie.
+
+The measured difference is in the adversarial margin, not the headline accuracy. Over all 210
+genomes, counting every genome where some rival scheme's statistic already undercuts the labelled
+scheme's — i.e. where the rule *would* invert if the scores happened to tie — and reading off the
+thinnest score gap that is currently keeping that rival out of the tie:
+
+| rule | ties resolved correctly | inversions / 210 | thinnest protecting score gap |
+| :-- | --: | --: | --: |
+| lexicographic (old) | 0 / 17 | — | — |
+| lowest sum of allele numbers | 17 / 17 | 2 | 37 |
+| lowest maximum allele number | 17 / 17 | 5 | 18 |
+| lowest median allele number | 17 / 17 | 2 | 37 |
+| **lowest mean allele percentile** | **17 / 17** | **1** | **40** |
+
+**Determinism (constraint 2).** `_tie_key` returns `(sentinel-last, allele depth, scheme name)`.
+The scheme NAME is the final key, so the order is **total** even when two schemes are
+depth-identical; upstream's randomised hash order is never reintroduced. The sentinel is pinned
+first so it keeps winning a 0–0 tie (step 38) — it has no alleles and would otherwise sort to
+`inf`. A scheme the catalogue cannot open contributes `inf` rather than raising (D10).
+
+**Cost.** `Scheme.allele_index` is lazy and cached, and `_tie_key` is evaluated only for the rows
+of an actual tie — typically two schemes, on ~8 % of assemblies.
+
+**The tie stays visible.** It is not silently resolved:
+
+* the upstream `WARNING: {a}({st})=={b}({st}) score={n} {path}` line still goes to stderr through
+  `wrn()`, unsuppressed by `--quiet` (step 47);
+* `SampleResult.tied` carries the whole tied block, winner first (§3.5), so `report.py` renders
+  "N schemes fit this assembly equally well at score 100 — `klebsiella` ST 258 (reported) and
+  `ecoli_achtman_4` ST 14464", flags the tied rows in the runner-up table, and `gui.py` shows the
+  same in the summary card, an expansion row and the status line;
+* the compat TSV/CSV/JSON rows are byte-identity surfaces (§12) and say nothing new.
+
+### 5.14b The labelled validation corpus
+
+210 NCBI RefSeq assemblies, 30 per organism, seven ESKAPE-adjacent species with a known expected
+scheme: `saureus`→`saureus`, `abaumannii`→`abaumannii_2` (Oxford `abaumannii` is excluded by
+default), `ecoli`→`ecoli_achtman_4`, `efaecium`→`efaecium`, `kpneumoniae`→`klebsiella`,
+`paeruginosa`→`paeruginosa`, `ecloacae`→`ecloacae`. Each assembly is run through WMLST and through
+real Perl `mlst` 2.35.0 against the same database and the same `blastn`.
+
+Measured, same DB, same BLAST:
+
+| | before (lexicographic) | after (allele depth) |
+| :-- | --: | --: |
+| genomes | 210 | 210 |
+| top-score ties (all 2-way, all at score 100) | 17 | 17 |
+| ties resolved to the labelled scheme | 0 / 17 | 17 / 17 |
+| scheme == label | 193 / 210 | 210 / 210 |
+| agreement with reference Perl `mlst` | 201 / 210 | 202 / 210 |
+
+The residual disagreements with upstream are all ties where upstream's coin flip landed on the
+off-species scheme; WMLST is the biologically correct one in every case. Upstream itself called
+8 / 210 against the label.
 
 ### 5.15 Post-processing and status (steps 49–52) — `bin/mlst:167-220, 275-284`
 
@@ -2382,7 +2516,7 @@ which is off by default and loudly labelled.
 
 | # | Divergence | Justification |
 | :-- | :-- | :-- |
-| D1 | Deterministic ordering everywhere (`sorted()` for scheme directories, candidate insertion, stable score sort, tie-break by scheme name) | upstream randomises hash iteration per process; ties are decided by a coin flip. Affects only exact ties, which upstream cannot reproduce run-to-run |
+| D1 | Deterministic ordering everywhere (`sorted()` for scheme directories, candidate insertion, stable score sort) **and a meaningful score tie-break: lowest mean allele percentile, scheme name last (§5.14a)** | upstream randomises hash iteration per process; ties are decided by a coin flip, which WMLST cannot reproduce and must not imitate. Applies **only** where scores are exactly equal, so no non-tied call can move (verified: 17 of 210 corpus rows changed, all of them ties). Measured on the §5.14b corpus: 17/17 ties resolved to the labelled species vs 0/17 for the old lexicographic rule, 210/210 scheme calls correct vs 193/210, and 8 remaining disagreements with upstream in all of which upstream is the biologically wrong one. `tests/data/equality.fa.gz` keeps its old outcome — `ecoli_achtman_4` ST 131 (depth 0.0202) over `salmonella` ST 3529 (0.3905) — so the 17 goldens stay byte-identical. The tie itself is never hidden: the upstream stderr `WARNING:` stays, and `SampleResult.tied` carries the alternatives to `report.py` and `gui.py` |
 | D2 | JSON key order fixed to `id, filename, scheme, sequence_type, alleles`, alleles in gene order | upstream's order is a randomised Perl hash |
 | D3 | `err()` prints `ERROR: `, not the upstream typo `ERRPR: ` | nothing numeric depends on it (C6) |
 | D4 | The BLAST-DB builder drops the whole `not a locus` **record**, not just its header line | upstream's `grep -v` orphans the sequence lines onto the previous record; zero such records exist in the shipped DB |

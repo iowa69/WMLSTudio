@@ -121,8 +121,8 @@ if os.path.isdir(BLAST_PAYLOAD):
 HIDDEN = [
     # The package's own modules, several of which are reached only by name.
     "wmlst", "wmlst.any2fasta", "wmlst.blastbin", "wmlst.branding",
-    "wmlst.cli", "wmlst.engine", "wmlst.gui", "wmlst.report",
-    "wmlst.schemes", "wmlst.updatedb", "wmlst.version",
+    "wmlst.cli", "wmlst.engine", "wmlst.gui", "wmlst.perf", "wmlst.report",
+    "wmlst.schemerefs", "wmlst.schemes", "wmlst.updatedb", "wmlst.version",
     # Tkinter submodules are imported lazily by tkinter itself.
     "tkinter", "tkinter.ttk", "tkinter.filedialog", "tkinter.messagebox",
     "tkinter.scrolledtext", "tkinter.font", "tkinter.simpledialog",
@@ -140,20 +140,105 @@ HIDDEN = [
     "csv", "json", "hashlib", "webbrowser", "secrets", "uuid", "sqlite3",
 ]
 
-# tkinterdnd2 is optional (MIT). Bundle it when the build machine has it, and
-# say so; the application degrades to a Browse button when it is missing.
+# --------------------------------------------------------------------------
+# tkinterdnd2 -- optional at RUNTIME, mandatory in a RELEASE BUILD
+# --------------------------------------------------------------------------
+# wmlst/gui.py imports tkinterdnd2 inside a try/except and degrades to the
+# Browse button when it is absent (ARCHITECTURE.md C21). That degradation is
+# correct for a `pip install wmlst` with no extras. It is NOT acceptable in a
+# frozen release: dropping a FASTA on the window is the primary interaction of
+# this product, and a build that silently lost it is indistinguishable from a
+# good one until a user complains.
+#
+# So the spec refuses to build without it. `pip install -e ".[gui]"` (what both
+# .github/workflows/ci.yml and release.yml already do) is the fix. A deliberate
+# no-drag-and-drop build is still possible with WMLST_ALLOW_NO_DND=1.
+#
+# What "collected" has to mean here: tkinterdnd2 is a thin Python shim over the
+# tkdnd Tcl extension, which lives in <package>/tkdnd/<platform>/ and is loaded
+# by TkinterDnD._require() via os.path.dirname(__file__). Collecting the two
+# Python modules and forgetting the Tcl/DLL payload produces an import that
+# succeeds and a `package require tkdnd` that fails at window-creation time, so
+# the presence of a tkdnd platform directory is checked explicitly.
+ALLOW_NO_DND = os.environ.get("WMLST_ALLOW_NO_DND", "").strip().lower() in (
+    "1", "true", "yes", "on",
+)
+
+#: Directory names TkinterDnD._require() may pick for a 64-bit Windows host.
+DND_WIN_PLATFORMS = ("win-x64", "win-x64-tcl9")
+
+_dnd_datas, _dnd_binaries, _dnd_hidden = [], [], []
+_dnd_problem = ""
+
 try:
     from PyInstaller.utils.hooks import collect_all as _collect_all
+except ImportError as exc:                                   # pragma: no cover
+    _dnd_problem = "PyInstaller.utils.hooks.collect_all is unavailable: %s" % exc
+else:
+    try:
+        _dnd_datas, _dnd_binaries, _dnd_hidden = _collect_all("tkinterdnd2")
+    except Exception as exc:
+        _dnd_datas, _dnd_binaries, _dnd_hidden = [], [], []
+        _dnd_problem = "collect_all('tkinterdnd2') failed: %s: %s" % (
+            type(exc).__name__, exc,
+        )
 
-    _dnd_datas, _dnd_binaries, _dnd_hidden = _collect_all("tkinterdnd2")
-except Exception:
+if not _dnd_problem and not _dnd_hidden:
+    _dnd_problem = "tkinterdnd2 is not importable on the build interpreter"
+
+if not _dnd_problem:
+    # Every collected destination directory, e.g. 'tkinterdnd2/tkdnd/win-x64'.
+    _dnd_dests = {
+        str(dest).replace("\\", "/")
+        for _src, dest in list(_dnd_datas) + list(_dnd_binaries)
+    }
+    _dnd_tkdnd = {d for d in _dnd_dests if "/tkdnd/" in d + "/"}
+    if not _dnd_tkdnd:
+        _dnd_problem = (
+            "tkinterdnd2 was found but its bundled tkdnd Tcl extension was not "
+            "collected; the frozen GUI would import tkinterdnd2 and then fail on "
+            "`package require tkdnd`"
+        )
+    elif sys.platform == "win32" and not any(
+        d.endswith(p) for d in _dnd_tkdnd for p in DND_WIN_PLATFORMS
+    ):
+        _dnd_problem = (
+            "tkinterdnd2 ships no %s build of tkdnd; collected platforms: %s"
+            % (" / ".join(DND_WIN_PLATFORMS), ", ".join(sorted(_dnd_tkdnd)))
+        )
+
+if _dnd_problem:
     _dnd_datas, _dnd_binaries, _dnd_hidden = [], [], []
-if _dnd_hidden:
+    _message = (
+        "\n"
+        "wmlst.spec: drag-and-drop dependency is missing.\n"
+        "  %s\n"
+        "\n"
+        "  Dropping a FASTA on the window is the primary interaction of WMLST,\n"
+        "  and wmlst/gui.py degrades SILENTLY when tkinterdnd2 is absent, so a\n"
+        "  build without it looks identical to a good one.\n"
+        "\n"
+        "  Fix it with:   python -m pip install -e \".[gui]\"\n"
+        "           or:   python -m pip install \"tkinterdnd2>=0.3.0\"\n"
+        "\n"
+        "  To build deliberately without drag-and-drop, set WMLST_ALLOW_NO_DND=1.\n"
+    ) % _dnd_problem
+    if not ALLOW_NO_DND:
+        raise SystemExit(_message)
+    print(_message)
+    print("wmlst.spec: WMLST_ALLOW_NO_DND is set; continuing without drag-and-drop")
+else:
     HIDDEN += list(_dnd_hidden)
     DATAS += list(_dnd_datas)
-    print("wmlst.spec: bundling optional tkinterdnd2 (drag-and-drop enabled)")
-else:
-    print("wmlst.spec: tkinterdnd2 not installed; drag-and-drop will be disabled")
+    print(
+        "wmlst.spec: bundling tkinterdnd2 (drag-and-drop enabled) -- "
+        "%d data files, %d binaries, tkdnd platforms: %s"
+        % (
+            len(_dnd_datas),
+            len(_dnd_binaries),
+            ", ".join(sorted(d.rsplit("/", 1)[-1] for d in _dnd_tkdnd)),
+        )
+    )
 
 # --------------------------------------------------------------------------
 # Exclusions -- section 13.1. PIL is on this list deliberately: the icon is
@@ -207,7 +292,9 @@ _exe_common = dict(
     target_arch=None,
     codesign_identity=None,
     entitlements_file=None,
-    icon=ICON,
+    # NOTE: `icon` is deliberately NOT set here. It is passed per-executable
+    # below, because the two executables must NOT look alike -- see the comment
+    # on cli_exe.
 )
 if sys.platform == "win32" and os.path.isfile(VERSION_INFO):
     _exe_common["version"] = VERSION_INFO
@@ -218,6 +305,9 @@ gui_exe = EXE(
     [],
     name="WMLST",
     console=False,   # THE point of the two-exe split. Never change this.
+    # The branded icon belongs to the windowed application and to nothing else.
+    # WMLST.exe is the only file a user is ever invited to double-click.
+    icon=ICON,
     **_exe_common
 )
 
@@ -227,6 +317,13 @@ cli_exe = EXE(
     [],
     name="wmlst-cli",
     console=True,
+    # NO custom icon, on purpose. Two files in one folder carrying the same
+    # artwork, one of which opens a black console window and exits, is a trap:
+    # the novice double-clicks whichever one Explorer happens to sort first and
+    # concludes the program is broken. wmlst-cli.exe keeps the default console
+    # icon so it reads as what it is -- a terminal tool -- and is reached by
+    # typing its name, not by clicking it. Do not "restore" this to ICON.
+    icon=None,
     **_exe_common
 )
 

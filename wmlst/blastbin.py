@@ -52,12 +52,15 @@ __all__ = [
     "child_env",
     "find_blast",
     "install_root",
+    "is_shutting_down",
     "job_dir",
     "makeblastdb_argv",
     "probe_version",
+    "reset_shutdown",
     "run_blastn",
     "run_makeblastdb",
     "run_tool",
+    "shutdown",
     "temp_root",
     "terminate_all",
     "verify_sha256sums",
@@ -111,6 +114,18 @@ SHA256SUMS = "SHA256SUMS"
 _EXC_CACHE: Dict[str, type] = {}
 _PROCS: set = set()
 _PROCS_LOCK = threading.Lock()
+#: Notified whenever a child enters or leaves ``_PROCS``, so :func:`shutdown`
+#: can wait for the registry to drain without polling.
+_PROCS_CHANGED = threading.Condition(_PROCS_LOCK)
+#: Set by :func:`shutdown`: refuse new children and release every blocking wait.
+_SHUTDOWN = threading.Event()
+#: The longest any blocking wait may sit before it re-checks cancel/shutdown.
+#: EVERY wait in this module is bounded by it -- an unbounded ``communicate()``
+#: is what leaves a worker thread parked on ``blastn`` while the window is gone.
+_POLL_S = 0.2
+#: Grace given to a child during shutdown, before ``kill()``. Shorter than the
+#: 5 s of section 9 on purpose: the user has already closed the window.
+_SHUTDOWN_GRACE = 1.0
 _JOB_COUNTER = itertools.count(1)
 
 
@@ -208,7 +223,13 @@ def run_tool(
 
     Raises ``subprocess.TimeoutExpired`` after ``kill()`` **then** ``wait()`` (the
     wait is required on Windows or the handle leaks and the job dir cannot be
-    removed), and ``engine.Cancelled`` when `cancel` is set.
+    removed), and ``engine.Cancelled`` when `cancel` is set OR when
+    :func:`shutdown` has been called -- then nothing new is launched at all.
+
+    Every wait here is bounded (``_POLL_S``) whether or not a `cancel` or a
+    `timeout` was given, so the calling thread always comes back and can be
+    joined. An unbounded wait here is what survives as a zombie process after
+    the window is closed; see :func:`shutdown`.
     """
     args = [str(a) for a in argv]
     kwargs: Dict[str, object] = {
@@ -227,6 +248,9 @@ def run_tool(
         kwargs["startupinfo"] = _startupinfo()
 
     _LOG.debug("run_tool: %r (cwd=%r)", args, cwd)
+    if _SHUTDOWN.is_set():
+        raise _exc("Cancelled")(
+            "WMLST is shutting down; %s was not started" % (args[0],))
     try:
         proc = subprocess.Popen(args, **kwargs)  # type: ignore[arg-type]
     except OSError as exc:
@@ -235,41 +259,79 @@ def run_tool(
             user_message="WMLST could not start '%s'." % (os.path.basename(args[0]),),
         ) from exc
 
-    with _PROCS_LOCK:
-        _PROCS.add(proc)
+    if not _register(proc):
+        # shutdown() ran between the check above and the Popen. This child is
+        # not in the registry, so nothing else will ever stop it: do it here.
+        _terminate(proc, grace=_SHUTDOWN_GRACE)
+        raise _exc("Cancelled")(
+            "WMLST is shutting down; %s was stopped" % (args[0],))
     deadline = None if timeout is None else time.monotonic() + timeout
     try:
         while True:
+            if _SHUTDOWN.is_set():
+                _terminate(proc, grace=_SHUTDOWN_GRACE)
+                raise _exc("Cancelled")(
+                    "WMLST is shutting down; %s was stopped" % (args[0],))
             if cancel is not None and cancel.is_set():
                 _terminate(proc)
                 raise _exc("Cancelled")("Cancelled before %s finished" % (args[0],))
             if deadline is None:
-                slice_s = None if cancel is None else 0.2
+                slice_s = _POLL_S
             else:
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
                     proc.kill()
                     proc.wait()
                     raise subprocess.TimeoutExpired(args, timeout)
-                slice_s = remaining if cancel is None else min(0.2, remaining)
+                slice_s = min(_POLL_S, remaining)
+            # The wait is ALWAYS bounded, cancel or no cancel: a worker parked
+            # here with no timeout is exactly what makes the interpreter hang
+            # at exit (see shutdown()).
             try:
                 out, err = proc.communicate(timeout=slice_s)
             except subprocess.TimeoutExpired:
                 continue
+            if _SHUTDOWN.is_set():
+                # The child did not finish: shutdown() killed it a moment ago
+                # and communicate() returned because the pipes closed. Report
+                # the cancellation, never a "blastn failed" CompletedProcess.
+                raise _exc("Cancelled")(
+                    "WMLST is shutting down; %s was stopped" % (args[0],))
             return subprocess.CompletedProcess(args, proc.returncode, out, err)
     finally:
-        with _PROCS_LOCK:
-            _PROCS.discard(proc)
+        _unregister(proc)
 
 
-def _terminate(proc) -> None:
-    """terminate() -> wait(5) -> kill() -> wait() (section 9)."""
+def _register(proc) -> bool:
+    """Track `proc`, unless a shutdown is already in progress. -> tracked?"""
+    with _PROCS_CHANGED:
+        if _SHUTDOWN.is_set():
+            return False
+        _PROCS.add(proc)
+        _PROCS_CHANGED.notify_all()
+        return True
+
+
+def _unregister(proc) -> None:
+    """Drop `proc` from the registry and wake anything waiting on it."""
+    with _PROCS_CHANGED:
+        _PROCS.discard(proc)
+        _PROCS_CHANGED.notify_all()
+
+
+def _terminate(proc, grace: float = 5.0) -> None:
+    """terminate() -> wait(`grace`) -> kill() -> wait() (section 9).
+
+    On Windows ``terminate()`` IS ``TerminateProcess``, and the trailing
+    ``wait()`` is mandatory there or the handle leaks and the job directory
+    cannot be removed. Both are unchanged; only the grace is now a parameter.
+    """
     try:
         proc.terminate()
     except OSError:  # pragma: no cover - already gone
         return
     try:
-        proc.wait(timeout=5)
+        proc.wait(timeout=grace)
         return
     except subprocess.TimeoutExpired:
         pass
@@ -280,14 +342,91 @@ def _terminate(proc) -> None:
         pass
 
 
-def terminate_all() -> int:
-    """Stop every child this process still owns. -> how many were signalled."""
+def terminate_all(timeout: float = 5.0) -> int:
+    """Stop every child this process still owns. -> how many were tracked.
+
+    Batched deliberately: ``terminate()`` reaches EVERY child first and the
+    grace period is then shared, so ``--jobs 4`` costs one grace period rather
+    than four. The ladder of section 9 is otherwise unchanged, including the
+    final ``wait()`` per child that Windows needs.
+    """
     with _PROCS_LOCK:
         procs = list(_PROCS)
-    for proc in procs:
-        if proc.poll() is None:
-            _terminate(proc)
+    live = [proc for proc in procs if proc.poll() is None]
+    for proc in live:
+        try:
+            proc.terminate()
+        except OSError:  # pragma: no cover - raced with its own exit
+            pass
+    deadline = time.monotonic() + max(0.0, float(timeout))
+    pending = list(live)
+    while pending:
+        pending = [proc for proc in pending if proc.poll() is None]
+        if not pending or time.monotonic() >= deadline:
+            break
+        time.sleep(0.02)
+    for proc in pending:
+        try:
+            proc.kill()
+        except OSError:  # pragma: no cover - raced with its own exit
+            pass
+    for proc in live:
+        # Reap: an un-waited handle leaks on Windows and the job dir stays.
+        try:
+            proc.wait(timeout=1.0)
+        except subprocess.TimeoutExpired:  # pragma: no cover - defensive
+            _LOG.warning("child pid %s survived kill()", proc.pid)
+        except OSError:  # pragma: no cover
+            pass
     return len(procs)
+
+
+def shutdown(timeout: float = 5.0) -> bool:
+    """Refuse new children, stop every running one, wait briefly. -> clean?
+
+    The process-wide "the window is closing" entry point (section 9). Two
+    things happen, in this order, and both matter:
+
+    1. the module is marked as shutting down, so :func:`run_tool` raises
+       ``Cancelled`` instead of launching anything new;
+    2. every tracked child is terminated, which releases the worker thread
+       parked in :func:`run_tool` on that child.
+
+    Without (2) that worker never returns, and because
+    ``concurrent.futures.ThreadPoolExecutor`` workers are NOT daemon threads
+    and ``concurrent.futures.thread`` registers an ``atexit`` hook that JOINS
+    them, one parked worker is enough to hang the interpreter forever at exit:
+    the window disappears and the process survives, killable only from Task
+    Manager. That is the bug this function exists to prevent.
+
+    -> True when the registry drained within `timeout`; False means a child is
+    still there and the caller should force the exit. Safe to call more than
+    once, and from any thread. :func:`reset_shutdown` re-enables launching.
+    """
+    deadline = time.monotonic() + max(0.0, float(timeout))
+    _SHUTDOWN.set()
+    terminate_all(timeout=max(0.0, (deadline - time.monotonic()) * 0.5))
+    with _PROCS_CHANGED:
+        while _PROCS:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            _PROCS_CHANGED.wait(min(0.05, remaining))
+        left = len(_PROCS)
+    if left:
+        _LOG.warning("shutdown: %d child process(es) still tracked", left)
+    return left == 0
+
+
+def is_shutting_down() -> bool:
+    """True once :func:`shutdown` has run and no child may be launched."""
+    return _SHUTDOWN.is_set()
+
+
+def reset_shutdown() -> None:
+    """Allow child launches again after :func:`shutdown` (tests; a cancelled
+    close). It does NOT resurrect the children shutdown already killed."""
+    _SHUTDOWN.clear()
 
 
 # ---------------------------------------------------------------------------
@@ -855,6 +994,13 @@ def _tools_from_blastn(blastn: str, origin: str) -> Optional[BlastTools]:
     directory = os.path.dirname(blastn)
     try:
         version, vtuple = probe_version(blastn)
+    except _exc("Cancelled"):
+        # Shutdown latched while probing. This candidate is not "bad" -- nothing
+        # was learned about it -- so swallowing it here would walk the rest of
+        # the ladder, reject every entry the same way, and end at
+        # BlastNotFoundError telling a user who just closed the window to go and
+        # install BLAST+. Propagate the real reason instead.
+        raise
     except Exception as exc:
         _LOG.debug("candidate %s rejected: %s", blastn, exc)
         return None
@@ -950,6 +1096,9 @@ def find_blast(explicit: Optional[str] = None) -> BlastTools:
     ``PATH`` (rejecting a directory that is the CWD or world-writable, which is the
     binary-planting guard) -> conda prefixes.  Raises ``BlastNotFoundError``.
     """
+    if is_shutting_down():
+        raise _exc("Cancelled")("WMLST is shutting down")
+
     tried: List[str] = []
 
     if explicit:
@@ -1118,6 +1267,8 @@ def bootstrap(
             progress(done, total, text)
 
     def check_cancel() -> None:
+        if _SHUTDOWN.is_set():
+            raise _exc("Cancelled")("WMLST is shutting down")
         if cancel is not None and cancel.is_set():
             raise _exc("Cancelled")("BLAST+ installation cancelled")
 

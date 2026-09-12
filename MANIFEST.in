@@ -23,6 +23,7 @@ recursive-include tests/golden *
 # The database is the product. 162 schemes, 1,108 locus files, byte-frozen.
 include db/VERSION.txt
 include db/scheme_species_map.tab
+include db/scheme_refs.tsv
 include db/schemes.manifest.tsv
 include db/__init__.py
 include db/pubmlst/__init__.py

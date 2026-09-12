@@ -1,0 +1,246 @@
+<!DOCTYPE html>
+<!--
+  SPDX-License-Identifier: GPL-2.0-only
+  Copyright (C) 2025-2026 IOWA-Tech - Giovanni Lorenzin
+  Copyright (C) Torsten Seemann (upstream `mlst`, from which WMLST is ported)
+
+  WMLST download page. One job: put the CURRENT portable zip one click away.
+
+  No version number is written in this file. The five sentinel strings below are
+  rewritten by .github/workflows/pages.yml at deploy time from the GitHub API,
+  and the small script at the bottom refreshes them again in the browser. Either
+  mechanism alone is enough; with both off the button still lands on the
+  releases page, where the zip is the first asset.
+
+  Sentinels, each of which MUST appear exactly once (the deploy fails loudly
+  otherwise): the href of #get-portable, the href of #get-installer, and the
+  three one-line elements with class f-version, f-size and f-date.
+-->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Download WMLST for Windows &mdash; IOWA-Tech</title>
+<meta name="description" content="WMLST: MLST typing for Windows. Download the portable build, unzip it, drop a FASTA on the window.">
+<meta name="color-scheme" content="light dark">
+<style>
+:root{
+  --bg:#ffffff; --surface:#f3f6f9; --surface-2:#e9eff4;
+  --text:#16202a; --muted:#4a5a68; --border:#d3dce4;
+  --accent:#0b5fa5; --accent-hov:#094b83; --accent-fg:#ffffff;
+  --note-bg:#fff6e0; --note-bd:#e0a800; --note-fg:#4a3805;
+  --focus:#0b5fa5;
+}
+@media (prefers-color-scheme: dark){
+  :root{
+    --bg:#11161b; --surface:#1a2128; --surface-2:#222c35;
+    --text:#e8eef3; --muted:#a9b7c2; --border:#333f4a;
+    --accent:#3d90e3; --accent-hov:#5aa4ee; --accent-fg:#08121b;
+    --note-bg:#2b2415; --note-bd:#c79a1a; --note-fg:#f0dfb4;
+    --focus:#7fb8f5;
+  }
+}
+*{box-sizing:border-box}
+html{-webkit-text-size-adjust:100%}
+body{
+  margin:0; background:var(--bg); color:var(--text);
+  font:16px/1.6 system-ui,-apple-system,"Segoe UI",Roboto,"Helvetica Neue",Arial,sans-serif;
+}
+a{color:var(--accent)}
+a:focus-visible,.btn:focus-visible{outline:3px solid var(--focus); outline-offset:3px; border-radius:4px}
+.wrap{max-width:44rem; margin:0 auto; padding:2.5rem 1.1rem 4rem}
+header{text-align:center}
+.logo{
+  display:inline-flex; align-items:center; justify-content:center;
+  width:4rem; height:4rem; border-radius:14px;
+  background:var(--accent); color:var(--accent-fg);
+  font-weight:700; font-size:1.15rem; letter-spacing:.02em;
+}
+h1{font-size:1.9rem; line-height:1.25; margin:1rem 0 .3rem}
+.tagline{color:var(--muted); margin:0 0 .2rem; font-size:1.05rem}
+.vendor{color:var(--muted); margin:0; font-size:.9rem}
+.cta{margin:2.2rem 0 0; text-align:center}
+.btn{
+  display:inline-block; max-width:100%;
+  background:var(--accent); color:var(--accent-fg);
+  font-size:1.12rem; font-weight:600; text-decoration:none;
+  padding:1rem 1.6rem; border-radius:10px; border:1px solid transparent;
+}
+.btn:hover{background:var(--accent-hov)}
+.meta{margin:.85rem 0 0; color:var(--muted); font-size:.92rem}
+.meta span{white-space:nowrap}
+.sep{opacity:.55; padding:0 .35rem}
+.secondary{display:block; margin:.9rem 0 0; font-size:.88rem; color:var(--muted)}
+.secondary a{color:var(--muted)}
+.note{
+  margin:2.2rem 0 0; padding:.95rem 1.1rem;
+  background:var(--note-bg); color:var(--note-fg);
+  border:1px solid var(--note-bd); border-left-width:5px; border-radius:8px;
+  font-size:.95rem;
+}
+.note strong{color:inherit}
+h2{font-size:1.15rem; margin:2.4rem 0 .8rem}
+ol.steps{margin:0; padding:0; list-style:none; counter-reset:step}
+ol.steps li{
+  counter-increment:step; position:relative;
+  background:var(--surface); border:1px solid var(--border); border-radius:10px;
+  padding:.9rem 1rem .9rem 3.4rem; margin:0 0 .6rem;
+}
+ol.steps li::before{
+  content:counter(step); position:absolute; left:.85rem; top:.85rem;
+  width:1.75rem; height:1.75rem; border-radius:50%;
+  background:var(--surface-2); color:var(--text);
+  font-weight:700; font-size:.9rem; display:flex; align-items:center; justify-content:center;
+}
+code{
+  background:var(--surface-2); border:1px solid var(--border); border-radius:5px;
+  padding:.08em .38em; font-family:ui-monospace,"Cascadia Mono",Consolas,"DejaVu Sans Mono",monospace;
+  font-size:.9em; word-break:break-word;
+}
+.facts{margin:.5rem 0 0; padding-left:1.2rem; color:var(--muted); font-size:.95rem}
+.facts li{margin:.25rem 0}
+footer{
+  margin-top:3rem; padding-top:1.4rem; border-top:1px solid var(--border);
+  color:var(--muted); font-size:.85rem;
+}
+footer p{margin:.45rem 0}
+@media (max-width:30rem){
+  .wrap{padding-top:1.8rem}
+  h1{font-size:1.55rem}
+  .btn{display:block; padding:1rem .9rem; font-size:1.02rem}
+  .meta .sep{display:none}
+  .meta span{display:block; white-space:normal}
+}
+@media (prefers-reduced-motion:no-preference){
+  .btn{transition:background-color .15s ease-in-out}
+}
+</style>
+</head>
+<body>
+<div class="wrap">
+
+  <header>
+    <div class="logo" aria-hidden="true">MLST</div>
+    <h1>WMLST</h1>
+    <p class="tagline">MLST typing for Windows. No install, no command line, no internet.</p>
+    <p class="vendor">IOWA-Tech &mdash; Giovanni Lorenzin</p>
+  </header>
+
+  <main>
+    <div class="cta">
+      <a class="btn" id="get-portable"
+         href="https://github.com/iowa69/WMLST/releases/latest#portable">Download WMLST for Windows (portable)</a>
+
+      <p class="meta">
+        <span class="f-version">the latest release</span><span class="sep">&middot;</span><span class="f-size">ZIP archive</span><span class="sep">&middot;</span><span class="f-date">published on GitHub</span>
+      </p>
+
+      <small class="secondary">
+        Would you rather have a Start-menu entry?
+        <a id="get-installer" href="https://github.com/iowa69/WMLST/releases/latest#installer">Get the Windows installer instead</a>.
+      </small>
+    </div>
+
+    <div class="note">
+      <strong>Windows will say it protected your PC.</strong>
+      That is normal. WMLST is not signed with a paid certificate, so the first
+      time you run it Windows shows a blue box. Click <strong>More info</strong>,
+      then <strong>Run anyway</strong>. Do not switch SmartScreen or Defender off.
+    </div>
+
+    <h2>Three steps</h2>
+    <ol class="steps">
+      <li>Unzip the file you just downloaded, anywhere you like &mdash; Desktop, Documents, a USB stick.</li>
+      <li>Open the folder and double-click <code>WMLST.exe</code>.</li>
+      <li>Drag a FASTA file of assembled contigs onto the window. The sequence type appears in a few seconds.</li>
+    </ol>
+
+    <h2>Good to know</h2>
+    <ul class="facts">
+      <li>Windows 10 and 11, 64-bit. Nothing is written outside the folder you unzipped.</li>
+      <li>The allele database and the BLAST+ binaries are inside the zip, so it works offline.</li>
+      <li>Accepts FASTA, GenBank, EMBL and GFF, plain or gzipped.</li>
+      <li>Results are byte-identical to <a href="https://github.com/tseemann/mlst">tseemann/mlst</a> on the reference fixtures.</li>
+      <li>Research use only. Not a medical device.</li>
+    </ul>
+  </main>
+
+  <footer>
+    <p>
+      <a href="https://github.com/iowa69/WMLST">Source code</a> &middot;
+      <a href="https://github.com/iowa69/WMLST/releases">All releases and SHA256SUMS</a> &middot;
+      <a href="https://github.com/iowa69/WMLST/issues">Report a problem</a>
+    </p>
+    <p>
+      WMLST is GPL-2.0-only, a port of <a href="https://github.com/tseemann/mlst"><em>mlst</em></a>
+      by Torsten Seemann &mdash; please cite that first. Allele data from
+      <a href="https://pubmlst.org">PubMLST</a> (Jolley, Bray &amp; Maiden 2018, PMID 30345391).
+    </p>
+    <p>Packaged for Windows by IOWA-Tech &mdash; Giovanni Lorenzin.</p>
+  </footer>
+
+</div>
+
+<script>
+/* Refresh the download link from the GitHub API.
+   The href is already correct when the page was stamped at deploy time; this
+   only closes the gap if a release was published after the last Pages deploy.
+   Every failure path is a no-op: we never downgrade a working link. */
+(function () {
+  "use strict";
+  var API = "https://api.github.com/repos/iowa69/WMLST/releases/latest";
+  var WANT = [
+    { id: "get-portable", re: /-win64-portable\.zip$/i, meta: true },
+    { id: "get-installer", re: /-win64-setup\.exe$/i, meta: false }
+  ];
+
+  function text(sel, value) {
+    var nodes = document.querySelectorAll(sel);
+    for (var i = 0; i < nodes.length; i++) { nodes[i].textContent = value; }
+  }
+
+  function size(bytes) {
+    if (!bytes || bytes < 0) { return null; }
+    var mb = bytes / 1048576;
+    return (mb >= 100 ? Math.round(mb) : Math.round(mb * 10) / 10) + " MB";
+  }
+
+  function day(iso) {
+    var d = new Date(iso);
+    if (isNaN(d.getTime())) { return null; }
+    try {
+      return d.toLocaleDateString(undefined, { year: "numeric", month: "long", day: "numeric" });
+    } catch (e) {
+      return iso.slice(0, 10);
+    }
+  }
+
+  if (typeof fetch !== "function") { return; }
+
+  fetch(API, { headers: { Accept: "application/vnd.github+json" } })
+    .then(function (r) { return r.ok ? r.json() : Promise.reject(r.status); })
+    .then(function (rel) {
+      var assets = (rel && rel.assets) || [];
+      WANT.forEach(function (want) {
+        var el = document.getElementById(want.id);
+        if (!el) { return; }
+        for (var i = 0; i < assets.length; i++) {
+          var a = assets[i];
+          if (!a.name || !want.re.test(a.name) || !a.browser_download_url) { continue; }
+          el.href = a.browser_download_url;
+          if (want.meta) {
+            if (rel.tag_name) { text(".f-version", rel.tag_name); }
+            var s = size(a.size);
+            if (s) { text(".f-size", s + " ZIP"); }
+            var d = day(rel.published_at || rel.created_at);
+            if (d) { text(".f-date", "released " + d); }
+          }
+          return;
+        }
+      });
+    })
+    .catch(function () { /* offline, rate-limited, or blocked: keep what we have */ });
+})();
+</script>
+</body>
+</html>

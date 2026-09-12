@@ -21,9 +21,11 @@ import dataclasses
 import json
 import logging
 import logging.handlers
+import math
 import os
 import platform
 import queue
+import shutil
 import socket
 import sys
 import threading
@@ -39,7 +41,7 @@ from tkinter import filedialog, messagebox, ttk
 from tkinter import font as tkfont
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
-from . import branding
+from . import branding, perf, schemerefs
 from .engine import (
     AlleleCall,
     BlastFailedError,
@@ -81,46 +83,104 @@ LOG = logging.getLogger("wmlst.gui")
 #: Scale factor, 1.0 at 96 dpi. Set once by :func:`apply_scaling`.
 SC = 1.0
 
-#: Spacing scale (section 10.1). Use ``px(PAD_M)``, never a bare number.
-PAD_XS, PAD_S, PAD_M, PAD_L, PAD_XL, PAD_XXL = 4, 8, 12, 16, 24, 32
+#: Spacing scale (section 10.1) — an 8 px rhythm with a 4 px half-step. Use
+#: ``px(PAD_M)``, never a bare number, and never a value off this ladder.
+PAD_XS, PAD_S, PAD_M, PAD_L, PAD_XL, PAD_XXL = 4, 8, 16, 24, 32, 48
+
+#: Corner radius of a card, in unscaled pixels (see :class:`Card`).
+RADIUS = 10
 
 #: Font sizes in POINTS. These are never multiplied by :data:`SC` — Tk's own
 #: scaling already accounts for dpi, and doubling it is the classic HiDPI bug.
+#: At 96 dpi the ladder renders as roughly 11 / 12 / 13 / 15 / 21 / 35 px, which
+#: is the type scale the design asks for: one step per role, no in-between sizes.
 FONT_PT = {
-    "body": 10,
-    "small": 9,
-    "tiny": 8,
-    "heading": 12,
-    "title": 15,
-    "hero": 28,
+    "tiny": 8,       # ~11 px — table captions, the smallest thing on screen
+    "small": 9,      # ~12 px — secondary text, field labels, the footer
+    "body": 10,      # ~13 px — everything the user reads
+    "heading": 11,   # ~15 px — card titles (semibold)
+    "title": 16,     # ~21 px — section titles
+    "hero": 26,      # ~35 px — the ST, and nothing else
     "mono": 9,
 }
 
-PREFERRED_FAMILIES = ("Segoe UI", "Inter", "Noto Sans", "DejaVu Sans", "Helvetica")
-PREFERRED_MONO = ("Consolas", "Cascadia Mono", "DejaVu Sans Mono", "Courier New")
+#: Body/UI family ladder. Windows 11 ships "Segoe UI Variable Text", which is
+#: the small-optical-size cut and is meaningfully crisper below 16 px; Windows 10
+#: has plain "Segoe UI". Everything after that is a non-Windows fallback.
+PREFERRED_FAMILIES = ("Segoe UI Variable Text", "Segoe UI", "Inter",
+                      "Noto Sans", "DejaVu Sans", "Helvetica")
+#: Display family ladder, used for ``title`` and ``hero`` only. "Segoe UI
+#: Variable Display" is the large-optical-size cut: tighter spacing, thinner
+#: joins, and it is what makes a 35 px number look designed rather than blown up.
+PREFERRED_DISPLAY = ("Segoe UI Variable Display", "Segoe UI Semibold", "Segoe UI",
+                     "Inter", "Noto Sans", "DejaVu Sans", "Helvetica")
+PREFERRED_MONO = ("Cascadia Mono", "Consolas", "DejaVu Sans Mono", "Courier New")
 
-#: Flat, modern palette. Deliberately not the 1998 Tk grey.
+#: Light palette. One restrained accent (a single blue), semantic status colours
+#: that are never the only channel, and a hairline border — no 3-D edges, no
+#: system grey. Every foreground here clears WCAG AA (>= 4.5:1) on ``surface``
+#: and on ``bg``; the ratios are asserted in tests/test_gui_headless.py.
 PALETTE = {
-    "bg": "#f2f4f7",
+    "bg": "#f4f6f9",
     "surface": "#ffffff",
-    "surface_alt": "#f7f9fc",
-    "border": "#d5dae1",
-    "border_strong": "#b6bec9",
-    "text": "#16191d",
-    "muted": "#5c6673",
-    "accent": "#1f6feb",
-    "accent_hover": "#3a83f0",
-    "accent_active": "#1a5fd0",
-    "accent_soft": "#e8f0fe",
+    "surface_alt": "#eef1f6",
+    "surface_sunk": "#f8fafc",
+    "border": "#dfe3ea",
+    "border_strong": "#c2c9d4",
+    "text": "#121820",
+    "text_soft": "#3d4754",
+    "muted": "#5b6573",
+    "accent": "#2563eb",
+    "accent_hover": "#3b76ee",
+    "accent_active": "#1d4ed8",
+    "accent_soft": "#e9f0fe",
+    "accent_tint": "#f5f8ff",
     "on_accent": "#ffffff",
-    "ok": "#146c2e",
-    "warn": "#8a5a00",
-    "bad": "#b3261e",
-    "info": "#1f6feb",
-    "focus": "#1f6feb",
-    "row_alt": "#f7f9fc",
-    "drop_idle": "#aab3c0",
-    "drop_hover": "#1f6feb",
+    "ok": "#0f7032",
+    "warn": "#8a5300",
+    "bad": "#b42318",
+    "info": "#1d4ed8",
+    "ok_soft": "#e7f5ec",
+    "warn_soft": "#fdf3e2",
+    "bad_soft": "#fdeceb",
+    "focus": "#1d4ed8",
+    "row_alt": "#f8fafc",
+    "drop_idle": "#c2c9d4",
+    "drop_hover": "#2563eb",
+    "shadow": "#e6e9ef",
+}
+
+#: Dark palette. Not an inversion: the surfaces stay separated by luminance the
+#: way they are in the light theme, and the accent is lightened so that text on
+#: it still clears AA. Chosen by :func:`detect_theme_mode`.
+DARK_PALETTE = {
+    "bg": "#111419",
+    "surface": "#191d24",
+    "surface_alt": "#212732",
+    "surface_sunk": "#14181e",
+    "border": "#2a313c",
+    "border_strong": "#3c4552",
+    "text": "#e9edf4",
+    "text_soft": "#c3cbd7",
+    "muted": "#98a3b3",
+    "accent": "#6ea0ff",
+    "accent_hover": "#8db4ff",
+    "accent_active": "#4d87f5",
+    "accent_soft": "#1d2836",
+    "accent_tint": "#161c26",
+    "on_accent": "#0b1220",
+    "ok": "#4ade80",
+    "warn": "#fbbf24",
+    "bad": "#fb7185",
+    "info": "#6ea0ff",
+    "ok_soft": "#14261c",
+    "warn_soft": "#2a2113",
+    "bad_soft": "#2c1619",
+    "focus": "#8db4ff",
+    "row_alt": "#1d222a",
+    "drop_idle": "#3c4552",
+    "drop_hover": "#6ea0ff",
+    "shadow": "#0d1014",
 }
 
 #: High-contrast fallback (section 10.1). Populated from the system palette when
@@ -129,24 +189,119 @@ HIGH_CONTRAST_PALETTE = {
     "bg": "#000000",
     "surface": "#000000",
     "surface_alt": "#000000",
+    "surface_sunk": "#000000",
     "border": "#ffffff",
     "border_strong": "#ffffff",
     "text": "#ffffff",
+    "text_soft": "#ffffff",
     "muted": "#ffffff",
     "accent": "#ffff00",
     "accent_hover": "#ffff00",
     "accent_active": "#ffff00",
     "accent_soft": "#000000",
+    "accent_tint": "#000000",
     "on_accent": "#000000",
     "ok": "#00ff00",
     "warn": "#ffff00",
     "bad": "#ff6060",
     "info": "#00ffff",
+    "ok_soft": "#000000",
+    "warn_soft": "#000000",
+    "bad_soft": "#000000",
     "focus": "#ffff00",
     "row_alt": "#000000",
     "drop_idle": "#ffffff",
     "drop_hover": "#ffff00",
+    "shadow": "#000000",
 }
+
+
+def mix(a: str, b: str, t: float) -> str:
+    """Blend two ``#rrggbb`` colours, ``t`` of the way from ``a`` to ``b``.
+
+    Tk draws no antialiasing, so every soft edge in this module — the rounded
+    card corners, the chromosome glow in the drop zone — is a hand-blended ramp
+    computed here rather than an alpha channel Tk does not have.
+    """
+    try:
+        ar, ag, ab = (int(a[i:i + 2], 16) for i in (1, 3, 5))
+        br, bg_, bb = (int(b[i:i + 2], 16) for i in (1, 3, 5))
+    except (ValueError, IndexError):
+        return a
+    t = 0.0 if t < 0.0 else (1.0 if t > 1.0 else t)
+    return "#{:02x}{:02x}{:02x}".format(
+        int(round(ar + (br - ar) * t)),
+        int(round(ag + (bg_ - ag) * t)),
+        int(round(ab + (bb - ab) * t)),
+    )
+
+
+def detect_theme_mode() -> str:
+    """Return ``"light"``, ``"dark"`` or ``"high-contrast"`` for this session.
+
+    ``WMLST_THEME`` wins, so a user (and the test suite) can pin a variant
+    without a preference file. Otherwise Windows high contrast wins over
+    everything, then the Windows "apps use light theme" registry value, then the
+    desktop hint on other platforms. Anything unreadable means light.
+    """
+    forced = os.environ.get("WMLST_THEME", "").strip().lower()
+    if forced in ("light", "dark", "high-contrast", "highcontrast"):
+        return "high-contrast" if forced.startswith("high") else forced
+    if high_contrast_active():
+        return "high-contrast"
+    if sys.platform.startswith("win"):  # pragma: no cover - Windows only
+        try:
+            import winreg
+
+            key = winreg.OpenKey(
+                winreg.HKEY_CURRENT_USER,
+                r"Software\Microsoft\Windows\CurrentVersion\Themes\Personalize")
+            with key:
+                value, _ = winreg.QueryValueEx(key, "AppsUseLightTheme")
+            return "light" if int(value) else "dark"
+        except Exception:
+            return "light"
+    hint = os.environ.get("GTK_THEME", "") + os.environ.get("QT_STYLE_OVERRIDE", "")
+    return "dark" if "dark" in hint.lower() else "light"
+
+
+def palette_for(mode: str) -> Dict[str, str]:
+    """The colour map for a theme mode name."""
+    if mode == "high-contrast":
+        return dict(HIGH_CONTRAST_PALETTE)
+    if mode == "dark":
+        return dict(DARK_PALETTE)
+    return dict(PALETTE)
+
+
+def reduced_motion() -> bool:
+    """True when this machine has asked software to stop animating (WCAG 2.3.3).
+
+    ``WMLST_REDUCED_MOTION`` pins it. Otherwise Windows is asked directly via
+    SPI_GETCLIENTAREAANIMATION, and high contrast always implies it. The drop
+    zone reads this once and draws a single static frame when it is set.
+    """
+    flag = os.environ.get("WMLST_REDUCED_MOTION", "").strip().lower()
+    if flag in ("1", "true", "yes", "on"):
+        return True
+    if flag in ("0", "false", "no", "off"):
+        return False
+    if os.environ.get("NO_ANIMATIONS"):
+        return True
+    if high_contrast_active():
+        return True
+    if sys.platform.startswith("win"):  # pragma: no cover - Windows only
+        try:
+            import ctypes
+
+            enabled = ctypes.c_int(1)
+            SPI_GETCLIENTAREAANIMATION = 0x1042
+            if ctypes.windll.user32.SystemParametersInfoW(
+                    SPI_GETCLIENTAREAANIMATION, 0, ctypes.byref(enabled), 0):
+                return not bool(enabled.value)
+        except Exception:
+            return False
+    return False
 
 
 def px(n: float) -> int:
@@ -230,10 +385,16 @@ def pick_font(available: Sequence[str], preferred: Sequence[str], fallback: str)
 
     Split out from widget code so the font ladder is testable without a display.
     """
-    have = {str(a) for a in available}
+    have = {str(a): str(a) for a in available}
+    folded = {k.lower(): v for k, v in have.items()}
     for name in preferred:
         if name in have:
             return name
+        match = folded.get(name.lower())
+        if match is not None:
+            # Tk reports the X core fonts lower-cased ("helvetica"), and a family
+            # asked for by its proper name would otherwise miss by case alone.
+            return match
     return fallback
 
 
@@ -241,37 +402,50 @@ def pick_font(available: Sequence[str], preferred: Sequence[str], fallback: str)
 # Status presentation (section 11.3 wording, reused verbatim in the GUI)
 # ---------------------------------------------------------------------------
 
-#: The ONLY status knowledge in this module: glyph, colour key and the sentence
-#: shown to a novice. Nothing here derives a status — ``engine.status_column``
-#: already did that and the value arrives on ``SampleResult.status``.
+#: The ONLY status knowledge in this module: glyph, colour key, the sentence shown
+#: to a novice, and the SHAPE drawn beside the row. Nothing here derives a status —
+#: ``engine.status_column`` already did that and the value arrives on
+#: ``SampleResult.status``. The shape is the non-colour channel required by
+#: docs/ARCHITECTURE.md: status must never be conveyed by colour alone, so
+#: dot_image() reads it from here rather than re-listing the status words.
 STATUS_UI = {
     "PERFECT": ("\u2714", "ok",
                 "Every locus matched a known allele exactly, and the combination "
-                "is a recognised sequence type."),
+                "is a recognised sequence type.", "disc"),
     "NOVEL": ("\u271a", "info",
               "Every locus matched a known allele exactly, but this combination is "
               "not yet a named sequence type \u2014 it may be a new ST worth "
-              "submitting to PubMLST."),
+              "submitting to PubMLST.", "disc"),
     "MIXED": ("\u29c9", "warn",
               "At least one locus matched two or more different alleles equally "
               "well. This usually means the assembly contains more than one strain, "
-              "or a duplicated gene \u2014 check culture purity before reporting."),
+              "or a duplicated gene \u2014 check culture purity before reporting.", "triangle"),
     "MISSING": ("\u25cc", "warn",
                 "At least one locus could not be found in this assembly. It may be "
                 "incomplete, or the locus may genuinely be absent \u2014 an ST "
-                "cannot be assigned."),
+                "cannot be assigned.", "ring"),
     "BAD": ("\u26a0", "bad",
             "The best-matching scheme scored below 70 out of 100. Treat this result "
-            "as unreliable: wrong organism, heavily fragmented, or contaminated."),
+            "as unreliable: wrong organism, heavily fragmented, or contaminated.", "triangle"),
     "OK": ("\u25cf", "info",
            "The scheme matched reasonably well, but at least one locus is only an "
            "approximate or partial match, so no exact sequence type could be "
-           "assigned."),
+           "assigned.", "disc"),
     "NONE": ("\u25cb", "muted",
              "No MLST scheme matched this file at all. Check that it really "
              "contains assembled contigs for a species covered by one of the "
-             "bundled schemes."),
+             "bundled schemes.", "ring"),
 }
+
+#: The key dot_image()/status_icon() fall back to for an empty status.
+DEFAULT_STATUS = next(iter(k for k in STATUS_UI if STATUS_UI[k][1] == "muted"))
+
+#: Statuses that are good news, so the row keeps neutral ink: a page of green
+#: says nothing. Derived from the tone in STATUS_UI, never re-listed by hand.
+CALM_STATUSES = frozenset(k for k, v in STATUS_UI.items() if v[1] in ("ok", "info"))
+
+#: The status whose shape marks a file that could not be read at all.
+ERROR_STATUS = next(iter(k for k, v in STATUS_UI.items() if v[1] == "bad"))
 
 #: Plain-language meaning of an allele code, for the per-locus view.
 SYMBOL_UI = {
@@ -285,9 +459,14 @@ SYMBOL_UI = {
 
 
 def status_cell(status: str) -> str:
-    """Render the STATUS cell as ``"glyph WORD"`` — colour is never the only channel."""
-    glyph = STATUS_UI.get(status, ("\u25cb", "muted", ""))[0]
-    return "{} {}".format(glyph, status) if status else ""
+    """Render the STATUS cell.
+
+    The word alone: the *shape* channel is carried by :func:`dot_image`, drawn
+    into the row rather than typed, because a dingbat is only as good as the
+    font under it — on a Tk built without Xft every one of them came out a
+    hollow box, silently reducing status to colour alone.
+    """
+    return status or ""
 
 
 def status_tag(status: str) -> str:
@@ -312,6 +491,139 @@ def app_data_dir() -> Path:
     xdg = os.environ.get("XDG_CONFIG_HOME")
     base = Path(xdg) if xdg else Path.home() / ".config"
     return base / branding.APP_NAME.lower()
+
+
+def user_db_dir() -> Path:
+    """Per-user database folder — where updates go when portable mode is off.
+
+    A packaged WMLST may sit in ``C:\\Program Files``, and a one-file build
+    unpacks itself into a temporary directory that is deleted on exit, so the
+    installed copy of the database is not always a place an update can be
+    written to. This folder always belongs to the user.
+    """
+    if sys.platform.startswith("win"):
+        base = os.environ.get("LOCALAPPDATA") or str(Path.home() / "AppData" / "Local")
+        return Path(base) / branding.VENDOR / branding.APP_NAME / "db"
+    xdg = os.environ.get("XDG_DATA_HOME")
+    base = Path(xdg) if xdg else Path.home() / ".local" / "share"
+    return base / branding.APP_NAME.lower() / "db"
+
+
+def portable_root() -> Optional[Path]:
+    """The folder holding the executable in a packaged build, else ``None``.
+
+    ``WMLST_PORTABLE_DIR`` overrides the detection, which is how the portable
+    layout is exercised from a source checkout and in the tests.
+    """
+    forced = os.environ.get("WMLST_PORTABLE_DIR", "").strip()
+    if forced:
+        try:
+            return Path(os.path.expanduser(forced))
+        except Exception:
+            return None
+    if getattr(sys, "frozen", False):
+        try:
+            return Path(sys.executable).resolve().parent
+        except Exception:
+            return None
+    return None
+
+
+def portable_db_dir() -> Optional[Path]:
+    """``<folder holding the exe>/db``, or ``None`` when this is not a
+    packaged build."""
+    root = portable_root()
+    return None if root is None else root / "db"
+
+
+def dir_writable(path: Any) -> bool:
+    """True when a file can actually be created in an EXISTING directory.
+
+    ``os.access`` lies on Windows (it reports the ACL, not the effective right,
+    and never sees a read-only medium), so this writes a probe file and removes
+    it again. Never raises.
+    """
+    try:
+        folder = Path(path)
+        if not folder.is_dir():
+            return False
+        probe = folder / ".wmlst-write-test"
+    except Exception:
+        return False
+    try:
+        with open(probe, "w", encoding="utf-8") as fh:
+            fh.write("ok")
+        return True
+    except Exception:
+        return False
+    finally:
+        try:
+            os.remove(str(probe))
+        except OSError:
+            pass
+
+
+def looks_like_database(path: Any) -> bool:
+    """True when ``path`` already holds a WMLST database (it has ``pubmlst/``)."""
+    try:
+        return Path(path).joinpath("pubmlst").is_dir()
+    except Exception:
+        return False
+
+
+def portable_possible() -> bool:
+    """True when this build can keep its database beside the executable."""
+    root = portable_root()
+    return root is not None and root.is_dir()
+
+
+def db_location(prefs: Prefs, env: Optional[Environment] = None) -> str:
+    """The folder database updates and the rebuilt index are written to.
+
+    Presentation only: this is what the Settings tab prints under the portable
+    checkbox so there is never any doubt where the data goes.
+    """
+    if getattr(prefs, "portable_db", False):
+        target = portable_db_dir()
+        if target is not None:
+            return str(target)
+    if getattr(prefs, "dbdir", None):
+        return str(prefs.dbdir)
+    if env is not None and env.dbdir:
+        return str(env.dbdir)
+    return str(user_db_dir())
+
+
+def copy_database(source: str, target: str, *, progress: Any = None,
+                  cancel: Any = None) -> str:
+    """Copy a database folder file by file, reporting progress. WORKER THREAD.
+
+    Used once, when portable mode is switched on and the folder beside the
+    executable has no database yet. Staging leftovers and ``__pycache__`` are
+    skipped; everything else is copied verbatim, so the copy is byte-identical
+    and the index stays valid.
+    """
+    src, dst = Path(source), Path(target)
+    files = []
+    for item in src.rglob("*"):
+        parts = item.parts
+        if any(p == "__pycache__" or ".staging" in p for p in parts):
+            continue
+        if item.is_file():
+            files.append(item)
+    total = max(1, len(files))
+    dst.mkdir(parents=True, exist_ok=True)
+    for index, path in enumerate(files, 1):
+        if cancel is not None and cancel.is_set():
+            raise Cancelled("the copy was cancelled")
+        out = dst / path.relative_to(src)
+        out.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(str(path), str(out))
+        if progress is not None and (index % 20 == 0 or index == total):
+            progress(100.0 * index / total,
+                     "Copying the database beside the program — {} of {} files"
+                     .format(index, total))
+    return str(dst)
 
 
 def log_dir() -> Path:
@@ -431,6 +743,11 @@ class Prefs:
     dnd_note_shown: bool = False
     blast_prompt_shown: bool = False
     html_evidence: str = "best"
+    #: GUI only: let wmlst.perf size threads/jobs for this computer at start-up.
+    #: The CLI defaults stay 1/1 (perf.py is never imported by cli.py).
+    perf_auto: bool = True
+    #: Keep the database beside the executable instead of in the user profile.
+    portable_db: bool = False
     #: Transient, never persisted: a note the status line shows once at startup.
     load_note: str = ""
 
@@ -484,6 +801,8 @@ class Prefs:
         p.blast_prompt_shown = bool(raw.get("blast_prompt_shown", False))
         ev = str(raw.get("html_evidence") or "best")
         p.html_evidence = ev if ev in ("none", "best", "all") else "best"
+        p.perf_auto = bool(raw.get("perf_auto", True))
+        p.portable_db = bool(raw.get("portable_db", False))
         return p
 
     def to_dict(self) -> Dict[str, Any]:
@@ -1363,6 +1682,10 @@ class AnalysisController:
 #: high contrast. Read through :func:`c` so a later swap reaches every widget.
 C: Dict[str, str] = dict(PALETTE)
 
+#: Which variant :func:`install_theme` chose. Read by the widgets that
+#: need to know whether they are painting on a light or a dark ground.
+THEME_MODE = "light"
+
 #: Named fonts, created once against the root.
 F: Dict[str, Any] = {}
 
@@ -1387,15 +1710,378 @@ def apply_scaling(root: tk.Misc) -> float:
     return set_scale(dpi)
 
 
+# ---------------------------------------------------------------------------
+# Drawn widget skins — the ttk "image" element engine (section 10.1)
+# ---------------------------------------------------------------------------
+#
+# clam cannot round a corner and cannot be talked out of drawing a 3-D spin
+# arrow, so the four controls a user actually touches — button, entry, spinbox,
+# combobox — are given their shape by images this module rasterises itself and
+# hands to ``style.element_create(..., "image", ...)`` as a nine-patch. Every
+# pixel is computed from the live palette, so the dark and high-contrast
+# variants are skinned by the same code with no second set of assets.
+
+#: ``element_create`` raises on a name that already exists, and install_theme
+#: runs again on every theme change (and repeatedly across the test suite).
+_SKIN_GEN = [0]
+
+
+def _skin_name(base: str) -> str:
+    """A fresh element name, so re-theming never collides with the last pass."""
+    return "w{}.{}".format(_SKIN_GEN[0], base)
+
+
+def rounded_image(master: tk.Misc, w: int, h: int, radius: float, *,
+                  fill: str, edge: str, width: float = 1.0,
+                  back: Optional[str] = None) -> Any:
+    """An antialiased rounded rectangle as a :class:`tkinter.PhotoImage`.
+
+    Outside the corner arc the pixel is made transparent (or painted ``back``
+    when a backdrop colour is given), so one image sits correctly on the page,
+    on a card, and on a selected row.
+    """
+    side_w, side_h = max(1, int(w)), max(1, int(h))
+    img = tk.PhotoImage(master=master, width=side_w, height=side_h)
+    x0, y0 = 0.5, 0.5
+    x1, y1 = side_w - 1.5, side_h - 1.5
+    radius = max(0.0, min(radius, (x1 - x0) / 2.0, (y1 - y0) / 2.0))
+    inner_r = max(0.0, radius - width)
+    base = back or fill
+    rows, clear = [], []
+    for yy in range(side_h):
+        row = []
+        for xx in range(side_w):
+            cover = inner = 0.0
+            for sy in (0.17, 0.5, 0.83):
+                for sx in (0.17, 0.5, 0.83):
+                    sxx, syy = xx + sx, yy + sy
+                    cover += _rounded_cover(sxx, syy, x0, y0, x1, y1, radius)
+                    inner += _rounded_cover(sxx, syy, x0 + width, y0 + width,
+                                            x1 - width, y1 - width, inner_r)
+            cover /= 9.0
+            inner /= 9.0
+            if cover <= 0.001:
+                if back is None:
+                    clear.append((xx, yy))
+                row.append(base)
+                continue
+            row.append(mix(mix(base, edge, cover), fill, inner))
+        rows.append(row)
+    img.put(rows)
+    for xx, yy in clear:
+        try:
+            img.transparency_set(xx, yy, True)
+        except (tk.TclError, AttributeError):  # pragma: no cover - ancient Tk
+            break
+    return img
+
+
+def chevron_image(master: tk.Misc, w: int, h: int, *, colour: str, back: str,
+                  down: bool = True, weight: float = 1.6) -> Any:
+    """A stroked chevron (the only arrow in this application), antialiased."""
+    side_w, side_h = max(5, int(w)), max(5, int(h))
+    img = tk.PhotoImage(master=master, width=side_w, height=side_h)
+    span = side_w * 0.26
+    mid_x, mid_y = side_w / 2.0, side_h / 2.0
+    rise = span * 0.62
+    if down:
+        ax, ay, bx, by = mid_x - span, mid_y - rise / 2.0, mid_x, mid_y + rise / 2.0
+        cx_, cy_ = mid_x + span, mid_y - rise / 2.0
+    else:
+        ax, ay, bx, by = mid_x - span, mid_y + rise / 2.0, mid_x, mid_y - rise / 2.0
+        cx_, cy_ = mid_x + span, mid_y + rise / 2.0
+    half = max(0.7, weight * SC / 2.0)
+    rows, clear = [], []
+    for yy in range(side_h):
+        row = []
+        for xx in range(side_w):
+            d = min(_seg_distance(xx + 0.5, yy + 0.5, ax, ay, bx, by),
+                    _seg_distance(xx + 0.5, yy + 0.5, bx, by, cx_, cy_))
+            t = half + 0.5 - d
+            if t <= 0.0:
+                clear.append((xx, yy))
+                row.append(back)
+            else:
+                row.append(mix(back, colour, min(1.0, t)))
+        rows.append(row)
+    img.put(rows)
+    for xx, yy in clear:
+        try:
+            img.transparency_set(xx, yy, True)
+        except (tk.TclError, AttributeError):  # pragma: no cover
+            break
+    return img
+
+
+def dot_image(master: tk.Misc, kind: str, *, size: int = 12, gap: int = 9,
+              back: Optional[str] = None) -> Any:
+    """The STATUS indicator for a results row, drawn rather than typed.
+
+    A Treeview cell cannot hold a widget and the row font cannot be trusted to
+    own U+2714: on a Tk built without Xft every dingbat in the status column
+    became a hollow box, which is exactly the channel that is supposed to carry
+    the result when colour cannot. So the shape is rasterised here — a filled
+    disc, a ring, a half-filled disc or a triangle — and set as the row image,
+    ahead of the file name. Shape, colour and the status word: three channels.
+    """
+    side = max(8, px(size))
+    pad_right = max(0, px(gap))
+    surface = back or c("surface")
+    entry = STATUS_UI.get(kind, (None, "muted", None, "ring"))
+    colour = c(entry[1])
+    shape = entry[3] if len(entry) > 3 else "ring"
+    img = tk.PhotoImage(master=master, width=side + pad_right, height=side)
+    cx = cy = (side - 1) / 2.0
+    r = side / 2.0 - 1.2
+    hollow = shape == "ring"
+    triangle = shape == "triangle"
+    ring = max(1.3, side * 0.16)
+    rows, clear = [], []
+    for yy in range(side):
+        row = []
+        for xx in range(side + pad_right):
+            if xx >= side:
+                clear.append((xx, yy))
+                row.append(surface)
+                continue
+            cover = 0.0
+            for sy in (0.17, 0.5, 0.83):
+                for sx in (0.17, 0.5, 0.83):
+                    dx, dy = xx + sx - cx, yy + sy - cy
+                    if triangle:
+                        # an upright triangle inscribed in the same circle: the
+                        # apex is at the TOP, because that is the shape everyone
+                        # already reads as "caution" -- inverted, it reads as a
+                        # downward arrow, which means something else entirely.
+                        ty = dy + r * 0.28
+                        edge = (ty + r * 0.95) * 0.577
+                        hit = (-r * 0.95 <= ty <= r * 0.80) and abs(dx) <= edge
+                    else:
+                        hit = dx * dx + dy * dy <= r * r
+                    cover += 1.0 if hit else 0.0
+            cover /= 9.0
+            if cover <= 0.001:
+                clear.append((xx, yy))
+                row.append(surface)
+                continue
+            if hollow:
+                hole = 0.0
+                rr = r - ring
+                for sy in (0.17, 0.5, 0.83):
+                    for sx in (0.17, 0.5, 0.83):
+                        dx, dy = xx + sx - cx, yy + sy - cy
+                        hole += 1.0 if dx * dx + dy * dy <= rr * rr else 0.0
+                cover *= 1.0 - hole / 9.0
+            if cover <= 0.001:
+                clear.append((xx, yy))
+                row.append(surface)
+                continue
+            row.append(mix(surface, colour, cover))
+        rows.append(row)
+    img.put(rows)
+    for xx, yy in clear:
+        try:
+            img.transparency_set(xx, yy, True)
+        except (tk.TclError, AttributeError):  # pragma: no cover
+            break
+    return img
+
+
+def _install_skins(root: tk.Misc, style: ttk.Style) -> None:
+    """Give button, entry, spinbox and combobox a drawn, rounded shape."""
+    _SKIN_GEN[0] += 1
+    # ttk keeps no reference to an element image; Python must, or Tk frees it
+    # and the widget paints as an empty box. The list hangs off the ROOT rather
+    # than off the module, so the images die with the interpreter that owns
+    # them -- a module-level list would pin a PhotoImage per skin per window
+    # for the life of the process, and leave dead ones behind after destroy().
+    images: List[Any] = []
+    root._wmlst_skin_images = images  # type: ignore[attr-defined]
+    keep = images.append
+    radius = float(px(RADIUS - 2))
+    side = int(radius * 2 + px(8))
+    border = int(radius + px(2))
+    surface, alt = c("surface"), c("surface_alt")
+    text, muted, accent = c("text"), c("muted"), c("accent")
+    edge_rest, edge_hot = c("border_strong"), c("muted")
+
+    def plate(fill: str, edge: str, width: float = 1.0) -> Any:
+        img = rounded_image(root, side, side, radius, fill=fill, edge=edge,
+                            width=width)
+        keep(img)
+        return img
+
+    def make(base: str, specs: Sequence[Tuple[Any, Any]], default: Any,
+             *, nine_patch: bool = True) -> str:
+        """Register one image element. A glyph is placed, never stretched."""
+        name = _skin_name(base)
+        args: List[Any] = [default]
+        args.extend(tuple(spec) for spec in specs)
+        opts = ({"border": border, "sticky": "nsew"} if nine_patch
+                else {"border": 0, "sticky": ""})
+        try:
+            style.element_create(name, "image", *args, padding=0, **opts)
+        except tk.TclError:  # pragma: no cover - name collision is impossible
+            return ""
+        return name
+
+    # -- buttons -----------------------------------------------------------
+    btn = make("button", [
+        ("disabled", plate(c("surface_sunk"), c("border"))),
+        ("pressed", plate(c("border"), edge_hot)),
+        ("active", plate(mix(alt, text, 0.05), edge_hot)),
+        ("focus", plate(alt, c("focus"), width=2.0)),
+    ], plate(alt, edge_rest))
+    acc = make("accentbutton", [
+        # A disabled primary must not out-shout an enabled secondary beside it,
+        # so it drops to the same inert outline the other disabled buttons wear.
+        ("disabled", plate(c("surface_sunk"), c("border"))),
+        ("pressed", plate(c("accent_active"), c("accent_active"))),
+        ("active", plate(c("accent_hover"), c("accent_hover"))),
+        ("focus", plate(accent, c("text"), width=2.0)),
+    ], plate(accent, accent))
+    quiet = make("quietbutton", [
+        ("disabled", plate(surface, surface)),
+        ("pressed", plate(c("border"), c("border"))),
+        ("active", plate(alt, alt)),
+        ("focus", plate(surface, c("focus"), width=2.0)),
+    ], plate(surface, surface))
+
+    def button_layout(name: str, element: str) -> None:
+        if not element:
+            return
+        try:
+            style.layout(name, [
+                (element, {"sticky": "nswe", "children": [
+                    ("Button.padding", {"sticky": "nswe", "children": [
+                        ("Button.label", {"sticky": "nswe"})]})]})])
+        except tk.TclError:  # pragma: no cover
+            pass
+
+    button_layout("TButton", btn)
+    button_layout("Accent.TButton", acc)
+    button_layout("Surface.TButton", quiet)
+    button_layout("Quiet.TButton", quiet)
+    # A link is text. ttk hands a style with no layout of its own its parent's,
+    # so without this the two link styles inherited the button plate and every
+    # citation link grew a grey box around it.
+    for link_style in ("Link.TButton", "CardLink.TButton"):
+        try:
+            style.layout(link_style, [
+                ("Button.padding", {"sticky": "nswe", "children": [
+                    ("Button.label", {"sticky": "nswe"})]})])
+        except tk.TclError:  # pragma: no cover
+            pass
+
+    # -- fields (entry, spinbox, combobox) ---------------------------------
+    field = make("field", [
+        ("disabled", plate(alt, c("border"))),
+        ("focus", plate(surface, c("focus"), width=2.0)),
+        ("hover", plate(surface, edge_hot)),
+    ], plate(surface, edge_rest))
+    invalid = make("invalidfield", [
+        ("focus", plate(c("bad_soft"), c("bad"), width=2.0)),
+    ], plate(c("bad_soft"), c("bad")))
+
+    # The glyph is centred in its image, so the extra width IS the margin that
+    # keeps the chevron off the field's rounded right border.
+    arrow_w, arrow_h = int(px(28)), int(px(10))
+    spin_up = chevron_image(root, arrow_w, arrow_h, colour=muted, back=surface,
+                            down=False)
+    spin_down = chevron_image(root, arrow_w, arrow_h, colour=muted, back=surface)
+    spin_up_hot = chevron_image(root, arrow_w, arrow_h, colour=accent,
+                                back=surface, down=False)
+    spin_down_hot = chevron_image(root, arrow_w, arrow_h, colour=accent,
+                                  back=surface)
+    combo_arrow = chevron_image(root, int(px(30)), int(px(18)), colour=muted,
+                                back=surface)
+    combo_arrow_hot = chevron_image(root, int(px(30)), int(px(18)),
+                                    colour=accent, back=surface)
+    for image in (spin_up, spin_down, spin_up_hot, spin_down_hot, combo_arrow,
+                  combo_arrow_hot):
+        keep(image)
+    up = make("uparrow", [("pressed", spin_up_hot), ("active", spin_up_hot)],
+              spin_up, nine_patch=False)
+    down = make("downarrow", [("pressed", spin_down_hot),
+                              ("active", spin_down_hot)], spin_down,
+                nine_patch=False)
+    combo = make("comboarrow", [("pressed", combo_arrow_hot),
+                                ("active", combo_arrow_hot)], combo_arrow,
+                 nine_patch=False)
+
+    if field:
+        try:
+            style.layout("TEntry", [
+                (field, {"sticky": "nswe", "children": [
+                    ("Entry.padding", {"sticky": "nswe", "children": [
+                        ("Entry.textarea", {"sticky": "nswe"})]})]})])
+            style.layout("Invalid.TEntry", [
+                (invalid or field, {"sticky": "nswe", "children": [
+                    ("Entry.padding", {"sticky": "nswe", "children": [
+                        ("Entry.textarea", {"sticky": "nswe"})]})]})])
+        except tk.TclError:  # pragma: no cover
+            pass
+    if field and up and down:
+        try:
+            style.layout("TSpinbox", [
+                (field, {"sticky": "nswe", "children": [
+                    ("null", {"side": "right", "sticky": "ns", "children": [
+                        (up, {"side": "top", "sticky": "e"}),
+                        (down, {"side": "bottom", "sticky": "e"})]}),
+                    ("Spinbox.padding", {"sticky": "nswe", "children": [
+                        ("Spinbox.textarea", {"sticky": "nswe"})]})]})])
+        except tk.TclError:  # pragma: no cover
+            pass
+    if field and combo:
+        try:
+            style.layout("TCombobox", [
+                (field, {"sticky": "nswe", "children": [
+                    (combo, {"side": "right", "sticky": "ns"}),
+                    ("Combobox.padding", {"sticky": "nswe", "children": [
+                        ("Combobox.textarea", {"sticky": "nswe"})]})]})])
+        except tk.TclError:  # pragma: no cover
+            pass
+
+    # -- progress bars ------------------------------------------------------
+    # NOT skinned with an image element: ttk sizes the "pbar" from the element's
+    # own requested size, so an image element pins it to the image width and the
+    # bar stops reporting the value at all. clam's own rectangle stays, with the
+    # bevel configured away (see TProgressbar above).
+
+    # A scrollbar thumb that is a rounded pill rather than a grey slab.
+    rest_thumb = mix(c("border_strong"), text, 0.18)
+    thumb = make("thumb", [
+        ("pressed", plate(muted, muted)),
+        ("active", plate(mix(c("border_strong"), text, 0.40),
+                         mix(c("border_strong"), text, 0.40))),
+    ], plate(rest_thumb, rest_thumb))
+    if thumb:
+        for orient, fill in (("Vertical", "ns"), ("Horizontal", "ew")):
+            try:
+                style.layout("{}.TScrollbar".format(orient), [
+                    ("{}.Scrollbar.trough".format(orient), {
+                        "sticky": fill, "children": [
+                            (thumb, {"expand": "1", "sticky": "nswe"})]})])
+            except tk.TclError:  # pragma: no cover
+                pass
+
+
 def install_theme(root: tk.Misc) -> ttk.Style:
     """Install the flat theme and the font ladder (section 10.1).
 
     ``clam`` on every platform: it is the only stdlib theme that honours
-    ``configure``/``map`` for background colours. Under Windows high contrast the
-    custom palette is abandoned for the system one.
+    ``configure``/``map`` for background colours. Every 3-D element clam draws by
+    default — the sunken entry well, the ridged notebook, the dotted focus
+    rectangle, the bevelled button — is flattened here by re-laying the element
+    out or by painting ``lightcolor``/``darkcolor``/``bordercolor`` the same
+    colour, which is how a Tk theme is made to look like this decade.
+
+    The palette comes from :func:`detect_theme_mode`, so Windows high contrast
+    and the dark system theme both reach every widget through :func:`c`.
     """
-    global C
-    C = dict(HIGH_CONTRAST_PALETTE if high_contrast_active() else PALETTE)
+    global C, THEME_MODE
+    THEME_MODE = detect_theme_mode()
+    C = palette_for(THEME_MODE)
 
     style = ttk.Style(root)
     try:
@@ -1413,109 +2099,237 @@ def install_theme(root: tk.Misc) -> ttk.Style:
     except Exception:
         pass
     ui = pick_font(families, PREFERRED_FAMILIES, fallback)
+    display = pick_font(families, PREFERRED_DISPLAY, ui)
     mono = pick_font(families, PREFERRED_MONO, fallback)
 
     F.clear()
     F["family"] = ui
+    F["display_family"] = display
     for key, size in FONT_PT.items():
-        family = mono if key == "mono" else ui
+        if key == "mono":
+            family = mono
+        elif key in ("title", "hero"):
+            family = display
+        else:
+            family = ui
         weight = "bold" if key in ("heading", "title", "hero") else "normal"
         F[key] = tkfont.Font(root=root, family=family, size=size, weight=weight)
     F["body_bold"] = tkfont.Font(root=root, family=ui, size=FONT_PT["body"],
                                  weight="bold")
+    F["small_bold"] = tkfont.Font(root=root, family=ui, size=FONT_PT["small"],
+                                  weight="bold")
+    # SMALL CAPS is not a Tk feature; a letter-spaced bold 9 pt is the honest
+    # substitute for an eyebrow label ("SEQUENCE TYPE") and is set as its own
+    # font so the spacing does not leak into ordinary small text.
+    F["eyebrow"] = tkfont.Font(root=root, family=ui, size=FONT_PT["tiny"],
+                               weight="bold")
+    # A binomial is italic by convention, and a diagnostic result that sets
+    # "Klebsiella pneumoniae" upright reads as careless to the people who have
+    # to sign it off. Two cuts: the headline on the summary card, and the small
+    # one used inline. "spp." stays upright, so it is a separate label.
+    F["organism"] = tkfont.Font(root=root, family=display, size=FONT_PT["title"],
+                                weight="normal", slant="italic")
+    F["organism_small"] = tkfont.Font(root=root, family=ui, size=FONT_PT["body"],
+                                      slant="italic")
+    # Links carry an underline as well as the accent colour: colour is never the
+    # only channel (WCAG 1.4.1).
+    F["link"] = tkfont.Font(root=root, family=ui, size=FONT_PT["small"],
+                            underline=True)
     for named in ("TkDefaultFont", "TkTextFont", "TkMenuFont", "TkHeadingFont"):
         try:
             nf = tkfont.nametofont(named)
-            nf.configure(family=ui, size=FONT_PT["body"])
+            nf.configure(family=ui, size=FONT_PT["body"], weight="normal")
         except Exception:
             pass
 
     bg, surface, text, muted = c("bg"), c("surface"), c("text"), c("muted")
-    border, accent = c("border"), c("accent")
+    border, accent, soft = c("border"), c("accent"), c("text_soft")
 
+    # No widget in this theme owns a border it did not ask for.
     style.configure(".", background=bg, foreground=text, font=F["body"],
-                    borderwidth=0, focuscolor=c("focus"))
+                    borderwidth=0, relief="flat", focuscolor=c("focus"),
+                    bordercolor=border, lightcolor=bg, darkcolor=bg,
+                    troughcolor=c("surface_alt"), selectbackground=c("accent_soft"),
+                    selectforeground=text)
     style.configure("TFrame", background=bg)
     style.configure("Surface.TFrame", background=surface)
+    style.configure("SurfaceAlt.TFrame", background=c("surface_alt"))
     style.configure("CardBorder.TFrame", background=border)
-    style.configure("Footer.TFrame", background=surface)
-    # The forced-scheme notice on the Analyse tab: a tinted band, never colour
-    # alone -- the text says what is pinned and the button undoes it.
-    style.configure("Notice.TFrame", background=c("warn"))
-    style.configure("Notice.TLabel", background=c("warn"), foreground=bg,
+    style.configure("Footer.TFrame", background=c("surface_alt"))
+    style.configure("Hairline.TFrame", background=border)
+    style.configure("Rule.TFrame", background=accent)
+    # The forced-scheme notice: a tinted band with a status word in it, never
+    # colour alone -- the text says what is pinned and the button undoes it.
+    style.configure("Notice.TFrame", background=c("warn_soft"))
+    style.configure("NoticeBar.TFrame", background=c("warn"))
+    style.configure("Notice.TLabel", background=c("warn_soft"), foreground=c("warn"),
                     font=F["body"])
+    style.configure("NoticeStrong.TLabel", background=c("warn_soft"),
+                    foreground=c("warn"), font=F["body_bold"])
+    style.configure("NoticeBadge.TLabel", background=c("warn_soft"),
+                    foreground=c("warn"), font=F["eyebrow"])
 
     style.configure("TLabel", background=bg, foreground=text, font=F["body"])
     style.configure("Surface.TLabel", background=surface, foreground=text)
+    style.configure("SurfaceSoft.TLabel", background=surface, foreground=soft)
     style.configure("Muted.TLabel", background=bg, foreground=muted, font=F["small"])
     style.configure("SurfaceMuted.TLabel", background=surface, foreground=muted,
                     font=F["small"])
+    style.configure("Eyebrow.TLabel", background=surface, foreground=muted,
+                    font=F["eyebrow"])
     style.configure("Heading.TLabel", background=surface, foreground=text,
                     font=F["heading"])
     style.configure("Title.TLabel", background=bg, foreground=text, font=F["title"])
+    style.configure("SurfaceTitle.TLabel", background=surface, foreground=text,
+                    font=F["title"])
     style.configure("Hero.TLabel", background=surface, foreground=text, font=F["hero"])
-    style.configure("Status.TLabel", background=surface, foreground=muted,
+    style.configure("Status.TLabel", background=c("surface_alt"), foreground=muted,
                     font=F["small"])
     for key in ("ok", "warn", "bad", "info"):
         style.configure("{}.TLabel".format(key.capitalize()), background=surface,
                         foreground=c(key), font=F["body"])
 
-    style.configure("TButton", background=surface, foreground=text, font=F["body"],
-                    padding=(px(14), px(7)), borderwidth=1, relief="flat",
-                    bordercolor=c("border_strong"), lightcolor=surface,
-                    darkcolor=surface, anchor="center")
+    # Buttons: flat fills, a hairline that only appears on hover/focus, and a
+    # real pressed state. Exactly one Accent button is used per screen.
+    style.configure("TButton", background=c("surface_alt"), foreground=text,
+                    font=F["body"], padding=(px(PAD_M), px(9)), borderwidth=1,
+                    relief="flat", bordercolor=c("border_strong"),
+                    lightcolor=c("surface_alt"), darkcolor=c("surface_alt"),
+                    anchor="center")
     style.map("TButton",
-              background=[("disabled", c("surface_alt")), ("pressed", c("accent_soft")),
-                          ("active", c("accent_soft"))],
-              foreground=[("disabled", muted)],
-              bordercolor=[("focus", c("focus")), ("active", accent)])
+              background=[("disabled", c("surface_sunk")),
+                          ("pressed", c("border")),
+                          ("active", mix(c("surface_alt"), c("text"), 0.06))],
+              lightcolor=[("pressed", c("border")),
+                          ("active", mix(c("surface_alt"), c("text"), 0.06))],
+              darkcolor=[("pressed", c("border")),
+                         ("active", mix(c("surface_alt"), c("text"), 0.06))],
+              foreground=[("disabled", mix(muted, c("surface"), 0.45))],
+              bordercolor=[("focus", c("focus")), ("active", c("border_strong")),
+                           ("disabled", c("border"))])
+    style.configure("Surface.TButton", background=surface, foreground=text,
+                    lightcolor=surface, darkcolor=surface)
+    style.map("Surface.TButton",
+              background=[("disabled", surface),
+                          ("pressed", c("surface_alt")),
+                          ("active", c("accent_tint"))],
+              lightcolor=[("active", c("accent_tint"))],
+              darkcolor=[("active", c("accent_tint"))])
     style.configure("Accent.TButton", background=accent, foreground=c("on_accent"),
                     bordercolor=accent, lightcolor=accent, darkcolor=accent,
-                    font=F["body_bold"], padding=(px(18), px(8)))
+                    font=F["body_bold"], padding=(px(PAD_L), px(9)))
     style.map("Accent.TButton",
               background=[("disabled", c("border")), ("pressed", c("accent_active")),
                           ("active", c("accent_hover"))],
-              foreground=[("disabled", muted)],
-              bordercolor=[("focus", c("text"))])
+              lightcolor=[("pressed", c("accent_active")),
+                          ("active", c("accent_hover"))],
+              darkcolor=[("pressed", c("accent_active")),
+                         ("active", c("accent_hover"))],
+              bordercolor=[("focus", c("text")), ("disabled", c("border"))],
+              foreground=[("disabled", muted)])
     style.configure("Link.TButton", background=bg, foreground=accent,
-                    borderwidth=0, padding=(px(4), px(2)), font=F["small"])
-    style.map("Link.TButton", background=[("active", bg)],
+                    borderwidth=0, padding=(px(PAD_XS), px(PAD_XS)), font=F["small"])
+    style.map("Link.TButton",
+              background=[("active", bg), ("pressed", bg)],
               foreground=[("active", c("accent_hover"))])
+    # A link that sits on a card, not on the window background.
+    style.configure("CardLink.TButton", background=surface, foreground=accent,
+                    borderwidth=0, padding=(0, px(PAD_XS)), font=F["link"],
+                    focuscolor=c("focus"), lightcolor=surface, darkcolor=surface)
+    style.map("CardLink.TButton",
+              background=[("active", surface), ("pressed", surface)],
+              foreground=[("active", c("accent_hover")), ("disabled", muted)])
+    style.configure("Quiet.TButton", background=surface, foreground=muted,
+                    borderwidth=0, padding=(px(PAD_S), px(PAD_XS)), font=F["small"],
+                    lightcolor=surface, darkcolor=surface)
+    style.map("Quiet.TButton",
+              background=[("active", c("surface_alt")), ("pressed", c("border"))],
+              foreground=[("active", text)])
 
-    style.configure("TNotebook", background=bg, borderwidth=0, tabmargins=(0, 0, 0, 0))
+    # A flat tab strip: no folder tabs, no ridge. The selected tab is the only
+    # one painted on the card surface, and it carries an accent underline drawn
+    # by TabUnderline below -- shape and colour, never colour alone.
+    style.configure("TNotebook", background=bg, borderwidth=0,
+                    bordercolor=bg, lightcolor=bg, darkcolor=bg,
+                    tabmargins=(0, 0, 0, 0))
     style.configure("TNotebook.Tab", background=bg, foreground=muted,
-                    padding=(px(20), px(9)), font=F["body"], borderwidth=0)
+                    padding=(px(PAD_L), px(10)), font=F["body"], borderwidth=0,
+                    bordercolor=bg, lightcolor=bg, darkcolor=bg)
     style.map("TNotebook.Tab",
-              background=[("selected", surface)],
-              foreground=[("selected", text), ("active", text)],
+              background=[("selected", c("accent_soft")),
+                          ("active", c("surface_alt"))],
+              lightcolor=[("selected", c("accent_soft"))],
+              darkcolor=[("selected", c("accent_soft"))],
+              foreground=[("selected", accent), ("active", text)],
+              font=[("selected", F["body_bold"])],
               expand=[("selected", (0, 0, 0, 0))])
+    try:  # drop clam's dotted focus rectangle from the tab
+        style.layout("TNotebook.Tab", [
+            ("Notebook.tab", {"sticky": "nswe", "children": [
+                ("Notebook.padding", {"side": "top", "sticky": "nswe", "children": [
+                    ("Notebook.label", {"side": "top", "sticky": ""})]})]})])
+    except tk.TclError:  # pragma: no cover - layout name is stable in clam
+        pass
 
     style.configure("Treeview", background=surface, fieldbackground=surface,
-                    foreground=text, rowheight=px(26), borderwidth=0, font=F["body"])
-    style.configure("Treeview.Heading", background=c("surface_alt"), foreground=muted,
-                    font=F["small"], relief="flat", padding=(px(8), px(6)),
-                    borderwidth=0)
-    style.map("Treeview.Heading", background=[("active", c("accent_soft"))])
+                    foreground=text, rowheight=px(30), borderwidth=0,
+                    font=F["body"], relief="flat")
+    style.configure("Treeview.Heading", background=surface, foreground=muted,
+                    font=F["small_bold"], relief="flat",
+                    padding=(px(PAD_S), px(10)), borderwidth=0,
+                    bordercolor=border, lightcolor=surface, darkcolor=surface)
+    style.map("Treeview.Heading",
+              background=[("active", c("surface_alt"))],
+              foreground=[("active", text)])
     style.map("Treeview", background=[("selected", c("accent_soft"))],
               foreground=[("selected", text)])
+    try:  # no dotted rectangle around the focused row
+        style.layout("Treeview.Item", [
+            ("Treeitem.padding", {"sticky": "nswe", "children": [
+                ("Treeitem.indicator", {"side": "left", "sticky": ""}),
+                ("Treeitem.image", {"side": "left", "sticky": ""}),
+                ("Treeitem.text", {"side": "left", "sticky": ""})]})])
+    except tk.TclError:  # pragma: no cover
+        pass
 
+    # Entries and spinboxes: a hairline box, not a sunken well.
     style.configure("TEntry", fieldbackground=surface, foreground=text,
                     bordercolor=c("border_strong"), lightcolor=c("border_strong"),
                     darkcolor=c("border_strong"), insertcolor=text,
-                    padding=px(5), borderwidth=1)
+                    padding=(px(PAD_S), px(7)), borderwidth=1, relief="flat")
     style.map("TEntry", bordercolor=[("focus", c("focus"))],
-              lightcolor=[("focus", c("focus"))], darkcolor=[("focus", c("focus"))])
-    style.configure("Invalid.TEntry", fieldbackground="#fdeeed",
+              lightcolor=[("focus", c("focus"))], darkcolor=[("focus", c("focus"))],
+              fieldbackground=[("disabled", c("surface_alt"))])
+    style.configure("Invalid.TEntry", fieldbackground=c("bad_soft"),
                     bordercolor=c("bad"), lightcolor=c("bad"), darkcolor=c("bad"))
     style.configure("TSpinbox", fieldbackground=surface, foreground=text,
-                    bordercolor=c("border_strong"), arrowcolor=text,
-                    background=c("surface_alt"), padding=px(4), borderwidth=1)
-    style.map("TSpinbox", bordercolor=[("focus", c("focus"))])
+                    bordercolor=c("border_strong"), arrowcolor=muted,
+                    lightcolor=c("border_strong"), darkcolor=c("border_strong"),
+                    background=surface, padding=(px(PAD_S), px(6)), borderwidth=1,
+                    arrowsize=px(14), relief="flat")
+    style.map("TSpinbox", bordercolor=[("focus", c("focus"))],
+              lightcolor=[("focus", c("focus"))], darkcolor=[("focus", c("focus"))],
+              arrowcolor=[("active", accent), ("disabled", c("border_strong"))],
+              fieldbackground=[("disabled", c("surface_alt"))])
     style.configure("TCombobox", fieldbackground=surface, foreground=text,
-                    background=c("surface_alt"), bordercolor=c("border_strong"),
-                    arrowcolor=text, padding=px(4))
+                    background=surface, bordercolor=c("border_strong"),
+                    lightcolor=c("border_strong"), darkcolor=c("border_strong"),
+                    arrowcolor=muted, padding=(px(PAD_S), px(6)), borderwidth=1,
+                    arrowsize=px(14), relief="flat")
     style.map("TCombobox", bordercolor=[("focus", c("focus"))],
-              fieldbackground=[("readonly", surface)])
+              lightcolor=[("focus", c("focus"))], darkcolor=[("focus", c("focus"))],
+              arrowcolor=[("active", accent)],
+              fieldbackground=[("readonly", surface), ("disabled", c("surface_alt"))])
+    try:  # the dropdown list is a plain Tk listbox and ignores ttk entirely
+        root.option_add("*TCombobox*Listbox.background", surface)
+        root.option_add("*TCombobox*Listbox.foreground", text)
+        root.option_add("*TCombobox*Listbox.selectBackground", c("accent_soft"))
+        root.option_add("*TCombobox*Listbox.selectForeground", text)
+        root.option_add("*TCombobox*Listbox.borderWidth", 0)
+        root.option_add("*TCombobox*Listbox.font", F["body"])
+    except tk.TclError:  # pragma: no cover
+        pass
+
     style.configure("TCheckbutton", background=surface, foreground=text,
                     focuscolor=c("focus"))
     style.map("TCheckbutton", background=[("active", surface)])
@@ -1525,15 +2339,57 @@ def install_theme(root: tk.Misc) -> ttk.Style:
     style.configure("TSeparator", background=border)
     style.configure("TProgressbar", background=accent, troughcolor=c("surface_alt"),
                     bordercolor=c("surface_alt"), lightcolor=accent, darkcolor=accent,
-                    thickness=px(10))
-    style.configure("Thin.Horizontal.TProgressbar", thickness=px(4))
-    style.configure("Big.Horizontal.TProgressbar", thickness=px(12))
-    style.configure("Vertical.TScrollbar", background=c("surface_alt"),
+                    thickness=px(8), borderwidth=0)
+    # No trough: this one is a liveness tell that runs beside the real bar,
+    # and a second empty track under the first one reads as a broken duplicate.
+    style.configure("Thin.Horizontal.TProgressbar", thickness=px(4),
                     troughcolor=surface, bordercolor=surface,
-                    arrowcolor=muted, gripcount=0)
-    style.configure("Horizontal.TScrollbar", background=c("surface_alt"),
+                    background=c("accent_hover"), lightcolor=c("accent_hover"),
+                    darkcolor=c("accent_hover"))
+    style.configure("Big.Horizontal.TProgressbar", thickness=px(10))
+    for _orient, _fill in (("Vertical", "ns"), ("Horizontal", "ew")):
+        try:  # a thumb in a trough; the stepper arrows are 1995 furniture
+            style.layout("{}.TScrollbar".format(_orient), [
+                ("{}.Scrollbar.trough".format(_orient), {
+                    "sticky": _fill, "children": [
+                        ("{}.Scrollbar.thumb".format(_orient),
+                         {"expand": "1", "sticky": "nswe"})]})])
+        except tk.TclError:  # pragma: no cover - element names are clam's own
+            pass
+    style.configure("Vertical.TScrollbar", background=c("border_strong"),
                     troughcolor=surface, bordercolor=surface,
-                    arrowcolor=muted, gripcount=0)
+                    lightcolor=c("border_strong"), darkcolor=c("border_strong"),
+                    arrowcolor=muted, gripcount=0, borderwidth=0,
+                    arrowsize=px(10), width=px(9))
+    style.map("Vertical.TScrollbar",
+              background=[("active", c("muted")), ("pressed", c("muted"))])
+    style.configure("Horizontal.TScrollbar", background=c("border_strong"),
+                    troughcolor=surface, bordercolor=surface,
+                    lightcolor=c("border_strong"), darkcolor=c("border_strong"),
+                    arrowcolor=muted, gripcount=0, borderwidth=0,
+                    arrowsize=px(10), width=px(9))
+    style.map("Horizontal.TScrollbar",
+              background=[("active", c("muted")), ("pressed", c("muted"))])
+
+    # The menubar is a native Tk widget, not ttk, and inherits nothing.
+    try:
+        root.option_add("*Menu.background", surface)
+        root.option_add("*Menu.foreground", text)
+        root.option_add("*Menu.activeBackground", c("accent_soft"))
+        root.option_add("*Menu.activeForeground", text)
+        root.option_add("*Menu.selectColor", accent)
+        root.option_add("*Menu.borderWidth", 0)
+        root.option_add("*Menu.activeBorderWidth", 0)
+        root.option_add("*Menu.relief", "flat")
+    except tk.TclError:  # pragma: no cover
+        pass
+
+    # LAST: the drawn skins replace clam's layouts for the controls a user
+    # touches, so nothing configured above can put a square corner back.
+    try:
+        _install_skins(root, style)
+    except tk.TclError:  # pragma: no cover - a Tk with no image element engine
+        pass
     return style
 
 
@@ -1600,63 +2456,571 @@ class Tooltip:
             self._tip = None
 
 
-def card(parent: tk.Misc, **pack_kw: Any) -> ttk.Frame:
-    """A 1 px bordered frame wrapping a surface frame (section 10.1).
+def round_rect_points(x0: float, y0: float, x1: float, y1: float,
+                      r: float) -> List[float]:
+    """Point list for a rounded rectangle, to be drawn ``smooth=True``.
 
-    ttk has no border radius and faking rounded corners with images breaks at
-    150 % DPI, so cards are honest rectangles.
+    Tk has no rounded-rectangle primitive and no alpha channel. A smoothed
+    polygon through doubled corner points is the honest way to get a radius that
+    stays crisp at 150 % DPI, and it costs one canvas item.
     """
-    outer = ttk.Frame(parent, style="CardBorder.TFrame")
+    r = max(0.0, min(r, (x1 - x0) / 2.0, (y1 - y0) / 2.0))
+    return [x0 + r, y0, x1 - r, y0, x1, y0, x1, y0 + r, x1, y1 - r, x1, y1,
+            x1 - r, y1, x0 + r, y1, x0, y1, x0, y1 - r, x0, y0 + r, x0, y0]
+
+
+class Card(tk.Frame):
+    """A surface panel: 1 px hairline, flat fill, drawn rounded corners.
+
+    Never ``relief="sunken"``/``"groove"``/``"ridge"`` — those are the 3-D edges
+    that date the whole window. The body is an ordinary square frame with a
+    one-pixel border; the radius comes from four small canvases *placed over the
+    corners*, each painting the colour behind the card outside the arc and the
+    card surface inside it. Doing it that way keeps the body's geometry
+    rectangular, so every child still packs and grids normally, and it costs
+    four tiny canvases instead of a bitmap that would break at fractional DPI.
+    """
+
+    def __init__(self, parent: tk.Misc, *, under: Optional[str] = None,
+                 surface: Optional[str] = None, border: Optional[str] = None,
+                 radius: int = RADIUS):
+        self.under = under or c("bg")
+        self.surface = surface or c("surface")
+        self.border = border or c("border")
+        super().__init__(parent, background=self.border, borderwidth=0,
+                         highlightthickness=0)
+        self.body = tk.Frame(self, background=self.surface, borderwidth=0,
+                             highlightthickness=0)
+        self.body.pack(fill="both", expand=True, padx=1, pady=1)
+        # Created after the body on purpose: Tk stacks by creation order, so
+        # these sit on top of it whatever geometry manager either one uses.
+        self._corners = []
+        r = px(radius)
+        if r > 1 and self.border != self.surface:
+            for corner, place_kw in (
+                    ("nw", {"x": 0, "y": 0}),
+                    ("ne", {"relx": 1.0, "x": -r, "y": 0}),
+                    ("sw", {"x": 0, "rely": 1.0, "y": -r}),
+                    ("se", {"relx": 1.0, "x": -r, "rely": 1.0, "y": -r})):
+                cv = tk.Canvas(self, width=r, height=r, background=self.under,
+                               highlightthickness=0, borderwidth=0)
+                cv.place(width=r, height=r, **place_kw)
+                self._paint_corner(cv, corner, r)
+                self._corners.append(cv)
+
+    def _paint_corner(self, cv: tk.Canvas, corner: str, r: int) -> None:
+        """Paint one quarter-disc: surface inside, hairline on the edge."""
+        box = {"nw": (0, 0, 2 * r, 2 * r), "ne": (-r, 0, r, 2 * r),
+               "sw": (0, -r, 2 * r, r), "se": (-r, -r, r, r)}[corner]
+        start = {"nw": 90, "ne": 0, "sw": 180, "se": 270}[corner]
+        # A one-pixel ramp outside the hairline is a hand-rolled antialias: Tk
+        # draws hard pixels, and a bare arc at this radius reads as a staircase.
+        cv.create_arc(box[0] - 1, box[1] - 1, box[2] + 1, box[3] + 1,
+                      start=start - 2, extent=94, style="arc", width=1,
+                      outline=mix(self.under, self.border, 0.55))
+        cv.create_arc(box[0], box[1], box[2] - 1, box[3] - 1, start=start - 3,
+                      extent=96, style="pieslice", fill=self.surface, outline="")
+        # Stroked separately: a pieslice also outlines its two straight radii,
+        # which draws a stub of border *inside* the card.
+        cv.create_arc(box[0], box[1], box[2] - 1, box[3] - 1, start=start - 2,
+                      extent=94, style="arc", outline=self.border, width=1)
+
+
+def card(parent: tk.Misc, **pack_kw: Any) -> tk.Frame:
+    """A :class:`Card`, returning the body frame the caller fills.
+
+    Kept as a function because every view says ``inner = card(parent)`` and then
+    ``inner.master.pack(...)``; ``inner.master`` is the Card itself.
+    """
+    outer = Card(parent, under=pack_kw.pop("under", None))
     if pack_kw:
         outer.pack(**pack_kw)
-    inner = ttk.Frame(outer, style="Surface.TFrame")
-    inner.pack(fill="both", expand=True, padx=1, pady=1)
-    outer.inner = inner  # type: ignore[attr-defined]
-    return inner
+    outer.inner = outer.body  # type: ignore[attr-defined]
+    return outer.body
 
 
-def focus_ring(parent: tk.Misc) -> tk.Frame:
-    """A tk.Frame whose highlight border is the 3 px focus ring (section 10.8).
+class FocusRing(tk.Frame):
+    """A hairline container that turns into an accent ring when its child has focus.
 
-    ``clam`` will not draw a focus ring on a Treeview or a Canvas, so the
-    container does it instead.
+    ``clam`` will not draw a focus indicator on a Treeview or a Canvas, and its
+    default is a dotted rectangle nobody can see anyway. This is a real 2 px ring
+    in the focus colour, which is the WCAG 2.4.7 requirement.
     """
-    return tk.Frame(parent, background=c("border"), highlightthickness=px(3),
-                    highlightbackground=c("border"), highlightcolor=c("focus"),
-                    borderwidth=0)
+
+    def __init__(self, parent: tk.Misc, under: Optional[str] = None):
+        self.under = under or c("bg")
+        super().__init__(parent, background=c("border"),
+                         highlightthickness=px(2), highlightbackground=self.under,
+                         highlightcolor=c("focus"), borderwidth=0)
+
+    def track(self, widget: tk.Misc) -> None:
+        """Light the ring while ``widget`` holds keyboard focus."""
+        widget.bind("<FocusIn>", self._on, add="+")
+        widget.bind("<FocusOut>", self._off, add="+")
+
+    def _on(self, _event: Any = None) -> None:
+        try:
+            self.configure(highlightbackground=c("focus"),
+                           background=c("focus"))
+        except tk.TclError:  # pragma: no cover - during teardown
+            pass
+
+    def _off(self, _event: Any = None) -> None:
+        try:
+            self.configure(highlightbackground=self.under, background=c("border"))
+        except tk.TclError:  # pragma: no cover - during teardown
+            pass
+
+
+def focus_ring(parent: tk.Misc, under: Optional[str] = None) -> FocusRing:
+    """A container whose border is the focus ring (section 10.8)."""
+    return FocusRing(parent, under=under)
+
+
+def autohide(bar: tk.Misc, owner: tk.Misc, **pack_kw: Any) -> Callable[[str, str], None]:
+    """A scrollbar that is only there when there is something to scroll.
+
+    A full-height thumb over a table of seven rows is a slab of furniture that
+    says nothing; ttk has no opinion about it, so the set-callback takes one.
+    """
+    def _set(first: str, last: str) -> None:
+        try:
+            if float(first) <= 0.0 and float(last) >= 1.0:
+                bar.pack_forget()
+            elif not bar.winfo_manager():
+                bar.pack(before=owner, **pack_kw)
+        except (tk.TclError, ValueError):  # pragma: no cover - teardown
+            pass
+        try:
+            bar.set(first, last)  # type: ignore[attr-defined]
+        except tk.TclError:  # pragma: no cover
+            pass
+    return _set
+
+
+class ScrollPane(ttk.Frame):
+    """A vertically scrollable region whose scrollbar appears only when needed.
+
+    The Settings tab is a stack of cards with generous padding, and at the
+    minimum window size (960x640) the last card used to be cut off by the footer
+    with no way to reach it. The canvas takes no focus, so the Tab order still
+    runs straight through the real controls.
+    """
+
+    def __init__(self, parent: tk.Misc, style: str = "TFrame",
+                 background: Optional[str] = None):
+        super().__init__(parent, style=style)
+        self.canvas = tk.Canvas(self, background=background or c("bg"),
+                                highlightthickness=0,
+                                borderwidth=0, takefocus=0)
+        self.vsb = ttk.Scrollbar(self, orient="vertical", command=self.canvas.yview,
+                                 takefocus=0)
+        self.canvas.configure(yscrollcommand=self._on_scroll)
+        self.canvas.pack(side="left", fill="both", expand=True)
+        self._sb_shown = False
+        self.body = ttk.Frame(self.canvas, style=style)
+        self._win = self.canvas.create_window(0, 0, window=self.body, anchor="nw")
+        self.body.bind("<Configure>", self._body_configure, add="+")
+        self.canvas.bind("<Configure>", self._canvas_configure, add="+")
+        # One global wheel binding, filtered by where the pointer actually is.
+        # Binding and unbinding on <Enter>/<Leave> looks tidier and is wrong: Tk
+        # sends those when the pointer crosses into a *child*, so the binding
+        # stacks up or disappears while the pointer is still inside the pane.
+        for seq in ("<MouseWheel>", "<Button-4>", "<Button-5>"):
+            self.canvas.bind_all(seq, self._wheel, add="+")
+        self.bind("<Destroy>", self._release_wheel, add="+")
+
+    def _body_configure(self, _event: Any = None) -> None:
+        try:
+            self.canvas.configure(scrollregion=self.canvas.bbox("all"))
+        except tk.TclError:  # pragma: no cover - teardown
+            pass
+
+    def _canvas_configure(self, event: Any) -> None:
+        self.canvas.itemconfigure(self._win, width=event.width)
+
+    def _on_scroll(self, first: str, last: str) -> None:
+        need = not (float(first) <= 0.0 and float(last) >= 1.0)
+        if need and not self._sb_shown:
+            self.vsb.pack(side="right", fill="y")
+            self._sb_shown = True
+        elif not need and self._sb_shown:
+            self.vsb.pack_forget()
+            self._sb_shown = False
+        self.vsb.set(first, last)
+
+    def _release_wheel(self, _event: Any = None) -> None:
+        for seq in ("<MouseWheel>", "<Button-4>", "<Button-5>"):
+            try:
+                self.canvas.unbind_all(seq)
+            except tk.TclError:  # pragma: no cover - teardown
+                pass
+
+    def _inside(self, event: Any) -> bool:
+        """True when the pointer is over this pane or one of its children."""
+        try:
+            under = self.winfo_containing(event.x_root, event.y_root)
+        except (tk.TclError, AttributeError):  # pragma: no cover
+            return False
+        while under is not None:
+            if under is self:
+                return True
+            under = getattr(under, "master", None)
+        return False
+
+    def _wheel(self, event: Any) -> None:
+        if not self._sb_shown or not self._inside(event):
+            return
+        num = getattr(event, "num", 0)
+        delta = getattr(event, "delta", 0)
+        step = -1 if (num == 4 or delta > 0) else 1
+        try:
+            self.canvas.yview_scroll(step, "units")
+        except tk.TclError:  # pragma: no cover - teardown
+            pass
+
+
+class CheckBox(tk.Frame):
+    """A Canvas-drawn checkbox: bigger than ttk's, with real states.
+
+    The stock ``ttk.Checkbutton`` indicator is a 13 px bevelled square that no
+    amount of styling can enlarge or flatten, and at 150 % DPI it blurs. This
+    draws its own: a 22 px rounded box with a stroked tick, hover and pressed
+    tints, a 2 px focus ring, and a disabled state that changes shape as well as
+    colour. It behaves like a checkbox for the keyboard (Tab reaches it, Space
+    and Return toggle it) and the whole row is clickable, label included.
+
+    The Database tab needs dozens of these, so the drawing is four canvas items
+    reused across states rather than a full repaint.
+    """
+
+    SIZE = 22          # unscaled px, the side of the box itself
+    GAP = 10           # unscaled px between the box and its label
+
+    def __init__(self, parent: tk.Misc, text: str = "", *,
+                 variable: Optional[tk.Variable] = None,
+                 command: Optional[Callable[[], None]] = None,
+                 surface: Optional[str] = None, wraplength: int = 0,
+                 font: Any = None, subtext: str = ""):
+        self.surface = surface or c("surface")
+        super().__init__(parent, background=self.surface, borderwidth=0,
+                         highlightthickness=0, takefocus=True)
+        self.var = variable if variable is not None else tk.BooleanVar(value=False)
+        self.command = command
+        self._hover = False
+        self._focus = False
+        self._pressed = False
+        self._enabled = True
+        side = px(self.SIZE)
+        self.box = tk.Canvas(self, width=side, height=side, background=self.surface,
+                             highlightthickness=0, borderwidth=0, takefocus=False)
+        self.box.pack(side="left", anchor="n", pady=px(2))
+        holder = tk.Frame(self, background=self.surface, borderwidth=0,
+                          highlightthickness=0)
+        holder.pack(side="left", fill="x", expand=True, padx=(px(self.GAP), 0))
+        self.label = tk.Label(holder, text=text, background=self.surface,
+                              foreground=c("text"), font=font or F.get("body"),
+                              anchor="w", justify="left", borderwidth=0,
+                              highlightthickness=0)
+        self.label.pack(anchor="w", fill="x")
+        if wraplength:
+            self.label.configure(wraplength=px(wraplength))
+        self.sublabel: Optional[tk.Label] = None
+        if subtext:
+            self.sublabel = tk.Label(holder, text=subtext, background=self.surface,
+                                     foreground=c("muted"), font=F.get("small"),
+                                     anchor="w", justify="left", borderwidth=0,
+                                     highlightthickness=0)
+            if wraplength:
+                self.sublabel.configure(wraplength=px(wraplength))
+            self.sublabel.pack(anchor="w", fill="x")
+
+        for w in (self, self.box, holder, self.label, self.sublabel):
+            if w is None:
+                continue
+            w.bind("<Button-1>", self._press, add="+")
+            w.bind("<ButtonRelease-1>", self._release, add="+")
+            w.bind("<Enter>", self._enter, add="+")
+            w.bind("<Leave>", self._leave, add="+")
+        self.bind("<FocusIn>", self._focus_in, add="+")
+        self.bind("<FocusOut>", self._focus_out, add="+")
+        self.bind("<space>", self._key, add="+")
+        self.bind("<Return>", self._key, add="+")
+        self.bind("<KP_Enter>", self._key, add="+")
+        try:
+            self.var.trace_add("write", lambda *_a: self._draw())
+        except AttributeError:  # pragma: no cover - Python 3.9 keeps trace()
+            self.var.trace("w", lambda *_a: self._draw())
+        self._draw()
+
+    # -- public API ----------------------------------------------------------
+    def get(self) -> bool:
+        return bool(self.var.get())
+
+    def set(self, value: bool) -> None:
+        self.var.set(bool(value))
+
+    def toggle(self) -> None:
+        if not self._enabled:
+            return
+        self.var.set(not bool(self.var.get()))
+        if self.command is not None:
+            self.command()
+
+    def set_enabled(self, enabled: bool) -> None:
+        self._enabled = bool(enabled)
+        self.configure(takefocus=bool(enabled))
+        fg = c("text") if enabled else mix(c("muted"), self.surface, 0.4)
+        self.label.configure(foreground=fg)
+        if self.sublabel is not None:
+            self.sublabel.configure(
+                foreground=c("muted") if enabled else mix(c("muted"), self.surface, 0.4))
+        self._draw()
+
+    def configure_state(self, state: str) -> None:
+        """``"normal"``/``"disabled"``, so callers can mirror ttk's vocabulary."""
+        self.set_enabled(state != "disabled")
+
+    # -- events --------------------------------------------------------------
+    def _enter(self, _event: Any = None) -> None:
+        self._hover = True
+        self._draw()
+
+    def _leave(self, _event: Any = None) -> None:
+        self._hover = False
+        self._pressed = False
+        self._draw()
+
+    def _press(self, _event: Any = None) -> str:
+        if self._enabled:
+            self.focus_set()
+            self._pressed = True
+            self._draw()
+        return "break"
+
+    def _release(self, _event: Any = None) -> str:
+        was = self._pressed
+        self._pressed = False
+        if was and self._enabled:
+            self.toggle()
+        self._draw()
+        return "break"
+
+    def _focus_in(self, _event: Any = None) -> None:
+        self._focus = True
+        self._draw()
+
+    def _focus_out(self, _event: Any = None) -> None:
+        self._focus = False
+        self._draw()
+
+    def _key(self, _event: Any = None) -> str:
+        self.toggle()
+        return "break"
+
+    # -- painting ------------------------------------------------------------
+    def _draw(self) -> None:
+        try:
+            self.box.delete("all")
+        except tk.TclError:  # pragma: no cover - during teardown
+            return
+        side = px(self.SIZE)
+        on = bool(self.var.get())
+        r = px(6)
+        pad = px(3)
+        x0, y0, x1, y1 = pad, pad, side - pad - 1, side - pad - 1
+        if not self._enabled:
+            fill = c("surface_alt")
+            edge = c("border")
+            tick = mix(c("muted"), c("surface_alt"), 0.35)
+        elif on:
+            fill = c("accent_active") if self._pressed else c("accent")
+            edge = fill
+            tick = c("on_accent")
+        else:
+            fill = c("surface_alt") if self._pressed else (
+                c("accent_tint") if self._hover else self.surface)
+            edge = c("accent") if self._hover else c("border_strong")
+            tick = edge
+        if self._focus and self._enabled:
+            self.box.create_polygon(
+                round_rect_points(0, 0, side - 1, side - 1, r + px(3)),
+                smooth=True, splinesteps=16, fill="", outline=c("focus"),
+                width=max(2, px(2)))
+        self.box.create_polygon(round_rect_points(x0, y0, x1, y1, r),
+                                smooth=True, splinesteps=16, fill=fill,
+                                outline=edge, width=px(2) if not on else px(1))
+        if on:
+            # A stroked tick, not a glyph: it stays sharp at any scale and its
+            # weight can match the box.
+            self.box.create_line(
+                x0 + (x1 - x0) * 0.24, y0 + (y1 - y0) * 0.53,
+                x0 + (x1 - x0) * 0.43, y0 + (y1 - y0) * 0.72,
+                x0 + (x1 - x0) * 0.77, y0 + (y1 - y0) * 0.30,
+                fill=tick, width=max(2, px(2.4)), capstyle="round",
+                joinstyle="round")
+        elif not self._enabled:
+            # Shape, not colour: an off-and-locked box carries a dash.
+            self.box.create_line(x0 + (x1 - x0) * 0.28, (y0 + y1) / 2.0,
+                                 x0 + (x1 - x0) * 0.72, (y0 + y1) / 2.0,
+                                 fill=tick, width=max(2, px(2)), capstyle="round")
+
+
+def _rounded_cover(x: float, y: float, x0: float, y0: float, x1: float,
+                   y1: float, r: float) -> float:
+    """Coverage in ``[0, 1]`` of a rounded rectangle at a sample point.
+
+    A 3x3 supersample of this is the antialiasing Tk will not do for us.
+    """
+    cx = x0 + r if x < x0 + r else (x1 - r if x > x1 - r else x)
+    cy = y0 + r if y < y0 + r else (y1 - r if y > y1 - r else y)
+    if x < x0 or x > x1 or y < y0 or y > y1:
+        return 0.0
+    dx, dy = x - cx, y - cy
+    if dx == 0.0 and dy == 0.0:
+        return 1.0
+    return 1.0 if (dx * dx + dy * dy) <= r * r else 0.0
+
+
+def _seg_distance(px_: float, py_: float, ax: float, ay: float,
+                  bx: float, by: float) -> float:
+    """Distance from a point to a line segment (for the stroked tick)."""
+    vx, vy = bx - ax, by - ay
+    wx, wy = px_ - ax, py_ - ay
+    denom = vx * vx + vy * vy
+    t = 0.0 if denom <= 0 else (wx * vx + wy * vy) / denom
+    t = 0.0 if t < 0.0 else (1.0 if t > 1.0 else t)
+    dx, dy = px_ - (ax + t * vx), py_ - (ay + t * vy)
+    return math.sqrt(dx * dx + dy * dy)
+
+
+def checkbox_image(master: tk.Misc, on: bool, *, size: int = 20, gap: int = 10,
+                   surface: Optional[str] = None) -> tk.PhotoImage:
+    """A :class:`CheckBox`-styled checkbox as a Tk image, for a Treeview row.
+
+    The Database tab needs a checkbox on 162 rows. A Treeview cell can hold an
+    image but not a widget, so the very same square the custom
+    :class:`CheckBox` draws on a canvas is rendered here into a
+    :class:`tkinter.PhotoImage`: same radius, same accent fill, same stroked
+    tick, antialiased by supersampling and transparent outside the rounded
+    corners so it sits correctly on a selected row.
+    """
+    side = max(12, px(size))
+    # A Treeview butts its text straight up against the row image, so the gap
+    # between box and label is transparent padding carried by the image itself.
+    pad_right = max(0, px(gap))
+    back = surface or c("surface")
+    img = tk.PhotoImage(master=master, width=side + pad_right, height=side)
+    fill = c("accent") if on else back
+    edge = c("accent") if on else c("border_strong")
+    tick = c("on_accent")
+    pad = 1.0
+    x0, y0, x1, y1 = pad, pad, side - 1 - pad, side - 1 - pad
+    radius = max(2.0, side * 0.28)
+    stroke = max(1.6, side * 0.09)
+    # The tick, as two segments across the box (the CheckBox proportions).
+    tx = [x0 + (x1 - x0) * f for f in (0.24, 0.43, 0.77)]
+    ty = [y0 + (y1 - y0) * f for f in (0.53, 0.72, 0.30)]
+    tick_w = max(1.5, side * 0.11)
+    rows = []
+    transparent = []
+    for yy in range(side):
+        row = []
+        for xx in range(side + pad_right):
+            if xx >= side:
+                transparent.append((xx, yy))
+                row.append(back)
+                continue
+            cover = 0.0
+            inner = 0.0
+            for sy in (0.17, 0.5, 0.83):
+                for sx in (0.17, 0.5, 0.83):
+                    sxx, syy = xx + sx, yy + sy
+                    cover += _rounded_cover(sxx, syy, x0, y0, x1, y1, radius)
+                    inner += _rounded_cover(sxx, syy, x0 + stroke, y0 + stroke,
+                                            x1 - stroke, y1 - stroke,
+                                            max(1.0, radius - stroke))
+            cover /= 9.0
+            inner /= 9.0
+            if cover <= 0.0:
+                transparent.append((xx, yy))
+                row.append(back)
+                continue
+            colour = mix(mix(back, edge, cover), fill, inner)
+            if on:
+                d = min(_seg_distance(xx + 0.5, yy + 0.5, tx[0], ty[0], tx[1], ty[1]),
+                        _seg_distance(xx + 0.5, yy + 0.5, tx[1], ty[1], tx[2], ty[2]))
+                t = (tick_w / 2.0 + 0.5 - d) / 1.0
+                if t > 0.0:
+                    colour = mix(colour, tick, min(1.0, t))
+            row.append(colour)
+        rows.append(row)
+    img.put(rows)
+    for xx, yy in transparent:
+        try:
+            img.transparency_set(xx, yy, True)
+        except (tk.TclError, AttributeError):  # pragma: no cover - very old Tk
+            break
+    return img
 
 
 class DropZone(tk.Canvas):
-    """The one big target a novice needs (section 10.2).
+    """The one big target a novice needs (section 10.2), and the only animation.
 
-    A Canvas, not a Frame, so the dashed border can be redrawn on ``<Configure>``.
-    Idle / hover / drag-over / keyboard-focus differ in outline colour and width;
-    the glyph is drawn with lines and polygons — no emoji, no bitmap.
+    A Canvas, so the whole thing is drawn: a rounded dashed boundary, and inside
+    it a stylised circular chromosome carrying **seven** illuminated locus arcs —
+    seven housekeeping loci *is* the MLST idea — swept in sequence by a travelling
+    read head, with a few softly drifting cocci and rods behind. No image files,
+    no dependencies, no cartoon.
+
+    Cost when idle is zero. The frame chain is a single ``after()`` handle that is
+    armed only while the zone is actually on screen and waiting for a file, and
+    is cancelled the moment a run starts, results appear, or the window is
+    minimised. It re-arms BEFORE painting, exactly like the controller's poll
+    chain, so a slow frame can never stall the next one. Under a reduced-motion
+    preference it paints one static frame and never arms at all.
 
     Click anywhere browses for files; ``Return``/``space`` browses files and
     ``Shift-Return`` browses a folder.
     """
 
+    FPS_MS = 33             # ~30 fps
+    LOCI = 7                # the seven housekeeping loci of a classical scheme
+    SWEEP_PER_FRAME = 0.042  # loci per frame -> one full circuit in ~5.5 s
+    FLOURISH_FRAMES = 18
+
     def __init__(self, parent: tk.Misc, *, on_files: Callable[[Sequence[str]], None],
                  on_browse: Callable[[], None], on_browse_folder: Callable[[], None],
                  dnd: bool):
-        super().__init__(parent, highlightthickness=px(3),
-                         highlightbackground=c("bg"), highlightcolor=c("focus"),
+        # highlightthickness=0 on purpose: Tk's own focus ring is a hard square
+        # drawn around a rounded dashed boundary, which read as two borders.
+        # The ring is drawn inside, on the same radius, by redraw().
+        super().__init__(parent, highlightthickness=0,
                          background=c("bg"), borderwidth=0, takefocus=True,
-                         height=px(210), cursor="hand2")
+                         height=px(260), cursor="hand2")
         self.on_files = on_files
         self.on_browse = on_browse
         self.on_browse_folder = on_browse_folder
         self.dnd = dnd
         self.zone_state = "idle"
         self._enabled = True
-        self.headline = ("Drop a FASTA file here, or click to browse"
-                         if dnd else "Click to choose your FASTA file")
-        self.subline = ("Analysis starts by itself. "
-                        "You can drop several files, or a whole folder."
+        self.headline = ("Drop a FASTA file here"
+                         if dnd else "Choose your FASTA file")
+        self.subline = ("or click to browse. Analysis starts by itself - one file, "
+                        "several, or a whole folder."
                         if dnd else
-                        "Analysis starts by itself. "
-                        "Press Shift+Enter to choose a whole folder.")
+                        "Click anywhere in this box. Analysis starts by itself; "
+                        "press Shift+Enter to choose a whole folder.")
+        #: Single animation handle. There is never a second one.
+        self._anim_after: Optional[str] = None
+        self._want_anim = True      # the view says the zone is the current focus
+        self._mapped = True
+        self._static = reduced_motion()
+        self._phase = 0.0
+        self._flourish = 0
+        self._items: Dict[str, Any] = {}
+        self._geo: Dict[str, float] = {}
+        self._bugs: List[Dict[str, float]] = []
         self.bind("<Configure>", lambda e: self.redraw(), add="+")
         self.bind("<Button-1>", self._click, add="+")
         self.bind("<Return>", self._key_browse, add="+")
@@ -1667,6 +3031,15 @@ class DropZone(tk.Canvas):
         self.bind("<Leave>", lambda e: self.set_state("idle"), add="+")
         self.bind("<FocusIn>", lambda e: self.set_state("focus"), add="+")
         self.bind("<FocusOut>", lambda e: self.set_state("idle"), add="+")
+        self.bind("<Map>", self._on_map, add="+")
+        self.bind("<Unmap>", self._on_unmap, add="+")
+        self.bind("<Destroy>", lambda e: self._stop_anim(), add="+")
+        try:  # a minimised window unmaps the toplevel, not this canvas
+            top = self.winfo_toplevel()
+            top.bind("<Map>", self._on_map, add="+")
+            top.bind("<Unmap>", self._on_unmap, add="+")
+        except tk.TclError:  # pragma: no cover - no toplevel under test
+            pass
         if dnd:
             self._register_dnd()
 
@@ -1680,7 +3053,7 @@ class DropZone(tk.Canvas):
         except Exception:
             LOG.info("drag-and-drop registration failed; click-to-browse only")
             self.dnd = False
-            self.headline = "Click to choose your FASTA file"
+            self.headline = "Choose your FASTA file"
             self.redraw()
 
     def _drag_enter(self, event: Any) -> Any:
@@ -1697,6 +3070,7 @@ class DropZone(tk.Canvas):
         if self._enabled:
             paths = split_dnd_paths(self, getattr(event, "data", ""))
             if paths:
+                self.flourish()
                 self.on_files(paths)
         return getattr(event, "action", None)
 
@@ -1727,48 +3101,331 @@ class DropZone(tk.Canvas):
             self.zone_state = state
             self.redraw()
 
-    # -- painting ------------------------------------------------------------
-    def redraw(self) -> None:
-        self.delete("all")
-        w = max(self.winfo_width(), px(320))
-        h = max(self.winfo_height(), px(180))
-        dragging = self.zone_state == "dragover"
-        if not self._enabled:
-            outline, width, fill = c("border"), px(2), c("bg")
-            headline, sub = "Working...", "Please wait for the current files to finish."
-        elif dragging:
-            outline, width, fill = c("drop_hover"), px(3), c("accent_soft")
-            headline, sub = "Release to analyse", self.subline
-        elif self.zone_state in ("hover", "focus"):
-            outline, width, fill = c("accent"), px(2), c("surface")
-            headline, sub = self.headline, self.subline
+    # -- the animation chain -------------------------------------------------
+    def animate(self, on: bool) -> None:
+        """The view's switch: animate only while this zone is what matters."""
+        self._want_anim = bool(on)
+        self._sync_anim()
+
+    def _on_map(self, _event: Any = None) -> None:
+        self._mapped = True
+        self._sync_anim()
+
+    def _on_unmap(self, _event: Any = None) -> None:
+        self._mapped = False
+        self._stop_anim()
+
+    def should_animate(self) -> bool:
+        """Everything that has to be true before a single frame is scheduled."""
+        if self._static or not self._mapped:
+            return False
+        if self._flourish > 0:
+            return True
+        return bool(self._want_anim and self._enabled)
+
+    def _sync_anim(self) -> None:
+        if self.should_animate():
+            self._start_anim()
         else:
-            outline, width, fill = c("drop_idle"), px(2), c("surface")
-            headline, sub = self.headline, self.subline
+            self._stop_anim()
 
-        inset = px(6)
-        self.create_rectangle(inset, inset, w - inset, h - inset, outline=outline,
-                              width=width, dash=(px(6), px(5)), fill=fill)
+    def _start_anim(self) -> None:
+        if self._anim_after is None:
+            try:
+                self._anim_after = self.after(self.FPS_MS, self._tick)
+            except tk.TclError:  # pragma: no cover - widget already gone
+                self._anim_after = None
 
-        cx = w // 2
-        top = h // 2 - px(52)
-        glyph = outline if dragging else c("accent")
-        # A downward arrow dropping into an open tray, drawn as vector art so it
-        # scales cleanly at any DPI and needs no bundled bitmap.
-        self.create_line(cx, top, cx, top + px(34), fill=glyph, width=px(3),
-                         capstyle="round")
-        self.create_polygon(cx - px(11), top + px(26), cx + px(11), top + px(26),
-                            cx, top + px(42), fill=glyph, outline=glyph)
-        self.create_line(cx - px(30), top + px(52), cx - px(30), top + px(64),
-                         cx + px(30), top + px(64), cx + px(30), top + px(52),
-                         fill=glyph, width=px(3), joinstyle="round",
-                         capstyle="round")
+    def _stop_anim(self) -> None:
+        if self._anim_after is not None:
+            try:
+                self.after_cancel(self._anim_after)
+            except tk.TclError:  # pragma: no cover
+                pass
+            self._anim_after = None
 
-        self.create_text(cx, h // 2 + px(34), text=headline, fill=c("text"),
-                         font=F.get("title"), anchor="center")
-        self.create_text(cx, h // 2 + px(62), text=sub, fill=c("muted"),
-                         font=F.get("small"), anchor="center", width=w - px(80),
-                         justify="center")
+    def _tick(self) -> None:
+        self._anim_after = None
+        if not self.should_animate():
+            return
+        # Re-armed BEFORE the frame is painted, never after: a frame that took
+        # too long must not be able to drop the chain (the poll-chain rule).
+        try:
+            self._anim_after = self.after(self.FPS_MS, self._tick)
+        except tk.TclError:  # pragma: no cover
+            return
+        self._phase = (self._phase + self.SWEEP_PER_FRAME) % float(self.LOCI)
+        if self._flourish > 0:
+            self._flourish -= 1
+            if self._flourish == 0 and not (self._want_anim and self._enabled):
+                self._stop_anim()
+        self._frame()
+
+    def flourish(self) -> None:
+        """A brief confirming pulse when files actually land."""
+        if self._static:
+            return
+        self._flourish = self.FLOURISH_FRAMES
+        self._sync_anim()
+
+    # -- painting ------------------------------------------------------------
+    def _colours(self) -> Dict[str, str]:
+        """Zone colours for the current state. One accent, nothing else."""
+        if not self._enabled:
+            # No dashes: a dashed boundary is the universal "drop here" sign and
+            # this zone accepts nothing while a run is in flight.
+            fill, edge = c("surface_alt"), c("border")
+            return {"fill": fill, "edge": edge, "width": px(1), "dash": False,
+                    "ink": c("muted"), "headline": c("text"), "sub": c("muted")}
+        if self.zone_state == "dragover":
+            return {"fill": c("accent_soft"), "edge": c("drop_hover"),
+                    "width": px(3), "dash": False, "ink": c("accent"),
+                    "headline": c("text"), "sub": c("text_soft")}
+        if self.zone_state == "focus":
+            # Keyboard focus is a SOLID accent boundary: dashes already mean
+            # "you may drop here", and the two together read as two borders.
+            return {"fill": c("accent_tint"), "edge": c("focus"), "width": px(2),
+                    "dash": False, "ink": c("accent"), "headline": c("text"),
+                    "sub": c("muted")}
+        if self.zone_state == "hover":
+            return {"fill": c("accent_tint"), "edge": c("accent"), "width": px(2),
+                    "dash": True, "ink": c("accent"), "headline": c("text"),
+                    "sub": c("muted")}
+        return {"fill": c("accent_tint"), "edge": c("drop_idle"), "width": px(2),
+                "dash": True, "ink": c("accent"), "headline": c("text"),
+                "sub": c("muted")}
+
+    def _seed_bugs(self, w: float, h: float, top: float) -> None:
+        """Deterministic starting positions — no ``random`` import, no surprises."""
+        self._bugs = []
+        spec = ((0.13, 0.30, 1.0, 0.55, 7, "rod", 0.5),
+                (0.83, 0.22, -0.7, 0.9, 6, "coccus", 0.0),
+                (0.26, 0.74, 0.85, -0.7, 5, "coccus", 0.0),
+                (0.72, 0.68, -1.0, -0.5, 8, "rod", 2.1),
+                (0.48, 0.14, 0.6, 1.0, 5, "coccus", 0.0),
+                (0.92, 0.52, -0.9, -0.8, 6, "rod", 1.2))
+        for fx, fy, vx, vy, size, kind, ang in spec:
+            self._bugs.append({"x": fx * w, "y": top * fy, "vx": vx * 0.16,
+                               "vy": vy * 0.16, "r": float(px(size)),
+                               "rod": 1.0 if kind == "rod" else 0.0,
+                               "ang": ang, "spin": 0.004 if kind == "rod" else 0.0})
+
+    def _bug_points(self, bug: Dict[str, float]) -> List[float]:
+        """A capsule (rod) or a circle (coccus), as a smoothed polygon."""
+        r = bug["r"]
+        half = r * (1.9 if bug["rod"] else 0.0)
+        ca, sa = math.cos(bug["ang"]), math.sin(bug["ang"])
+        pts: List[float] = []
+        for k in range(12):
+            a = math.pi * 2.0 * k / 12.0
+            # a circle stretched along its own axis, then rotated
+            lx, ly = math.cos(a) * r, math.sin(a) * r
+            lx += half if math.cos(a) >= 0 else -half
+            pts.extend((bug["x"] + lx * ca - ly * sa, bug["y"] + lx * sa + ly * ca))
+        return pts
+
+    def redraw(self) -> None:
+        """Rebuild every canvas item. Called on resize and on a state change."""
+        self.delete("all")
+        self._items = {}
+        w = float(max(self.winfo_width(), px(320)))
+        # The floor used to be 150 px while show_state() gives the strip 104,
+        # so the boundary was drawn past the bottom of the canvas and the strip
+        # had three sides.
+        h = float(max(self.winfo_height(), px(84)))
+        col = self._colours()
+        pad = float(px(PAD_S))
+        self._items["frame"] = self.create_polygon(
+            round_rect_points(pad, pad, w - pad, h - pad, px(RADIUS + 8)),
+            smooth=True, splinesteps=24, fill=col["fill"], outline=col["edge"],
+            width=col["width"],
+            dash=(px(9), px(7)) if col["dash"] else ())
+
+        compact = h < px(215)
+        tiny = w < px(300) or h < px(120)
+        if compact:
+            # Short zone (results are on screen): illustration on the left, the
+            # words beside it, everything still legible.
+            radius = max(float(px(20)), min(float(px(38)), (h - pad * 2) * 0.36))
+            cx = pad + float(px(PAD_L)) + radius
+            cy = h / 2.0
+            text_x = cx + radius + float(px(PAD_L))
+            head_y = cy - float(px(11))
+            sub_y = cy + float(px(11))
+            anchor, text_w = "w", max(float(px(120)), w - text_x - pad - px(PAD_M))
+            top_area = h
+        else:
+            # One optically centred block — ring, headline, one line of help —
+            # rather than art floating at the top and words pinned to the floor.
+            gap_ring, gap_text = float(px(34)), float(px(28))
+            head_h, sub_h = float(px(24)), float(px(18))
+            radius = max(float(px(32)),
+                         min(float(px(128)),
+                             min(w * 0.15, (h - float(px(160))) * 0.34)))
+            block = (2 * radius + gap_ring + head_h + gap_text + sub_h
+                     + float(px(26)))
+            top = max(pad + float(px(PAD_M)), (h - block) / 2.0)
+            cx, cy = w / 2.0, top + radius
+            head_y = top + 2 * radius + gap_ring + head_h / 2.0
+            sub_y = head_y + gap_text
+            # The flora drift in the band above the words and never across them.
+            top_area = head_y - float(px(PAD_L))
+            text_x = w / 2.0
+            anchor, text_w = "center", max(float(px(220)), w * 0.62)
+
+        self._geo = {"w": w, "h": h, "cx": cx, "cy": cy, "r": radius,
+                     "top": top_area, "compact": 1.0 if compact else 0.0}
+
+        ink = col["ink"]
+        base = col["fill"]
+        dim = mix(base, ink, 0.38)
+        ring = mix(base, ink, 0.52)
+
+        # -- drifting flora, behind everything ------------------------------
+        if not tiny and not compact:
+            if not self._bugs:
+                self._seed_bugs(w, h, top_area)
+            bug_fill = mix(base, ink, 0.10)
+            bug_edge = mix(base, ink, 0.22)
+            ids = []
+            for bug in self._bugs:
+                ids.append(self.create_polygon(self._bug_points(bug), smooth=True,
+                                               splinesteps=10, fill=bug_fill,
+                                               outline=bug_edge, width=1))
+            self._items["bugs"] = ids
+        else:
+            self._items["bugs"] = []
+
+        # -- the chromosome --------------------------------------------------
+        self._items["pulse"] = self.create_oval(cx, cy, cx, cy, outline="", width=px(2))
+        self.create_oval(cx - radius * 0.72, cy - radius * 0.72,
+                         cx + radius * 0.72, cy + radius * 0.72,
+                         outline=mix(base, ink, 0.22), width=1)
+        self.create_oval(cx - radius, cy - radius, cx + radius, cy + radius,
+                         outline=ring, width=max(1, px(2)))
+
+        span = 360.0 / self.LOCI
+        arc_span = span * 0.62
+        box = (cx - radius, cy - radius, cx + radius, cy + radius)
+        arcs, nodes = [], []
+        for i in range(self.LOCI):
+            mid = 90.0 - i * span
+            arcs.append(self.create_arc(box[0], box[1], box[2], box[3],
+                                        start=mid - arc_span / 2.0, extent=arc_span,
+                                        style="arc", width=px(7), outline=dim))
+            orbit = radius + float(px(11))
+            ax = cx + orbit * math.cos(math.radians(mid))
+            ay = cy - orbit * math.sin(math.radians(mid))
+            nodes.append(self.create_oval(ax - px(4), ay - px(4), ax + px(4),
+                                          ay + px(4), fill=dim,
+                                          outline=base, width=1))
+        self._items["arcs"] = arcs
+        self._items["nodes"] = nodes
+        self._items["head"] = self.create_oval(cx, cy, cx, cy, fill=ink, outline="")
+
+        if not tiny:
+            # ASCII on purpose. A Tk canvas hands the string to the X font
+            # verbatim, and on a build with no Xft a U+2026 came out as three
+            # mojibake glyphs ("Working(R)<apple>f") in 24 pt across the hero.
+            headline = self.headline if self._enabled else "Working..."
+            sub = self.subline if self._enabled else (
+                "Please wait for the current files to finish.")
+            if self._enabled and self.zone_state == "dragover":
+                headline = "Release to analyse"
+                sub = "Let go and typing starts straight away."
+            self._items["headline"] = self.create_text(
+                text_x, head_y, text=headline, fill=col["headline"],
+                font=F.get("title"), anchor=anchor, width=int(text_w),
+                justify="left" if anchor == "w" else "center")
+            self._items["sub"] = self.create_text(
+                text_x, sub_y, text=sub, fill=col["sub"], font=F.get("small"),
+                anchor=anchor, width=int(text_w),
+                justify="left" if anchor == "w" else "center")
+            if not compact and self._enabled:
+                self.create_text(
+                    text_x, sub_y + float(px(26)),
+                    text="FASTA   \u00b7   GenBank   \u00b7   EMBL   \u00b7   "
+                         ".gz  .bz2  .zip",
+                    fill=col["sub"], font=F.get("tiny"),
+                    anchor=anchor)
+        self._frame()
+        self._sync_anim()
+
+    def _frame(self) -> None:
+        """Update only what moves. Called every ~33 ms, and once per redraw."""
+        arcs = self._items.get("arcs")
+        if not arcs:
+            return
+        col = self._colours()
+        ink, base = col["ink"], col["fill"]
+        dim = mix(base, ink, 0.38)
+        bright = ink
+        lit_all = self.zone_state == "dragover" and self._enabled
+        cx, cy, radius = self._geo["cx"], self._geo["cy"], self._geo["r"]
+        span = 360.0 / self.LOCI
+        try:
+            for i, item in enumerate(arcs):
+                if self._static:
+                    level = 0.45
+                elif lit_all:
+                    level = 1.0
+                else:
+                    d = (i - self._phase) % float(self.LOCI)
+                    d = min(d, self.LOCI - d)
+                    level = max(0.0, 1.0 - d / 1.45)
+                self.itemconfigure(item, outline=mix(dim, bright, level),
+                                   width=px(7) + px(3) * level)
+                node = self._items["nodes"][i]
+                nr = px(4) + px(2.4) * level
+                mid = 90.0 - i * span
+                orbit = radius + float(px(11))
+                ax = cx + orbit * math.cos(math.radians(mid))
+                ay = cy - orbit * math.sin(math.radians(mid))
+                self.coords(node, ax - nr, ay - nr, ax + nr, ay + nr)
+                self.itemconfigure(node, fill=mix(dim, bright, min(1.0, level + 0.15)))
+
+            # the travelling read head
+            head = self._items.get("head")
+            if head is not None:
+                if self._static or lit_all:
+                    self.itemconfigure(head, fill="")
+                else:
+                    ang = 90.0 - self._phase * span
+                    hx = cx + radius * math.cos(math.radians(ang))
+                    hy = cy - radius * math.sin(math.radians(ang))
+                    hr = float(px(4))
+                    self.coords(head, hx - hr, hy - hr, hx + hr, hy + hr)
+                    self.itemconfigure(head, fill=bright)
+
+            for idx, item in enumerate(self._items.get("bugs") or []):
+                bug = self._bugs[idx]
+                if not self._static:
+                    bug["x"] += bug["vx"]
+                    bug["y"] += bug["vy"]
+                    bug["ang"] += bug["spin"]
+                    margin = bug["r"] * 3.0
+                    if bug["x"] < -margin:
+                        bug["x"] = self._geo["w"] + margin
+                    elif bug["x"] > self._geo["w"] + margin:
+                        bug["x"] = -margin
+                    if bug["y"] < -margin:
+                        bug["y"] = self._geo["top"] + margin
+                    elif bug["y"] > self._geo["top"] + margin:
+                        bug["y"] = -margin
+                self.coords(item, *self._bug_points(bug))
+
+            pulse = self._items.get("pulse")
+            if pulse is not None:
+                if self._flourish > 0:
+                    k = 1.0 - self._flourish / float(self.FLOURISH_FRAMES)
+                    pr = radius * (1.0 + 1.4 * k)
+                    self.coords(pulse, cx - pr, cy - pr, cx + pr, cy + pr)
+                    self.itemconfigure(pulse, outline=mix(bright, base, k),
+                                       width=max(1, px(3) * (1.0 - k)))
+                else:
+                    self.itemconfigure(pulse, outline="")
+        except (tk.TclError, KeyError, IndexError):  # pragma: no cover - teardown
+            return
 
 
 class StatusLine(ttk.Frame):
@@ -1784,7 +3441,14 @@ class StatusLine(ttk.Frame):
         super().__init__(parent, style="Footer.TFrame")
         self.resting = "Ready."
         self._after: Optional[str] = None
-        self.icon = ttk.Label(self, text="", style="Status.TLabel")
+        # A drawn disc rather than a glyph: same reason as the results table --
+        # U+2714 is a hollow box on any Tk without a font that owns it, and a
+        # status channel that silently disappears is worse than none.
+        self.icon = tk.Canvas(self, width=px(13), height=px(13),
+                              highlightthickness=0, borderwidth=0,
+                              background=c("surface_alt"))
+        self._dot = self.icon.create_oval(px(2), px(2), px(11), px(11),
+                                          outline="", fill="")
         self.icon.pack(side="left", padx=(px(PAD_M), 0))
         self.label = ttk.Label(self, text=self.resting, style="Status.TLabel",
                                anchor="w")
@@ -1795,10 +3459,8 @@ class StatusLine(ttk.Frame):
             resting: bool = False) -> None:
         """Update the live region. ``resting`` also changes what it reverts to."""
         assert_main_thread("the status line")
-        glyph = {"ok": "✔", "warn": "⚠", "bad": "⚠",
-                 "info": "ℹ"}.get(kind, "")
         colour = c(kind) if kind in ("ok", "warn", "bad", "info") else c("muted")
-        self.icon.configure(text=glyph, foreground=colour)
+        self._set_dot(colour if kind in ("ok", "warn", "bad", "info") else "")
         self.label.configure(text=text, foreground=colour)
         if resting:
             self.resting = text
@@ -1811,9 +3473,15 @@ class StatusLine(ttk.Frame):
         if transient:
             self._after = self.after(self.REVERT_MS, self._revert)
 
+    def _set_dot(self, colour: str) -> None:
+        try:
+            self.icon.itemconfigure(self._dot, fill=colour)
+        except tk.TclError:  # pragma: no cover - teardown
+            pass
+
     def _revert(self) -> None:
         self._after = None
-        self.icon.configure(text="")
+        self._set_dot("")
         self.label.configure(text=self.resting, foreground=c("muted"))
 
 
@@ -1822,13 +3490,16 @@ class StatusLine(ttk.Frame):
 # ===========================================================================
 
 #: Column ids for the results tree. ``#0`` carries FILE.
-TREE_COLUMNS = ("scheme", "st", "status", "score")
-#: Heading words, identical to bin/mlst:151 plus the two --full columns.
-TREE_HEADINGS = {"#0": "FILE", "scheme": "SCHEME", "st": "ST",
-                 "status": "STATUS", "score": "SCORE"}
+TREE_COLUMNS = ("organism", "scheme", "st", "status", "score")
+#: Heading words: bin/mlst:151 plus the two --full columns, and ORGANISM first,
+#: because "abaumannii_2" is a directory name and *Acinetobacter baumannii* is
+#: the answer the reader came for.
+TREE_HEADINGS = {"#0": "FILE", "organism": "ORGANISM", "scheme": "SCHEME",
+                 "st": "ST", "status": "STATUS", "score": "SCORE"}
 #: Caption row inserted above the per-locus children so reused columns are
-#: never ambiguous (section 10.2).
-CHILD_CAPTION = ("ALLELE", "WHAT IT MEANS", "BEST EVIDENCE", "HITS")
+#: never ambiguous (section 10.2). The ST column is left empty for child rows so
+#: that the long evidence string lands in the widest column.
+CHILD_CAPTION = ("ALLELE", "WHAT IT MEANS", "", "BEST EVIDENCE", "HITS")
 
 CHUNK_ROWS = 200        # rows inserted per pump above 2000 rows
 BIG_BATCH = 50          # confirm threshold for a folder drop
@@ -1839,8 +3510,259 @@ def evidence_text(call: AlleleCall) -> str:
     hit = call.best
     if hit is None:
         return "no match found"
-    return "{} {}–{} · {:.1f}% identity · {:.1f}% of allele".format(
-        hit.qseqid, hit.qstart, hit.qend, hit.pct_identity, hit.pct_coverage)
+    # Identity and coverage lead: they are what a reader judges the call on,
+    # and if the column ever runs out of room it is the contig coordinates that
+    # should be the part cut, not the percentages.
+    return "{:.1f}% identity · {:.1f}% of allele · {} {}–{}".format(
+        hit.pct_identity, hit.pct_coverage, hit.qseqid, hit.qstart, hit.qend)
+
+
+def tied_schemes(result: SampleResult) -> str:
+    """``"klebsiella ST 258, ecoli_achtman_4 ST 14464"`` when the call is a tie.
+
+    Presentation only: it re-reads :attr:`~wmlst.engine.SampleResult.tied`,
+    the block of candidates the engine scored EQUAL to the reported one, and
+    never re-derives a number. Empty string when the winner stands alone.
+
+    A tie is a genuine scientific ambiguity -- two schemes fit the assembly
+    equally well -- so the GUI shows it rather than hiding the fact that a
+    heuristic picked between them (section 5.14a).
+    """
+    rows = getattr(result, "tied", ())
+    if len(rows) < 2:
+        return ""
+    return ", ".join(
+        "{} (no ST)".format(c.scheme) if c.st in ("", "-")
+        else "{} ST {}".format(c.scheme, c.st) for c in rows)
+
+
+TIE_SENTENCE = (
+    "Two or more schemes fit this assembly equally well; {app} reported the one "
+    "whose alleles sit lowest in each locus\u2019 allele registry. Confirm the "
+    "species by another method before using this ST."
+)
+
+
+def wrap_px(text: str, font: Any, max_px: int) -> List[str]:
+    """Word-wrap ``text`` to a pixel width, measured in the font that draws it.
+
+    A Treeview clips a cell without a word of warning, so the long explanations
+    in the expanded row are folded here against the column's real width rather
+    than against a guessed character count — which is how "fit this assembly
+    equally well; WM" happened.
+    """
+    words = str(text).split()
+    if not words or max_px <= 0:
+        return [str(text)] if text else []
+    try:
+        measure = font.measure
+    except AttributeError:  # pragma: no cover - no font object without a display
+        return wrap_words(text, max(8, max_px // 7))
+    lines: List[str] = []
+    line = ""
+    for word in words:
+        candidate = word if not line else line + " " + word
+        if measure(candidate) > max_px and line:
+            lines.append(line)
+            line = word
+        else:
+            line = candidate
+    if line:
+        lines.append(line)
+    return lines
+
+
+def elide_middle_px(text: str, font: Any, max_px: int) -> str:
+    """Shorten from the MIDDLE, keeping the head and the tail.
+
+    Assembly file names differ at both ends -- the accession at the front, the
+    extension at the back -- so cutting the tail off "GCF_000013425.1_ASM1342v1
+    _genomic.fna" throws away the half that says what kind of file it is.
+    """
+    text = str(text)
+    try:
+        measure = font.measure
+    except AttributeError:  # pragma: no cover
+        return text
+    if max_px <= 0 or measure(text) <= max_px:
+        return text
+    tail = text[-12:] if len(text) > 24 else text[-4:]
+    lo, hi = 0, len(text) - len(tail)
+    while lo < hi:
+        mid = (lo + hi + 1) // 2
+        if measure(text[:mid] + "..." + tail) <= max_px:
+            lo = mid
+        else:
+            hi = mid - 1
+    return text[:lo] + "..." + tail if lo else elide_px(text, font, max_px)
+
+
+def elide_px(text: str, font: Any, max_px: int) -> str:
+    """``text`` shortened with a trailing ellipsis until it fits ``max_px``."""
+    text = str(text)
+    try:
+        measure = font.measure
+    except AttributeError:  # pragma: no cover
+        return text
+    if max_px <= 0 or measure(text) <= max_px:
+        return text
+    lo, hi = 0, len(text)
+    while lo < hi:
+        mid = (lo + hi + 1) // 2
+        if measure(text[:mid] + "...") <= max_px:
+            lo = mid
+        else:
+            hi = mid - 1
+    # Trailing separators come with the cut, and "of allele ·..." reads as a
+    # mistake rather than as a shortening.
+    return (text[:lo].rstrip(" \u00b7-\u2013,;:") + "...") if lo else ""
+
+
+def wrap_words(text: str, width: int) -> List[str]:
+    """Greedy word wrap. ``textwrap`` would do, but this module keeps its text
+    helpers together and needs no tab expansion or hyphen breaking."""
+    lines: List[str] = []
+    line = ""
+    for word in str(text).split():
+        candidate = word if not line else line + " " + word
+        if len(candidate) > width and line:
+            lines.append(line)
+            line = word
+        else:
+            line = candidate
+    if line:
+        lines.append(line)
+    return lines
+
+
+#: The leading whitespace on a continuation row inside an expanded result. It
+#: is measured, not guessed at, before anything is wrapped against it.
+INDENT = "        "
+
+
+def _indent_px(font: Any) -> int:
+    """Width of :data:`INDENT` in ``font``, for wrapping a continuation row."""
+    try:
+        return int(font.measure(INDENT))
+    except AttributeError:  # pragma: no cover - no display
+        return 0
+
+
+#: The one-line form used inside the results table, where a paragraph does not
+#: belong. The full :data:`TIE_SENTENCE` is on the summary card and in the report.
+TIE_SHORT = ("Both schemes scored the same. Confirm the species by another "
+             "method before using this ST.")
+
+
+def tie_sentence() -> str:
+    """The novice-facing explanation of a scheme tie."""
+    return TIE_SENTENCE.format(app=branding.APP_NAME)
+
+
+# ---------------------------------------------------------------------------
+# Scheme provenance (wmlst.schemerefs) — organism, description, reference
+# ---------------------------------------------------------------------------
+# "abaumannii_2" and "ecoli_achtman_4" are scheme directory names, not answers.
+# A reader who has never met them cannot tell whether the tool typed the right
+# organism, and one of them told us so. Everything below turns a scheme id into
+# what the curated table actually knows, and shows NOTHING where the table is
+# blank: a blank cell means "not established", and a diagnostic report must
+# never invent a species or a citation.
+
+def scheme_ref(scheme: str, dbdir: str = "") -> Optional[Any]:
+    """The curated :class:`~wmlst.schemerefs.SchemeRef` for a scheme, or None.
+
+    The active database is asked first, then the one bundled with this copy of
+    WMLST: the table is curated provenance, not data, so a portable or
+    hand-placed database that predates it still names its organisms.
+    """
+    if not scheme or scheme == "-":
+        return None
+    for where in ((dbdir or None), None):
+        try:
+            found = schemerefs.lookup(scheme, where)
+        except Exception:  # pragma: no cover - the loader swallows its own
+            found = None
+        if found is not None:
+            return found
+        if where is None:
+            break
+    return None
+
+
+def organism_name(scheme: str, dbdir: str = "") -> str:
+    """``"Klebsiella pneumoniae"``, ``"Neisseria spp."`` or ``""``."""
+    ref = scheme_ref(scheme, dbdir)
+    return ref.organism if ref is not None else ""
+
+
+def organism_parts(scheme: str, dbdir: str = "") -> Tuple[str, str]:
+    """Split an organism label into ``(italic part, upright part)``.
+
+    ``Klebsiella pneumoniae`` is italic throughout; in ``Neisseria spp.`` only
+    the genus is italic, because "spp." is not part of the name.
+    """
+    label = organism_name(scheme, dbdir)
+    if not label:
+        return ("", "")
+    if label.endswith(" spp."):
+        return (label[:-5], "spp.")
+    return (label, "")
+
+
+def scheme_caption(scheme: str, ref: Optional[Any]) -> str:
+    """``klebsiella · Klebsiella pneumoniae MLST · 7 loci`` — known fields only."""
+    bits = [scheme] if scheme and scheme != "-" else []
+    if ref is not None:
+        if ref.description:
+            bits.append(ref.description)
+        if ref.n_loci:
+            bits.append("{} loci".format(ref.n_loci))
+    return "  \u00b7  ".join(bits)
+
+
+#: How the curated table spells a source, and how a human should read it.
+SOURCE_NAMES = {"pubmlst": "PubMLST", "pasteur": "Institut Pasteur",
+                "bigsdb": "BIGSdb"}
+
+
+def source_name(ref: Optional[Any]) -> str:
+    """``"PubMLST"`` / ``"Institut Pasteur"`` for the link label."""
+    source = str(getattr(ref, "source", "") or "")
+    return SOURCE_NAMES.get(source.strip().lower(), source or "Database")
+
+
+def reference_line(ref: Optional[Any]) -> str:
+    """The verified citation, with its PubMed id. ``""`` when none exists.
+
+    75 of the 162 schemes have one; the rest have no citation that could be
+    confirmed against PubMed, and for those this returns nothing at all.
+    """
+    if ref is None or not getattr(ref, "citation", ""):
+        return ""
+    if ref.pubmed_id:
+        return "{}  \u00b7  PMID {}".format(ref.citation, ref.pubmed_id)
+    return str(ref.citation)
+
+
+def open_url(url: str) -> None:
+    """Open an authoritative database or PubMed page in the user's browser."""
+    if not url:
+        return
+    try:
+        webbrowser.open(url)
+    except Exception as exc:  # pragma: no cover - browser-less box
+        LOG.warning("could not open %s: %s", url, exc)
+
+
+def link_button(parent: tk.Misc, text: str, url: str, *,
+                tip: str = "") -> ttk.Button:
+    """An underlined accent link that is a real button: Tab reaches it, Enter
+    and Space follow it, and the URL is in its tooltip."""
+    btn = ttk.Button(parent, text=text, style="CardLink.TButton",
+                     command=lambda u=url: open_url(u))
+    Tooltip(btn, tip or url)
+    return btn
 
 
 def allele_summary(result: SampleResult) -> str:
@@ -1860,6 +3782,13 @@ class AnalyseView(ttk.Frame):
         self.results: List[SampleResult] = []
         self.failures: List[Tuple[str, Friendly]] = []
         self._row_data: Dict[str, SampleResult] = {}
+        #: Drawn STATUS shapes, one per status word. Tk frees an image the
+        #: moment Python drops it, so the row would go blank without this.
+        self._status_icons: Dict[str, Any] = {}
+        #: The UNSHORTENED file name behind every row, so that widening the
+        #: window can put back what narrowing it had to elide.
+        self._row_names: Dict[str, str] = {}
+        self._fit_width = 0
         self._row_error: Dict[str, Friendly] = {}
         self._expanded: set = set()
         self._order = 0
@@ -1882,10 +3811,19 @@ class AnalyseView(ttk.Frame):
         # tool is broken" rather than "you pinned a scheme". Say so on this tab,
         # where the result is, not only on the Settings tab the user has left.
         self.scheme_notice = ttk.Frame(outer, style="Notice.TFrame")
+        # A 3 px bar in the warning colour down the leading edge, plus a glyph:
+        # the band is dark text on a tint, and the bar and the glyph give it two
+        # further channels for anyone who cannot see the tint at all.
+        ttk.Frame(self.scheme_notice, style="NoticeBar.TFrame",
+                  width=px(3)).pack(side="left", fill="y")
+        ttk.Label(self.scheme_notice, text="LOCKED",
+                  style="NoticeBadge.TLabel").pack(side="left",
+                                                   padx=(px(PAD_M), 0),
+                                                   pady=px(PAD_M))
         self.scheme_notice_label = ttk.Label(
             self.scheme_notice, style="Notice.TLabel", anchor="w", justify="left")
         self.scheme_notice_label.pack(side="left", fill="x", expand=True,
-                                      padx=(px(PAD_M), px(PAD_S)), pady=px(PAD_S))
+                                      padx=(px(PAD_S), px(PAD_S)), pady=px(PAD_M))
         ttk.Button(self.scheme_notice, text="Use automatic",
                    command=self._clear_forced_scheme).pack(side="right",
                                                            padx=(0, px(PAD_M)),
@@ -1913,37 +3851,99 @@ class AnalyseView(ttk.Frame):
         self.overall = ttk.Progressbar(progress, style="Big.Horizontal.TProgressbar",
                                        mode="determinate", maximum=100.0)
         self.overall.pack(fill="x", padx=px(PAD_M))
+        # Packed only while it is actually sweeping: two troughs stacked, one of
+        # them permanently empty, read as a broken second progress bar.
         self.pulse = ttk.Progressbar(progress, style="Thin.Horizontal.TProgressbar",
                                      mode="indeterminate", maximum=100.0)
-        self.pulse.pack(fill="x", padx=px(PAD_M), pady=(px(PAD_XS), 0))
         self.progress_detail = ttk.Label(progress, text="", style="SurfaceMuted.TLabel",
                                          anchor="w")
         self.progress_detail.pack(fill="x", padx=px(PAD_M), pady=(px(PAD_XS), px(PAD_M)))
 
         # -- single-file summary card ----------------------------------------
+        # The headline is the ORGANISM, in italic binomial form; the scheme id
+        # is secondary, and the reference that defines the scheme is on the card
+        # rather than three clicks away. A cryptic "abaumannii_2" alone made one
+        # user believe the tool had typed the wrong thing.
         self.summary_wrap = ttk.Frame(outer, style="TFrame")
         summary = card(self.summary_wrap)
         summary.master.pack(fill="x")
         self.summary_card = summary
-        left = ttk.Frame(summary, style="Surface.TFrame")
-        left.pack(side="left", padx=px(PAD_L), pady=px(PAD_M))
-        ttk.Label(left, text="SEQUENCE TYPE", style="SurfaceMuted.TLabel").pack(anchor="w")
+        head = ttk.Frame(summary, style="Surface.TFrame")
+        head.pack(fill="x")
+        left = ttk.Frame(head, style="Surface.TFrame")
+        # anchor="n": without it pack() centres this column against the tall one
+        # beside it and the hero number floated 75 px below the file name.
+        left.pack(side="left", anchor="n", padx=(px(PAD_L), px(PAD_XL)),
+                  pady=px(PAD_M))
+        ttk.Label(left, text="SEQUENCE TYPE", style="Eyebrow.TLabel").pack(anchor="w")
         self.st_label = ttk.Label(left, text="—", style="Hero.TLabel")
-        self.st_label.pack(anchor="w")
-        right = ttk.Frame(summary, style="Surface.TFrame")
+        self.st_label.pack(anchor="w", pady=(px(PAD_XS), 0))
+        ttk.Frame(left, style="Rule.TFrame", height=px(3),
+                  width=px(44)).pack(anchor="w", pady=(px(PAD_S), 0))
+        right = ttk.Frame(head, style="Surface.TFrame")
         right.pack(side="left", fill="both", expand=True, padx=(0, px(PAD_L)),
                    pady=px(PAD_M))
-        self.summary_title = ttk.Label(right, text="", style="Heading.TLabel", anchor="w")
-        self.summary_title.pack(anchor="w", fill="x")
+        self.summary_file = ttk.Label(right, text="", style="SurfaceMuted.TLabel",
+                                      anchor="w")
+        self.summary_file.pack(anchor="w", fill="x")
+        organism_row = ttk.Frame(right, style="Surface.TFrame")
+        organism_row.pack(anchor="w", fill="x")
+        self.organism_label = ttk.Label(organism_row, text="", style="Surface.TLabel",
+                                        font=F.get("organism"), anchor="w")
+        self.organism_label.pack(side="left")
+        # "spp." is not part of the name and is therefore not italic.
+        self.organism_suffix = ttk.Label(organism_row, text="",
+                                         style="SurfaceSoft.TLabel",
+                                         font=F.get("title"), anchor="w")
+        self.organism_suffix.pack(side="left", padx=(px(PAD_S), 0))
+        self.summary_title = ttk.Label(right, text="", style="SurfaceMuted.TLabel",
+                                       anchor="w")
+        self.summary_title.pack(anchor="w", fill="x", pady=(px(PAD_XS), 0))
         self.summary_status = ttk.Label(right, text="", style="Ok.TLabel", anchor="w")
-        self.summary_status.pack(anchor="w", fill="x", pady=(px(PAD_XS), 0))
+        self.summary_status.pack(anchor="w", fill="x", pady=(px(PAD_S), 0))
         self.summary_body = ttk.Label(right, text="", style="SurfaceMuted.TLabel",
                                       anchor="w", justify="left")
         self.summary_body.pack(anchor="w", fill="x", pady=(px(PAD_XS), 0))
         self.summary_body.bind(
             "<Configure>",
-            lambda e: self.summary_body.configure(wraplength=max(px(240), e.width - px(8))),
+            lambda e: self.summary_body.configure(
+                wraplength=max(px(240), min(px(720), e.width - px(8)))),
             add="+")
+
+        # The reference block. Hidden entirely when the curated table has no
+        # citation for this scheme: a blank cell means "not established", and an
+        # invented reference on a diagnostic result would be far worse than none.
+        self.reference_wrap = ttk.Frame(right, style="Surface.TFrame")
+        ttk.Label(self.reference_wrap, text="REFERENCE",
+                  style="Eyebrow.TLabel").pack(anchor="w")
+        self.reference_label = ttk.Label(self.reference_wrap, text="",
+                                         style="SurfaceMuted.TLabel", anchor="w",
+                                         justify="left")
+        self.reference_label.pack(anchor="w", fill="x")
+        # Capped, not merely fitted: a 1000 px card would otherwise set this
+        # citation as one 170-character line, which nobody reads.
+        self.reference_label.bind(
+            "<Configure>",
+            lambda e: self.reference_label.configure(
+                wraplength=max(px(240), min(px(720), e.width - px(8)))), add="+")
+        self.reference_links = ttk.Frame(self.reference_wrap, style="Surface.TFrame")
+        self.reference_links.pack(anchor="w", fill="x")
+
+        # A tie is a scientific ambiguity, not a footnote: it gets its own band
+        # across the bottom of the card, with both schemes and both STs.
+        self.tie_banner = ttk.Frame(summary, style="Notice.TFrame")
+        ttk.Frame(self.tie_banner, style="NoticeBar.TFrame",
+                  width=px(3)).pack(side="left", fill="y")
+        ttk.Label(self.tie_banner, text="TIE", style="NoticeBadge.TLabel").pack(
+            side="left", padx=(px(PAD_M), 0), pady=px(PAD_M))
+        self.tie_label = ttk.Label(self.tie_banner, text="", style="Notice.TLabel",
+                                   anchor="w", justify="left")
+        self.tie_label.pack(side="left", fill="x", expand=True,
+                            padx=(px(PAD_S), px(PAD_M)), pady=px(PAD_S))
+        self.tie_label.bind(
+            "<Configure>",
+            lambda e: self.tie_label.configure(
+                wraplength=max(px(240), e.width - px(8))), add="+")
 
         # -- results ----------------------------------------------------------
         self.results_wrap = ttk.Frame(outer, style="TFrame")
@@ -1959,23 +3959,41 @@ class AnalyseView(ttk.Frame):
         ring = focus_ring(self.results_wrap)
         self.tree = ttk.Treeview(ring, columns=TREE_COLUMNS, show="tree headings",
                                  selectmode="browse", height=6)
+        ring.track(self.tree)
         vsb = ttk.Scrollbar(ring, orient="vertical", command=self.tree.yview)
-        self.tree.configure(yscrollcommand=vsb.set)
-        vsb.pack(side="right", fill="y")
         self.tree.pack(side="left", fill="both", expand=True)
-        self.tree.column("#0", width=px(320), minwidth=px(180), stretch=True)
-        self.tree.column("scheme", width=px(150), minwidth=px(90), anchor="w")
-        self.tree.column("st", width=px(90), minwidth=px(60), anchor="w")
-        self.tree.column("status", width=px(200), minwidth=px(120), anchor="w")
-        self.tree.column("score", width=px(80), minwidth=px(60), anchor="e")
+        self.tree.configure(
+            yscrollcommand=autohide(vsb, self.tree, side="right", fill="y"))
+        # #0 is the only stretching column, so it absorbs the window: a RefSeq
+        # accession is 40 characters and used to be chopped mid-token.
+        # The six starting widths must SUM to less than the narrowest window
+        # this application allows (960 px), because "stretch" only ever grows a
+        # column: when the sum is larger, Tk clips the last one off the right
+        # edge and SCORE simply is not there.
+        self.tree.column("#0", width=px(215), minwidth=px(150), stretch=True)
+        self.tree.column("organism", width=px(145), minwidth=px(100), anchor="w")
+        self.tree.column("scheme", width=px(125), minwidth=px(84), anchor="w")
+        self.tree.column("st", width=px(50), minwidth=px(40), anchor="e")
+        # The child rows reuse this one for the BLAST evidence string, which is
+        # longer than any status word -- but the file name is the thing the
+        # reader owns, so the evidence elides and the file name does not.
+        self.tree.column("status", width=px(178), minwidth=px(96), anchor="w")
+        self.tree.column("score", width=px(58), minwidth=px(46), anchor="e")
         for col, title in TREE_HEADINGS.items():
             self.tree.heading(col, text=title,
+                              anchor="e" if col in ("score", "st") else "w",
                               command=lambda cc=col: self.sort_by(cc))
         for key in ("ok", "warn", "bad", "info", "muted"):
             self.tree.tag_configure("st_" + key, foreground=c(key))
         self.tree.tag_configure("failed", foreground=c("bad"))
         self.tree.tag_configure("caption", foreground=c("muted"), font=F.get("tiny"))
         self.tree.tag_configure("locus", foreground=c("text"))
+        self.tree.tag_configure("tie", foreground=c("warn"), font=F.get("body_bold"))
+        # Accent blue means "this is a link" everywhere else in the window, so
+        # the provenance row -- a citation, not a link -- is not painted blue.
+        self.tree.tag_configure("provenance", foreground=c("text_soft"))
+        self.tree.tag_configure("row_plain", foreground=c("text"))
+        self.tree.bind("<Configure>", self._refit_names, add="+")
         self.tree.bind("<<TreeviewOpen>>", self._on_open, add="+")
         self.tree.bind("<<TreeviewSelect>>", self._on_select, add="+")
         self.tree.bind("<Double-Button-1>", self._on_activate, add="+")
@@ -2066,8 +4084,16 @@ class AnalyseView(ttk.Frame):
             self._fill_summary(self.results[0])
         if have_rows:
             self.results_wrap.pack(fill="both", expand=True)
-        self.dropzone.configure(height=px(140) if have_rows else px(210))
+        # Once results are on screen the drop zone is a strip, not a target: the
+        # rows and the summary card are what the user is reading now, and every
+        # pixel it keeps is a row of the table they cannot see.
+        # Above the "tiny" threshold in DropZone.redraw(), or the strip loses
+        # its words and becomes a grey box with a drawing in it.
+        self.dropzone.configure(height=px(126) if have_rows else px(300))
         self.dropzone.set_enabled(not running)
+        # The animation costs nothing unless the drop zone is what the user is
+        # looking at: paused while a run is in flight and once results are up.
+        self.dropzone.animate(not running and not have_rows)
         self._set_actions_enabled(have_rows and not running)
 
     def _set_actions_enabled(self, enabled: bool) -> None:
@@ -2079,12 +4105,43 @@ class AnalyseView(ttk.Frame):
             self.btn_novel.configure(state="disabled")
 
     def _fill_summary(self, res: SampleResult) -> None:
-        """Fill the single-file card. Every value is copied, never recomputed."""
+        """Fill the single-file card. Every value is copied, never recomputed.
+
+        The organism is the headline, the scheme its subtitle, and the reference
+        that defines the scheme sits underneath — all of it read from the
+        curated table in :mod:`wmlst.schemerefs`, and every field omitted rather
+        than guessed at when that table is blank.
+        """
         # A bare hyphen at 28 pt reads as a dash, not as information (section 10.2).
         self.st_label.configure(text=res.st if res.st not in ("", "-") else "not assigned")
-        scheme = res.scheme if res.scheme != "-" else "no scheme matched"
-        self.summary_title.configure(text="{}  ·  {}".format(
-            os.path.basename(res.label) or res.label, scheme))
+        scheme = res.scheme if res.scheme != "-" else ""
+        dbdir = self.app.env.dbdir
+        ref = scheme_ref(scheme, dbdir)
+        italic, upright = organism_parts(scheme, dbdir)
+        # No ST means nothing was confirmed, so the name is stated quietly: a
+        # 21 px italic binomial over a blank ST would read as an identification
+        # the engine never made.
+        assigned = res.st not in ("", "-")
+        name_style = "Surface.TLabel" if assigned else "SurfaceMuted.TLabel"
+        try:
+            self.organism_label.configure(style=name_style)
+            self.organism_suffix.configure(style=name_style)
+        except tk.TclError:  # pragma: no cover
+            pass
+        if italic:
+            self.organism_label.configure(text=italic, font=F.get("organism"))
+        elif scheme:
+            # No organism in the table: show what we DO know, in upright type, so
+            # that nobody reads a directory name as a species name.
+            self.organism_label.configure(text=scheme, font=F.get("title"))
+        else:
+            self.organism_label.configure(text="No scheme matched",
+                                          font=F.get("title"))
+        self.organism_suffix.configure(text=upright)
+        self.summary_title.configure(
+            text=scheme_caption(scheme if italic else "", ref))
+        self.summary_file.configure(text=os.path.basename(res.label) or res.label)
+
         glyph_style = "{}.TLabel".format(
             STATUS_UI.get(res.status, (None, "muted", None))[1].capitalize())
         try:
@@ -2097,6 +4154,42 @@ class AnalyseView(ttk.Frame):
         if res.alleles:
             body += "\n" + allele_summary(res)
         self.summary_body.configure(text=body)
+        self._fill_reference(ref)
+
+        tied = tied_schemes(res)
+        if tied:
+            self.tie_label.configure(
+                text="{}. {}".format(tied, tie_sentence()))
+            self.tie_banner.pack(fill="x", side="bottom")
+        else:
+            self.tie_banner.pack_forget()
+
+    def _fill_reference(self, ref: Optional[Any]) -> None:
+        """Show the citation and the authoritative links, or nothing at all."""
+        for child in self.reference_links.winfo_children():
+            child.destroy()
+        citation = reference_line(ref)
+        database_url = getattr(ref, "database_url", "") if ref is not None else ""
+        pubmed_url = getattr(ref, "pubmed_url", "") if ref is not None else ""
+        if not citation and not database_url:
+            self.reference_wrap.pack_forget()
+            return
+        self.reference_label.configure(text=citation)
+        if citation:
+            self.reference_label.pack(anchor="w", fill="x")
+        else:
+            self.reference_label.pack_forget()
+        if pubmed_url:
+            link_button(self.reference_links,
+                        "PubMed {}".format(ref.pubmed_id), pubmed_url,
+                        tip="Open the primary publication for this scheme:\n"
+                            + pubmed_url).pack(side="left", padx=(0, px(PAD_M)))
+        if database_url:
+            link_button(self.reference_links,
+                        "{} record".format(source_name(ref)), database_url,
+                        tip="Open the authoritative scheme record:\n"
+                            + database_url).pack(side="left")
+        self.reference_wrap.pack(anchor="w", fill="x", pady=(px(PAD_S), 0))
 
     # -- input ---------------------------------------------------------------
     def browse_files(self) -> None:
@@ -2213,6 +4306,8 @@ class AnalyseView(ttk.Frame):
         if not self._indeterminate:
             self._indeterminate = True
             try:
+                self.pulse.pack(fill="x", padx=px(PAD_M), pady=(px(PAD_XS), 0),
+                                before=self.progress_detail)
                 self.pulse.start(60)
             except tk.TclError:
                 pass
@@ -2222,6 +4317,7 @@ class AnalyseView(ttk.Frame):
             self._indeterminate = False
             try:
                 self.pulse.stop()
+                self.pulse.pack_forget()
             except tk.TclError:
                 pass
 
@@ -2255,14 +4351,101 @@ class AnalyseView(ttk.Frame):
         else:
             self._insert_result_row(res)
 
+    def _refit_names(self, _event: Any = None) -> None:
+        """Re-elide every file name after a resize — and after the first layout.
+
+        The first row is inserted before Tk has stretched #0, so without this it
+        would keep the harsh elision it was given against the unstretched width
+        while every later row got the roomy one: two lengths in one column.
+        """
+        width = self._file_width()
+        if width == self._fit_width:
+            return
+        self._fit_width = width
+        font = F.get("body")
+        for iid, name in self._row_names.items():
+            try:
+                self.tree.item(iid, text=elide_middle_px(name, font, width))
+            except tk.TclError:  # pragma: no cover - teardown
+                return
+
+    def _file_width(self) -> int:
+        """Room left for a file name once the dot and the expander have theirs."""
+        try:
+            width = int(self.tree.column("#0", "width"))
+        except (tk.TclError, ValueError):  # pragma: no cover - teardown
+            return px(260)
+        # The dot image and the disclosure arrow both live in this cell and
+        # both take real pixels off the text; measured, not guessed.
+        return max(px(140), width - px(46))
+
+    def _column_width(self, col: str) -> int:
+        """The drawn width of a fixed column, less the cell's own padding."""
+        try:
+            return max(px(60), int(self.tree.column(col, "width")) - px(PAD_M))
+        except (tk.TclError, ValueError):  # pragma: no cover - teardown
+            return px(200)
+
+    def _name_width(self) -> int:
+        """Drawn width of the #0 cell on a child row.
+
+        ``column("#0", "width")`` reports the width AFTER stretch, so this is
+        the real number; what has to come off it is the disclosure indent and
+        the cell's own padding.
+        """
+        try:
+            width = int(self.tree.column("#0", "width"))
+        except (tk.TclError, ValueError):  # pragma: no cover - teardown
+            return px(300)
+        # PAD_L is the disclosure indent a depth-1 row carries, PAD_S the
+        # cell's own padding. Both are real pixels the text does not get.
+        # A child row is indented, and Tk reserves an image slot on every row
+        # of #0 once ANY row carries one. Both come off before anything wraps.
+        return max(px(180), width - px(PAD_L) - px(PAD_L) - px(PAD_S))
+
+    @staticmethod
+    def _row_tone(status: str) -> str:
+        """Which colour a whole result row is painted in.
+
+        A Treeview colours the row or nothing, so a PERFECT result used to set
+        the file name, the organism and the score in green as well -- a page of
+        green says nothing at all. The drawn dot carries the good news; row
+        colour is kept for the rows that want a second look.
+        """
+        if status in CALM_STATUSES:
+            return "row_plain"
+        return status_tag(status)
+
+    def status_icon(self, status: str) -> Any:
+        """The drawn status shape for a row, built once per status per theme."""
+        key = status or DEFAULT_STATUS
+        icon = self._status_icons.get(key)
+        if icon is None:
+            try:
+                icon = dot_image(self.tree, key)
+            except tk.TclError:  # pragma: no cover - teardown
+                return ""
+            self._status_icons[key] = icon
+        return icon
+
     def _insert_result_row(self, res: SampleResult) -> None:
         self._order += 1
+        organism = organism_name(res.scheme, self.app.env.dbdir)
+        scheme_cell = res.scheme if res.scheme != "-" else "—"
+        if tied_schemes(res):
+            # Colour is never the only channel: the word is in the cell too.
+            scheme_cell += "  \u00b7 tie"
+        name = os.path.basename(res.label) or res.label
         iid = self.tree.insert(
-            "", "end", text=os.path.basename(res.label) or res.label,
-            values=(res.scheme, res.st, status_cell(res.status), str(res.score)),
-            tags=(status_tag(res.status), "row"), open=False)
+            "", "end",
+            text=elide_middle_px(name, F.get("body"), self._file_width()),
+            image=self.status_icon(res.status),
+            values=(organism or "—", scheme_cell, res.st,
+                    status_cell(res.status), str(res.score)),
+            tags=(self._row_tone(res.status), "row"), open=False)
         self._row_data[iid] = res
-        if res.alleles:
+        self._row_names[iid] = name
+        if res.alleles or res.tied:
             # A dummy child makes the disclosure arrow appear; the real per-locus
             # rows are built lazily on <<TreeviewOpen>> (section 10.2).
             self.tree.insert(iid, "end", text="", values=("", "", "", ""),
@@ -2276,10 +4459,15 @@ class AnalyseView(ttk.Frame):
         self._current_pct = 0.0
         self._update_bar()
         self._order += 1
+        name = os.path.basename(path) or path
         iid = self.tree.insert(
-            "", "end", text=os.path.basename(path) or path,
-            values=("—", "—", "⚠ COULD NOT READ", "—"), tags=("failed", "row"))
+            "", "end",
+            text=elide_middle_px(name, F.get("body"), self._file_width()),
+            image=self.status_icon(ERROR_STATUS),
+            values=("—", "—", "—", "COULD NOT READ", "—"),
+            tags=("failed", "row"))
         self._row_error[iid] = friendly
+        self._row_names[iid] = name
         self.tree.see(iid)
 
     def _on_open(self, _event: Any = None) -> None:
@@ -2292,22 +4480,75 @@ class AnalyseView(ttk.Frame):
         self._expanded.add(iid)
         for child in self.tree.get_children(iid):
             self.tree.delete(child)
+        tied = tied_schemes(res)
+        wide = self._name_width()
+        if tied:
+            # Both of these used to be chopped mid-word inside a 215 px column.
+            # They are the reason the row exists, so they go in #0 — the one
+            # column that stretches with the window.
+            head = wrap_px("TIE  \u00b7  " + tied, F.get("body_bold"), wide)
+            for n, line in enumerate(head):
+                self.tree.insert(
+                    iid, "end", text=line if not n else INDENT + line,
+                    values=(("", "equal score", "", "", "") if not n
+                            else ("", "", "", "", "")),
+                    tags=("tie", "locus"))
+            # The full paragraph lives on the summary card, in the status line
+            # and in the report; four wrapped lines of it inside a table is
+            # clutter, so the row carries only what the reader must act on.
+            indent = _indent_px(F.get("tiny"))
+            for line in wrap_px(TIE_SHORT, F.get("tiny"), wide - indent):
+                self.tree.insert(iid, "end", text=INDENT + line,
+                                 values=("", "", "", "", ""), tags=("caption",))
+        # The provenance of the call: which scheme, from which database, out of
+        # which publication. Blank fields are simply absent.
+        ref = scheme_ref(res.scheme, self.app.env.dbdir)
+        if ref is not None:
+            self.tree.insert(
+                iid, "end", text="SCHEME",
+                values=(organism_name(res.scheme, self.app.env.dbdir) or "—",
+                        res.scheme, "",
+                        elide_px(reference_line(ref) or ref.database_url
+                                 or ref.description, F.get("body"),
+                                 self._column_width("status")),
+                        "{} loci".format(ref.n_loci) if ref.n_loci else ""),
+                tags=("provenance", "locus"))
         self.tree.insert(iid, "end", text="LOCUS", values=CHILD_CAPTION,
                          tags=("caption",))
+        evidence_px = self._column_width("status")
         for call in res.alleles:
             meaning = SYMBOL_UI.get(call.symbol, (call.symbol, "muted"))[0]
             colour = SYMBOL_UI.get(call.symbol, (call.symbol, "muted"))[1]
+            # An exact match is the expected case and is set in ordinary ink: a
+            # whole block of green says nothing, while one amber row among seven
+            # says "look here". Colour is spent only where it carries meaning.
+            tag = "locus" if call.symbol == "exact" else "st_" + colour
             self.tree.insert(
                 iid, "end", text="    " + call.locus,
-                values=(call.code, meaning, evidence_text(call), str(len(call.hits))),
-                tags=("st_" + colour, "locus"))
+                values=(call.code, meaning, "",
+                        elide_px(evidence_text(call), F.get("body"), evidence_px),
+                        str(len(call.hits))),
+                tags=(tag, "locus"))
 
     def _on_select(self, _event: Any = None) -> None:
         iid = self.tree.focus()
         res = self._row_data.get(iid)
         if res is not None:
-            self.app.status.set("{} — {}".format(res.path, status_sentence(res.status)),
-                                STATUS_UI.get(res.status, (None, "muted", None))[1])
+            # The MEANING leads and the file name follows. A live region that
+            # opens with 90 characters of absolute path spends its whole width
+            # before it says anything, and then runs off the right edge.
+            label = os.path.basename(res.path) or res.path
+            if tied_schemes(res):
+                self.app.status.set(
+                    "Tie: {}. {} — {}".format(tied_schemes(res), tie_sentence(),
+                                              label), "warn")
+            else:
+                organism = organism_name(res.scheme, self.app.env.dbdir)
+                self.app.status.set(
+                    "{}{} — {}".format(
+                        "{} ({}) — ".format(organism, res.scheme) if organism else "",
+                        status_sentence(res.status), label),
+                    STATUS_UI.get(res.status, (None, "muted", None))[1])
         elif iid in self._row_error:
             self.app.status.set(self._row_error[iid].headline + " — press Enter for "
                                 "details.", "bad")
@@ -2332,7 +4573,10 @@ class AnalyseView(ttk.Frame):
 
         def key(iid: str) -> Any:
             if col == "#0":
-                value: Any = self.tree.item(iid, "text").lower()
+                # The cell may be middle-elided for width; sort the real name.
+                res = self._row_data.get(iid)
+                value: Any = (os.path.basename(res.label) if res is not None
+                              else self.tree.item(iid, "text")).lower()
             else:
                 value = self.tree.set(iid, col)
                 if col == "score":
@@ -2362,7 +4606,9 @@ class AnalyseView(ttk.Frame):
         if res is None:
             self.app.status.set("Select a file row first.", "warn", transient=True)
             return
-        text = "\t".join([res.label, res.scheme, res.st, res.status, str(res.score),
+        text = "\t".join([res.label,
+                          organism_name(res.scheme, self.app.env.dbdir),
+                          res.scheme, res.st, res.status, str(res.score),
                           allele_summary(res)])
         self.clipboard_clear()
         self.clipboard_append(text)
@@ -2382,13 +4628,19 @@ class AnalyseView(ttk.Frame):
                                 "warn", transient=True)
             return False
         self.st_label.configure(text="—")
+        self.organism_label.configure(text="")
+        self.organism_suffix.configure(text="")
         self.summary_title.configure(text="")
+        self.summary_file.configure(text="")
         self.summary_status.configure(text="")
         self.summary_body.configure(text="")
+        self.reference_wrap.pack_forget()
+        self.tie_banner.pack_forget()
         self.results.clear()
         self.failures.clear()
         self._row_data.clear()
         self._row_error.clear()
+        self._row_names.clear()
         self._expanded.clear()
         self._pending_rows.clear()
         for iid in self.tree.get_children(""):
@@ -2446,6 +4698,12 @@ class DatabaseView(ttk.Frame):
         self._infos: Tuple[Any, ...] = ()
         self._jobs: Dict[int, str] = {}
         self._cancel: Optional[threading.Event] = None
+        #: scheme name -> ticked. What the next update will include.
+        self.checked: Dict[str, bool] = {}
+        #: The two checkbox images the rows share. Built once, on this widget's
+        #: own Tk root, and kept referenced here or Tk would collect them.
+        self._image_on: Optional[tk.PhotoImage] = None
+        self._image_off: Optional[tk.PhotoImage] = None
         self._build()
 
     def _build(self) -> None:
@@ -2458,8 +4716,8 @@ class DatabaseView(ttk.Frame):
         grid.pack(fill="x", padx=px(PAD_M), pady=px(PAD_M))
         self.count_label = ttk.Label(grid, text="—", style="Hero.TLabel")
         self.count_label.grid(row=0, column=0, rowspan=2, padx=(0, px(PAD_L)))
-        ttk.Label(grid, text="schemes installed", style="SurfaceMuted.TLabel").grid(
-            row=0, column=1, sticky="w")
+        ttk.Label(grid, text="SCHEMES INSTALLED", style="Eyebrow.TLabel").grid(
+            row=0, column=1, sticky="sw")
         self.version_label = ttk.Label(grid, text="", style="Heading.TLabel")
         self.version_label.grid(row=1, column=1, sticky="w")
         buttons = ttk.Frame(grid, style="Surface.TFrame")
@@ -2478,28 +4736,161 @@ class DatabaseView(ttk.Frame):
                                 "has changed. Nothing is downloaded or altered yet.")
         Tooltip(self.btn_update, "Download the changed schemes and rebuild the search "
                                  "index. Your current database is backed up first.")
+        # Packed by _show_progress() only while something is actually running:
+        # an empty trough sitting under the header for the life of the window is
+        # a piece of furniture, not a progress report.
         self.db_progress = ttk.Progressbar(info, style="Thin.Horizontal.TProgressbar",
                                            mode="determinate", maximum=100.0)
-        self.db_progress.pack(fill="x", padx=px(PAD_M))
         self.db_detail = ttk.Label(info, text="", style="SurfaceMuted.TLabel", anchor="w")
-        self.db_detail.pack(fill="x", padx=px(PAD_M), pady=(px(PAD_XS), px(PAD_M)))
+        self.db_detail.pack(fill="x", padx=px(PAD_M), pady=(0, px(PAD_XS)))
+        self.db_where = ttk.Label(info, text="", style="SurfaceMuted.TLabel", anchor="w")
+        self.db_where.pack(fill="x", padx=px(PAD_M), pady=(0, px(PAD_M)))
+
+        # -- selection controls ----------------------------------------------
+        # "make the checkbox nicer in design and bigger, and put a couple of
+        # select all / deselect all buttons": the checkbox on every row is the
+        # same square the custom CheckBox widget draws, rendered as an image
+        # because a Treeview cell can hold an image but not a widget.
+        bar = ttk.Frame(outer, style="TFrame")
+        bar.pack(fill="x", pady=(px(PAD_M), px(PAD_XS)))
+        self.btn_all = ttk.Button(bar, text="Select all", command=self.select_all)
+        self.btn_all.pack(side="left")
+        self.btn_none = ttk.Button(bar, text="Deselect all", command=self.deselect_all)
+        self.btn_none.pack(side="left", padx=(px(PAD_S), 0))
+        Tooltip(self.btn_all, "Tick every scheme in the list.")
+        Tooltip(self.btn_none, "Untick every scheme in the list.")
+        self.selection_label = ttk.Label(bar, text="", style="Muted.TLabel")
+        self.selection_label.pack(side="left", padx=px(PAD_M))
+        ttk.Label(bar, text="Click a tick box, or press Space, to change a row.",
+                  style="Muted.TLabel").pack(side="right")
 
         ring = focus_ring(outer)
-        ring.pack(fill="both", expand=True, pady=(px(PAD_M), 0))
+        ring.pack(fill="both", expand=True, pady=(px(PAD_XS), 0))
         self.tree = ttk.Treeview(ring, columns=DB_COLUMNS, show="tree headings",
                                  selectmode="browse")
+        ring.track(self.tree)
         vsb = ttk.Scrollbar(ring, orient="vertical", command=self.tree.yview)
-        self.tree.configure(yscrollcommand=vsb.set)
-        vsb.pack(side="right", fill="y")
         self.tree.pack(side="left", fill="both", expand=True)
-        self.tree.column("#0", width=px(220), minwidth=px(140), stretch=True)
+        self.tree.configure(
+            yscrollcommand=autohide(vsb, self.tree, side="right", fill="y"))
+        self.tree.column("#0", width=px(260), minwidth=px(160), stretch=True)
         self.tree.column("species", width=px(260), minwidth=px(140))
         for col in ("loci", "types", "alleles"):
             self.tree.column(col, width=px(90), minwidth=px(60), anchor="e")
-        self.tree.column("date", width=px(120), minwidth=px(80), anchor="w")
+        # DATE right-aligned like the three numeric columns before it: a
+        # left-aligned date butted against a right-aligned count left a five
+        # pixel alley and read as a collision.
+        self.tree.column("date", width=px(130), minwidth=px(90), anchor="e")
         for col, title in DB_HEADINGS.items():
-            self.tree.heading(col, text=title)
+            self.tree.heading(
+                col, text=title,
+                anchor="e" if col in ("loci", "types", "alleles", "date") else "w")
         self.tree.tag_configure("muted", foreground=c("muted"))
+        self.tree.bind("<Button-1>", self._click, add="+")
+        self.tree.bind("<space>", self._space, add="+")
+        self._update_selection_label()
+
+    # -- the per-scheme tick boxes -------------------------------------------
+    def _images(self) -> Tuple[Any, Any]:
+        """The ticked/unticked images, built on first use."""
+        if self._image_on is None or self._image_off is None:
+            try:
+                self._image_on = checkbox_image(self, True)
+                self._image_off = checkbox_image(self, False)
+            except tk.TclError:  # pragma: no cover - no display
+                return (None, None)
+        return (self._image_on, self._image_off)
+
+    def _row_image(self, name: str) -> Any:
+        on, off = self._images()
+        return on if self.checked.get(name, True) else off
+
+    def _click(self, event: Any) -> Any:
+        """A click on the tick box or the scheme name toggles that row.
+
+        The whole name column is the hit target, exactly as the label of a
+        :class:`CheckBox` is, and the row also takes focus and selection so that
+        Space afterwards operates the row the user just clicked.
+        """
+        try:
+            if self.tree.identify_region(event.x, event.y) != "tree":
+                return None
+            iid = self.tree.identify_row(event.y)
+        except tk.TclError:  # pragma: no cover
+            return None
+        if not iid:
+            return None
+        try:
+            # focus_set() is the KEYBOARD focus and focus(iid) is only the
+            # focused ROW. Both are needed: returning "break" below suppresses
+            # ttk::treeview's own Button-1 binding, which is what would
+            # otherwise have moved the keyboard focus here -- so without this
+            # line the focus stays wherever it was (the Analyse tab's drop
+            # zone, on a fresh window), Space never reaches _space, and a
+            # Space pressed over this list opened the file chooser belonging
+            # to another tab instead of ticking the row under the cursor.
+            self.tree.focus_set()
+            self.tree.focus(iid)
+            self.tree.selection_set(iid)
+        except tk.TclError:  # pragma: no cover
+            pass
+        self.toggle(iid)
+        return "break"
+
+    def _space(self, _event: Any = None) -> str:
+        iid = self.tree.focus()
+        if iid:
+            self.toggle(iid)
+        return "break"
+
+    def toggle(self, iid: str) -> None:
+        """Flip one row's tick box and refresh the count."""
+        name = self.tree.item(iid, "text")
+        if not name:
+            return
+        self.checked[name] = not self.checked.get(name, True)
+        try:
+            self.tree.item(iid, image=self._row_image(name))
+        except tk.TclError:  # pragma: no cover
+            return
+        self._update_selection_label()
+
+    def select_all(self) -> None:
+        """Tick every scheme."""
+        self._set_all(True)
+
+    def deselect_all(self) -> None:
+        """Untick every scheme."""
+        self._set_all(False)
+
+    def _set_all(self, value: bool) -> None:
+        for iid in self.tree.get_children(""):
+            name = self.tree.item(iid, "text")
+            if not name:
+                continue
+            self.checked[name] = value
+            try:
+                self.tree.item(iid, image=self._row_image(name))
+            except tk.TclError:  # pragma: no cover
+                pass
+        self._update_selection_label()
+
+    def selected_schemes(self) -> Tuple[str, ...]:
+        """The ticked schemes, in list order."""
+        return tuple(name for name in
+                     (self.tree.item(iid, "text")
+                      for iid in self.tree.get_children(""))
+                     if name and self.checked.get(name, True))
+
+    def _update_selection_label(self) -> None:
+        total = len(self.tree.get_children(""))
+        chosen = len(self.selected_schemes())
+        if not total:
+            self.selection_label.configure(text="")
+            return
+        self.selection_label.configure(
+            text="{} of {} scheme{} selected".format(
+                chosen, total, "" if total == 1 else "s"))
 
     # -- catalogue -----------------------------------------------------------
     def activate(self) -> None:
@@ -2511,6 +4902,7 @@ class DatabaseView(ttk.Frame):
         self.count_label.configure(text=str(env.scheme_count or "—"))
         self.version_label.configure(
             text="Database version {}".format(env.db_version or "unknown"))
+        self.refresh_location()
         if not env.db_ok:
             self.db_detail.configure(text=env.db_error or "The database is not available.")
             return
@@ -2526,6 +4918,13 @@ class DatabaseView(ttk.Frame):
         self._jobs[self.app.run_task("db-shallow", load, owner=self,
                                      with_progress=True)] = "shallow"
 
+    def refresh_location(self) -> None:
+        """Print the folder updates are written to — portable mode or not."""
+        where = db_location(self.app.prefs, self.app.env)
+        self.db_where.configure(
+            text="Updates are written to {}{}".format(
+                where, "  ·  portable mode" if self.app.prefs.portable_db else ""))
+
     def _fill(self, catalog: Any, infos: Sequence[Any], deep: bool) -> None:
         assert_main_thread("the database tree")
         self._infos = tuple(infos)
@@ -2539,15 +4938,20 @@ class DatabaseView(ttk.Frame):
                 species = None
             types = getattr(info, "num_genotypes", None)
             alleles = getattr(info, "num_alleles", None)
+            # The catalogue's own map first; the curated table is the fallback,
+            # so a scheme the map misses still names its organism.
+            label = species or organism_name(name, self.app.env.dbdir)
+            self.checked.setdefault(name, True)
             self.tree.insert(
-                "", "end", text=name,
-                values=(species or "scheme not mapped to a species",
+                "", "end", text=name, image=self._row_image(name),
+                values=(label or "scheme not mapped to a species",
                         db_cell(getattr(info, "locus", "")),
                         db_cell(types) if deep else "...",
                         db_cell(alleles) if deep else "...",
                         db_cell(getattr(info, "last_updated", ""))),
-                tags=() if species else ("muted",))
+                tags=() if label else ("muted",))
         self.count_label.configure(text=str(len(self._infos)))
+        self._update_selection_label()
 
     def on_task_done(self, job: int, payload: Any) -> bool:
         """Handle a finished background job. Returns True if it was ours."""
@@ -2571,7 +4975,7 @@ class DatabaseView(ttk.Frame):
             catalog, infos = payload
             self._fill(catalog, infos, deep=True)
             self.db_detail.configure(text="")
-            self.db_progress.configure(value=0.0)
+            self._show_progress(False)
         elif kind == "check":
             self._show_plan(payload)
         elif kind == "apply":
@@ -2593,13 +4997,29 @@ class DatabaseView(ttk.Frame):
     def on_progress(self, msg: Msg) -> bool:
         if msg.job not in self._jobs:
             return False
+        self._show_progress(True)
         self.db_progress.configure(value=msg.percent)
         if msg.text:
             self.db_detail.configure(text=msg.text)
         return True
 
+    def _show_progress(self, on: bool) -> None:
+        """Show the bar while work runs, and take it away again afterwards."""
+        try:
+            if on:
+                if not self.db_progress.winfo_manager():
+                    self.db_progress.pack(fill="x", padx=px(PAD_M),
+                                          pady=(0, px(PAD_XS)),
+                                          before=self.db_detail)
+            else:
+                self.db_progress.configure(value=0.0)
+                self.db_progress.pack_forget()
+        except tk.TclError:  # pragma: no cover - teardown
+            pass
+
     # -- updates -------------------------------------------------------------
     def _busy(self, busy: bool) -> None:
+        self._show_progress(busy)
         self.btn_check.configure(state="disabled" if busy else "normal")
         self.btn_cancel.configure(state="normal" if busy else "disabled")
         if busy:
@@ -2640,7 +5060,8 @@ class DatabaseView(ttk.Frame):
             self.db_detail.configure(text="Your database is up to date.")
             self.app.status.set("Your database is up to date.", "ok", transient=True)
             return
-        dialog = UpdatePlanDialog(self.app.root, plan, updates)
+        dialog = UpdatePlanDialog(self.app.root, plan, updates,
+                                  preselected=self.checked)
         self.app.root.wait_window(dialog)
         if not dialog.accepted:
             self.db_detail.configure(text="{} scheme(s) can be updated.".format(
@@ -2655,7 +5076,8 @@ class DatabaseView(ttk.Frame):
             return
         updates = [u for u in getattr(self.plan, "updates", ())
                    if getattr(u, "status", "") == "changed"]
-        dialog = UpdatePlanDialog(self.app.root, self.plan, updates)
+        dialog = UpdatePlanDialog(self.app.root, self.plan, updates,
+                                  preselected=self.checked)
         self.app.root.wait_window(dialog)
         if dialog.accepted:
             self._start_apply(dialog.chosen, dialog.backup)
@@ -2737,7 +5159,9 @@ class SettingsView(ttk.Frame):
         self.load_from(app.prefs)
 
     def _build(self) -> None:
-        outer = ttk.Frame(self, style="TFrame")
+        self.scroller = ScrollPane(self)
+        self.scroller.pack(fill="both", expand=True)
+        outer = ttk.Frame(self.scroller.body, style="TFrame")
         outer.pack(fill="both", expand=True, padx=px(PAD_L), pady=px(PAD_M))
 
         self._outer = outer
@@ -2761,10 +5185,13 @@ class SettingsView(ttk.Frame):
         self._spin(scoring, "mincov", "Minimum coverage (%)", 0, 100, 1.0)
         self._spin(scoring, "minscore", "Minimum scheme score", 0, 100, 1.0)
         warn = ttk.Frame(scoring, style="Surface.TFrame")
-        warn.pack(fill="x", padx=px(PAD_M), pady=(0, px(PAD_M)))
+        warn.pack(fill="x", padx=px(PAD_M), pady=(0, px(PAD_M) - px(PAD_XS)))
         self.scheme_warning = ttk.Label(
             warn, text="", style="Warn.TLabel", anchor="w", justify="left")
         self.scheme_warning.pack(anchor="w")
+        # It is empty far more often than not, and an empty label still claims
+        # a line: every card then closed on a different amount of white.
+        warn.configure(height=1)
 
         scheme = card(outer)
         scheme.master.pack(fill="x", pady=(px(PAD_M), 0))
@@ -2775,10 +5202,14 @@ class SettingsView(ttk.Frame):
         ttk.Label(row, text="Always use this scheme", style="Surface.TLabel",
                   width=26, anchor="w").pack(side="left")
         self.vars["scheme"] = tk.StringVar(value="")
+        # The combobox and the "Never report these" entry below it are the two
+        # controls in this column; they share a left edge AND a right edge,
+        # because two boxes of different widths stacked on one another is the
+        # single loudest piece of sloppiness on a settings page.
         self.scheme_box = ttk.Combobox(row, textvariable=self.vars["scheme"],
                                        state="readonly", width=32,
                                        values=("Automatic (recommended)",))
-        self.scheme_box.pack(side="left")
+        self.scheme_box.pack(side="left", fill="x", expand=True)
         self.scheme_box.bind("<<ComboboxSelected>>", lambda e: self._changed(), add="+")
         Tooltip(self.scheme_box, SETTING_HELP["scheme"])
         row2 = ttk.Frame(scheme, style="Surface.TFrame")
@@ -2791,15 +5222,54 @@ class SettingsView(ttk.Frame):
         self.exclude_entry.bind("<FocusOut>", lambda e: self._changed(), add="+")
         Tooltip(self.exclude_entry, SETTING_HELP["exclude"])
 
-        perf = card(outer)
-        perf.master.pack(fill="x", pady=(px(PAD_M), 0))
-        ttk.Label(perf, text="Speed", style="Heading.TLabel").pack(
+        speed = card(outer)
+        speed.master.pack(fill="x", pady=(px(PAD_M), 0))
+        ttk.Label(speed, text="Speed", style="Heading.TLabel").pack(
             anchor="w", padx=px(PAD_M), pady=(px(PAD_M), px(PAD_XS)))
-        self._spin(perf, "threads", "Cores per file", 1, max_threads(), 1)
-        self._spin(perf, "jobs", "Files at once", 1, max_threads(), 1)
-        ttk.Label(perf, text="This computer has {} processor cores.".format(cpu_count()),
-                  style="SurfaceMuted.TLabel").pack(anchor="w", padx=px(PAD_M),
-                                                    pady=(0, px(PAD_M)))
+        # WMLST sizes itself on this machine at start-up (wmlst.perf): one file
+        # per four cores, four search threads each. The CLI is untouched by this
+        # and still defaults to 1/1.
+        self.vars["perf_auto"] = tk.BooleanVar(value=True)
+        self.auto_box = CheckBox(
+            speed, "Tune for this computer automatically",
+            variable=self.vars["perf_auto"], command=self._auto_changed,
+            subtext="Untick to set the two numbers below yourself.")
+        self.auto_box.pack(anchor="w", fill="x", padx=px(PAD_M), pady=px(PAD_XS))
+        self.tuning_label = ttk.Label(
+            speed, text="This computer has {} processor cores.".format(cpu_count()),
+            style="SurfaceMuted.TLabel", anchor="w", justify="left")
+        # Indented to the checkbox's own text column: it explains the tick.
+        self.tuning_label.pack(anchor="w", fill="x",
+                               padx=(px(PAD_M) + px(30), px(PAD_M)),
+                               pady=(0, px(PAD_S)))
+        self._spin(speed, "threads", "Cores per file", 1, max_threads(), 1)
+        self._spin(speed, "jobs", "Files at once", 1, max_threads(), 1)
+        ttk.Frame(speed, style="Surface.TFrame",
+                  height=px(PAD_M) - px(PAD_XS)).pack(fill="x")
+
+        # -- where the database lives ----------------------------------------
+        store = card(outer)
+        store.master.pack(fill="x", pady=(px(PAD_M), 0))
+        ttk.Label(store, text="Database location", style="Heading.TLabel").pack(
+            anchor="w", padx=px(PAD_M), pady=(px(PAD_M), px(PAD_XS)))
+        self.vars["portable_db"] = tk.BooleanVar(value=False)
+        self.portable_box = CheckBox(
+            store, "Keep the database next to {}.exe (portable mode)".format(
+                branding.APP_NAME),
+            variable=self.vars["portable_db"], command=self._portable_changed,
+            subtext="Downloaded schemes and the rebuilt search index are then "
+                    "written beside the program, so the whole installation can "
+                    "travel on a USB stick.",
+            wraplength=520)
+        self.portable_box.pack(anchor="w", fill="x", padx=px(PAD_M), pady=px(PAD_XS))
+        self.portable_path = ttk.Label(store, text="", style="SurfaceMuted.TLabel",
+                                       anchor="w", justify="left", wraplength=px(560))
+        self.portable_path.pack(anchor="w", fill="x", padx=px(PAD_M),
+                                pady=(0, px(PAD_XS)))
+        self.portable_note = ttk.Label(store, text="", style="SurfaceMuted.TLabel",
+                                       anchor="w", justify="left", wraplength=px(560))
+        self.portable_note.pack(anchor="w", fill="x", padx=px(PAD_M),
+                                pady=(0, px(PAD_M)))
 
         footer = ttk.Frame(outer, style="TFrame")
         footer.pack(fill="x", pady=px(PAD_M))
@@ -2817,10 +5287,10 @@ class SettingsView(ttk.Frame):
                   anchor="w").pack(side="left")
         var = tk.StringVar()
         self.vars[key] = var
-        spin = ttk.Spinbox(row, from_=lo, to=hi, increment=step, width=8,
+        spin = ttk.Spinbox(row, from_=lo, to=hi, increment=step, width=9,
                            textvariable=var, justify="right",
                            command=self._changed)
-        spin.pack(side="left")
+        spin.pack(side="left", ipady=px(2))
         spin.bind("<FocusOut>", lambda e, k=key: self._clamp(k), add="+")
         spin.bind("<Return>", lambda e, k=key: self._clamp(k), add="+")
         setattr(self, "spin_" + key, spin)
@@ -2841,7 +5311,11 @@ class SettingsView(ttk.Frame):
         self.vars["jobs"].set(str(prefs.jobs))
         self.vars["exclude"].set(", ".join(prefs.exclude))
         self.vars["scheme"].set(prefs.scheme or "Automatic (recommended)")
+        self.vars["perf_auto"].set(bool(prefs.perf_auto))
+        self.vars["portable_db"].set(bool(prefs.portable_db))
         self._loading = False
+        self._sync_perf_lock()
+        self.refresh_db_location()
         self._minscore_forced = False   # re-capture the shadow from these values
         self._sync_scheme_lock()
 
@@ -2861,6 +5335,10 @@ class SettingsView(ttk.Frame):
         prefs.threads = clamp_int(self.vars["threads"].get(), 1, max_threads(), 1)
         prefs.jobs = clamp_int(self.vars["jobs"].get(), 1, max_threads(), 1)
         prefs.exclude = parse_exclude(self.vars["exclude"].get())
+        prefs.perf_auto = bool(self.vars["perf_auto"].get())
+        # portable_db is not read back from the widget: turning it on has to
+        # succeed (a writable folder, a database to point at) before it becomes
+        # a preference, and WmlstApp.set_portable_db is what decides that.
         chosen = self.vars["scheme"].get().strip()
         prefs.scheme = None if chosen.startswith("Automatic") or not chosen else chosen
         # The scheme override (minscore 0, empty exclude) is applied per run by
@@ -2920,6 +5398,52 @@ class SettingsView(ttk.Frame):
                 self._minscore_forced = False
             self.scheme_warning.configure(text="")
 
+    # -- automatic tuning ----------------------------------------------------
+    def set_tuning(self, tuning: Any) -> None:
+        """Show what :mod:`wmlst.perf` decided, in one calm sentence."""
+        rationale = str(getattr(tuning, "rationale", "") or "")
+        self.tuning_label.configure(
+            text=rationale or "This computer has {} processor cores.".format(
+                cpu_count()))
+
+    def _sync_perf_lock(self) -> None:
+        """Automatic tuning owns the two numbers; a manual override frees them."""
+        auto = bool(self.vars["perf_auto"].get())
+        for key in ("threads", "jobs"):
+            spin = getattr(self, "spin_" + key, None)
+            if spin is not None:
+                try:
+                    spin.configure(state="disabled" if auto else "normal")
+                except tk.TclError:  # pragma: no cover
+                    pass
+
+    def _auto_changed(self) -> None:
+        self._sync_perf_lock()
+        self._changed()
+        if self.vars["perf_auto"].get():
+            self.app.apply_autotune(announce=True)
+
+    # -- portable mode -------------------------------------------------------
+    def _portable_changed(self) -> None:
+        if getattr(self, "_loading", False):
+            return
+        self.app.set_portable_db(bool(self.vars["portable_db"].get()))
+
+    def refresh_db_location(self) -> None:
+        """Print the resolved folder, so there is no doubt where data goes."""
+        self.portable_path.configure(
+            text="Database and updates: {}".format(
+                db_location(self.app.prefs, self.app.env)))
+        if portable_possible():
+            self.portable_box.set_enabled(True)
+            self.portable_note.configure(text="")
+        else:
+            self.portable_box.set_enabled(False)
+            self.portable_note.configure(
+                text="Portable mode applies to the packaged {}.exe. This copy "
+                     "is running from a Python installation, so the database "
+                     "stays where it is.".format(branding.APP_NAME))
+
     def _changed(self) -> None:
         if getattr(self, "_loading", False):
             return
@@ -2941,6 +5465,10 @@ class SettingsView(ttk.Frame):
         self.vars["minscore"].set(_num(DEFAULT_MINSCORE))
         self.vars["threads"].set("1")
         self.vars["jobs"].set("1")
+        # The reference defaults ARE 1/1, so automatic tuning would immediately
+        # contradict them: restoring them turns it off.
+        self.vars["perf_auto"].set(False)
+        self._sync_perf_lock()
         self.vars["exclude"].set(", ".join(DEFAULT_EXCLUDE))
         self.vars["scheme"].set("Automatic (recommended)")
         self._minscore_forced = False   # these ARE the user's values now
@@ -3295,12 +5823,14 @@ class BootstrapDialog(ModalDialog):
 class UpdatePlanDialog(ModalDialog):
     """Per-scheme update plan with checkboxes and a byte estimate (section 10.3)."""
 
-    def __init__(self, parent: tk.Misc, plan: Any, updates: Sequence[Any]):
+    def __init__(self, parent: tk.Misc, plan: Any, updates: Sequence[Any],
+                 *, preselected: Optional[Dict[str, bool]] = None):
         super().__init__(parent, "Database update", width=560)
         self.accepted = False
         self.backup = True
         self.chosen: List[str] = []
         self._vars: List[Tuple[str, tk.BooleanVar]] = []
+        self._preselected = dict(preselected or {})
         total = sum(int(getattr(u, "bytes_estimate", 0) or 0) for u in updates)
         self.heading("{} scheme{} can be updated".format(
             len(updates), "" if len(updates) == 1 else "s"))
@@ -3308,35 +5838,42 @@ class UpdatePlanDialog(ModalDialog):
             "About {} will be downloaded. Your current database keeps working "
             "until every chosen scheme has been replaced.".format(human_bytes(total)))
 
-        ring = focus_ring(self.body)
+        surface = c("surface")
+        bar = ttk.Frame(self.body, style="Surface.TFrame")
+        bar.pack(fill="x", pady=(px(PAD_S), 0))
+        ttk.Button(bar, text="Select all",
+                   command=lambda: self._set_all(True)).pack(side="left")
+        ttk.Button(bar, text="Deselect all",
+                   command=lambda: self._set_all(False)).pack(side="left",
+                                                              padx=(px(PAD_S), 0))
+        self.count_label = ttk.Label(bar, text="", style="SurfaceMuted.TLabel")
+        self.count_label.pack(side="left", padx=px(PAD_M))
+
+        ring = focus_ring(self.body, under=surface)
         ring.pack(fill="both", expand=True, pady=px(PAD_S))
-        canvas = tk.Canvas(ring, background=c("surface"), highlightthickness=0,
-                           height=px(220), width=px(520))
-        scroll = ttk.Scrollbar(ring, orient="vertical", command=canvas.yview)
-        canvas.configure(yscrollcommand=scroll.set)
-        scroll.pack(side="right", fill="y")
-        canvas.pack(side="left", fill="both", expand=True)
-        holder = ttk.Frame(canvas, style="Surface.TFrame")
-        canvas.create_window((0, 0), window=holder, anchor="nw")
-        holder.bind("<Configure>",
-                    lambda e: canvas.configure(scrollregion=canvas.bbox("all")), add="+")
+        pane = ScrollPane(ring, style="Surface.TFrame", background=surface)
+        pane.configure(height=px(240), width=px(520))
+        pane.pack_propagate(False)
+        pane.pack(fill="both", expand=True, padx=1, pady=1)
         for update in updates:
             name = str(getattr(update, "name", ""))
-            var = tk.BooleanVar(value=True)
+            var = tk.BooleanVar(value=self._preselected.get(name, True))
+            var.trace_add("write", lambda *_a: self._update_count())
             self._vars.append((name, var))
             added = getattr(update, "added_types", None)
             detail = str(getattr(update, "detail", "") or "")
             text = "{}   ({}{})".format(
                 name, human_bytes(getattr(update, "bytes_estimate", 0)),
                 ", {} new sequence types".format(added) if added else "")
-            row = ttk.Checkbutton(holder, text=text, variable=var)
-            row.pack(anchor="w", padx=px(PAD_S), pady=px(2))
-            if detail:
-                Tooltip(row, detail)
+            row = CheckBox(pane.body, text, variable=var, surface=surface,
+                           subtext=detail, wraplength=430)
+            row.pack(anchor="w", fill="x", padx=px(PAD_M), pady=px(PAD_XS))
 
+        self._update_count()
         self.backup_var = tk.BooleanVar(value=True)
-        ttk.Checkbutton(self.body, text="Keep a backup of the current database",
-                        variable=self.backup_var).pack(anchor="w", pady=(px(PAD_S), 0))
+        CheckBox(self.body, "Keep a backup of the current database",
+                 variable=self.backup_var, surface=surface).pack(
+            anchor="w", pady=(px(PAD_M), 0))
         ttk.Button(self.buttons, text="Cancel", command=self.close).pack(side="right",
                                                                         padx=(px(PAD_S), 0))
         go = ttk.Button(self.buttons, text="Update now", style="Accent.TButton",
@@ -3344,6 +5881,23 @@ class UpdatePlanDialog(ModalDialog):
         go.pack(side="right")
         go.focus_set()
         self.present()
+
+    def _set_all(self, value: bool) -> None:
+        """Tick or untick every scheme in the plan."""
+        for _name, var in self._vars:
+            var.set(value)
+        self._update_count()
+
+    def _update_count(self) -> None:
+        """Keep the live count honest as the ticks change."""
+        total = len(self._vars)
+        chosen = sum(1 for _n, var in self._vars if var.get())
+        try:
+            self.count_label.configure(
+                text="{} of {} scheme{} selected".format(
+                    chosen, total, "" if total == 1 else "s"))
+        except tk.TclError:  # pragma: no cover - during teardown
+            pass
 
     def _accept(self) -> None:
         self.chosen = [name for name, var in self._vars if var.get()]
@@ -3460,6 +6014,8 @@ class WmlstApp:
         self._auto_index_build_tried = False
         self._bootstrap: Optional[BootstrapDialog] = None
         self._failed_count = 0
+        #: What wmlst.perf recommended for this machine, once probed.
+        self.tuning: Any = None
         self._build()
         # Nothing reaches the console: every uncaught Tk callback error becomes
         # the friendly dialog (section 10.6).
@@ -3581,6 +6137,7 @@ class WmlstApp:
         self.controller.ensure_polling()
         prefs = self.prefs
         self.analyse_view.refresh_scheme_notice()
+        self.apply_autotune(announce=True)
         self.run_task("env", lambda: probe_environment(prefs))
         if prefs.load_note:
             self.status.set(prefs.load_note, "warn", transient=True)
@@ -3594,6 +6151,8 @@ class WmlstApp:
         self.refresh_footer()
         try:
             self.settings_view.set_scheme_choices(env.scheme_names)
+            self.settings_view.refresh_db_location()
+            self.database_view.refresh_location()
         except tk.TclError:
             pass
         if not env.db_ok:
@@ -3751,6 +6310,8 @@ class WmlstApp:
         elif kind == "rebuild":
             self.status.set("The search index was rebuilt.", "ok", transient=True)
             self.run_task("env", lambda: probe_environment(self.prefs))
+        elif kind == "portable-copy":
+            self._portable_ready(str(payload or ""))
 
     def _task_failed(self, kind: str, friendly: Friendly) -> None:
         if kind == "env":
@@ -3961,6 +6522,121 @@ class WmlstApp:
         self.status.set("Rebuilding the search index...", "info")
         self.run_task("rebuild", run, with_progress=True)
 
+    # -- automatic tuning (wmlst.perf) ---------------------------------------
+    def apply_autotune(self, *, announce: bool = False) -> None:
+        """Size threads/jobs for this computer at start-up (section C3).
+
+        GUI ONLY. ``wmlst.perf`` is not imported by the command line and the CLI
+        defaults stay 1/1; this is the window choosing sensible numbers for the
+        machine it happens to be running on, which the user can override in
+        Settings by unticking "Tune for this computer automatically".
+        """
+        assert_main_thread("auto-tuning")
+        try:
+            tuning = perf.probe()
+        except Exception as exc:  # pragma: no cover - every probe degrades itself
+            LOG.warning("could not size this computer: %s", exc)
+            return
+        self.tuning = tuning
+        try:
+            self.settings_view.set_tuning(tuning)
+        except tk.TclError:  # pragma: no cover
+            pass
+        if not self.prefs.perf_auto:
+            return
+        if (self.prefs.threads, self.prefs.jobs) != (tuning.threads, tuning.jobs):
+            self.prefs.threads = tuning.threads
+            self.prefs.jobs = tuning.jobs
+            self.schedule_save()
+        try:
+            self.settings_view.load_from(self.prefs)
+        except tk.TclError:  # pragma: no cover
+            pass
+        if announce and tuning.rationale:
+            self.status.set(tuning.rationale, "info", transient=True)
+
+    # -- portable mode -------------------------------------------------------
+    def set_portable_db(self, on: bool) -> None:
+        """Move where database updates are written, or explain why we cannot.
+
+        A read-only folder (a CD, a locked USB stick, Program Files without
+        elevation) is an ordinary situation, not a crash: the tick comes back
+        off and the status line says what happened.
+        """
+        assert_main_thread("portable mode")
+        if not on:
+            self.prefs.portable_db = False
+            self.prefs.dbdir = None
+            self.schedule_save()
+            self._refresh_db_location()
+            self.status.set("Database updates go back to the per-user folder: "
+                            "{}".format(db_location(self.prefs, self.env)),
+                            "info", transient=True)
+            self.run_task("env", lambda: probe_environment(self.prefs))
+            return
+        root, target = portable_root(), portable_db_dir()
+        if root is None or target is None:
+            self._portable_refused(
+                "Portable mode applies to the packaged {}.exe.".format(
+                    branding.APP_NAME))
+            return
+        if not dir_writable(root):
+            self._portable_refused(
+                "{} cannot be written to, so the database cannot be kept "
+                "there. Copy {} to a writable folder first.".format(
+                    root, branding.APP_NAME))
+            return
+        if looks_like_database(target):
+            self._portable_ready(str(target), copied=False)
+            return
+        source = self.env.dbdir
+        if not looks_like_database(source):
+            self._portable_refused(
+                "There is no database to copy yet — install or update the "
+                "database first, then turn portable mode on.")
+            return
+        self.status.set("Copying the database beside the program...", "info")
+        destination = str(target)
+
+        def copy(progress: Callable[..., None], cancel: threading.Event) -> Any:
+            return copy_database(source, destination, progress=progress,
+                                 cancel=cancel)
+
+        self.run_task("portable-copy", copy, with_progress=True)
+
+    def _portable_refused(self, why: str) -> None:
+        """Undo the tick and say why, rather than raising at the user."""
+        self.prefs.portable_db = False
+        try:
+            self.settings_view.vars["portable_db"].set(False)
+        except (tk.TclError, KeyError):  # pragma: no cover
+            pass
+        self._refresh_db_location()
+        self.status.set(why, "warn", resting=False, transient=True)
+
+    def _portable_ready(self, path: str, *, copied: bool = True) -> None:
+        """Adopt the folder beside the executable as the live database."""
+        self.prefs.portable_db = True
+        self.prefs.dbdir = path
+        try:
+            self.settings_view.vars["portable_db"].set(True)
+        except (tk.TclError, KeyError):  # pragma: no cover
+            pass
+        self.schedule_save()
+        self._refresh_db_location()
+        self.status.set(
+            "Portable mode is on. {} {}".format(
+                "The database was copied to" if copied else "Using the database in",
+                path), "ok", transient=True)
+        self.run_task("env", lambda: probe_environment(self.prefs))
+
+    def _refresh_db_location(self) -> None:
+        try:
+            self.settings_view.refresh_db_location()
+            self.database_view.refresh_location()
+        except tk.TclError:  # pragma: no cover
+            pass
+
     # -- settings ------------------------------------------------------------
     def settings_changed(self, prefs: Prefs) -> None:
         """Adopt edited settings, offering a re-run when results are on screen."""
@@ -4101,7 +6777,23 @@ class WmlstApp:
 
     # -- shutdown ------------------------------------------------------------
     def on_close(self) -> None:
-        """Cancel, join for at most 1.5 s, then destroy regardless (section 10.5)."""
+        """Close for good: stop the workers, kill the children, then exit.
+
+        The window disappearing is not the same as the process ending. A worker
+        parked on a running search child never returns, and
+        ``concurrent.futures`` registers an ``atexit`` hook that JOINS its
+        non-daemon workers — so one live child was enough to leave WMLST in Task
+        Manager with no window to close it by, which is exactly what the user
+        hit. Three layers now prevent that:
+
+        1. the controller stops accepting work and joins briefly;
+        2. :func:`wmlst.engine.shutdown_all` stops every engine and every search
+           child, and :func:`wmlst.blastbin.shutdown` is called again directly,
+           belt and braces, for children launched outside an engine;
+        3. if either reports "not clean" the process is ended outright, and in
+           every case a daemon watchdog ends it a few seconds later should the
+           interpreter still be hanging on someone else's thread.
+        """
         if self.controller.running:
             if not messagebox.askokcancel(
                     "Stop the analysis?",
@@ -4114,11 +6806,87 @@ class WmlstApp:
         except tk.TclError:
             pass
         self.prefs.save()
+        if owns_process():
+            arm_exit_watchdog(EXIT_WATCHDOG_S)
+        self.controller.request_cancel()
+        clean = stop_the_engines(SHUTDOWN_TIMEOUT_S)
         self.controller.shutdown(1.5)
+        try:
+            self.root.quit()
+        except tk.TclError:  # pragma: no cover - already gone
+            pass
         try:
             self.root.destroy()
         except tk.TclError:
             pass
+        if not clean and owns_process():
+            LOG.warning("a search child outlived the shutdown timeout; "
+                        "ending the process")
+            force_exit()
+
+
+#: How long the engines and their children get to stop before the process is
+#: ended outright. The user must never have to reach for Task Manager.
+SHUTDOWN_TIMEOUT_S = 2.0
+#: The last resort: a daemon timer that ends the process even if the
+#: interpreter is hung joining somebody else's thread at exit.
+EXIT_WATCHDOG_S = 5.0
+
+#: True only inside ``main()``: this process exists to BE the window, so ending
+#: it outright is the right answer. A test (or an embedding application) that
+#: builds a WmlstApp of its own owns its process and must never be exited by us.
+_OWNS_PROCESS = False
+
+
+def owns_process() -> bool:
+    """True when this module was launched as the application (``main()``)."""
+    return _OWNS_PROCESS
+
+
+def stop_the_engines(timeout: float = SHUTDOWN_TIMEOUT_S) -> bool:
+    """Stop every engine and every search child. -> was it clean?
+
+    Both calls are idempotent and safe from any thread;
+    :func:`wmlst.engine.shutdown_all` already reaches the backend, and the
+    second call catches children started outside an engine (a version probe, an
+    index rebuild). Never raises: this runs while the window is closing.
+    """
+    clean = True
+    try:
+        from . import engine as engine_mod
+        clean = bool(engine_mod.shutdown_all(timeout)) and clean
+    except Exception as exc:  # pragma: no cover - defensive
+        LOG.warning("engine shutdown failed: %s", exc)
+        clean = False
+    try:
+        from . import blastbin
+        clean = bool(blastbin.shutdown(max(0.5, timeout / 2.0))) and clean
+    except Exception as exc:  # pragma: no cover - defensive
+        LOG.warning("search-engine shutdown failed: %s", exc)
+        clean = False
+    return clean
+
+
+def force_exit(code: int = 0) -> None:
+    """End the process now, flushing the log first. No atexit, no join."""
+    try:
+        logging.shutdown()
+    except Exception:  # pragma: no cover
+        pass
+    os._exit(code)
+
+
+def arm_exit_watchdog(seconds: float = EXIT_WATCHDOG_S) -> Any:
+    """Start a daemon timer that force-exits if a clean exit never arrives.
+
+    A daemon thread does not keep the interpreter alive, and it is still
+    running while ``atexit`` hooks run — which is precisely when the hang that
+    stranded WMLST in Task Manager used to happen.
+    """
+    timer = threading.Timer(max(0.5, float(seconds)), force_exit)
+    timer.daemon = True
+    timer.start()
+    return timer
 
 
 def open_path(path: str) -> None:
@@ -4210,6 +6978,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         root.destroy()
         return 0
 
+    global _OWNS_PROCESS
+    _OWNS_PROCESS = True
     prefs = Prefs.load()
     app = WmlstApp(root, prefs)
     set_window_icon(root)
@@ -4222,6 +6992,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         root.mainloop()
     except KeyboardInterrupt:  # pragma: no cover - console launch only
         app.on_close()
+    # mainloop() has returned, so the window is gone. Anything still holding a
+    # search child would hang the interpreter's atexit join with no window left
+    # to close, so stop them here too -- returning from main() must mean the
+    # process really is finished.
+    if not stop_the_engines(SHUTDOWN_TIMEOUT_S):
+        force_exit()
     return 0
 
 

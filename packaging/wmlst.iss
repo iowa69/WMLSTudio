@@ -36,7 +36,7 @@
 ; ---------------------------------------------------------------------------
 
 #define MyAppName        "WMLST"
-#define MyAppVersion     "1.0.2"
+#define MyAppVersion     "1.1.0"
 #define MyAppPublisher   "IOWA-Tech"
 #define MyAppAuthor      "Giovanni Lorenzin"
 #define MyAppURL         "https://github.com/iowa69/WMLST"
@@ -112,10 +112,16 @@ Name: "english"; MessagesFile: "compiler:Default.isl"
 [Tasks]
 ; Checked by default: the desktop shortcut is how most users will start WMLST.
 Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "{cm:AdditionalIcons}"
-Name: "addtopath"; Description: "Add the command-line tool (wmlst-cli.exe) to my PATH"; GroupDescription: "Command line"; Flags: unchecked
+; wmlst-cli.exe is ALWAYS installed (it arrives with the [Files] tree below).
+; This task only decides whether a terminal can find it by name. It stays
+; unticked because most users never open a terminal, and an unrequested PATH
+; entry is a change to the user's environment we have no business making.
+Name: "addtopath"; Description: "Add the command-line tool ({#MyAppCliName}) to my PATH"; GroupDescription: "Command line"; Flags: unchecked
 
 [Files]
-; The whole PyInstaller one-folder tree, including _internal\db (162 schemes).
+; The whole PyInstaller one-folder tree, including _internal\db (162 schemes)
+; and wmlst-cli.exe. The command-line tool is installed unconditionally; what
+; it deliberately does NOT get is a Start Menu shortcut -- see [Icons].
 Source: "{#SourceDir}\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
 
 ; Licence and attribution, installed as .txt so Notepad opens them on a
@@ -127,8 +133,16 @@ Source: "{#RepoRoot}\CITATION.cff"; DestDir: "{app}"; DestName: "CITATION.cff"; 
 Source: "SMARTSCREEN.txt";          DestDir: "{app}"; DestName: "SMARTSCREEN.txt"; Flags: ignoreversion
 
 [Icons]
+; EXACTLY ONE clickable way into the application, and it is the GUI.
+;
+; There used to be a "WMLST command line" entry here that opened cmd.exe on
+; wmlst-cli.exe, wearing the same artwork as WMLST.exe. Two near-identical
+; icons a few pixels apart in the Start Menu is a trap: the novice picks the
+; wrong one, gets a black console window, and concludes the program is broken.
+; The command-line tool is still installed and still works -- run `wmlst-cli`
+; from a terminal, optionally after ticking the addtopath task -- it is simply
+; not something a user is invited to click. Do not add a shortcut back.
 Name: "{group}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"; Comment: "MLST typing for Windows - {#MyAppPublisher}"
-Name: "{group}\{#MyAppName} command line"; Filename: "{sys}\cmd.exe"; Parameters: "/K ""{app}\{#MyAppCliName}"" --help"; IconFilename: "{app}\{#MyAppCliName}"; Comment: "Open a prompt with wmlst-cli"
 Name: "{group}\Licence and attribution"; Filename: "{app}\NOTICE.txt"
 Name: "{group}\{cm:UninstallProgram,{#MyAppName}}"; Filename: "{uninstallexe}"
 Name: "{autodesktop}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"; Tasks: desktopicon

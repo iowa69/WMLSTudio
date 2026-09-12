@@ -66,6 +66,64 @@ def _read(relpath, binary=False):
         return handle.read()
 
 
+def _iss_defines():
+    """-> {NAME: value} for every ``#define NAME "value"`` in wmlst.iss."""
+    out = {}
+    for line in _read(os.path.join("packaging", "wmlst.iss")).splitlines():
+        match = re.match(r'^#define\s+(\w+)\s+"(.*)"\s*$', line.strip())
+        if match:
+            out[match.group(1)] = match.group(2)
+    return out
+
+
+def _iss_expand(line):
+    """Substitute ``{#Name}`` preprocessor references, as ISCC would."""
+    defines = _iss_defines()
+    for _ in range(4):  # defines may nest; four passes is far more than enough
+        expanded = re.sub(
+            r"\{#(\w+)\}", lambda m: defines.get(m.group(1), m.group(0)), line
+        )
+        if expanded == line:
+            break
+        line = expanded
+    return line
+
+
+def _iss_section(name):
+    """-> the directive lines of one wmlst.iss section, comments stripped.
+
+    Inno treats a leading ``;`` as a comment, and the [Icons] section carries a
+    long explanation of why there is no command-line shortcut. Grepping the raw
+    text for "cmd.exe" would find that explanation and fail; only the directive
+    lines are assertions about the installer.
+    """
+    text = _read(os.path.join("packaging", "wmlst.iss"))
+    lines = []
+    current = None
+    pending = ""
+    for raw in text.splitlines():
+        line = raw.strip()
+        match = re.fullmatch(r"\[([A-Za-z]+)\]", line)
+        if match:
+            current = match.group(1)
+            pending = ""
+            continue
+        if current != name:
+            continue
+        if not pending and (not line or line.startswith(";")):
+            continue
+        # Inno continues a directive onto the next line with a trailing "\".
+        if line.endswith("\\"):
+            pending += line[:-1].rstrip() + " "
+            continue
+        lines.append(_iss_expand(pending + line))
+        pending = ""
+    if pending:
+        lines.append(_iss_expand(pending))
+    assert lines or ("[%s]" % name) in text, "wmlst.iss has no [%s] section" % name
+    return lines
+
+
 def _load_toml():
     try:
         import tomllib
@@ -609,6 +667,360 @@ def test_inno_setup_creates_a_start_menu_and_a_default_desktop_shortcut():
     assert re.search(r'Tasks:\s*desktopicon', text), (
         "the desktop [Icons] line must be gated on the desktopicon task"
     )
+
+
+# ---------------------------------------------------------------------------
+# C21 -- drag-and-drop is optional at runtime, mandatory in a frozen build
+# ---------------------------------------------------------------------------
+# wmlst/gui.py imports tkinterdnd2 inside a try/except and degrades silently to
+# click-to-browse (ARCHITECTURE.md C21). Silent is right for `pip install wmlst`
+# and wrong for a release: dropping a FASTA on the window is the primary
+# interaction, and a build that lost it looks exactly like one that did not.
+# The spec therefore refuses to build without it, and these tests execute the
+# spec -- with PyInstaller stubbed out -- to prove the refusal actually happens.
+# ---------------------------------------------------------------------------
+
+#: What collect_all("tkinterdnd2") returns on a healthy Windows build machine:
+#: the two Python modules, the tkdnd Tcl scripts, and the native extension that
+#: TkinterDnD._require() loads out of <package>/tkdnd/<platform>/.
+FAKE_DND_OK = (
+    [
+        ("/site/tkinterdnd2/tkdnd/win-x64/tkdnd.tcl", "tkinterdnd2/tkdnd/win-x64"),
+        ("/site/tkinterdnd2/tkdnd/win-x64/pkgIndex.tcl", "tkinterdnd2/tkdnd/win-x64"),
+    ],
+    [("/site/tkinterdnd2/tkdnd/win-x64/libtkdnd2.10.2.dll", "tkinterdnd2/tkdnd/win-x64")],
+    ["tkinterdnd2", "tkinterdnd2.TkinterDnD"],
+)
+
+#: The package imports but its Tcl payload was not collected. The frozen GUI
+#: would import tkinterdnd2 happily and then die on `package require tkdnd`.
+FAKE_DND_NO_TCL = (
+    [("/site/tkinterdnd2/__init__.py", "tkinterdnd2")],
+    [],
+    ["tkinterdnd2", "tkinterdnd2.TkinterDnD"],
+)
+
+#: tkinterdnd2 is not installed at all.
+FAKE_DND_ABSENT = ([], [], [])
+
+
+def _stub_pyinstaller(monkeypatch, collect_all_result, record):
+    """Put a minimal fake PyInstaller in sys.modules.
+
+    The spec is executed for real, so every name it imports has to exist; none
+    of them has to build anything. `record` collects the EXE()/COLLECT()/...
+    calls so the caller can inspect what the spec asked for.
+    """
+    import types
+
+    def maker(kind):
+        def factory(*args, **kwargs):
+            record.append((kind, args, kwargs))
+            stub = types.SimpleNamespace(**kwargs)
+            for attr in ("scripts", "pure", "zipped_data", "binaries", "datas"):
+                setattr(stub, attr, [])
+            return stub
+
+        return factory
+
+    root = types.ModuleType("PyInstaller")
+    building = types.ModuleType("PyInstaller.building")
+    api = types.ModuleType("PyInstaller.building.api")
+    build_main = types.ModuleType("PyInstaller.building.build_main")
+    datastruct = types.ModuleType("PyInstaller.building.datastruct")
+    utils = types.ModuleType("PyInstaller.utils")
+    hooks = types.ModuleType("PyInstaller.utils.hooks")
+
+    for name in ("COLLECT", "EXE", "MERGE", "PYZ"):
+        setattr(api, name, maker(name))
+    build_main.Analysis = maker("Analysis")
+    datastruct.Tree = maker("Tree")
+    if collect_all_result is not None:
+        hooks.collect_all = lambda package: collect_all_result
+
+    modules = {
+        "PyInstaller": root,
+        "PyInstaller.building": building,
+        "PyInstaller.building.api": api,
+        "PyInstaller.building.build_main": build_main,
+        "PyInstaller.building.datastruct": datastruct,
+        "PyInstaller.utils": utils,
+        "PyInstaller.utils.hooks": hooks,
+    }
+    for name, module in modules.items():
+        monkeypatch.setitem(sys.modules, name, module)
+
+
+def _exec_spec(tmp_path, monkeypatch, collect_all_result, *, allow_no_dnd=None,
+               platform="win32"):
+    """Run packaging/wmlst.spec end to end against the stubs.
+
+    The spec is copied into `tmp_path` first: it writes generated entry-point
+    launchers next to itself, and a test must not leave files in the checkout.
+    -> (spec globals, recorded calls). Raises SystemExit when the spec refuses.
+    """
+    import shutil
+
+    staged = tmp_path / "packaging"
+    staged.mkdir(parents=True)
+    for name in (
+        "wmlst.spec", "wmlst.ico", "version_info.txt", "runtime_hook_noconsole.py",
+    ):
+        shutil.copy2(os.path.join(PACKAGING, name), staged / name)
+
+    record = []
+    _stub_pyinstaller(monkeypatch, collect_all_result, record)
+    monkeypatch.setattr(sys, "platform", platform, raising=False)
+    if allow_no_dnd is None:
+        monkeypatch.delenv("WMLST_ALLOW_NO_DND", raising=False)
+    else:
+        monkeypatch.setenv("WMLST_ALLOW_NO_DND", allow_no_dnd)
+
+    source = (staged / "wmlst.spec").read_text(encoding="utf-8")
+    namespace = {"__name__": "__main__", "SPECPATH": str(staged)}
+    exec(compile(source, "wmlst.spec", "exec"), namespace)
+    return namespace, record
+
+
+def test_spec_bundles_tkinterdnd2_when_it_is_available(tmp_path, monkeypatch):
+    """The happy path: the Tcl payload and the hidden imports reach the bundle."""
+    namespace, _record = _exec_spec(tmp_path, monkeypatch, FAKE_DND_OK)
+
+    assert "tkinterdnd2" in namespace["HIDDEN"]
+    assert "tkinterdnd2.TkinterDnD" in namespace["HIDDEN"]
+
+    dests = {dest for _src, dest in namespace["DATAS"]}
+    assert "tkinterdnd2/tkdnd/win-x64" in dests, (
+        "the tkdnd Tcl scripts must be collected, not just the Python shim"
+    )
+    assert namespace["BINARIES"], "the native tkdnd extension was not collected"
+    assert any(
+        "libtkdnd" in os.path.basename(src) for src, _dest in namespace["BINARIES"]
+    )
+
+
+@pytest.mark.parametrize(
+    ("payload", "because"),
+    [
+        (FAKE_DND_ABSENT, "tkinterdnd2 is not installed"),
+        (FAKE_DND_NO_TCL, "the tkdnd Tcl extension was not collected"),
+        (None, "PyInstaller.utils.hooks.collect_all is unavailable"),
+    ],
+)
+def test_spec_refuses_to_build_without_drag_and_drop(
+    tmp_path, monkeypatch, payload, because
+):
+    """Fail loudly, not quietly.
+
+    A frozen WMLST without drag-and-drop is a regression the build log must
+    scream about, because nothing downstream of the build can detect it.
+    """
+    with pytest.raises(SystemExit) as excinfo:
+        _exec_spec(tmp_path, monkeypatch, payload)
+
+    message = str(excinfo.value)
+    assert "tkinterdnd2" in message, because
+    # The message has to tell the person reading a red CI log what to type.
+    assert "pip install" in message
+    assert "WMLST_ALLOW_NO_DND" in message, (
+        "the refusal must document its own escape hatch"
+    )
+
+
+def test_spec_refuses_when_tkdnd_has_no_windows_build(tmp_path, monkeypatch):
+    """A Linux-only tkdnd payload is useless to a Windows release."""
+    linux_only = (
+        [("/site/tkinterdnd2/tkdnd/linux-x64/tkdnd.tcl", "tkinterdnd2/tkdnd/linux-x64")],
+        [("/site/tkinterdnd2/tkdnd/linux-x64/libtkdnd.so", "tkinterdnd2/tkdnd/linux-x64")],
+        ["tkinterdnd2"],
+    )
+    with pytest.raises(SystemExit) as excinfo:
+        _exec_spec(tmp_path, monkeypatch, linux_only, platform="win32")
+    assert "win-x64" in str(excinfo.value)
+
+    # ... and the same payload is fine when the build host is not Windows.
+    namespace, _ = _exec_spec(tmp_path / "linux", monkeypatch, linux_only,
+                              platform="linux")
+    assert "tkinterdnd2" in namespace["HIDDEN"]
+
+
+def test_spec_escape_hatch_builds_without_drag_and_drop(tmp_path, monkeypatch):
+    """WMLST_ALLOW_NO_DND=1 is a deliberate, explicit downgrade -- and it works.
+
+    It exists so a developer without the extra can still produce a build. It is
+    never set in CI; test_workflows_install_the_gui_extra pins that.
+    """
+    namespace, record = _exec_spec(
+        tmp_path, monkeypatch, FAKE_DND_ABSENT, allow_no_dnd="1"
+    )
+    assert "tkinterdnd2" not in namespace["HIDDEN"]
+    assert namespace["BINARIES"] == []
+    assert [kind for kind, _a, _k in record].count("EXE") == 2
+
+
+def test_workflows_install_the_gui_extra_wherever_they_freeze_the_app():
+    """Every workflow job that runs PyInstaller must install tkinterdnd2.
+
+    The spec now fails without it, so a workflow that forgot the extra would be
+    a broken release pipeline rather than a silently worse product -- but the
+    cheapest place to notice is here.
+    """
+    for relpath in (
+        os.path.join(".github", "workflows", "ci.yml"),
+        os.path.join(".github", "workflows", "release.yml"),
+    ):
+        text = _read(relpath)
+        if "pyinstaller --noconfirm" not in text:
+            continue
+        assert re.search(r'pip install -e "\.\[[^"]*\bgui\b[^"]*\]"', text), (
+            "%s freezes the app but never installs the gui extra" % relpath
+        )
+        assert "WMLST_ALLOW_NO_DND" not in text, (
+            "%s must not disable the drag-and-drop guard" % relpath
+        )
+
+
+def test_gui_extra_provides_tkinterdnd2():
+    """The `gui` extra is what the spec's error message tells people to install."""
+    extras = _load_toml()["project"]["optional-dependencies"]
+    assert any(
+        req.split(">")[0].split("=")[0].split("[")[0].strip() == "tkinterdnd2"
+        for req in extras["gui"]
+    ), extras["gui"]
+
+
+# ---------------------------------------------------------------------------
+# 13.1 -- only ONE thing in this product is meant to be clicked
+# ---------------------------------------------------------------------------
+# WMLST.exe (windowed) and wmlst-cli.exe (console) live in the same folder. For
+# a novice, two files wearing the same artwork is a coin flip, and losing it
+# means a black console window that appears and vanishes. The rule that follows
+# from that: the branded icon marks the GUI and nothing else, and the Start Menu
+# offers the GUI and nothing else. wmlst-cli.exe stays installed and stays
+# usable from a terminal -- it is simply never advertised as clickable.
+# ---------------------------------------------------------------------------
+def _spec_exe_calls():
+    """-> {exe name: {keyword: unparsed source}} for every EXE() in wmlst.spec.
+
+    Parsed rather than grepped: ``icon=None`` and ``icon = None`` and a keyword
+    inherited from ``**_exe_common`` are three different facts, and only an AST
+    tells them apart.
+    """
+    tree = ast.parse(_read(os.path.join("packaging", "wmlst.spec")))
+    found = {}
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        if not (isinstance(node.func, ast.Name) and node.func.id == "EXE"):
+            continue
+        kwargs = {}
+        starred = []
+        for keyword in node.keywords:
+            if keyword.arg is None:
+                starred.append(ast.unparse(keyword.value))
+            else:
+                kwargs[keyword.arg] = ast.unparse(keyword.value)
+        kwargs["**"] = starred
+        found[ast.literal_eval(kwargs["name"])] = kwargs
+    return found
+
+
+def _spec_exe_common_keys():
+    """-> the keyword names of the shared ``_exe_common = dict(...)`` literal."""
+    tree = ast.parse(_read(os.path.join("packaging", "wmlst.spec")))
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Assign):
+            continue
+        targets = [t.id for t in node.targets if isinstance(t, ast.Name)]
+        if "_exe_common" not in targets:
+            continue
+        if isinstance(node.value, ast.Call) and isinstance(node.value.func, ast.Name):
+            return {k.arg for k in node.value.keywords if k.arg}
+    raise AssertionError("wmlst.spec no longer defines _exe_common = dict(...)")
+
+
+def test_only_the_windowed_exe_carries_the_branded_icon():
+    """WMLST.exe gets wmlst.ico; wmlst-cli.exe gets no custom icon at all.
+
+    The console executable keeps the default console icon on purpose, so that
+    Explorer, the taskbar and Alt-Tab all show it as what it is. If this test
+    fails because someone put ``icon=ICON`` back on the CLI, the fix is to take
+    it off again, not to update the test.
+    """
+    exes = _spec_exe_calls()
+    assert set(exes) == {"WMLST", "wmlst-cli"}, sorted(exes)
+
+    assert "icon" not in _spec_exe_common_keys(), (
+        "_exe_common must not set `icon`: sharing it gives both executables the "
+        "same artwork, which is exactly what this change removed"
+    )
+
+    assert exes["WMLST"]["icon"] == "ICON"
+    assert exes["WMLST"]["console"] == "False"
+
+    assert "icon" in exes["wmlst-cli"], (
+        "wmlst-cli must pass icon explicitly; omitting the keyword would silently "
+        "inherit one again the next time _exe_common changes"
+    )
+    assert exes["wmlst-cli"]["icon"] == "None"
+    assert exes["wmlst-cli"]["console"] == "True"
+
+
+def test_inno_setup_has_no_start_menu_shortcut_for_the_command_line():
+    """No 'WMLST command line' entry, and nothing in [Icons] launches a shell."""
+    icons = _iss_section("Icons")
+    for line in icons:
+        lowered = line.lower()
+        assert "cmd.exe" not in lowered, (
+            "an [Icons] entry opens a console window: %s" % line
+        )
+        assert "powershell" not in lowered, line
+        assert "wmlst-cli" not in lowered, (
+            "the command-line tool must not have a Start Menu shortcut: %s" % line
+        )
+        assert "command line" not in lowered, line
+
+    filenames = [
+        re.search(r'Filename:\s*"([^"]+)"', line).group(1)
+        for line in icons
+        if re.search(r'Filename:\s*"([^"]+)"', line)
+    ]
+    assert filenames, "[Icons] has no entries at all"
+    exe_targets = [f for f in filenames if f.lower().endswith(".exe")]
+    assert exe_targets, "[Icons] points at no executable"
+    for target in exe_targets:
+        assert os.path.basename(target.replace("\\", "/")) == "WMLST.exe", (
+            "the only clickable executable is WMLST.exe: %s" % target
+        )
+
+
+def test_inno_setup_still_installs_the_cli_and_still_offers_the_path_task():
+    """Removing the shortcut must not remove the tool or the way to reach it."""
+    text = _read(os.path.join("packaging", "wmlst.iss"))
+    assert '#define MyAppCliName     "wmlst-cli.exe"' in text, (
+        "wmlst-cli.exe is still part of the product"
+    )
+
+    # The whole dist\WMLST tree is copied verbatim, and wmlst-cli.exe is in it.
+    files = _iss_section("Files")
+    assert any(
+        "dist\\WMLST\\*" in line and "recursesubdirs" in line for line in files
+    ), "the installer no longer copies the PyInstaller one-folder tree"
+
+    tasks = _iss_section("Tasks")
+    addtopath = [line for line in tasks if 'Name: "addtopath"' in line]
+    assert addtopath, "the optional add-to-PATH task was removed"
+    assert "unchecked" in addtopath[0], (
+        "add-to-PATH must stay opt-in; it edits the user's environment"
+    )
+    assert "wmlst-cli.exe" in addtopath[0], (
+        "the task must still name the tool it adds to PATH: %s" % addtopath[0]
+    )
+
+    registry = _iss_section("Registry")
+    path_rows = [line for line in registry if "Tasks: addtopath" in line]
+    assert path_rows, "no [Registry] row gated on the addtopath task"
+    assert any("Environment" in line and "Path" in line for line in path_rows)
 
 
 def test_uninstall_deletes_only_derived_data():

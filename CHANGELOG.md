@@ -12,7 +12,106 @@ independently of the software version. Both appear in every JSON and HTML report
 
 ## [Unreleased]
 
-Nothing yet.
+### Changed
+
+- **A tie between two schemes is now broken by allele registry depth, not by
+  alphabetical order.** *(This can alter a typing result, so it is a MAJOR
+  change under the rule above.)* WMLST's scheme score is coarse — a 7-locus
+  scheme has eight reachable values — so two schemes reaching 100 on the same
+  assembly is routine. The Achtman *E. coli* scheme is built from housekeeping
+  genes conserved across the Enterobacteriaceae and carries off-species alleles,
+  so a *Klebsiella pneumoniae* draft scores 100 in both `klebsiella` and
+  `ecoli_achtman_4`. Upstream `mlst` breaks that tie with a coin flip; WMLST used
+  to take the alphabetically first scheme name — reproducible, but no more
+  meaningful, and it reported five *K. pneumoniae* as `ecoli_achtman_4` ST 14464
+  instead of the carbapenem-resistant ST 258 / ST 11 clones.
+
+  Where, and only where, the scores are exactly equal, WMLST now prefers the
+  scheme whose called alleles sit lowest in each locus' allele registry.
+  PubMLST issues allele numbers in order of first observation, so a scheme's own
+  species keeps matching the long-established alleles it has been depositing
+  since the scheme opened, while an off-species coincidence can only match rare,
+  late-registered variants. The scheme name remains the final key, so the result
+  stays fully deterministic. Measured over a 210-genome labelled RefSeq corpus
+  (30 assemblies each of *S. aureus*, *A. baumannii*, *E. coli*, *E. faecium*,
+  *K. pneumoniae*, *P. aeruginosa*, *E. cloacae*): 17 genomes tie, 17/17 now
+  resolve to the correct species where 0/17 did before, and the scheme call is
+  correct on 210/210 rather than 193/210. Only the 17 tied rows changed; no
+  other call moved, and the 17 byte-identical goldens are untouched.
+
+### Added
+
+- **A tie is now visible instead of silently resolved.** The upstream
+  `WARNING: a(st)==b(st) score=N` line on stderr is unchanged, and
+  `SampleResult.tied` now carries the tied alternatives, so the HTML report names
+  both schemes with their sequence types ("2 schemes fit this assembly equally
+  well at score 100 — klebsiella ST 258 (reported) and ecoli_achtman_4
+  ST 14464"), flags the tied rows in the runner-up table, and the GUI shows the
+  same on the summary card, in an expansion row and in the status line. The
+  compat TSV/CSV/JSON row formats are byte-identity surfaces and are unchanged.
+
+## [1.1.0] - 2026-09-12
+
+### Changed - this release can alter a typing result
+
+- **Scheme ties are no longer broken alphabetically.** When two schemes score
+  identically, WMLST now prefers the one whose called alleles sit lowest in each
+  locus' own allele registry, measured as a percentile so that a scheme's age and
+  size do not decide the call. Scheme name remains the final key, so selection
+  stays fully deterministic.
+
+  This fixes real misidentifications. Measured on 210 labelled NCBI RefSeq
+  genomes, 30 each across seven ESKAPE organisms: schemes matching the known
+  organism went from 193/210 to **210/210**, and top-score ties resolved to the
+  correct species went from **0/17 to 17/17**. Five *Klebsiella pneumoniae*
+  genomes - two of them ST 258, the dominant carbapenem-resistant clone - were
+  being reported as *Escherichia coli* ST 14464, because the Achtman scheme uses
+  housekeeping genes conserved across Enterobacteriaceae. No non-tied call
+  changed, and all 17 golden outputs remain byte-identical.
+
+### Added
+
+- **The organism is now the headline.** Results name the genus and species in
+  italic binomial form, the scheme and its description, the locus count, and the
+  primary reference with a PubMed link and a link to the authoritative PubMLST or
+  Pasteur record. A new bundled table covers all 162 schemes: 158 carry a genus,
+  and 75 carry a verified citation. A cryptic "abaumannii_2" now reads
+  *Acinetobacter baumannii*.
+- **Ties are shown, not silently resolved.** Two schemes fitting equally well is a
+  real ambiguity; both are named, with both STs, on the card, in the table and in
+  the HTML report.
+- **Automatic performance tuning.** At start-up WMLST sizes itself to the machine:
+  one file at a time per four cores, four BLAST threads each - 8 cores analyse 2
+  files at once, 16 cores 4, 32 cores 8. Overridable in Settings. CLI defaults are
+  unchanged for upstream parity.
+- **Portable database.** A checkbox keeps the database beside WMLST.exe so a
+  portable copy updates itself in place, with the resolved path always shown.
+- **A redesigned interface.** New light, dark and high-contrast palettes, a real
+  type scale, an 8px spacing grid, flat buttons with proper states, hairline cards
+  with drawn rounded corners, and custom drawn checkboxes. The drop zone carries a
+  circular chromosome whose seven locus arcs illuminate in turn, with drifting
+  cocci and rods; it pauses when idle or running and honours reduced-motion.
+- **Database tab controls**: Select all, Deselect all, a live selection count, and
+  larger checkboxes that respond to click, Space and keyboard focus.
+- **A one-click download page** that always resolves to the newest portable zip.
+
+### Fixed
+
+- **WMLST can always be closed.** Closing the window during a run left the process
+  alive and only Task Manager could end it: ThreadPoolExecutor workers are
+  non-daemon, concurrent.futures joins them at exit, and the BLAST children were
+  never killed because terminate_all() was defined but never called. Closing now
+  stops the engine, kills every child and exits - measured at 0.05s to kill the
+  child and 1.04s to exit, with nothing left behind.
+- Status is drawn as a shape rather than a font glyph, which rendered as an empty
+  box on systems without the dingbat; the status word and colour are unchanged, so
+  status is still never conveyed by colour alone.
+- Several labels rendered as mojibake under some locales.
+- db/scheme_refs.tsv is packaged in the wheel and sdist; without it the organism
+  names silently disappeared.
+- Shutting down no longer tells a user who just closed the window to install BLAST+.
+- The CLI executable no longer carries the application icon, and the installer no
+  longer creates a command-line Start Menu entry that a novice might click.
 
 ## [1.0.2] - 2026-09-11
 

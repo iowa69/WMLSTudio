@@ -137,7 +137,7 @@ def rich_sample():
     return SampleResult(
         path="/data/sample one.fna", label="sample one.fna", scheme="sepidermidis",
         st="184", signature="16/~80/114?/1,2/-/0", score=100, status="PERFECT",
-        alleles=calls, candidates=candidates, novel=novel,
+        alleles=calls, candidates=candidates, tied=candidates[:2], novel=novel,
         warnings=("WARNING: sepidermidis(184)==saureus(-) score=100 /data/sample one.fna",),
         n_contigs=42, total_bp=2_812_345, hits_seen=1423, hits_kept=88,
         elapsed_s=1.5,
@@ -362,6 +362,26 @@ def test_tie_is_surfaced_outside_a_fold():
     card_start = html.index('id="sample-1"')
     fold_start = html.index("<details", card_start)
     assert card_start < index < fold_start
+
+
+def test_tie_names_both_schemes_with_their_sequence_types():
+    """5.14a -- the ambiguity must be legible, not just flagged."""
+    html = report.render_html(one_result())
+    assert "sepidermidis ST 184" in html
+    assert "saureus (no ST)" in html
+    assert "fit this assembly equally well at score 100" in html
+    assert "confirm the species by another method" in html.lower()
+
+
+def test_tied_rows_are_flagged_in_the_runner_up_table():
+    html = report.render_html(one_result())
+    assert "ties with the reported scheme" in html
+
+
+def test_no_tie_block_when_the_winner_stands_alone():
+    sample = mk_sample("solo.fa", "sepidermidis", "184", "PERFECT", 100, "arcC(16)")
+    html = report.render_html(mk_result([sample], RunConfig(dbdir=DBDIR)))
+    assert "fit this assembly equally well" not in html
 
 
 def test_species_line_and_caveat():
