@@ -4539,9 +4539,13 @@ class AnalyseView(ttk.Frame):
             # before it says anything, and then runs off the right edge.
             label = os.path.basename(res.path) or res.path
             if tied_schemes(res):
+                # The status line is one line: the full explanation lives on the
+                # summary card and in the report. Naming both schemes and the
+                # file is what the user needs HERE; the paragraph that followed
+                # ran off the right edge and was simply lost.
                 self.app.status.set(
-                    "Tie: {}. {} — {}".format(tied_schemes(res), tie_sentence(),
-                                              label), "warn")
+                    "Tie: {} fit equally well — {}".format(tied_schemes(res),
+                                                           label), "warn")
             else:
                 organism = organism_name(res.scheme, self.app.env.dbdir)
                 self.app.status.set(

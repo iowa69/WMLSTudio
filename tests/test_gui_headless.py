@@ -1959,17 +1959,45 @@ def test_portable_mode_is_detected_from_the_layout(tmp_path=None):
         shutil.rmtree(folder, ignore_errors=True)
 
 
+#: POSIX mode bits are the only portable way to make a directory unwritable in
+#: a test. os.chmod on Windows toggles a file's read-only attribute and does
+#: nothing at all to a directory, and os.getuid does not exist there, so the
+#: chmod half of these tests is POSIX-only. The product behaviour is exercised
+#: on EVERY platform by _unwritable_path(), which needs no permissions at all.
+_MODE_BITS_WORK = hasattr(os, "getuid") and os.name != "nt"
+
+
+def _running_as_root() -> bool:
+    """True when mode bits are advisory for this process."""
+    return _MODE_BITS_WORK and os.getuid() == 0
+
+
+def _unwritable_path(tmpdir: str) -> str:
+    """A path that can never be a writable directory, on any platform.
+
+    Its parent is a regular file, so creating or writing inside it fails with
+    NotADirectoryError/FileNotFoundError wherever the test runs.
+    """
+    blocker = os.path.join(tmpdir, "not-a-directory")
+    with open(blocker, "w", encoding="utf-8") as handle:
+        handle.write("x")
+    return os.path.join(blocker, "db")
+
+
 def test_a_read_only_folder_is_reported_not_raised():
     folder = tempfile.mkdtemp(prefix="wmlst-ro-")
     try:
         assert gui.dir_writable(folder) is True
         assert gui.dir_writable(os.path.join(folder, "nope")) is False
-        os.chmod(folder, 0o500)
-        if os.getuid() != 0:     # root ignores the mode bits
+        # Cross-platform: a path under a regular file can never be written.
+        assert gui.dir_writable(_unwritable_path(folder)) is False
+        if _MODE_BITS_WORK and not _running_as_root():
+            os.chmod(folder, 0o500)
             assert gui.dir_writable(folder) is False
         assert gui.looks_like_database(folder) is False
     finally:
-        os.chmod(folder, 0o700)
+        if _MODE_BITS_WORK:
+            os.chmod(folder, 0o700)
         shutil.rmtree(folder, ignore_errors=True)
 
 
@@ -2026,9 +2054,13 @@ def test_portable_mode_refuses_a_read_only_folder_without_a_traceback():
     os.environ["WMLST_PORTABLE_DIR"] = folder
     root, app = _idle_app()
     try:
-        os.chmod(folder, 0o500)
-        if os.getuid() == 0:
+        if _running_as_root():
             raise SkipTest("running as root: the mode bits mean nothing")
+        if _MODE_BITS_WORK:
+            os.chmod(folder, 0o500)
+        else:
+            # Windows: point the preference at a path that cannot be a directory.
+            os.environ["WMLST_PORTABLE_DIR"] = _unwritable_path(folder)
         app.set_portable_db(True)
         assert app.prefs.portable_db is False
         assert app.settings_view.vars["portable_db"].get() is False

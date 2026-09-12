@@ -112,10 +112,36 @@ def _child_names(pid: int):
 
 
 def _pid_is_gone(pid: int) -> bool:
-    """True when `pid` is no longer a live process of ours."""
+    """True when `pid` has exited.
+
+    NOT ``os.kill(pid, 0)`` on Windows. That is not a liveness probe there:
+    CPython maps os.kill to OpenProcess+TerminateProcess for every signal
+    except CTRL_C_EVENT/CTRL_BREAK_EVENT, so the "probe" would kill whatever
+    it touched. It is also wrong in the other direction -- a process that has
+    already exited keeps an openable PID for as long as anyone holds a handle
+    to it, and Popen holds one until it is reaped, so a dead child reported as
+    alive. Ask the kernel whether the process object is signalled instead.
+    """
     if os.path.isdir("/proc"):
         return not os.path.isdir("/proc/%d" % pid)
-    try:  # pragma: no cover - Windows
+    if os.name == "nt":  # pragma: no cover - Windows only
+        import ctypes
+
+        SYNCHRONIZE = 0x00100000
+        PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+        WAIT_OBJECT_0 = 0
+        kernel32 = ctypes.windll.kernel32
+        handle = kernel32.OpenProcess(
+            SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+        if not handle:
+            return True  # no such process, or it is already reaped
+        try:
+            # A process object becomes signalled the moment the process exits,
+            # regardless of who still holds a handle to it.
+            return kernel32.WaitForSingleObject(handle, 0) == WAIT_OBJECT_0
+        finally:
+            kernel32.CloseHandle(handle)
+    try:
         os.kill(pid, 0)
     except OSError:
         return True

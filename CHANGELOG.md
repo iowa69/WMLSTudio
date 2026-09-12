@@ -50,6 +50,29 @@ independently of the software version. Both appear in every JSON and HTML report
   same on the summary card, in an expansion row and in the status line. The
   compat TSV/CSV/JSON row formats are byte-identity surfaces and are unchanged.
 
+## [1.1.1] - 2026-09-12
+
+### Fixed
+
+- **The Database tab showed no sequence-type or allele counts.** `SchemeInfo`
+  had no fields for them, so the deep catalogue scan the GUI already ran filled
+  in nothing and both columns stayed empty forever. They are now populated for
+  160 of the 162 schemes (two ship no profile table), and `wmlst --info` remains
+  byte-identical to the reference tool across all 163 rows.
+- The tie notice on the status bar ran off the right edge and lost its ending.
+  The status line now names both schemes and the file; the full explanation
+  stays on the result card and in the report, where there is room for it.
+- Two tests used POSIX-only APIs (`os.getuid`, and `os.chmod` on a directory)
+  and could not run on Windows. They now assert the same product behaviour on
+  every platform using a path whose parent is a regular file, and keep the
+  mode-bit assertions where mode bits exist.
+- The shutdown tests reported a killed child as surviving on Windows.
+  `os.kill(pid, 0)` is not a liveness probe there — CPython maps it to
+  `TerminateProcess` for every signal but CTRL_C/CTRL_BREAK, so it kills what it
+  touches, and an exited process keeps an openable PID while anyone holds a
+  handle to it. The probe now asks whether the process object is signalled.
+  The shutdown behaviour itself was correct; only the measurement was wrong.
+
 ## [1.1.0] - 2026-09-12
 
 ### Changed - this release can alter a typing result

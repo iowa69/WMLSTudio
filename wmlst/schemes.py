@@ -258,6 +258,11 @@ class SchemeInfo:
     name: str
     description: str = ""
     locus: int = 0
+    #: Sequence types in the profile table, and distinct locus/allele pairs
+    #: across those profiles -- the same two numbers `mlst --info` prints.
+    #: Populated only under ``deep=True``; 0 means "not counted", not "none".
+    num_genotypes: int = 0
+    num_alleles: int = 0
     download_date: str = ""
     last_updated: str = ""
     source: str = ""
@@ -701,10 +706,17 @@ class SchemeCatalog:
         except (TypeError, ValueError):
             locus = 0
         genes = scheme.genes if deep else ()
+        # Both come from the profile table, which the deep path has already
+        # parsed for `genes`; counting them again costs nothing measurable
+        # (~2 s for all 162 schemes, on the catalogue's background thread).
+        n_types = scheme.num_genotypes if deep else 0
+        n_alleles = scheme.num_alleles if deep else 0
         return SchemeInfo(
             name=str(raw.get("name") or name),
             description=str(raw.get("description") or ""),
             locus=locus,
+            num_genotypes=n_types,
+            num_alleles=n_alleles,
             download_date=str(raw.get("download_date") or ""),
             last_updated=str(raw.get("last_updated") or ""),
             source=str(raw.get("source") or ""),
