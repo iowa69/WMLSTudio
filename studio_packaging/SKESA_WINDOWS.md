@@ -16,6 +16,8 @@ are recorded; this is not a bit-for-bit reproducible dependency lock.
 ## Reviewed portability changes
 
 * Add BSD unsigned integer aliases on Windows, preserving exact bit widths.
+* Include stdint.h explicitly in glb_align.cpp; its fixed-width integer types
+  were previously obtained indirectly from Linux standard-library headers.
 * Use GCC's __builtin_ffsll instead of the unavailable POSIX ffsll;
   both return the one-based index of the first set bit, or zero for zero.
 * Compile the two upstream NO_NGS translation units with UCRT64 libraries,

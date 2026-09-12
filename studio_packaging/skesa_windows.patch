@@ -28,3 +28,15 @@ diff --git a/common_util.hpp b/common_util.hpp
              
                  return extend;
              }
+diff --git a/glb_align.cpp b/glb_align.cpp
+--- a/glb_align.cpp
++++ b/glb_align.cpp
+@@ -30,6 +30,8 @@
+ #include <sstream>
+ #include <limits>
+ #include <iostream>
++// WMLSTudio UCRT port: fixed-width types need their defining header explicitly.
++#include <stdint.h>
+ 
+ using namespace std;
+ namespace DeBruijn {
