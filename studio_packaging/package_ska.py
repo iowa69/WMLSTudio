@@ -53,9 +53,9 @@ def smoke(binary):
                     "passed": False}
         # Column order and exact result checked explicitly against the CLI format.
         header = rows[0].split("\t")
-        snp_column = next((index for index, value in enumerate(header) if "snp" in value.lower()), None)
+        snp_column = next((index for index, value in enumerate(header) if value == "Distance"), None)
         if snp_column is None:
-            raise ValueError(f"SKA2 distance output has no SNP column: {header}")
+            raise ValueError(f"SKA2 distance output has no Distance column: {header}")
         observed = {}
         for row in rows[1:]:
             values = row.split("\t")
