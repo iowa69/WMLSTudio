@@ -1,11 +1,28 @@
 """Guard against data loss and misleading state in native application workflows."""
 
 import json
+from types import SimpleNamespace
 
 import pytest
 
 from wmlstudio.app import MainWindow
 from wmlstudio.export import write_csv, write_html, write_json, write_tsv
+
+
+@pytest.mark.parametrize("arguments, expected", [([], []), (["--window-size", "1080x720"], [(1080, 720)])])
+def test_entrypoint_preserves_screen_aware_size_without_explicit_override(monkeypatch, arguments, expected):
+    import wmlstudio.app as desktop
+
+    sizes = []
+    application = SimpleNamespace(
+        setApplicationName=lambda value: None, setOrganizationName=lambda value: None,
+        setStyle=lambda value: None, setStyleSheet=lambda value: None, exec=lambda: 0,
+    )
+    window = SimpleNamespace(resize=lambda width, height: sizes.append((width, height)), show=lambda: None)
+    monkeypatch.setattr(desktop, "QApplication", SimpleNamespace(instance=lambda: application))
+    monkeypatch.setattr(desktop, "MainWindow", lambda *args: window)
+    assert desktop.main(arguments) == 0
+    assert sizes == expected
 
 
 @pytest.mark.parametrize("writer", [write_csv, write_html, write_json, write_tsv])

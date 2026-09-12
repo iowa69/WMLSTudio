@@ -1073,15 +1073,16 @@ def main(argv=None):
     parser.add_argument("--screenshot", type=Path)
     parser.add_argument("--screenshot-page", type=int, choices=range(7), default=0,
                         help="Workspace page index for reproducible screenshots (0–6)")
-    parser.add_argument("--window-size", default="1380x940", help="Desktop size WIDTHxHEIGHT")
+    parser.add_argument("--window-size", help="Override screen-aware desktop size with WIDTHxHEIGHT")
     parser.add_argument("--native-screenshot", action="store_true", help="Capture the native window surface, not an offscreen render")
     args = parser.parse_args(argv)
-    try:
-        width, height = map(int, args.window_size.lower().split("x"))
-        if not 1000 <= width <= 7680 or not 680 <= height <= 4320:
-            raise ValueError
-    except ValueError:
-        parser.error("--window-size must be WIDTHxHEIGHT, at least 1000x680 and at most 7680x4320")
+    if args.window_size:
+        try:
+            width, height = map(int, args.window_size.lower().split("x"))
+            if not 1000 <= width <= 7680 or not 680 <= height <= 4320:
+                raise ValueError
+        except ValueError:
+            parser.error("--window-size must be WIDTHxHEIGHT, at least 1000x680 and at most 7680x4320")
     app = QApplication.instance() or QApplication(sys.argv[:1])
     app.setApplicationName("WMLSTudio")
     app.setOrganizationName("IOWA-BioTech")
@@ -1095,7 +1096,8 @@ def main(argv=None):
         if temp:
             temp.cleanup()
         return 1
-    window.resize(width, height)
+    if args.window_size:
+        window.resize(width, height)
     window.show()
     if args.demo:
         window.load_demo()
