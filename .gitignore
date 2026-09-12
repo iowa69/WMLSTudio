@@ -1,0 +1,103 @@
+# WMLSTudio source repository. Reference databases are staged explicitly;
+# local sequences, analysis results and portable builds are not committed.
+
+# Local data and credentials
+data/
+db/
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.fasta
+*.fasta.gz
+*.fasta.bz2
+*.fa
+*.fa.gz
+*.fa.bz2
+*.fna
+*.fna.gz
+*.fna.bz2
+*.fastq
+*.fastq.gz
+*.fastq.bz2
+*.fq
+*.fq.gz
+*.fq.bz2
+*.tfa
+
+# Legacy reference-project outputs
+db/blast/
+db/pubmlst/*/database_version.txt
+db/.backup/
+db/*.staging/
+
+# Python bytecode / caches
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# Build artefacts
+build/
+dist/
+sdist/
+wheels/
+*.egg-info/
+*.egg
+.eggs/
+pip-wheel-metadata/
+MANIFEST
+
+# PyInstaller / Inno Setup output
+packaging/build/
+packaging/dist/
+packaging/Output/
+packaging/*.manifest
+*.spec.bak
+SHA256SUMS.txt
+
+# Test / lint caches
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.tox/
+.nox/
+.coverage
+.coverage.*
+htmlcov/
+coverage.xml
+junit*.xml
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# Editors / OS noise
+.vscode/
+.idea/
+*.swp
+*~
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Scratch output produced by a local run
+*.bls
+mlst.fna
+wmlst-report.html
+/tmp-wmlst/
+
+# Native WMLSTudio generated results and local database staging
+results/**
+!results/**/README.md
+!results/lab_notebook.md
+src/wmlstudio/resources/schemes/
+studio_packaging/payload/
+studio_packaging/generated_notices/
+*.wmlstudio
+*.wmlstudio-journal
+*.wmlstudio.lock
+artifacts/
