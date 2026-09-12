@@ -33,6 +33,9 @@ synthetic genome must recover a >=9 kbp contig and all returned contigs must
 match ground truth before the artifact is published. This is a platform smoke
 test, not biological or clinical validation. Windows execution remains
 unverified until this workflow has passed on a Windows runner.
+The second smoke phase runs WMLSTudio's real Python adapter with Unicode and
+comma-containing FASTQ paths, checks full pairing/provenance, and verifies that
+the originals are unchanged and the assembled sequence matches ground truth.
 
 ## Licensing and distribution
 

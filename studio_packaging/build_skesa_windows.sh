@@ -36,7 +36,7 @@ python "$recipe_dir/stage_skesa_runtime.py" \
     --source "$build_dir/source" --recipe-dir "$recipe_dir" --commit "$commit"
 cp -- "$build_dir/compile.log" "$build_dir/stage/compile.log"
 python "$recipe_dir/check_skesa.py" "$build_dir/stage/skesa.exe" \
-    --output "$build_dir/stage/smoke-test.json"
+    --output "$build_dir/stage/smoke-test.json" --adapter-source "$repo_dir"
 # Publish only after a real assembly and validation of the runtime DLL closure.
 mv -T -- "$build_dir/stage" "$destination"
 echo "Native SKESA 2.4.0 ready: $destination"

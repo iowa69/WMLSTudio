@@ -10,7 +10,9 @@ import hashlib
 import json
 import os
 import random
+import shutil
 import subprocess
+import sys
 import tempfile
 from pathlib import Path
 
@@ -19,7 +21,7 @@ def reverse_complement(sequence):
     return sequence.translate(str.maketrans("ACGT", "TGCA"))[::-1]
 
 
-def check(executable, output=None):
+def check(executable, output=None, adapter_source=None):
     executable = Path(executable).resolve()
     version = subprocess.check_output([str(executable), "--version"], stderr=subprocess.STDOUT,
                                       text=True, timeout=20).strip()
@@ -62,6 +64,34 @@ def check(executable, output=None):
                   "assembled_bases": sum(map(len, contigs)), "largest_contig": max(map(len, contigs)),
                   "all_contigs_match_reference": True, "command": command,
                   "stderr": completed.stderr[-12000:]}
+        if adapter_source:
+            sys.path.insert(0, str(Path(adapter_source).resolve() / "src"))
+            from wmlstudio.assembly import run_skesa
+            from wmlstudio.sequence import iter_sequences
+
+            # Exercise a real native process from a Unicode working directory.
+            reads_directory = directory / "Unicode reads λ, paired"
+            reads_directory.mkdir()
+            original_reads = []
+            for mate in (1, 2):
+                path = reads_directory / f"isolate, λ_R{mate}.fastq"
+                shutil.copy2(directory / f"mate{mate}.fastq", path)
+                original_reads.append(path)
+            before = [hashlib.sha256(path.read_bytes()).hexdigest() for path in original_reads]
+            result = run_skesa(*original_reads, reads_directory / "assembled λ",
+                               executable=executable, threads=2, memory_gb=2)
+            assembled = [record.sequence for record in iter_sequences(result["assembly_path"])]
+            if not assembled or max(map(len, assembled)) < 9000 or any(
+                    seq not in genome and reverse_complement(seq) not in genome for seq in assembled):
+                raise RuntimeError("Native adapter assembly does not match synthetic ground truth.")
+            after = [hashlib.sha256(path.read_bytes()).hexdigest() for path in original_reads]
+            if before != after or result["pairing"]["records_checked"] != number + 1:
+                raise RuntimeError("Native adapter changed inputs or did not validate every pair.")
+            report["native_adapter"] = {
+                "passed": True, "unicode_comma_paths": True, "original_inputs_unchanged": True,
+                "assembly_sha256": result["provenance"]["assembly_sha256"],
+                "read_pairs": result["pairing"]["records_checked"], "qc": result["qc"],
+            }
     if output:
         Path(output).write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
     print(json.dumps(report))
@@ -72,5 +102,6 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("executable")
     parser.add_argument("--output")
+    parser.add_argument("--adapter-source", help="WMLSTudio checkout to test its real native process adapter")
     arguments = parser.parse_args()
-    check(arguments.executable, arguments.output)
+    check(arguments.executable, arguments.output, arguments.adapter_source)
