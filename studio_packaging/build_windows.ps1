@@ -33,6 +33,8 @@ try {
     }
     & uv run pyinstaller --noconfirm studio_packaging/wmlstudio.spec
     if ($LASTEXITCODE -ne 0) { throw "Freezing failed" }
+    & uv run python studio_packaging/audit_windows_runtime.py dist/WMLSTudio --output dist/windows-runtime-closure.json
+    if ($LASTEXITCODE -ne 0) { throw "Portable Windows dependency closure failed; system-installed redistributables are not accepted" }
     $env:QT_QPA_PLATFORM = "offscreen"
     & uv run python studio_packaging/check_frozen.py dist/WMLSTudio --output dist/frozen-check.json
     if ($LASTEXITCODE -ne 0) { throw "Frozen reference typing and desktop checks failed" }

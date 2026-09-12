@@ -82,6 +82,11 @@ Their archive and extracted-file SHA-256 values are recorded in
 `Tools/blast/manifest.json`; `Tools/blast/LICENSE` and `BLAST_PRIVACY` travel
 with the binaries. NCBI's public-domain notice does not erase the separate
 licenses of bundled third-party components.
+BLAST's required Microsoft VC++ runtime DLLs are copied app-locally from the
+official target-version PySide6 Windows wheel, not from a developer machine's
+System32 or Wine libraries. Their exact provider and hashes are recorded in
+`notices/licenses/manifest.json`. The dependency-closure gate rejects missing
+redistributable libraries even when the build runner has them installed.
 
 The NCBI-only HYDRA starter contains the AMRFinderPlus nucleotide, protein and
 mutation reference data, with attribution to NCBI and Feldgarden et al.

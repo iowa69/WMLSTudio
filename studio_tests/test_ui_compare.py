@@ -1,9 +1,11 @@
 import json
+import platform
 import threading
 from pathlib import Path
 
 import pytest
-from PySide6.QtCore import QTimer
+from PySide6.QtCore import QPoint, QTimer, qVersion
+from PySide6.QtWidgets import QApplication, QSplitter, QWidget
 
 from wmlstudio import ui_compare
 from wmlstudio.app import MainWindow
@@ -192,7 +194,67 @@ def test_comparison_fits_normal_desktop_sizes_without_outer_scroll(window, qtbot
     window.resize(*size)
     window.navigate(2)
     window.refresh_comparison()
+    assert_comparison_geometry(window, qtbot, f'{size[0]}x{size[1]}-normal')
+
+
+def assert_comparison_geometry(window, qtbot, case):
+    """Keep exact geometry evidence in CI artifacts, including on assertion failure."""
     page = window.pages.widget(2)
-    qtbot.waitUntil(lambda: page.verticalScrollBar().maximum() == 0
-                   and page.horizontalScrollBar().maximum() == 0, timeout=3000)
+    window.refresh_cohort_table()
+    # Allow queued height-for-width layouts and the graph's 80 ms resize-fit
+    # timer to settle before measuring; an early zero scroll range can lie.
+    qtbot.wait(120)
+    try:
+        qtbot.waitUntil(lambda: page.verticalScrollBar().maximum() == 0
+                       and page.horizontalScrollBar().maximum() == 0
+                       and window.tree.height() >= 200
+                       and window.tree_status.height() >= window.tree_status.heightForWidth(window.tree_status.width()),
+                       timeout=3000)
+    finally:
+        destination = Path('artifacts') / 'compare-geometry'
+        destination.mkdir(parents=True, exist_ok=True)
+        stem = destination / f'{platform.system().lower()}-{case}'
+        content = page.widget()
+        def dimensions(size):
+            return [size.width(), size.height()]
+        widgets = []
+        for widget in [content, *content.findChildren(QWidget)]:
+            if not widget.isVisible():
+                continue
+            position = widget.mapTo(content, QPoint(0, 0))
+            widgets.append({
+                'class': type(widget).__name__, 'name': widget.objectName(),
+                'text': (widget.text()[:180] if callable(getattr(widget, 'text', None)) else ''),
+                'position': [position.x(), position.y()], 'size': dimensions(widget.size()),
+                'minimum': dimensions(widget.minimumSize()), 'hint': dimensions(widget.sizeHint()),
+                'minimum_hint': dimensions(widget.minimumSizeHint()),
+                'font': widget.font().toString(),
+                'splitter_sizes': widget.sizes() if isinstance(widget, QSplitter) else None,
+            })
+        evidence = {
+            'qt': qVersion(), 'platform': QApplication.platformName(),
+            'window': dimensions(window.size()), 'viewport': dimensions(page.viewport().size()),
+            'content': dimensions(content.size()), 'content_minimum': dimensions(content.minimumSizeHint()),
+            'scroll_maximum': {'vertical': page.verticalScrollBar().maximum(),
+                               'horizontal': page.horizontalScrollBar().maximum()},
+            'graph': dimensions(window.tree.size()), 'widgets': widgets,
+        }
+        stem.with_suffix('.json').write_text(json.dumps(evidence, indent=2), encoding='utf-8')
+        window.grab().save(str(stem.with_suffix('.png')))
+        print(f'Comparison geometry: {stem}.json; scroll={evidence["scroll_maximum"]}; '
+              f'viewport={evidence["viewport"]}; content={evidence["content"]}; graph={evidence["graph"]}')
     assert window.tree.height() >= 200
+
+
+def test_comparison_fits_larger_font_metrics_without_outer_scroll(window, qtbot):
+    profile(window, 0)
+    profile(window, 1)
+    page = window.pages.widget(2)
+    # Stress font metrics independently of whichever Windows/Linux font is installed.
+    page.setStyleSheet('QPushButton, QToolButton, QComboBox, QLineEdit, QSpinBox, QDoubleSpinBox, QTabBar '
+                      '{ font-size: 15px; } QLabel#small { font-size: 13px; } '
+                      'QLabel#cardTitle { font-size: 17px; }')
+    window.resize(1080, 720)
+    window.navigate(2)
+    window.refresh_comparison()
+    assert_comparison_geometry(window, qtbot, '1080x720-larger-font')

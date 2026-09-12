@@ -2,9 +2,10 @@
 import json
 import os
 import sys
+from importlib.metadata import distribution
 from pathlib import Path
 
-from PyInstaller.utils.hooks import collect_data_files, copy_metadata
+from PyInstaller.utils.hooks import collect_data_files, collect_submodules, copy_metadata
 
 root = Path(SPECPATH).parent
 sys.path.insert(0, str(root / "studio_packaging"))
@@ -52,12 +53,20 @@ if sys.platform == "win32":
     skesa = root / "src/wmlstudio/resources/tools/skesa"
     verify_skesa_bundle(skesa)
     datas.append((str(skesa), "wmlstudio/resources/tools/skesa"))
+    # Native BLAST imports VC++ runtime libraries absent from NCBI's archive.
+    # Keep them app-local: a runner's installed redist is not a portable dependency.
+    qt_runtime = Path(distribution("PySide6-Essentials").locate_file("PySide6"))
+    for name in ("msvcp140.dll", "vcruntime140.dll", "vcruntime140_1.dll"):
+        source = qt_runtime / name
+        if not source.is_file():
+            raise SystemExit(f"The official Qt wheel is missing required native runtime {name}")
+        datas.append((str(source), "Tools/blast/bin"))
 
 common = dict(
     pathex=[str(root / "src")],
     binaries=[],
     datas=datas,
-    hiddenimports=["ahocorasick"],
+    hiddenimports=["ahocorasick", *collect_submodules("pyrodigal")],
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],

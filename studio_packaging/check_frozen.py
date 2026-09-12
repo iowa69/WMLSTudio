@@ -12,6 +12,7 @@ import subprocess
 import tempfile
 from pathlib import Path
 
+from wmlstudio import __version__
 from wmlstudio.sequence import iter_sequences
 from wmlstudio.typing import load_scheme
 
@@ -80,6 +81,8 @@ def main() -> int:
         result = json.loads(destination.read_text(encoding="utf-8"))["samples"][0]
         if result["st"] != expected or result["status"] != "complete":
             raise ValueError(f"Frozen typing expected complete ST {expected}, observed {result['st']}")
+        if result.get("engine_version") != __version__:
+            raise ValueError(f"Frozen engine version differs from build source: {result.get('engine_version')} != {__version__}")
         hydra = check_hydra(bundle, root, suffix)
         skesa = None
         if suffix:
@@ -95,12 +98,16 @@ def main() -> int:
         raise ValueError("Frozen desktop did not produce a screenshot")
     report = {
         "platform": platform.platform(), "bundle": str(bundle),
+        "application_version": __version__, "engine_version": result["engine_version"],
         "scheme_count": snapshot["scheme_count"], "scheme_snapshot_sha256": snapshot["snapshot_sha256"],
         "control": "Synthetic assembly generated from one complete bundled profile",
         "expected_st": expected, "observed_st": result["st"],
         "typing": "passed", "desktop_demo": "passed", "screenshot": str(screenshot),
         "hydra_frozen_worker": hydra, "native_skesa": skesa,
     }
+    revision = os.environ.get("GITHUB_SHA") or os.environ.get("WMLSTUDIO_SOURCE_REVISION")
+    if revision:
+        report["source_revision"] = revision
     args.output.write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
     print(json.dumps(report, indent=2))
     return 0

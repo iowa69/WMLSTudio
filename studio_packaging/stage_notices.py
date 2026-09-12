@@ -131,6 +131,17 @@ def main() -> int:
     manifest["files"].append({"path": source_target.relative_to(destination).as_posix(),
                               "source": "Exact local application/build source at staging time; sample data excluded",
                               "sha256": hashlib.sha256(source_target.read_bytes()).hexdigest()})
+    if platform.system() == "Windows":
+        qt_runtime = Path(distribution("PySide6-Essentials").locate_file("PySide6"))
+        manifest["native_runtime"] = []
+        for name in ("msvcp140.dll", "vcruntime140.dll", "vcruntime140_1.dll"):
+            path = qt_runtime / name
+            content = path.read_bytes()
+            if content[:2] != b"MZ":
+                raise ValueError(f"The official Qt wheel has no valid native runtime: {name}")
+            manifest["native_runtime"].append({"name": name, "sha256": hashlib.sha256(content).hexdigest(),
+                "provider": f"Official PySide6-Essentials {qt_version} Windows wheel",
+                "bundle_path": f"Tools/blast/bin/{name}"})
     (destination / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
     print(f"Preserved {len(manifest['files'])} version-matched license texts in {destination}")
     return 0

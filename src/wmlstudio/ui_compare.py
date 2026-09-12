@@ -177,21 +177,28 @@ class EvidenceMatrixModel(QAbstractTableModel):
 
 class ComparisonWorkspaceMixin:
     def build_compare(self):
-        _, layout = self.page()
+        page, layout = self.page()
+        # Dense workbench controls need breathing room at 1080×720 with native
+        # Windows font metrics. Keep text size intact; reduce padding rather
+        # than letting action strips consume the graph's usable height.
+        page.setStyleSheet('QPushButton, QToolButton { padding: 6px 10px; } '
+                           'QComboBox, QLineEdit, QSpinBox, QDoubleSpinBox '
+                           '{ padding-top: 5px; padding-bottom: 5px; }')
         layout.setSpacing(8)
         self.heading(layout, "Compare a cohort", "Choose isolates and one reference snapshot. Reuse saved profiles without reading the genomes again.")
         filters = QHBoxLayout()
         self.compare_genus = QComboBox()
-        self.compare_genus.setProperty('compactCharacters', 9)
+        self.compare_genus.setProperty('compactCharacters', 6)
         self.compare_genus.addItem("All genera", "")
         self.compare_species = QComboBox()
-        self.compare_species.setProperty('compactCharacters', 9)
+        self.compare_species.setProperty('compactCharacters', 6)
         self.compare_species.addItem("All species", "")
         self.compare_scheme = QComboBox()
+        self.compare_scheme.setProperty('compactCharacters', 12)
         self.compare_scheme.addItem("Existing profile snapshot", None)
-        self.compare_scheme.setMinimumWidth(190)
+        self.compare_scheme.setMinimumWidth(160)
         self.compare_scheme.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon)
-        self.compare_scheme.setMinimumContentsLength(18)
+        self.compare_scheme.setMinimumContentsLength(12)
         self.compare_genus.currentIndexChanged.connect(self.refresh_cohort_table)
         self.compare_species.currentIndexChanged.connect(self.refresh_cohort_table)
         self.compare_scheme.currentIndexChanged.connect(self.comparison_scheme_changed)
@@ -211,15 +218,16 @@ class ComparisonWorkspaceMixin:
         self.cluster_threshold = QSpinBox()
         self.cluster_threshold.setRange(0, 100000)
         self.cluster_threshold.setValue(1)
+        self.cluster_threshold.setToolTip('Maximum allele distance for grouping this graph. Similarity groups are not proof of transmission.')
         self.cluster_threshold.valueChanged.connect(self.refresh_comparison)
-        for text, control in [('Shared loci ≥', self.overlap), ('Group threshold', self.cluster_threshold)]:
+        for text, control in [('Shared ≥', self.overlap), ('Group ≤', self.cluster_threshold)]:
             group = QWidget()
             row = QHBoxLayout(group)
             row.setContentsMargins(0, 0, 0, 0)
             row.addWidget(label(text, 'small'))
             row.addWidget(control)
             controls.addWidget(group)
-        controls.addWidget(button("Build comparison", self.refresh_comparison, True))
+        controls.addWidget(button("Compare", self.refresh_comparison, True))
         layout.addLayout(controls)
         splitter = QSplitter(Qt.Orientation.Horizontal)
         splitter.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Ignored)
@@ -254,7 +262,7 @@ class ComparisonWorkspaceMixin:
         content.setSpacing(6)
         toolbar = FlowLayout()
         self.color_by = QComboBox()
-        self.color_by.setProperty('compactCharacters', 12)
+        self.color_by.setProperty('compactCharacters', 9)
         self.color_by.addItem("Colour: cluster", "cluster")
         self.color_by.addItem("Colour: ST", "st")
         self.color_by.currentIndexChanged.connect(self.set_graph_color_by)
@@ -273,7 +281,7 @@ class ComparisonWorkspaceMixin:
         graph_options.setMenu(menu)
         toolbar.addWidget(graph_options)
         export = QComboBox()
-        export.setProperty('compactCharacters', 12)
+        export.setProperty('compactCharacters', 9)
         export.addItems(["Export graph…", "PNG image", "SVG vector", "GraphML", "Newick (MST topology)", "Distance JSON", "Distance matrix TSV"])
         export.activated.connect(lambda index: self.export_graph_action(index, export))
         toolbar.addWidget(export)
@@ -288,6 +296,7 @@ class ComparisonWorkspaceMixin:
         tabs = QTabWidget()
         tabs.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
         self.tree = ComparisonTreeView()
+        self.tree.setMinimumHeight(200)
         tabs.addTab(self.tree, "Graph")
         self.profile_table = QTableView()
         self.profile_model = EvidenceMatrixModel(self.profile_table)

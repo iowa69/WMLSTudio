@@ -60,6 +60,9 @@ jobs:
         run: uv run pytest --junitxml=artifacts/pytest.xml
       - name: Freeze native desktop and console companion
         run: uv run pyinstaller --noconfirm studio_packaging/wmlstudio.spec
+      - name: Verify app-local Windows DLL closure without runner redistributables
+        if: runner.os == 'Windows'
+        run: uv run python studio_packaging/audit_windows_runtime.py dist/WMLSTudio --output artifacts/windows-runtime-closure.json
       - name: Frozen reference typing and native desktop
         run: uv run python studio_packaging/check_frozen.py dist/WMLSTudio --output artifacts/frozen-check.json
       - name: Archive portable Linux build
