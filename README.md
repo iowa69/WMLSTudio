@@ -1,7 +1,106 @@
 # WMLSTudio
 
-A native desktop workspace for bacterial sequence typing, designed for people using
-Windows 11 without a command line. Built with Qt for Python; no browser or web server.
+**Your microbial genomics workspace for Windows.** Type assemblies, check sequence
+quality, compare isolates and explore HYDRA evidence in one native desktop application.
+
+No installation, separate Python, command line, browser or WSL required. The
+portable package includes the application, its runtime and 162 reference schemes;
+it does not download databases at startup.
+
+*IOWA-BioTech — Giovanni Lorenzin*
+
+## Download the preview
+
+### [⬇ Download WMLSTudio for Windows — portable ZIP](https://github.com/iowa69/WMLSTudio/releases/download/v0.1.0-preview.1/WMLSTudio-Windows-x64.zip)
+
+**v0.1.0-preview.1 · Windows x64 · 46.3 MB download · approximately 210 MB extracted**
+
+[Release notes and all downloads](https://github.com/iowa69/WMLSTudio/releases/tag/v0.1.0-preview.1)
+· [SHA-256 checksum](https://github.com/iowa69/WMLSTudio/releases/download/v0.1.0-preview.1/WMLSTudio-Windows-x64.zip.sha256)
+· [Build and test status](https://github.com/iowa69/WMLSTudio/actions/workflows/studio.yml)
+
+This repository is private. Sign in to GitHub with an account that has repository
+access before downloading; these links are not anonymous public downloads.
+
+> **Development preview, not a validated production release.** The target is
+> Windows 11, 64-bit. The ZIP was built with Windows Python and tested under Wine;
+> source tests and frozen builds also passed separately in GitHub Actions on Linux
+> and Windows. Clean Windows 11 desktop acceptance remains unfinished.
+>
+> The application is unsigned, so Windows may show an unknown-publisher or
+> SmartScreen warning. Verify the source and checksum before deciding whether to
+> run it. Do not disable Defender or SmartScreen; a matching checksum confirms
+> file integrity, not that a program is safe.
+
+<details>
+<summary>Verify your download in PowerShell</summary>
+
+```powershell
+Get-FileHash .\WMLSTudio-Windows-x64.zip -Algorithm SHA256
+```
+
+Compare the result with the checksum asset above. For this preview it is:
+
+```text
+9470e4e1e27666eec42dfea83d5c09b71ada25b38933dc83bd4648cca34422f3
+```
+
+</details>
+
+## Three steps
+
+### 1. Extract and open
+
+Right-click the downloaded ZIP, choose **Extract All**, and extract into a writable
+folder such as Documents. Open the extracted `WMLSTudio` folder and double-click
+`WMLSTudio.exe`. Keep the entire folder together, including `_internal`; do not run
+the executable from inside the ZIP or move it on its own.
+
+### 2. Try the practice project
+
+Click **Practice project** in the lower-left corner. It creates and analyses seven
+clearly labelled synthetic assemblies, so you can explore without preparing data.
+Open **Samples** to inspect the calls, then **Compare** to explore their relationships.
+
+![WMLSTudio native Windows interface showing the synthetic practice project](docs/images/wmlstudio-preview.png)
+
+*Actual frozen Windows application under Wine; the displayed samples are synthetic.*
+
+### 3. Analyse your own sequences
+
+Create or open your own project, then drag in FASTA/FASTQ files or a folder. On
+**Samples**, select the correct organism's scheme and click **Analyse pending**.
+Select a sample to inspect its quality summary, allele evidence and provenance.
+
+Accepted: FASTA (`.fasta`, `.fa`, `.fna`) and FASTQ (`.fastq`, `.fq`), including
+gzip (`.gz`) and bzip2 (`.bz2`) compression. **Assemblies receive exact typing;
+FASTQ reads receive quality checks only.** This preview does not assemble reads.
+
+## Comparing isolates
+
+After typing two or more assemblies, open **Compare**. The interactive minimum
+spanning forest shows allele differences, with zoom, pan, draggable nodes and PNG
+export. Only profiles with compatible scheme fingerprints and sufficient shared
+loci are compared. Missing calls are not counted as matches; disconnected samples
+remain visible. Visual groups are an exploration aid, not an outbreak diagnosis.
+
+## HYDRA evidence
+
+Open **HYDRA insights → Import HYDRA JSON** to view previously computed resistance,
+virulence, mutation, plasmid and lineage evidence. The original report's parameters,
+database information and provenance are preserved. **This does not run HYDRA's
+analysis engines.** See [the integration assessment](docs/HYDRA_INTEGRATION.md).
+
+## Saving and sharing
+
+Projects save automatically. Use **Reports** for PDF/HTML reports and CSV/TSV/JSON
+exports. **Save project copy** carries results and metadata to another computer;
+the original sequence files remain separate and are needed to rerun an analysis.
+HYDRA insights also exports the complete imported evidence as JSON.
+
+Workspaces and imported schemes live under `Data` beside the executable. Back up
+that folder and your original sequence files. Original inputs are never edited,
+and exports refuse to replace sequence inputs or the current project.
 
 ## What works in this preview
 
@@ -21,28 +120,10 @@ parity. Imported cgMLST uses exact known alleles; a missing match is not a novel
 allele call. See [the capability audit](docs/STUDIO_CAPABILITIES.md) and
 [HYDRA integration assessment](docs/HYDRA_INTEGRATION.md).
 
-## Using the application
-
-Extract the portable Windows ZIP into a writable folder, then double-click
-`WMLSTudio.exe` inside `WMLSTudio`. Python, Qt and the compiled matching engine are
-included. Keep the `_internal` folder beside the executable. Workspaces and local
-scheme imports are saved under `Data` beside the executable. No administrator
-privileges, browser, server or WSL are required by the application.
-
-Start with **Practice project** to analyse seven clearly labelled synthetic
-assemblies. For your own data, import files, select an organism-appropriate scheme
-on **Samples**, and click **Analyse pending**. FASTQ files receive quality checks;
-use an assembly FASTA for exact typing. Open **Compare** after typing assemblies.
-
-Projects save automatically. **Reports → Save project copy** carries results and
-metadata to another computer; original sequence files are referenced in place
-and must be copied separately to rerun them. Closing during a job requests safe
+Every typed result retains its input SHA-256, scheme fingerprint, parameters,
+software version and individual allele evidence. Closing during a job requests safe
 cancellation. Failed/interrupted samples can be retried. Two application windows
 cannot open the same project concurrently.
-
-Every typed result retains its input SHA-256, scheme fingerprint, parameters,
-software version and individual allele evidence. Original inputs are never edited;
-exports refuse to replace sequence inputs or the current project.
 
 ## Develop and test
 
@@ -77,8 +158,9 @@ uv run wmlstudio-cli compare results.json -o distances.json
 ```
 
 See [Windows build instructions](docs/STUDIO_WINDOWS.md) for packaging and
-acceptance checks. Windows CI is provided; configuration alone does not establish
-a successful Windows 11 test.
+acceptance checks. The [initial Linux and Windows CI run](https://github.com/iowa69/WMLSTudio/actions/runs/34705226772)
+passed both test and frozen-build jobs; hosted Windows CI does not establish a
+successful clean Windows 11 desktop acceptance test.
 
 This repository contains the new native implementation in `src/wmlstudio`.
 Legacy WMLST source/history and reference databases are not included. Existing
