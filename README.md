@@ -13,7 +13,7 @@ installation for the portable package.
 
 ### [⬇ Download WMLSTudio — Windows portable ZIP](https://github.com/iowa69/WMLSTudio/releases/download/v0.2.0-workbench.1/WMLSTudio-Windows-x64.zip)
 
-**v0.2.0-workbench.1 · Windows x64 · Non-commercial research workbench**
+**v0.2.0-workbench.1 · Windows x64 · 147.6 MB ZIP · Non-commercial research**
 
 [Release notes](https://github.com/iowa69/WMLSTudio/releases/tag/v0.2.0-workbench.1)
 · [SHA-256 checksum](https://github.com/iowa69/WMLSTudio/releases/download/v0.2.0-workbench.1/WMLSTudio-Windows-x64.zip.sha256)
@@ -23,6 +23,9 @@ installation for the portable package.
 This repository is private: sign in with an account that has access to download.
 The release notes distinguish observed Linux, native Windows CI and Wine checks
 from the still-required clean Windows 11 desktop acceptance test.
+The published binary was built from `e5d5f72`: **466 tests passed on each hosted
+platform**, followed by frozen-executable checks in
+[this successful build](https://github.com/iowa69/WMLSTudio/actions/runs/34713168070).
 
 > Research software, not a validated diagnostic device or an established
 > SeqSphere+ equivalent. Review the [capability audit](docs/STUDIO_CAPABILITIES.md).
@@ -37,6 +40,7 @@ from the still-required clean Windows 11 desktop acceptance test.
 Choose **Extract All**, use a writable folder such as Documents, then open
 `WMLSTudio/WMLSTudio.exe`. Keep every executable and the `_internal` folder
 together. Do not launch from inside the ZIP or move only the main executable.
+The extracted application occupies about 462 MB, before your projects and inputs.
 
 Keep your existing data backed up. Open a **copy** of an older project for the
 first retest: the workbench upgrades its project schema, and the old 0.1

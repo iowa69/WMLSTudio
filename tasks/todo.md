@@ -13,7 +13,8 @@
 - [x] Export selected report cohorts and highlighted sample groups.
 - [x] Execute native Windows SKESA and HYDRA, with real-data Linux/Wine agreement.
 - [x] Guard stale AMR, failed profile reuse and unverified external allele tokens.
-- [ ] Validate native workflows, rebuild Windows package, push and publish retest release.
+- [x] Validate native workflows, rebuild Windows package and push the source.
+- [ ] Publish and download-verify the private Windows retest release.
 
 Design and acceptance contract: [WORKBENCH_DESIGN](../docs/WORKBENCH_DESIGN.md).
 
