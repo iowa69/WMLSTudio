@@ -4,7 +4,7 @@ message: >-
   original mlst first, then this port.
 title: "WMLST: a Windows-native port of mlst for MLST typing of bacterial assemblies"
 abbreviation: WMLST
-version: "1.1.1"
+version: "1.2.0"
 date-released: "2026-09-11"
 type: software
 license: GPL-2.0-only
@@ -21,9 +21,9 @@ keywords:
 authors:
   - family-names: Lorenzin
     given-names: Giovanni
-    affiliation: IOWA-Tech
+    affiliation: IOWA-BioTech
 contact:
-  - name: IOWA-Tech
+  - name: IOWA-BioTech
     website: "https://github.com/iowa69/WMLST"
 references:
   - type: software
@@ -77,11 +77,11 @@ references:
 preferred-citation:
   type: software
   title: "WMLST: a Windows-native port of mlst for MLST typing of bacterial assemblies"
-  version: "1.1.1"
+  version: "1.2.0"
   year: 2026
   license: GPL-2.0-only
   url: "https://github.com/iowa69/WMLST"
   authors:
     - family-names: Lorenzin
       given-names: Giovanni
-      affiliation: IOWA-Tech
+      affiliation: IOWA-BioTech

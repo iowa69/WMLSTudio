@@ -50,6 +50,36 @@ independently of the software version. Both appear in every JSON and HTML report
   same on the summary card, in an expansion row and in the status line. The
   compat TSV/CSV/JSON row formats are byte-identity surfaces and are unchanged.
 
+## [1.2.0] - 2026-09-12
+
+### Added
+
+- **A Tree page.** Once two or more isolates share a scheme, WMLST draws a minimum
+  spanning tree over their allele profiles. Two views: *Clonality*, with dots
+  coloured by clonal group and sized by how many isolates share the sequence
+  type, and *Labelled tree*, with every isolate named and its ST shown, coloured
+  by ST. Edges carry the allelic distance. Zoom, pan, click an isolate to read
+  its full profile and nearest neighbours, and save the picture as a PNG.
+  Distances are computed only between isolates of the same scheme, ignoring loci
+  missing in either, and the view states how many loci were compared.
+- Results filter (Ctrl+F), row counts, and a View menu with Ctrl+1-4.
+
+### Changed
+
+- **The product is now IOWA-BioTech.** An existing installation keeps using the
+  BLAST+ it already downloaded: the previous vendor folder is still searched
+  before the new one, so upgrading never re-downloads 137 MB.
+- **A failing scheme no longer aborts a database update.** The other schemes
+  still update, the failed ones are left untouched on disk, and the run ends with
+  a summary naming each failure and why.
+- The animation is smoother and carries the IOWA-BioTech wordmark; panels are
+  outlined so regions of the window read as distinct.
+- README is now a user guide: download, three steps, what the output looks like
+  on screen and as files. The copyright notices live in NOTICE, where the licence
+  expects them.
+- Releases publish the portable zip only for now; the installer step is paused
+  behind a switch rather than removed, and v1.1.1's installer remains available.
+
 ## [1.1.1] - 2026-09-12
 
 ### Fixed
@@ -193,7 +223,7 @@ First public release. A complete Windows-native port of
   network access, safe to email.
 - **NCBI BLAST+ bootstrap** (`--bootstrap-blast`): downloads the official 2.17.0
   archive over HTTPS, verifies its MD5, and extracts only the ~35 MB actually
-  needed into `%LOCALAPPDATA%\IOWA-Tech\WMLST\blast\`. No administrator rights.
+  needed into `%LOCALAPPDATA%\IOWA-BioTech\WMLST\blast\`. No administrator rights.
 - **Database updater** (`--update-db`, `wmlst-update-db`, and the GUI Database tab):
   content-hash change detection rather than date comparison, per-scheme atomic
   commits, resumable, with rollback and offline import/export bundles.

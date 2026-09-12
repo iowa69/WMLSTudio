@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: GPL-2.0-only
-# Copyright (C) 2025 IOWA-Tech - Giovanni Lorenzin
+# Copyright (C) 2025 IOWA-BioTech - Giovanni Lorenzin
 # Copyright (C) Torsten Seemann (upstream `mlst`, GPL-2.0-only)
 #
 # Direct translation of tseemann/mlst 2.35.0 `bin/mlst` lines 40-155, 417-513

@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: GPL-2.0-only
-# Copyright (C) 2025-2026 IOWA-Tech - Giovanni Lorenzin
+# Copyright (C) 2025-2026 IOWA-BioTech - Giovanni Lorenzin
 # Copyright (C) Torsten Seemann (upstream `mlst`, from which WMLST is ported)
 """Structural, accessibility and self-containment tests for the HTML report.
 
@@ -204,7 +204,7 @@ def test_csp_and_referrer_locks():
 
 def test_branding_is_present():
     html = report.render_html(one_result())
-    assert "IOWA-Tech" in html
+    assert "IOWA-BioTech" in html
     assert "Giovanni Lorenzin" in html
     assert "WMLST" in html
     assert "Torsten Seemann" in html

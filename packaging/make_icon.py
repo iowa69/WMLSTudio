@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: GPL-2.0-only
-# Copyright (C) 2025-2026 IOWA-Tech - Giovanni Lorenzin
+# Copyright (C) 2025-2026 IOWA-BioTech - Giovanni Lorenzin
 # Copyright (C) Torsten Seemann (upstream `mlst`, from which WMLST is ported)
 """Generate ``packaging/wmlst.ico`` with nothing but the standard library.
 

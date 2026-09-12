@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: GPL-2.0-only
-# Copyright (C) 2025 IOWA-Tech - Giovanni Lorenzin
+# Copyright (C) 2025 IOWA-BioTech - Giovanni Lorenzin
 # Copyright (C) Torsten Seemann (upstream `mlst`, from which WMLST is ported)
 """`--help` snapshot and structure tests (docs/ARCHITECTURE.md section 13.4).
 

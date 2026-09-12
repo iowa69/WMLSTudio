@@ -1,5 +1,5 @@
 WMLST — MLST typing for Windows
-Copyright (C) 2025-2026 IOWA-Tech — Giovanni Lorenzin
+Copyright (C) 2025-2026 IOWA-BioTech — Giovanni Lorenzin
 
 This product is licensed under the GNU General Public License, version 2 only
 (SPDX: GPL-2.0-only). The full licence text is in the file LICENSE, which is
@@ -84,7 +84,7 @@ The git repository does NOT contain BLAST+ binaries. On Windows, `wmlst
 archive over HTTPS, verifies its MD5, and extracts only blastn.exe,
 makeblastdb.exe and nghttp2.dll into
 
-    %LOCALAPPDATA%\IOWA-Tech\WMLST\blast\
+    %LOCALAPPDATA%\IOWA-BioTech\WMLST\blast\
 
 Because BLAST+ is public domain, distributing those binaries alongside a GPLv2
 program raises no licence conflict; they are also merely invoked as separate
@@ -153,11 +153,11 @@ commit, the build workflow and the public build log, is available at:
 
 Every release is published from a public tagged commit and its GitHub Actions
 build log is linked from the release body, which satisfies section 3(a). If you
-received a binary without that link, write to IOWA-Tech and you will be sent the
+received a binary without that link, write to IOWA-BioTech and you will be sent the
 source on a physical medium for no more than the cost of distribution, which
 satisfies section 3(b).
 
 --------------------------------------------------------------------------------
-WMLST — IOWA-Tech - Giovanni Lorenzin.
+WMLST — IOWA-BioTech - Giovanni Lorenzin.
 Port of mlst 2.35.0 by Torsten Seemann (GPL-2.0-only).
 Allele data (c) PubMLST / Institut Pasteur - cite Jolley, Bray & Maiden (2018).

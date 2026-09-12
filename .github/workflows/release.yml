@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: GPL-2.0-only
-# Copyright (C) 2025-2026 IOWA-Tech - Giovanni Lorenzin
+# Copyright (C) 2025-2026 IOWA-BioTech - Giovanni Lorenzin
 # Copyright (C) Torsten Seemann (upstream `mlst`, from which WMLST is ported)
 #
 # WMLST release pipeline -- docs/ARCHITECTURE.md sections 13.1 and 13.4.
@@ -11,6 +11,13 @@
 #
 # Publishing to PyPI is NOT here. It stays a deliberate, manual step run by a
 # maintainer from a clean checkout (section 13.4).
+#
+# The Windows *installer* is intentionally PAUSED. A tag builds and publishes
+# the portable zip, the wheel and the sdist -- nothing else. The Inno Setup
+# step further down has NOT been deleted: it is kept wired and one flag away
+# from returning, and the step's own comment says how to ask for it. The
+# installer published with v1.1.1 stays attached to that release; nothing in
+# this file touches an already-published release.
 
 name: Release
 
@@ -23,6 +30,11 @@ on:
         description: "Tag to build (for a dry run)"
         required: false
         default: ""
+      build_installer:
+        description: "Also build the Inno Setup installer (paused; OFF by default)"
+        type: boolean
+        required: false
+        default: false
 
 permissions:
   contents: write   # required to create the Release and attach assets
@@ -91,7 +103,7 @@ jobs:
 
   # ---------------------------------------------------------------------
   windows:
-    name: Windows executables, portable zip and installer
+    name: Windows executables and the portable zip
     runs-on: windows-latest
     needs: gate
     steps:
@@ -112,7 +124,7 @@ jobs:
           python -m wmlst --bootstrap-blast
           # The spec picks up packaging\payload\blast automatically, so the
           # installed application works offline on first run.
-          $src = Join-Path $env:LOCALAPPDATA "IOWA-Tech\WMLST\blast"
+          $src = Join-Path $env:LOCALAPPDATA "IOWA-BioTech\WMLST\blast"
           if (Test-Path $src) {
             New-Item -ItemType Directory -Force -Path packaging\payload\blast | Out-Null
             Copy-Item "$src\*" packaging\payload\blast -Recurse -Force
@@ -149,7 +161,22 @@ jobs:
           Copy-Item packaging\SMARTSCREEN.txt dist\WMLST\SMARTSCREEN.txt -Force
           Compress-Archive -Path dist\WMLST\* -DestinationPath "release\WMLST-$v-win64-portable.zip" -CompressionLevel Optimal
 
-      - name: Inno Setup installer
+      # ---- PAUSED ----------------------------------------------------
+      # The installer build is intentionally paused: a tag publishes the
+      # portable zip only. This step is deliberately NOT deleted -- it is the
+      # whole installer recipe, and deleting it would mean rediscovering it.
+      #
+      # To turn it back on, either:
+      #   * once, for one run -- Actions -> Release -> "Run workflow" and tick
+      #     "Also build the Inno Setup installer"; or
+      #   * for good -- Settings -> Secrets and variables -> Actions ->
+      #     Variables -> add BUILD_INSTALLER with the value "true". An unset
+      #     variable is the empty string, so the default is OFF.
+      #
+      # Either switch also makes the publish job attach the .exe, because that
+      # job globs whatever this job uploaded.
+      - name: Inno Setup installer (paused - see BUILD_INSTALLER)
+        if: ${{ inputs.build_installer || vars.BUILD_INSTALLER == 'true' }}
         shell: pwsh
         run: |
           # Inno Setup 6 is preinstalled on windows-latest images; install it if
@@ -162,6 +189,10 @@ jobs:
           & $iscc packaging\wmlst.iss
           Copy-Item packaging\Output\*.exe release\ -Force
           Get-ChildItem release
+
+      - name: Note that the installer was skipped
+        if: ${{ !(inputs.build_installer || vars.BUILD_INSTALLER == 'true') }}
+        run: echo "::notice title=Installer paused::Only the portable zip was built. Set the BUILD_INSTALLER repository variable to 'true', or re-run this workflow with the build_installer input ticked, to build the Inno Setup installer again."
 
       - name: SHA256SUMS - the only provenance an unsigned build has
         shell: pwsh
@@ -197,6 +228,10 @@ jobs:
           mkdir -p release
           find artifacts -type f \( -name '*.exe' -o -name '*.zip' -o -name '*.whl' -o -name '*.tar.gz' \) \
             -exec cp {} release/ \;
+          ls -1 release/*-win64-portable.zip >/dev/null 2>&1 || {
+            echo "::error::no *-win64-portable.zip among the built artifacts"
+            exit 1
+          }
           cd release
           sha256sum * > SHA256SUMS.txt
           cat SHA256SUMS.txt
@@ -222,7 +257,7 @@ jobs:
           print("### Verifying this download")
           print()
           print("These binaries are **not code-signed**. SmartScreen will show")
-          print('*"Windows protected your PC"* the first time you run the installer.')
+          print('*"Windows protected your PC"* the first time you run WMLST.')
           print("That is a reputation signal, not a virus detection: click")
           print("**More info -> Run anyway**. Do not disable SmartScreen or Defender.")
           print()
@@ -235,7 +270,7 @@ jobs:
           print("WMLST is **GPL-2.0-only**, a port of [`mlst`](https://github.com/tseemann/mlst)")
           print("by **Torsten Seemann** - please cite that first. Allele data from")
           print("**PubMLST**: cite Jolley, Bray & Maiden (2018), *Wellcome Open Res* 3:124,")
-          print("PMID 30345391. Packaged for Windows by **IOWA-Tech - Giovanni Lorenzin**.")
+          print("PMID 30345391. Packaged for Windows by **IOWA-BioTech - Giovanni Lorenzin**.")
           print()
           print("Research use only. Not a medical device.")
           PY

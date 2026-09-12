@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: GPL-2.0-only
-# Copyright (C) 2025-2026 IOWA-Tech - Giovanni Lorenzin
+# Copyright (C) 2025-2026 IOWA-BioTech - Giovanni Lorenzin
 # Copyright (C) Torsten Seemann (upstream `mlst`, from which WMLST is ported)
 # Ported from scripts/mlst-make_blast_db:1-25 and bin/mlst:76-95
 """WMLST database updater — PubMLST / Pasteur BIGSdb refresh and BLAST index build.
@@ -26,6 +26,7 @@ Runtime dependencies are stdlib only; ``subprocess`` is never imported here —
 from __future__ import annotations
 
 import concurrent.futures
+import errno
 import functools
 import hashlib
 import importlib
@@ -55,9 +56,13 @@ from .version import __version__
 __all__ = [
     "REST_ROOTS",
     "USER_AGENT",
+    "FatalUpdateError",
+    "NetworkError",
+    "SchemeFailure",
     "SchemeRef",
     "SchemeUpdate",
     "UpdatePlan",
+    "UpdateResult",
     "apply",
     "build_blast_db",
     "build_manifest",
@@ -66,6 +71,7 @@ __all__ = [
     "db_version",
     "discover_new_schemes",
     "export_bundle",
+    "format_update_summary",
     "import_bundle",
     "index_is_stale",
     "journal_path",
@@ -509,6 +515,150 @@ class UpdatePlan:
 
 
 # --------------------------------------------------------------------------
+# 7.3 per-scheme failure isolation
+# --------------------------------------------------------------------------
+
+class FatalUpdateError(UpdateError):
+    """A condition under which NO scheme can succeed, so the run must stop.
+
+    The whole point of :func:`apply`'s isolation is that one bad scheme costs
+    the user only that scheme. That reasoning collapses when the failure is not
+    about a scheme at all -- the disk is full, the destination cannot be
+    written, a host has stopped answering entirely -- because carrying on would
+    then just reproduce the same failure 161 more times while the progress bar
+    pretends work is happening. Those conditions raise this instead of being
+    recorded and skipped.
+    """
+
+
+class NetworkError(UpdateError):
+    """A transport failure: the host could not be reached at all.
+
+    Per-scheme by default (one flaky download must not sink the run), but
+    counted: when EVERY scheme fails this way and none succeeded, there is no
+    network rather than 162 broken schemes, and :func:`apply` says so.
+    """
+
+
+#: ``errno`` values that mean the destination itself is unusable, not this file.
+_FATAL_ERRNOS = frozenset(
+    value for value in (getattr(errno, name, None) for name in
+                        ("ENOSPC", "EDQUOT", "EROFS", "EFBIG", "EIO", "ENODEV"))
+    if value is not None)
+
+
+def _is_fatal_oserror(exc) -> bool:
+    """True for an OSError that no other scheme could possibly survive either."""
+    return isinstance(exc, OSError) and exc.errno in _FATAL_ERRNOS
+
+
+def _one_line(text, limit: int = 160) -> str:
+    """Collapse ``text`` to one bounded line fit for a summary table."""
+    out = " ".join(str(text).split())
+    if len(out) > limit:
+        out = out[:limit - 3].rstrip() + "..."
+    return out
+
+
+@_frozen
+class SchemeFailure:
+    """One scheme that could not be updated, and why (section 7.3).
+
+    ``stage`` is where it broke -- ``resolve``, ``download``, ``validate`` or
+    ``commit`` -- which is what tells a user whether to retry, to check the
+    network, or to report a curation problem upstream. ``reason`` is already a
+    single bounded line, so a caller can print it without reformatting.
+    """
+
+    scheme: str
+    stage: str
+    reason: str
+
+    @property
+    def line(self) -> str:
+        """-> ``'<scheme>: <reason>'``, the one-line form used in summaries.
+
+        Several section 7.6 gates already name the scheme in their message, so
+        the prefix is not repeated when it is already there.
+        """
+        reason = self.reason
+        prefix = self.scheme + ": "
+        if reason.startswith(prefix):
+            reason = reason[len(prefix):]
+        return "%s: %s" % (self.scheme, reason)
+
+    @property
+    def pair(self) -> tuple:
+        """-> ``(scheme, reason)``, the documented public shape."""
+        return (self.scheme, self.reason)
+
+
+def format_update_summary(committed, unchanged, failed) -> str:
+    """-> the one-line end-of-run report (section 4.9).
+
+    ``"148 schemes updated, 3 unchanged, 2 could not be updated: kingella:
+    HTTP 404 ...; listeria_2: ..."``. Reported ONCE, at the end: a failure
+    announced mid-run scrolls past while 160 further schemes are downloading.
+    """
+    committed = tuple(committed)
+    unchanged = tuple(unchanged)
+    failed = tuple(failed)
+    text = "%d scheme%s updated, %d unchanged" % (
+        len(committed), "" if len(committed) == 1 else "s", len(unchanged))
+    if failed:
+        text += ", %d could not be updated: %s" % (
+            len(failed), "; ".join(f.line for f in failed))
+    return text
+
+
+class UpdateResult(str):
+    """What :func:`apply` returns: the new ``db/VERSION.txt``, plus the ledger.
+
+    It IS the version string -- ``str(result)``, ``result == "2026-09-12"`` and
+    every existing caller that treated :func:`apply`'s return value as text keep
+    working unchanged -- and it additionally carries ``committed``,
+    ``unchanged`` and ``failed`` so the GUI and the CLI can report
+    ``"148 schemes updated, 3 unchanged, 2 could not be updated: ..."`` without
+    re-reading the journal.
+    """
+
+    def __new__(cls, version, committed=(), unchanged=(), failed=()):
+        self = str.__new__(cls, version)
+        self.committed = tuple(committed)
+        self.unchanged = tuple(unchanged)
+        self.failed = tuple(failed)
+        return self
+
+    @property
+    def version(self) -> str:
+        """-> the ``db/VERSION.txt`` value as a plain :class:`str`."""
+        return str(self)
+
+    @property
+    def ok(self) -> bool:
+        """True when every chosen scheme was dealt with."""
+        return not self.failed
+
+    @property
+    def failed_pairs(self) -> tuple:
+        """-> ``((scheme, reason), ...)`` for callers that want plain tuples."""
+        return tuple(f.pair for f in self.failed)
+
+    @property
+    def failed_names(self) -> tuple:
+        return tuple(f.scheme for f in self.failed)
+
+    @property
+    def summary(self) -> str:
+        """-> the one-line end-of-run report (see :func:`format_update_summary`)."""
+        return format_update_summary(self.committed, self.unchanged, self.failed)
+
+    def __repr__(self) -> str:
+        return "UpdateResult(%r, committed=%d, unchanged=%d, failed=%d)" % (
+            str(self), len(self.committed), len(self.unchanged), len(self.failed))
+
+
+# --------------------------------------------------------------------------
 # HTTP layer — 7.4 etiquette
 # --------------------------------------------------------------------------
 
@@ -625,7 +775,7 @@ class _Fetcher:
             pauses = state.pauses
             state.paused_until = time.monotonic() + BREAKER_PAUSE
         if pauses >= BREAKER_MAX_PAUSES:
-            raise UpdateError(
+            raise FatalUpdateError(
                 "%s is not responding reliably; the update was stopped and can be "
                 "resumed later." % host)
         log.warning("pausing %s for %.0f s after repeated failures", host, BREAKER_PAUSE)
@@ -693,7 +843,7 @@ class _Fetcher:
             log.debug("retry %d/%d for %s in %.1fs (%s)",
                       attempt, MAX_ATTEMPTS, url, delay, last)
             self._sleep(delay)
-        raise UpdateError(
+        raise NetworkError(
             "Could not download %s after %d attempts (%s). Check your internet "
             "connection and try again." % (url, MAX_ATTEMPTS, last or "unknown error"))
 
@@ -764,6 +914,21 @@ class HttpStatusError(UpdateError):
     def is_undefined_scheme(self) -> bool:
         """True for the 404 that means 'this scheme no longer exists upstream'."""
         return self.code == 404 and "has not been defined" in self.message_text
+
+
+def _failure_reason(exc) -> str:
+    """-> the one-line reason recorded for a scheme that could not be updated."""
+    if isinstance(exc, HttpStatusError):
+        if exc.is_undefined_scheme:
+            return "Upstream no longer defines this scheme (HTTP 404)."
+        detail = (" " + exc.message_text) if exc.message_text else ""
+        return _one_line("The server refused the download (HTTP %d).%s"
+                         % (exc.code, detail))
+    if isinstance(exc, NetworkError):
+        return _one_line(exc)
+    if isinstance(exc, OSError):
+        return _one_line("The scheme could not be written (%s)." % exc)
+    return _one_line(exc)
 
 
 # --------------------------------------------------------------------------
@@ -1535,10 +1700,16 @@ def _chosen_names(plan: UpdatePlan, chosen) -> tuple:
     return tuple(sorted(set(picked), key=lambda s: s.encode("utf-8")))
 
 
+def _failed_records(failures):
+    """-> the JSON-safe form of ``failures`` written into the journal."""
+    return [{"scheme": f.scheme, "stage": f.stage, "reason": f.reason}
+            for f in failures]
+
+
 def apply(dbdir: str, plan: UpdatePlan, chosen, *, backup: bool = True,
           write_version_files: bool = False, progress=None, cancel=None,
           refs=None, allow_shrink: bool = False, force_blast: bool = False,
-          resume: bool = False, tools=None, fetcher=None) -> str:
+          resume: bool = False, tools=None, fetcher=None) -> UpdateResult:
     """Download, validate, commit per scheme, rebuild the index (sections 4.9, 7).
 
     ``chosen`` is an iterable of scheme names or :class:`SchemeUpdate` objects
@@ -1548,7 +1719,29 @@ def apply(dbdir: str, plan: UpdatePlan, chosen, *, backup: bool = True,
     recorded as ``date-moved-content-identical``: only its ``_info.json`` ledger
     is touched, the payload files are not rewritten and the BLAST index is not
     invalidated. Cancellation is honoured BETWEEN scheme commits, so the tree is
-    never left inconsistent. -> the new ``db/VERSION.txt`` value.
+    never left inconsistent.
+
+    A scheme that FAILS is isolated, not fatal (section 7.3). Upstream is 162
+    independently curated databases on two hosts; on any given day one of them
+    can 404, serve a truncated FASTA or publish a profile table that fails a
+    section 7.6 gate. Aborting the run there would mean the other 161 schemes
+    stay stale because of someone else's bad deploy, and the user has no way to
+    make progress except to guess which scheme to exclude. So the failure is
+    recorded as a :class:`SchemeFailure`, that scheme is left EXACTLY as it was
+    on disk -- the staging-plus-atomic-swap design of section 7.3 guarantees
+    this, since nothing touches the live directory until a fully validated copy
+    is ready to be renamed into place -- and the run carries on. The BLAST index
+    is then rebuilt from whatever did commit, and the failures are reported once
+    at the end.
+
+    Conditions under which nothing could work remain fatal and still stop the
+    run: cancellation, a :class:`FatalUpdateError` (a host that has stopped
+    answering, a full or read-only destination), a missing database directory,
+    and the case where every scheme failed at the transport layer, which means
+    there is no network rather than 162 broken schemes.
+
+    -> an :class:`UpdateResult`: the new ``db/VERSION.txt`` value as a string,
+    carrying ``committed``, ``unchanged`` and ``failed``.
     """
     refs = tuple(refs) if refs is not None else load_manifest(dbdir)
     by_name = {r.name: r for r in refs}
@@ -1561,6 +1754,8 @@ def apply(dbdir: str, plan: UpdatePlan, chosen, *, backup: bool = True,
     if unknown:
         raise UpdateError("Unknown scheme(s): %s" % ", ".join(sorted(unknown)))
 
+    failures = []
+
     # One fetch per upstream identity; aliases ride along (7.3).
     groups = {}
     for name in names:
@@ -1569,9 +1764,14 @@ def apply(dbdir: str, plan: UpdatePlan, chosen, *, backup: bool = True,
             continue
         ref = by_name[name]
         if not ref.resolved:
-            journal.record("scheme_error", scheme=name, reason="unresolved")
-            raise UpdateError(
-                "%s has no upstream mapping; fix db/%s first." % (name, MANIFEST_FILE))
+            failure = SchemeFailure(
+                name, "resolve",
+                "No upstream mapping is recorded for this scheme; fix db/%s."
+                % MANIFEST_FILE)
+            failures.append(failure)
+            journal.record("scheme_error", scheme=name, stage=failure.stage,
+                           reason=failure.reason)
+            continue
         source = by_name[ref.alias_of] if ref.alias_of and ref.alias_of in by_name else ref
         groups.setdefault(source.triple, {"source": source, "members": []})
         groups[source.triple]["members"].append(ref)
@@ -1580,6 +1780,8 @@ def apply(dbdir: str, plan: UpdatePlan, chosen, *, backup: bool = True,
     fetcher = fetcher or _Fetcher(cancel=cancel)
     dirty = []
     unchanged = []
+    attempted = 0
+    network_failures = 0
     total_groups = max(1, len(groups))
     index = 0
     try:
@@ -1591,10 +1793,15 @@ def apply(dbdir: str, plan: UpdatePlan, chosen, *, backup: bool = True,
             base = index / total_groups
             span = 1.0 / total_groups
             index += 1
+            attempted += 1
             label = "/".join(m.name for m in members)
             _emit(progress, base, "Downloading %s" % label)
             journal.record("scheme_fetch_begin", scheme=source.name,
                            members=[m.name for m in members], api=source.api)
+            # Members already committed within this group keep their commit: the
+            # swap that installed them is complete and independent of the rest.
+            settled = set()
+            stage = "download"
             try:
                 meta = fetcher.get_json(source.api)
                 locus_urls = list(meta.get("loci") or ())
@@ -1611,6 +1818,7 @@ def apply(dbdir: str, plan: UpdatePlan, chosen, *, backup: bool = True,
                     [profiles_url, *list(loci)],
                     progress=progress, base=base, span=span * 0.9,
                     message="Downloading %s" % label)
+                stage = "validate"
                 fields = _field_names(meta)
                 locus_names = [loci[u] for u in loci]
                 rows = validate_profiles(source.name, responses[profiles_url],
@@ -1621,11 +1829,13 @@ def apply(dbdir: str, plan: UpdatePlan, chosen, *, backup: bool = True,
                     alleles[locus] = responses[url].body
                 profiles = responses[profiles_url].body
                 digest = content_sha256(profiles, alleles)
+                stage = "commit"
                 for member in members:
                     _check_cancel(cancel)
                     if local_content_sha256(dbdir, member.name) == digest:
                         _touch_info(dbdir, member, meta, digest)
                         unchanged.append(member.name)
+                        settled.add(member.name)
                         journal.record("scheme_commit", scheme=member.name,
                                        status="date-moved-content-identical",
                                        sha256=digest, rows=rows)
@@ -1635,37 +1845,77 @@ def apply(dbdir: str, plan: UpdatePlan, chosen, *, backup: bool = True,
                                  write_version_files=write_version_files,
                                  allow_shrink=allow_shrink)
                     dirty.append(member.name)
+                    settled.add(member.name)
                     journal.record("scheme_commit", scheme=member.name,
                                    status="changed", sha256=digest, rows=rows)
-            except Cancelled:
+            except (Cancelled, FatalUpdateError):
                 raise
-            except UpdateError as exc:
-                journal.record("scheme_error", scheme=source.name, reason=str(exc))
-                raise
+            except (UpdateError, OSError) as exc:
+                if _is_fatal_oserror(exc):
+                    raise FatalUpdateError(
+                        "The database could not be written (%s). The update was "
+                        "stopped; every scheme already committed was left "
+                        "complete." % _one_line(exc)) from exc
+                if isinstance(exc, NetworkError):
+                    network_failures += 1
+                reason = _failure_reason(exc)
+                skipped = [m.name for m in members if m.name not in settled]
+                for skipped_name in skipped:
+                    failures.append(SchemeFailure(skipped_name, stage, reason))
+                journal.record("scheme_error", scheme=source.name,
+                               members=skipped, stage=stage, reason=reason)
+                log.warning("skipping %s (%s): %s", "/".join(skipped), stage, reason)
+                # The progress bar must keep moving through a failure: a run
+                # that stalls at 43 % looks hung even though it is working.
+                _emit(progress, base + span, "Skipped %s: %s" % (label, reason))
+                continue
             _emit(progress, base + span, "Updated %s" % label)
     except Cancelled:
         journal.record("run_end", status="cancelled", changed=dirty,
-                       unchanged=unchanged)
+                       unchanged=unchanged, failed=_failed_records(failures))
         raise
     except BaseException as exc:
         journal.record("run_end", status="error", changed=dirty,
-                       unchanged=unchanged, reason=str(exc))
+                       unchanged=unchanged, failed=_failed_records(failures),
+                       reason=str(exc))
         raise
+
+    if attempted and network_failures == attempted and not dirty and not unchanged:
+        # Every single scheme failed to reach its host: that is one broken
+        # connection, not 162 broken schemes, and the right answer is to say so
+        # rather than to report a list of identical timeouts.
+        journal.record("run_end", status="error", changed=[], unchanged=[],
+                       failed=_failed_records(failures),
+                       reason="no scheme could be downloaded")
+        raise FatalUpdateError(
+            "No scheme could be downloaded, so nothing was changed. Check your "
+            "internet connection and try again.")
 
     if backup:
         _write_rollback_meta(dbdir, plan.run_id, dirty)
     # Rebuild the index BEFORE stamping the version. Stamping first would leave a
     # failed rebuild advertising a fresh date over a stale or absent index, and
-    # the next run would then see nothing to do.
+    # the next run would then see nothing to do. It is built from whatever
+    # committed; a skipped scheme contributes the alleles it already had.
     if dirty or force_blast or index_is_stale(dbdir):
         _emit(progress, 0.95, "Rebuilding the BLAST database")
         build_blast_db(dbdir, tools, progress=progress, cancel=cancel)
-    version = stamp_db_version(dbdir, _today())
-    journal.record("run_end", status="ok", changed=dirty, unchanged=unchanged,
-                   db_version=version)
-    _emit(progress, 1.0, "Database updated (%d changed, %d already current)"
-          % (len(dirty), len(unchanged)))
-    return version
+    if dirty or unchanged or not failures:
+        version = stamp_db_version(dbdir, _today())
+    else:
+        # Nothing was verified against upstream, so the database is no fresher
+        # than it was: stamping today's date would hide that from the next run.
+        version = db_version(dbdir)
+    result = UpdateResult(version, dirty, unchanged, failures)
+    journal.record("run_end", status="partial" if failures else "ok",
+                   changed=dirty, unchanged=unchanged,
+                   failed=_failed_records(failures), db_version=version)
+    if failures:
+        log.warning("%s", result.summary)
+    # Reported ONCE, here, so the user reads one clean line instead of hunting
+    # through the log for whatever scrolled past thirty schemes ago.
+    _emit(progress, 1.0, result.summary)
+    return result
 
 
 # --------------------------------------------------------------------------

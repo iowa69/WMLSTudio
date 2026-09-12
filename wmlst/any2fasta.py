@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: GPL-2.0-only
-# Copyright (C) 2025-2026 IOWA-Tech - Giovanni Lorenzin
+# Copyright (C) 2025-2026 IOWA-BioTech - Giovanni Lorenzin
 # Copyright (C) Torsten Seemann (upstream `mlst`, from which WMLST is ported)
 """Pure-Python replacement for ``any2fasta`` 0.9.0 as invoked by ``mlst``.
 

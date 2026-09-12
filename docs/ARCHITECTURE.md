@@ -1,7 +1,7 @@
 # WMLST — Authoritative Implementation Specification
 
 **Product:** WMLST — native Windows 11 MLST typing from assembled contigs.
-**Vendor:** IOWA-Tech — Giovanni Lorenzin.
+**Vendor:** IOWA-BioTech — Giovanni Lorenzin.
 **Upstream:** a Python 3 port of `tseemann/mlst` **2.35.0** (GPL-2.0-only). Reference checkout used
 throughout this document:
 `/tmp/claude-1000/-home-iowa-Desktop-wmlst/12caaa71-cd44-4d35-9516-55648dcead69/scratchpad/ref-mlst`
@@ -480,7 +480,7 @@ No functions. No imports. This file is read by `pyproject.toml`
 ### 4.2 `wmlst/branding.py` — owner F
 
 ```python
-VENDOR:    str = "IOWA-Tech"
+VENDOR:    str = "IOWA-BioTech"
 AUTHOR:    str = "Giovanni Lorenzin"
 APP:       str = "WMLST"
 HOMEPAGE:  str = "https://github.com/iowa69/WMLST"
@@ -498,8 +498,8 @@ def banner_lines(db_version: str) -> list:
     (mirrors bin/mlst:55). Lines 1-2 carry the vendor and upstream attribution."""
 
 def window_title(running: "str | None" = None) -> str:
-    """-> 'WMLST 1.0.0 - MLST typing - IOWA-Tech . Giovanni Lorenzin', or
-       'WMLST - analysing 3 of 12 - IOWA-Tech . Giovanni Lorenzin' when `running` is given."""
+    """-> 'WMLST 1.0.0 - MLST typing - IOWA-BioTech . Giovanni Lorenzin', or
+       'WMLST - analysing 3 of 12 - IOWA-BioTech . Giovanni Lorenzin' when `running` is given."""
 
 def html_branding() -> dict:
     """-> Mapping[str, str] handed to report.render_html(); keys:
@@ -606,7 +606,7 @@ BLAST_MEMBERS: tuple = ("blastn.exe", "makeblastdb.exe", "nghttp2.dll", "blastdb
                         "blastdbcmd.exe.manifest", "LICENSE", "BLAST_PRIVACY")
 
 def install_root() -> str:
-    """-> %LOCALAPPDATA%\\IOWA-Tech\\WMLST  on Windows; ~/.local/share/wmlst elsewhere."""
+    """-> %LOCALAPPDATA%\\IOWA-BioTech\\WMLST  on Windows; ~/.local/share/wmlst elsewhere."""
 
 def find_blast(explicit: "str | None" = None) -> BlastTools:
     """Discovery ladder, first hit wins:
@@ -686,7 +686,7 @@ def ansi_safe(path: str) -> "str | None":
 
 def temp_root() -> str:
     """Ladder: %WMLST_TMPDIR% -> tempfile.gettempdir() if ansi_safe -> its short name ->
-    %LOCALAPPDATA%\\IOWA-Tech\\WMLST\\tmp -> C:\\ProgramData\\IOWA-Tech\\WMLST\\tmp ->
+    %LOCALAPPDATA%\\IOWA-BioTech\\WMLST\\tmp -> C:\\ProgramData\\IOWA-BioTech\\WMLST\\tmp ->
     %SystemDrive%\\WMLST-tmp. Validated by writing and deleting a probe file.
     MUST be <= ~40 chars so <root>\\wmlst-<pid>-<n>\\mlst.bls stays far below MAX_PATH."""
 
@@ -721,7 +721,7 @@ def resolve_dbdir(explicit: "str | None" = None) -> str:
 
 def resolve_blastdb(dbdir: str) -> str:
     """-> <dbdir>/blast/mlst.fa, UNLESS <dbdir>/blast is not writable AND the index is absent
-    there, in which case %LOCALAPPDATA%\\IOWA-Tech\\WMLST\\blast\\mlst.fa. Reading prefers the
+    there, in which case %LOCALAPPDATA%\\IOWA-BioTech\\WMLST\\blast\\mlst.fa. Reading prefers the
     writable location when it holds a complete index. Logs
     msg('BLAST database directory is read-only; using <path>') on the fallback."""
 
@@ -981,7 +981,7 @@ def reconfigure_streams() -> None:
 ```python
 REST_ROOTS = {"pubmlst": "https://rest.pubmlst.org",
               "pasteur": "https://bigsdb.pasteur.fr/api"}
-USER_AGENT = "WMLST/{version} (IOWA-Tech; Giovanni Lorenzin; https://github.com/iowa69/WMLST)"
+USER_AGENT = "WMLST/{version} (IOWA-BioTech; Giovanni Lorenzin; https://github.com/iowa69/WMLST)"
 
 @dataclass(frozen=True)
 class SchemeRef:
@@ -1114,7 +1114,7 @@ steps is a parity break. Read §0.1 first.
 4. Set logger quiet/debug flags.
 5. Emit the banner to stderr (suppressed by `--quiet`): line 0 is
    `This is wmlst 1.0.0 running on win32 with Python 3.12.4` (mirrors `bin/mlst:55`), lines 1–2 are
-   the IOWA-Tech / upstream attribution. The banner MUST NOT be merged into line 0, or `--version`
+   the IOWA-BioTech / upstream attribution. The banner MUST NOT be merged into line 0, or `--version`
    greps break.
 6. Dependency check (`bin/mlst:58-68`): with `--skipcheck`, `msg("Skipping dependency check due to
    --skipcheck")`. Otherwise `msg("Checking wmlst dependencies:")` then locate `blastn`
@@ -1776,7 +1776,7 @@ plus the index rebuild.
 
 Neither API documents a rate limit and neither throttled a 12-request burst, so the policy is
 self-imposed: **4 in-flight requests per host** (PubMLST and Pasteur counted separately), 100 ms
-per-worker delay, an identifiable `User-Agent` naming WMLST, IOWA-Tech, Giovanni Lorenzin and the
+per-worker delay, an identifiable `User-Agent` naming WMLST, IOWA-BioTech, Giovanni Lorenzin and the
 repository URL. Retry on 429/500/502/503/504 and on connect/read timeouts: 5 attempts, exponential
 backoff 1/2/4/8/16 s with ±25 % jitter, honouring `Retry-After`. **Never retry 400/401/403/404.**
 Circuit breaker: 10 consecutive failures against one host pauses it for 60 s; three pauses abort the
@@ -1870,7 +1870,7 @@ next to `blastn.exe` where the build machine's licence permits; (3) detect retur
 and show the `https://aka.ms/vs/17/release/vc_redist.x64.exe` message. Never surface the raw
 `WinError`.
 
-Install root `%LOCALAPPDATA%\IOWA-Tech\WMLST\blast\` — per-user, no elevation, **not** OneDrive
+Install root `%LOCALAPPDATA%\IOWA-BioTech\WMLST\blast\` — per-user, no elevation, **not** OneDrive
 Known-Folder-Move synced (so the index is never turned into a cloud placeholder, and no
 `ERROR_SHARING_VIOLATION` from a sync lock), and excluded from roaming profiles. The
 `.wmlst-install-ok` sentinel is written **last**, after `SHA256SUMS` verifies, so a half-extracted
@@ -1939,7 +1939,7 @@ Defender: the first-run scan storm is mitigated primarily by selective extractio
 search after install touches every mapped page of `.nsq`/`.nin`/`.nhr` and can take several times
 longer than steady state, so the GUI shows *"Preparing database (first run may take a minute)…"*.
 Ship `scripts/Add-DefenderExclusion.ps1` (`Add-MpPreference -ExclusionPath
-"$env:LOCALAPPDATA\IOWA-Tech\WMLST"`) and **offer** it under Help → Troubleshooting; never invoke it
+"$env:LOCALAPPDATA\IOWA-BioTech\WMLST"`) and **offer** it under Help → Troubleshooting; never invoke it
 silently and never request elevation. Warn — do not block — when `--datadir`/`--blastdb` points
 under a OneDrive root or a UNC path (Files-On-Demand turns `.nsq` into a placeholder and `blastn`'s
 mmap triggers a synchronous cloud fetch mid-search). If an output write fails with `WinError 5`,
@@ -2446,7 +2446,7 @@ the ported parts and MIT for the new ones" (§2(b) licenses the derivative as a 
 * **Attribution is mandatory and must credit upstream first.** The README's ATTRIBUTION section,
   the GUI About box, the HTML report colophon and the CLI banner all name **Torsten Seemann** and
   the PubMLST citation (Jolley, Bray & Maiden 2018, *Wellcome Open Res* 3:124, PMID 30345391)
-  alongside the IOWA-Tech / Giovanni Lorenzin packaging credit.
+  alongside the IOWA-BioTech / Giovanni Lorenzin packaging credit.
 
 ### 13.4 Test strategy
 
@@ -2483,7 +2483,7 @@ against `tests/golden/help.txt`.
 | `Checking wmlst dependencies:` | `cli` | bats 21 (negative) |
 | `SCHEME\tLOCII\tTYPES\tALLELES\tDATE\tLOCII_NAMES` | `report.write_info` | bats 10 |
 | `Setting --minscore=0 because user chose --scheme` | `cli` | added case 48 |
-| `IOWA-Tech`, `Giovanni Lorenzin` | `branding` | added case 51 (banner, `--help`, HTML report) |
+| `IOWA-BioTech`, `Giovanni Lorenzin` | `branding` | added case 51 (banner, `--help`, HTML report) |
 
 CI: `ubuntu-latest` (lint, mypy, stdlib-only check, icon check, tests on 3.9/3.12/3.13 with apt
 `ncbi-blast+`) and `windows-latest` (bootstrap, tests, PyInstaller build, exe smoke test, Inno
@@ -2551,7 +2551,7 @@ A release candidate is acceptable only when **all** of these hold.
 9. `wmlst-cli.exe --quiet --skipcheck tests\data\example.fna` prints a row containing
    `\tsepidermidis\t184\t`.
 10. The HTML report for every fixture contains no external reference, survives every escaping
-    payload, parses as valid HTML, and carries `IOWA-Tech` and `Giovanni Lorenzin`.
+    payload, parses as valid HTML, and carries `IOWA-BioTech` and `Giovanni Lorenzin`.
 11. The installer installs and uninstalls cleanly for a non-admin user, SmartScreen behaves exactly
     as the README says it will, and `SHA256SUMS.txt` verifies.
 12. `LICENSE`, `NOTICE`, the README ATTRIBUTION section, the GUI About box and the report colophon
@@ -2559,5 +2559,5 @@ A release candidate is acceptable only when **all** of these hold.
 
 ---
 
-*WMLST — IOWA-Tech · Giovanni Lorenzin. Port of `mlst` 2.35.0 by Torsten Seemann (GPL-2.0-only).
+*WMLST — IOWA-BioTech · Giovanni Lorenzin. Port of `mlst` 2.35.0 by Torsten Seemann (GPL-2.0-only).
 Allele data © PubMLST / Institut Pasteur — cite Jolley, Bray & Maiden (2018), PMID 30345391.*

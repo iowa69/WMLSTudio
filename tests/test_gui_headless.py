@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: GPL-2.0-only
-# Copyright (C) 2025-2026 IOWA-Tech - Giovanni Lorenzin
+# Copyright (C) 2025-2026 IOWA-BioTech - Giovanni Lorenzin
 # Copyright (C) Torsten Seemann (upstream `mlst`, from which WMLST is ported)
 """GUI tests that need no display (docs/ARCHITECTURE.md section 10).
 
@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import dataclasses
 import json
+import math
 import os
 import shutil
 import sys
@@ -694,11 +695,13 @@ def test_the_whole_window_builds_and_shows_a_result():
         app.refresh_footer()
         app.settings_view.set_scheme_choices(app.env.scheme_names)
 
-        # the three tabs, the title, the footer credit
-        assert root.title() == "WMLST — MLST typing for Windows — IOWA-Tech"
-        assert [app.notebook.tab(i, "text") for i in range(3)] == [
-            "Analyse", "Database", "Settings"]
-        assert "IOWA-Tech" in app.footer_env.master.winfo_children()[0].cget("text")
+        # the four tabs, the title, the footer credit
+        assert root.title() == "WMLST — MLST typing for Windows — IOWA-BioTech"
+        assert [app.notebook.tab(i, "text") for i in range(4)] == [
+            "Analyse", "Tree", "Database", "Settings"]
+        # the tree tab is disabled until two isolates share a scheme
+        assert str(app.notebook.tab(app.mst_view, "state")) == "disabled"
+        assert "IOWA-BioTech" in app.footer_env.master.winfo_children()[0].cget("text")
 
         # drive one fake batch through the real controller and the real view
         app.controller._engine_factory = lambda cfg: FakeEngine(cfg)
@@ -1573,6 +1576,7 @@ def test_the_drop_zone_animates_once_and_stops_on_every_pause_condition():
         for pause, resume in (
                 (lambda: zone.animate(False), lambda: zone.animate(True)),
                 (lambda: zone._on_unmap(), lambda: zone._on_map()),
+                (lambda: zone.set_showing(False), lambda: zone.set_showing(True)),
                 (lambda: zone.set_enabled(False), lambda: zone.set_enabled(True))):
             pause()
             assert zone._anim_after is None, "a paused zone kept a timer"
@@ -2222,3 +2226,683 @@ def test_stopping_the_engines_is_safe_with_nothing_running():
         # shutdown() latches the module; the rest of the suite still needs it
         blastbin.reset_shutdown()
     assert blastbin.is_shutting_down() is False
+
+
+# ---------------------------------------------------------------------------
+# the tree page (section 10.10): colour, the rasteriser, the PNG, the labels
+# ---------------------------------------------------------------------------
+def make_tree_results(n: int = 6, scheme: str = "kpneu") -> list:
+    """``n`` results of one scheme, three STs, one profile each."""
+    profiles = (("11", ("3", "3", "1", "1", "1", "1", "79")),
+                ("11", ("3", "3", "1", "1", "1", "1", "79")),
+                ("258", ("3", "3", "1", "1", "1", "1", "79")),
+                ("258", ("3", "3", "1", "1", "1", "2", "79")),
+                ("23", ("2", "1", "1", "1", "9", "4", "12")),
+                ("37", ("2", "1", "1", "1", "9", "4", "-")))
+    loci = ("gapA", "infB", "mdh", "pgi", "phoE", "rpoB", "tonB")
+    out = []
+    for i in range(n):
+        st, codes = profiles[i % len(profiles)]
+        alleles = tuple(
+            AlleleCall(locus=locus, code=code, symbol="exact",
+                       best=make_hit(locus, code), hits=(make_hit(locus, code),))
+            for locus, code in zip(loci, codes))
+        out.append(dataclasses.replace(
+            make_result("GCF_00{}0001.1_ASM{}v1_genomic.fna".format(i, i)),
+            label="/some/where/GCF_00{}0001.1_ASM{}v1_genomic.fna".format(i, i),
+            scheme=scheme, st=st, alleles=alleles))
+    return out
+
+
+def test_the_categorical_palette_is_even_deterministic_and_distinct():
+    """N groups must give N colours nobody has to guess between."""
+    for n in (1, 2, 3, 7, 12, 25):
+        swatches = gui.categorical_palette(n, "light")
+        assert len(swatches) == n
+        assert len(set(swatches)) == n, swatches
+        for value in swatches:
+            assert len(value) == 7 and value.startswith("#")
+        # fixed lightness is the whole point: no swatch may be twice as light
+        # as another, which is what stepping an HSV hue would have given.
+        lums = [_luminance(v) for v in swatches]
+        assert max(lums) - min(lums) < 0.16, (n, round(max(lums) - min(lums), 3))
+    assert gui.categorical_palette(8, "light") == gui.categorical_palette(8, "light")
+    assert gui.categorical_palette(8, "dark") != gui.categorical_palette(8, "light")
+
+
+def test_oklch_always_lands_inside_the_srgb_gamut():
+    for hue in range(0, 360, 7):
+        value = gui.oklch_hex(0.62, 0.30, float(hue))     # 0.30 is out of gamut
+        assert len(value) == 7
+        for i in (1, 3, 5):
+            assert 0 <= int(value[i:i + 2], 16) <= 255
+
+
+def test_easing_is_bounded_monotonic_and_flat_at_both_ends():
+    for fn in (gui.ease_in_out, gui.ease_out):
+        assert fn(0.0) == 0.0 and fn(1.0) == 1.0
+        assert fn(-3.0) == 0.0 and fn(4.0) == 1.0
+        previous = -1.0
+        for i in range(41):
+            value = fn(i / 40.0)
+            assert value >= previous - 1e-9, (fn, i)
+            previous = value
+    # smoothstep is symmetric about the middle, which is what "ease in AND out"
+    # means; a linear ramp would fail this at every sample.
+    assert abs(gui.ease_in_out(0.5) - 0.5) < 1e-9
+    assert gui.ease_in_out(0.25) < 0.25 and gui.ease_in_out(0.75) > 0.75
+
+
+def test_every_printable_ascii_has_a_glyph_and_descenders_descend():
+    for code in range(32, 127):
+        rows = gui.FONT5X7.get(chr(code))
+        assert rows is not None and len(rows) == gui.GLYPH_H, chr(code)
+        assert all(0 <= bits < 32 for bits in rows), chr(code)
+    assert all(bits == 0 for bits in gui.FONT5X7[" "]), "space is not blank"
+    # the bug this font was re-cut for: p/g/q/y need the row below the baseline,
+    # or "groups" renders as "9roups".
+    for ch in "pgqyj,":
+        assert gui.FONT5X7[ch][gui.GLYPH_H - 1] != 0, ch
+    assert gui.FONT5X7["g"] != gui.FONT5X7["9"]
+    assert gui.FONT5X7["p"] != gui.FONT5X7["P"]
+
+
+def test_text_width_is_never_smaller_than_what_the_raster_draws():
+    """The label placer reserves text_width(); the renderer must fit inside it."""
+    for size in (9.0, 11.0, 12.5, 16.0, 23.0, 26.0, 32.5, 48.0):
+        for text in ("A", "GCF_002278055.1  ST 11", "iiii", "WWWWWWWW"):
+            scale = max(1, int(size / float(gui.GLYPH_H)))
+            drawn = len(text) * gui.GLYPH_ADVANCE * scale - scale
+            assert drawn <= gui.text_width(text, size) + 1e-9, (size, text)
+
+
+def test_the_raster_writes_a_real_png_that_decodes():
+    import struct as _struct
+    import zlib as _zlib
+
+    raster = gui.Raster(40, 20, "#ffffff")
+    raster.rect(2, 2, 38, 18, fill="#2563eb", outline="#000000", width=1, radius=3)
+    raster.text(20, 10, "ok", "#ffffff", 9, anchor="c")
+    data = raster.png_bytes()
+    assert data[:8] == b"\x89PNG\r\n\x1a\n"
+    assert data[12:16] == b"IHDR"
+    width, height, depth, colour = _struct.unpack(">IIBB", data[16:26])
+    assert (width, height, depth, colour) == (40, 20, 8, 2)
+    # pull IDAT back out and check the middle pixel really is the fill
+    offset, idat = 8, b""
+    while offset < len(data):
+        length = _struct.unpack(">I", data[offset:offset + 4])[0]
+        tag = data[offset + 4:offset + 8]
+        if tag == b"IDAT":
+            idat += data[offset + 8:offset + 8 + length]
+        offset += 12 + length
+    raw = _zlib.decompress(idat)
+    stride = width * 3 + 1
+    assert len(raw) == stride * height
+    for row in range(height):
+        assert raw[row * stride] == 0, "filter must be None"
+    pixel = raw[5 * stride + 1 + 20 * 3:5 * stride + 1 + 20 * 3 + 3]
+    assert tuple(pixel) == (0x25, 0x63, 0xeb), pixel.hex()
+
+
+def test_the_raster_leaves_the_ground_alone_outside_a_shape():
+    raster = gui.Raster(30, 30, "#ffffff")
+    raster.disc(15, 15, 5, fill="#000000")
+    assert raster.buf[0:3] == bytearray(b"\xff\xff\xff")
+    middle = (15 * 30 + 15) * 3
+    assert raster.buf[middle] < 40
+
+
+def test_place_labels_keeps_labels_off_each_other():
+    points = [(0.0, 0.0), (30.0, 0.0), (60.0, 0.0), (0.0, 30.0), (30.0, 30.0)]
+    radii = [7.0] * 5
+    texts = ["GCF_00%d ST 11" % i for i in range(5)]
+    labels = gui.place_labels(points, radii, texts, 12.0,
+                              [(0.0, 0.0, 30.0, 0.0)], gap=5.0)
+    assert len(labels) == 5
+    assert [lab.index for lab in labels] == list(range(5))
+    for i, first in enumerate(labels):
+        for second in labels[i + 1:]:
+            assert gui._overlap(first.box, second.box) == 0.0, (first, second)
+    # deterministic
+    again = gui.place_labels(points, radii, texts, 12.0,
+                             [(0.0, 0.0, 30.0, 0.0)], gap=5.0)
+    assert [(lab.x, lab.y, lab.anchor) for lab in labels] == \
+           [(lab.x, lab.y, lab.anchor) for lab in again]
+
+
+def test_a_label_pushed_far_out_gets_a_leader_line():
+    # twelve isolates piled on one another: somebody has to go a long way out
+    points = [(math.cos(i) * 6.0, math.sin(i) * 6.0) for i in range(12)]
+    labels = gui.place_labels(points, [6.0] * 12,
+                              ["isolate_number_%02d ST 258" % i for i in range(12)],
+                              12.0, (), gap=4.0)
+    assert any(lab.leader is not None for lab in labels)
+    for lab in labels:
+        if lab.leader is not None:
+            assert len(lab.leader) == 4
+
+
+def test_segment_box_intersection():
+    box = (0.0, 0.0, 10.0, 10.0)
+    assert gui._segment_hits_box(-5.0, 5.0, 15.0, 5.0, box) is True
+    assert gui._segment_hits_box(-5.0, -5.0, -1.0, -1.0, box) is False
+    assert gui._segment_hits_box(5.0, 5.0, 6.0, 6.0, box) is True
+
+
+def test_compact_labels_shorten_but_stay_distinct():
+    names = ["GCF_002278055.1_ASM227805v1_genomic",
+             "GCF_001902235.1_ASM190223v1_genomic",
+             "GCF_002164835.4_ASM216483v4_genomic"]
+    short = gui.compact_labels(names, 21)
+    assert short == ["GCF_002278055.1", "GCF_001902235.1", "GCF_002164835.4"]
+    assert len(set(short)) == 3
+    # a set whose names differ ONLY in the tail may not be shortened into one
+    same = ["sample_A_run1", "sample_A_run2"]
+    assert gui.compact_labels(same, 6) == gui.compact_labels(same, 6)
+    assert len(set(gui.compact_labels(same, 6))) == 2
+    # nothing to drop: elide the middle, never the head
+    long_one = gui.compact_labels(["A" * 40], 20)[0]
+    assert len(long_one) <= 20 and long_one.startswith("AAAAAA") and ".." in long_one
+
+
+def test_isolate_label_drops_the_folder_and_the_suffix():
+    assert gui.isolate_label("/a/b/GCF_1.1_genomic.fna") == "GCF_1.1_genomic"
+    assert gui.isolate_label("/a/b/sample.fna.gz") == "sample"
+    assert gui.isolate_label("plain") == "plain"
+    assert gui.isolate_label("") == ""
+
+
+def test_node_radius_grows_with_the_count_and_is_capped():
+    assert gui.node_radius(1) < gui.node_radius(2) < gui.node_radius(9)
+    assert gui.node_radius(10_000) <= 20.0
+    assert gui.node_radius(0) == gui.node_radius(1)
+
+
+def test_st_sort_key_puts_numbers_first_and_in_order():
+    keys = sorted(["258", "11", "-", "1777", "novel"], key=gui.mst_st_key)
+    assert keys[:3] == ["11", "258", "1777"]
+
+
+def test_prims_bbox_covers_text_and_discs():
+    prims = [gui.Prim("disc", x=0.0, y=0.0, r=5.0),
+             gui.Prim("text", x=100.0, y=0.0, text="hello", size=10.0, anchor="w")]
+    x0, y0, x1, _y1 = gui.prims_bbox(prims)
+    assert x0 <= -5.0 and y0 < 0.0
+    assert x1 >= 100.0 + gui.text_width("hello", 10.0) - 1.0
+    assert gui.prims_bbox(()) == (0.0, 0.0, 1.0, 1.0)
+
+
+# ---------------------------------------------------------------------------
+# the tree page, on a real display
+# ---------------------------------------------------------------------------
+def _app_with_tree(n: int = 6, width: int = 900, height: int = 600):
+    """An app with ``n`` typed isolates and a tree canvas of a known size.
+
+    The canvas is given its size by hand rather than by mapping the window: a
+    real layout pass costs seconds on a slow X server, and every assertion here
+    is about what the view DRAWS, which only needs the two numbers.
+    """
+    root, app = _idle_app()
+    for res in make_tree_results(n):
+        app.analyse_view.add_result(res)
+    app.refresh_tree_tab()
+    view = app.mst_view
+    view.canvas.winfo_width = lambda: width      # type: ignore[method-assign]
+    view.canvas.winfo_height = lambda: height    # type: ignore[method-assign]
+    return root, app
+
+
+def test_the_tree_tab_is_locked_until_two_isolates_share_a_scheme():
+    root, app = _idle_app()
+    try:
+        assert app.mst_view.available() is False
+        assert str(app.notebook.tab(app.mst_view, "state")) == "disabled"
+        app.analyse_view.add_result(make_tree_results(1)[0])
+        app.refresh_tree_tab()
+        assert app.mst_view.available() is False, "one isolate is not a tree"
+        app.analyse_view.add_result(make_tree_results(2)[1])
+        app.refresh_tree_tab()
+        assert app.mst_view.available() is True
+        assert str(app.notebook.tab(app.mst_view, "state")) == "normal"
+    finally:
+        root.destroy()
+
+
+def test_both_tree_views_draw_and_keep_one_palette():
+    root, app = _app_with_tree()
+    try:
+        view = app.mst_view
+        view.activate()
+        assert view.scheme == "kpneu"
+        assert view.tree_obj is not None and view.tree_obj.n_nodes == 6
+        assert view.canvas.find_all(), "the clonality view drew nothing"
+        clonal_colours = set(view._colours.values())
+        assert len(clonal_colours) >= 2
+        # SIX, not seven: one isolate has no tonB call, and mst reports the
+        # smallest number of loci any kept edge was actually measured over.
+        assert "6 loci compared" in view.subtitle.cget("text")
+        assert "kpneu" in view.subtitle.cget("text")
+
+        # every dot is sized by how many isolates share its ST
+        radii = {p.tag: p.r for p in view._scene if p.kind == "disc"}
+        assert len(set(radii.values())) >= 2, radii
+
+        # edges carry the allelic distance as a number
+        numbers = [p.text for p in view._scene if p.kind == "text"]
+        assert numbers and all(t.isdigit() for t in numbers)
+
+        view.set_mode(gui.VIEW_LABELLED)
+        assert view.mode == gui.VIEW_LABELLED
+        labels = [p.text for p in view._scene
+                  if p.kind == "text" and p.tag == "label"]
+        assert len(labels) == 6, labels
+        assert all("ST " in t for t in labels)
+        assert any("GCF_" in t for t in labels)
+        # the same generator feeds both views, so the swatches come from one set
+        assert set(view._colours.values()) <= set(
+            gui.categorical_palette(12)) | clonal_colours | {
+                gui.mix(gui.c("surface"), gui.c("muted"), 0.86)}
+    finally:
+        root.destroy()
+
+
+def test_a_clicked_node_shows_its_whole_profile():
+    root, app = _app_with_tree()
+    try:
+        view = app.mst_view
+        view.activate()
+        label = view._nodes[0].label
+        view.select(label)
+        assert view.pick_name.cget("text") == label
+        assert "ST " in view.pick_meta.cget("text")
+        rows = view.profile.get_children("")
+        assert len(rows) == 7, "all seven loci must be listed"
+        assert view.profile.item(rows[0], "text") == "gapA"
+        assert "Nearest" in view.pick_near.cget("text")
+    finally:
+        root.destroy()
+
+
+def test_the_tree_zooms_pans_and_fits_without_losing_the_drawing():
+    root, app = _app_with_tree()
+    try:
+        view = app.mst_view
+        view.activate()
+        view.fit()
+        fitted, origin = view._zoom, list(view._origin)
+        view.zoom_by(2.0, 100.0, 100.0)
+        assert view._zoom > fitted
+        view.zoom_by(0.001)
+        assert view._zoom >= gui.ZOOM_MIN
+        view.zoom_by(10_000.0)
+        assert view._zoom <= gui.ZOOM_MAX
+        view.fit()
+        assert abs(view._zoom - fitted) < 1e-6
+        assert [round(v, 3) for v in view._origin] == [round(v, 3) for v in origin]
+        assert view.canvas.find_all()
+    finally:
+        root.destroy()
+
+
+def test_saving_the_tree_writes_a_png_carrying_the_legend():
+    root, app = _app_with_tree()
+    try:
+        view = app.mst_view
+        view.activate()
+        data = view.png_bytes(scale=1.5)
+        assert data[:8] == b"\x89PNG\r\n\x1a\n"
+        assert len(data) > 2000
+        overlay = view._overlay_prims(900.0, 600.0, caption=True)
+        assert any(p.kind == "text" and "loci compared" in p.text for p in overlay)
+        assert any(p.kind == "disc" for p in overlay), "no legend swatches"
+        view.legend_box.set(False)
+        view._legend_toggled()
+        assert view._legend_size() == (0.0, 0.0)
+        assert not any(p.kind == "disc"
+                       for p in view._overlay_prims(900.0, 600.0))
+    finally:
+        root.destroy()
+
+
+def test_the_legend_is_a_strip_below_the_picture_and_never_over_it():
+    """Nothing is painted on top of the drawing, so no isolate can be hidden.
+
+    A legend panel floating in the canvas corner covered whichever names
+    happened to be under it, and at "Fit" there was nowhere to pan them out to.
+    """
+    root, app = _app_with_tree(n=6, width=520, height=360)
+    try:
+        view = app.mst_view
+        view.legend_strip.winfo_width = lambda: 520   # type: ignore[method-assign]
+        view.set_mode(gui.VIEW_LABELLED)
+        view.activate()
+        assert view._legend, "the labelled view always has sequence types"
+        placed, height = view._strip_plan(520.0)
+        assert len(placed) == len(view._legend), "an entry was dropped"
+        assert height > 2 * view.STRIP_PAD
+        rows = max(row for _x, row, _s, _t in placed) + 1
+        assert 1 <= rows <= view.STRIP_MAX_ROWS
+        # a narrow strip wraps into more rows and gets taller, never wider
+        narrow, tall = view._strip_plan(200.0)
+        assert tall >= height and len(narrow) <= len(placed)
+        # and the canvas itself carries no legend: only tree primitives
+        view._redraw()
+        assert view.canvas.find_all(), "nothing was drawn"
+        assert not any(p.kind == "rect" and p.outline for p in view._scene)
+    finally:
+        root.destroy()
+
+
+def test_fit_frames_every_isolate_in_both_views():
+    """"Fit" that leaves an isolate off the edge is a button telling a lie."""
+    root, app = _app_with_tree(n=6, width=520, height=360)
+    try:
+        view = app.mst_view
+        for mode in (gui.VIEW_CLONAL, gui.VIEW_LABELLED):
+            view.set_mode(mode)
+            view.activate()
+            view.fit()
+            zoom, (ox, oy) = view._zoom, view._origin
+            for node in view._nodes:
+                sx, sy = node.x * zoom + ox, node.y * zoom + oy
+                assert -1.0 <= sx <= 521.0, (mode, node.label, sx)
+                assert -1.0 <= sy <= 361.0, (mode, node.label, sy)
+    finally:
+        root.destroy()
+
+
+def test_an_isolate_on_its_own_is_called_a_singleton_not_a_group():
+    """The legend calls it a singleton; the side panel must not call it group 4."""
+    root, app = _app_with_tree(n=5)
+    try:
+        view = app.mst_view
+        view.activate()
+        lone = [node for node in view.tree_obj.nodes
+                if len([g for g in view.tree_obj.groups
+                        if g.id == node.group and g.size == 1]) == 1]
+        assert lone, "this fixture is supposed to have one isolate on its own"
+        view.select(lone[0].label)
+        assert "singleton" in view.pick_meta.cget("text")
+        assert "clonal group" not in view.pick_meta.cget("text")
+        crowd = next(node for node in view.tree_obj.nodes if node not in lone)
+        view.select(crowd.label)
+        assert "clonal group" in view.pick_meta.cget("text")
+    finally:
+        root.destroy()
+
+
+def test_the_empty_tree_page_explains_what_to_do():
+    root, app = _idle_app()
+    try:
+        app.mst_view.activate()
+        assert app.mst_view.empty.winfo_manager(), "the empty state is not shown"
+        assert not app.mst_view.body.winfo_manager()
+        texts = []
+
+        def walk(widget):
+            try:
+                texts.append(str(widget.cget("text")))
+            except Exception:
+                pass
+            for child in widget.winfo_children():
+                walk(child)
+
+        walk(app.mst_view.empty)
+        joined = " ".join(texts).lower()
+        assert "two" in joined and "same scheme" in joined
+    finally:
+        root.destroy()
+
+
+# ---------------------------------------------------------------------------
+# the drop-zone animation: frame rate, easing, the wordmark
+# ---------------------------------------------------------------------------
+def test_the_animation_runs_at_sixty_and_eases_between_loci():
+    assert gui.DropZone.FPS_MS <= 17, "30 fps is where the sweep visibly stepped"
+    # one full circuit still takes about five and a half seconds
+    circuit = gui.DropZone.LOCI * gui.DropZone.FPS_MS / gui.DropZone.SWEEP_PER_FRAME
+    assert 4500 <= circuit <= 7000, circuit
+
+
+def test_the_wordmark_sits_inside_the_chromosome_ring():
+    root, app = _idle_app()
+    try:
+        zone = app.analyse_view.dropzone
+        # Sized by hand: a real layout pass costs seconds on a slow display and
+        # the drawing only ever reads these two numbers.
+        zone.winfo_width = lambda: 900      # type: ignore[method-assign]
+        zone.winfo_height = lambda: 520     # type: ignore[method-assign]
+        zone.redraw()
+        mark = zone._items.get("mark")
+        assert mark is not None, "no wordmark was drawn"
+        assert zone.itemcget(mark, "text") == gui.WORDMARK == "IOWA-BioTech"
+        mx, my = zone.coords(mark)
+        assert abs(mx - zone._geo["cx"]) < 2 and abs(my - zone._geo["cy"]) < 2
+        # it is FITTED to the ring, never merely placed in it
+        assert zone._mark_font.measure(gui.WORDMARK) <= zone._geo["r"] * 1.35
+
+        # a ring too small to hold it legibly gets no wordmark at all
+        zone._items = {}
+        zone._draw_wordmark(10.0, 10.0, 8.0, zone._colours())
+        assert "mark" not in zone._items
+
+        # reduced motion still draws it, in the one static frame, with no timer
+        zone._static = True
+        zone.redraw()
+        assert zone._items.get("mark") is not None
+        assert zone._anim_after is None
+    finally:
+        root.destroy()
+
+
+def test_the_locus_sweep_is_a_soft_hue_ramp_not_one_flat_blue():
+    root, app = _idle_app()
+    try:
+        zone = app.analyse_view.dropzone
+        hues = zone.locus_colours()
+        assert len(hues) == gui.DropZone.LOCI
+        assert len(set(hues)) == gui.DropZone.LOCI, hues
+        lums = [_luminance(h) for h in hues]
+        assert max(lums) - min(lums) < 0.16, lums
+        assert zone.locus_colours() is zone.locus_colours(), "not memoised"
+        # eased sweep: the head slows into each locus instead of gliding
+        zone._phase = 0.0
+        assert zone.sweep() == 0.0
+        zone._phase = 0.25
+        assert zone.sweep() < 0.25
+        zone._phase = 0.75
+        assert zone.sweep() > 0.75
+        zone._phase = 3.5
+        assert abs(zone.sweep() - 3.5) < 1e-9
+    finally:
+        root.destroy()
+
+
+# ---------------------------------------------------------------------------
+# usability: the results filter, the tab shortcuts, the update summary
+# ---------------------------------------------------------------------------
+def test_the_results_filter_hides_rows_and_gives_them_all_back():
+    root, app = _idle_app()
+    try:
+        view = app.analyse_view
+        for res in make_tree_results(6):
+            view.add_result(res)
+        root.update_idletasks()
+        assert len(view.tree.get_children("")) == 6
+        assert "(6)" in view.results_title.cget("text")
+
+        view.set_filter("ST 258")            # matches nothing: the ST cell is "258"
+        assert len(view.tree.get_children("")) == 0
+        assert "nothing matches" in view.results_hint.cget("text").lower()
+
+        view.set_filter("258")
+        assert len(view.tree.get_children("")) == 2
+        assert "of 6" in view.results_title.cget("text")
+
+        view.set_filter("gcf_0050001")
+        assert len(view.tree.get_children("")) == 1
+
+        view.clear_filter()
+        root.update_idletasks()
+        assert len(view.tree.get_children("")) == 6
+        # and the original order came back, not "matching first"
+        names = [view.tree.item(i, "text") for i in view.tree.get_children("")]
+        assert names == [view.tree.item(i, "text") for i in view._rows]
+    finally:
+        root.destroy()
+
+
+def test_sorting_survives_a_filter():
+    root, app = _idle_app()
+    try:
+        view = app.analyse_view
+        for res in make_tree_results(6):
+            view.add_result(res)
+        root.update_idletasks()
+        view.set_filter("258")
+        view.sort_by("st")
+        assert len(view.tree.get_children("")) == 2
+        view.clear_filter()
+        root.update_idletasks()
+        assert len(view.tree.get_children("")) == 6
+        assert len(view._rows) == 6
+    finally:
+        root.destroy()
+
+
+def test_control_number_switches_tabs_and_refuses_a_locked_one():
+    root, app = _idle_app()
+    try:
+        app.select_tab(3)
+        assert app.notebook.nametowidget(app.notebook.select()) is app.settings_view
+        app.select_tab(1)          # the tree tab, still locked
+        assert app.notebook.nametowidget(app.notebook.select()) is app.settings_view
+        assert "same" in app.status.label.cget("text").lower()
+        app.select_tab(0)
+        assert app.notebook.nametowidget(app.notebook.select()) is app.analyse_view
+        app.select_tab(99)         # out of range is a no-op, never an exception
+    finally:
+        root.destroy()
+
+
+class FakeFailure:
+    def __init__(self, scheme, reason):
+        self.scheme = scheme
+        self.reason = reason
+        self.pair = (scheme, reason)
+
+    @property
+    def line(self):
+        return "%s: %s" % (self.scheme, self.reason)
+
+
+class FakeUpdateResult(str):
+    def __new__(cls, version, committed=(), unchanged=(), failed=()):
+        self = str.__new__(cls, version)
+        self.committed = tuple(committed)
+        self.unchanged = tuple(unchanged)
+        self.failed = tuple(failed)
+        return self
+
+    @property
+    def failed_pairs(self):
+        return tuple(f.pair for f in self.failed)
+
+    @property
+    def summary(self):
+        return "%d updated, %d unchanged, %d failed" % (
+            len(self.committed), len(self.unchanged), len(self.failed))
+
+
+def test_a_partly_failed_update_reports_every_number_and_names_the_failures():
+    root, app = _idle_app()
+    try:
+        view = app.database_view
+        result = FakeUpdateResult(
+            "2026-09-12",
+            committed=tuple("scheme%d" % i for i in range(148)),
+            unchanged=("a", "b", "c"),
+            failed=(FakeFailure("kingella", "HTTP 404 from PubMLST"),
+                    FakeFailure("listeria_2", "the profile table is not TSV")))
+        sentence = view.show_update_outcome(result)
+        assert sentence == "148 updated, 3 already current, 2 could not be updated"
+        assert view.outcome_label.cget("text") == sentence
+        assert view.outcome.winfo_manager(), "the band was never shown"
+        assert view.outcome_toggle.winfo_manager(), "no way to see the failures"
+
+        # the names and the reasons are one click away, not in a modal
+        view._flip_failures()
+        assert view._failures_open is True
+        body = view.outcome_list.get("1.0", "end")
+        assert "kingella: HTTP 404 from PubMLST" in body
+        assert "listeria_2: the profile table is not TSV" in body
+        view._flip_failures()
+        assert view._failures_open is False
+
+        # a clean run says so, in the calm colour, with no fold at all
+        clean = FakeUpdateResult("2026-09-12", committed=("a",), unchanged=("b",))
+        assert view.show_update_outcome(clean) == "1 updated, 1 already current"
+        assert not view.outcome_toggle.winfo_manager()
+        assert str(view.outcome.cget("style")) == "Ok.TFrame"
+    finally:
+        root.destroy()
+
+
+def test_a_partly_failed_update_still_reloads_the_catalogue():
+    root, app = _idle_app()
+    try:
+        view = app.database_view
+        calls = []
+        view.activate = lambda: calls.append("activate")
+        result = FakeUpdateResult("2026-09-12", committed=("a", "b"),
+                                  unchanged=(),
+                                  failed=(FakeFailure("kingella", "HTTP 404"),))
+        view._after_update(result)
+        assert calls == ["activate"], "a failure stopped the reload"
+        assert app.env.db_version == "2026-09-12"
+        assert "could not be updated" in app.status.label.cget("text")
+    finally:
+        root.destroy()
+
+
+def test_a_slow_display_backs_the_frame_rate_off_instead_of_locking_up():
+    """A timer that re-arms faster than the machine paints never gives the event
+    loop back, and ``update()`` then never returns. The interval is chosen from
+    what the last frame cost, so at least a third of it always stays idle."""
+    root, app = _idle_app()
+    try:
+        zone = app.analyse_view.dropzone
+        zone._frame_ms = 0.0
+        assert zone.frame_delay() == gui.DropZone.FPS_MS
+        zone._frame_ms = 4.0
+        assert zone.frame_delay() == gui.DropZone.FPS_MS
+        zone._frame_ms = 40.0
+        assert zone.frame_delay() >= 60, zone.frame_delay()
+        zone._frame_ms = 10_000.0
+        assert zone.frame_delay() <= 160, "the back-off must itself be bounded"
+        # and a real tick records what it cost
+        zone._static = False
+        zone._mapped = True
+        zone.animate(True)
+        zone._frame_ms = 0.0
+        zone._tick()
+        assert zone._frame_ms >= 0.0
+        assert zone._anim_after is not None
+    finally:
+        root.destroy()
+
+
+def test_fit_stops_retrying_on_a_tab_that_was_never_opened():
+    """An unbounded 60 ms retry would be a timer running for the life of the
+    window, on a page the user never looked at."""
+    root, app = _idle_app()
+    try:
+        view = app.mst_view
+        view.canvas.winfo_width = lambda: 1       # type: ignore[method-assign]
+        view.canvas.winfo_height = lambda: 1      # type: ignore[method-assign]
+        for _ in range(40):
+            view.fit()
+        assert view._fit_tries == 12, view._fit_tries
+    finally:
+        root.destroy()

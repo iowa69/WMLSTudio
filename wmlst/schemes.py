@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: GPL-2.0-only
-# Copyright (C) 2025-2026 IOWA-Tech - Giovanni Lorenzin
+# Copyright (C) 2025-2026 IOWA-BioTech - Giovanni Lorenzin
 # Copyright (C) Torsten Seemann (upstream `mlst`, from which WMLST is ported)
 """Scheme / SchemeCatalog / database path resolution.
 
@@ -202,7 +202,7 @@ def _local_appdata_blastdir() -> str:
     base = os.environ.get("LOCALAPPDATA")
     if not base:
         base = os.path.join(os.path.expanduser("~"), ".local", "share")
-    return os.path.join(base, "IOWA-Tech", "WMLST", "blast")
+    return os.path.join(base, "IOWA-BioTech", "WMLST", "blast")
 
 
 #: The 12 BLAST v5 index extensions makeblastdb -hash_index produces.

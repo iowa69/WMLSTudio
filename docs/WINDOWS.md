@@ -59,10 +59,10 @@ corrupts the MSVC runtime DLLs CPython ships. If your endpoint protection quaran
 
 | | |
 | :-- | :-- |
-| Install location | `%LOCALAPPDATA%\Programs\IOWA-Tech\WMLST` (per-user) |
+| Install location | `%LOCALAPPDATA%\Programs\IOWA-BioTech\WMLST` (per-user) |
 | Administrator rights | **none required** |
 | Registry | only a `PATH` entry, and only if you tick that optional task |
-| Start Menu | `IOWA-Tech → WMLST` |
+| Start Menu | `IOWA-BioTech → WMLST` |
 | Desktop shortcut | optional, off by default |
 | Size on disk | ~195 MB, of which ~116 MB is the allele database |
 
@@ -94,7 +94,7 @@ wmlst-cli --bootstrap-blast
 - Archive: 143,400,333 bytes, MD5-verified before anything is unpacked.
 - Only ~35 MB is extracted: `blastn.exe`, `makeblastdb.exe`, `nghttp2.dll` and the NCBI
   licence notices.
-- Destination: `%LOCALAPPDATA%\IOWA-Tech\WMLST\blast\` — per-user, no elevation, and
+- Destination: `%LOCALAPPDATA%\IOWA-BioTech\WMLST\blast\` — per-user, no elevation, and
   deliberately outside any OneDrive-synced folder.
 
 Then the search index is built once, in about twelve seconds:
@@ -145,7 +145,7 @@ machine, then move a verified snapshot across with `--export-bundle` / `--import
 
 ---
 
-*WMLST — IOWA-Tech · Giovanni Lorenzin · GPL-2.0-only.
+*WMLST — IOWA-BioTech · Giovanni Lorenzin · GPL-2.0-only.
 Port of [`mlst`](https://github.com/tseemann/mlst) by Torsten Seemann.
 Allele data © PubMLST — cite Jolley, Bray & Maiden (2018), PMID 30345391.
 Research use only. Not a medical device.*

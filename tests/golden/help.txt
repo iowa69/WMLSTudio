@@ -50,6 +50,6 @@ WMLST EXTRAS
   --repair-locus-ids Recover alleles whose id the sseqid regex drops - results will NOT match tseemann/mlst (default OFF)
   --html-evidence STR How much BLAST evidence the HTML report shows: none|best|all (default 'best')
 HOMEPAGE
-  https://github.com/iowa69/WMLST - IOWA-Tech — Giovanni Lorenzin
+  https://github.com/iowa69/WMLST - IOWA-BioTech — Giovanni Lorenzin
 UPSTREAM
   https://github.com/tseemann/mlst - Torsten Seemann

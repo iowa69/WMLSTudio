@@ -1,5 +1,5 @@
 ; SPDX-License-Identifier: GPL-2.0-only
-; Copyright (C) 2025-2026 IOWA-Tech - Giovanni Lorenzin
+; Copyright (C) 2025-2026 IOWA-BioTech - Giovanni Lorenzin
 ; Copyright (C) Torsten Seemann (upstream `mlst`, from which WMLST is ported)
 ;
 ; Inno Setup 6 installer for WMLST -- docs/ARCHITECTURE.md section 13.1.
@@ -36,8 +36,8 @@
 ; ---------------------------------------------------------------------------
 
 #define MyAppName        "WMLST"
-#define MyAppVersion     "1.1.1"
-#define MyAppPublisher   "IOWA-Tech"
+#define MyAppVersion     "1.2.0"
+#define MyAppPublisher   "IOWA-BioTech"
 #define MyAppAuthor      "Giovanni Lorenzin"
 #define MyAppURL         "https://github.com/iowa69/WMLST"
 #define MyAppExeName     "WMLST.exe"
@@ -159,7 +159,7 @@ Filename: "{app}\NOTICE.txt"; Description: "Show the licence and citation notice
 ; ONLY derived data. The BLAST index and the bootstrapped BLAST+ binaries are
 ; rebuildable; a user's result files, exported reports and any database they
 ; updated in place are NOT, and are deliberately left alone. If you ever feel
-; tempted to add {userdocs} or {localappdata}\IOWA-Tech\WMLST\results here:
+; tempted to add {userdocs} or {localappdata}\IOWA-BioTech\WMLST\results here:
 ; don't. Deleting a scientist's output on uninstall is unforgivable.
 Type: filesandordirs; Name: "{app}\_internal\db\blast"
 Type: filesandordirs; Name: "{app}\_internal\__pycache__"

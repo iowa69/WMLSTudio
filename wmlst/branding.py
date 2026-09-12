@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: GPL-2.0-only
-# Copyright (C) 2025-2026 IOWA-Tech - Giovanni Lorenzin
+# Copyright (C) 2025-2026 IOWA-BioTech - Giovanni Lorenzin
 # Copyright (C) Torsten Seemann (upstream `mlst`, from which WMLST is ported)
 """Every vendor-facing string, defined exactly once.
 
@@ -17,7 +17,7 @@ APP_NAME = "WMLST"
 APP_TAGLINE = "MLST typing for Windows"
 
 #: Vendor / organisation.
-VENDOR = "IOWA-Tech"
+VENDOR = "IOWA-BioTech"
 
 #: Author.
 AUTHOR = "Giovanni Lorenzin"
@@ -102,7 +102,7 @@ def banner_lines(db_version: str) -> list:
 def window_title(running=None) -> str:
     """The GUI title bar (section 4.2).
 
-    Without ``running``: ``'WMLST 1.0.0 - MLST typing - IOWA-Tech - Giovanni
+    Without ``running``: ``'WMLST 1.0.0 - MLST typing - IOWA-BioTech - Giovanni
     Lorenzin'``.  With it, the middle segment becomes the progress text.
     """
     middle = running if running else APP_TAGLINE

@@ -46,7 +46,7 @@ public.
 
 Report abusive, harassing or otherwise unacceptable behaviour to the maintainer:
 
-**Giovanni Lorenzin, IOWA-Tech** — open a private security advisory on
+**Giovanni Lorenzin, IOWA-BioTech** — open a private security advisory on
 <https://github.com/iowa69/WMLST> or contact the maintainer directly through the
 address listed in `CITATION.cff`.
 

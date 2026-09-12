@@ -1,6 +1,6 @@
 # Contributing to WMLST
 
-Thanks for being here. WMLST is maintained by **IOWA-Tech — Giovanni Lorenzin**, and
+Thanks for being here. WMLST is maintained by **IOWA-BioTech — Giovanni Lorenzin**, and
 patches, bug reports and test cases are all welcome.
 
 Before anything else, please read the one rule that shapes everything below.

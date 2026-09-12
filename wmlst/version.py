@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: GPL-2.0-only
-# Copyright (C) 2025-2026 IOWA-Tech - Giovanni Lorenzin
+# Copyright (C) 2025-2026 IOWA-BioTech - Giovanni Lorenzin
 # Copyright (C) Torsten Seemann (upstream `mlst`, from which WMLST is ported)
 """Single source of version truth for WMLST.
 
@@ -8,7 +8,7 @@ Keeping UPSTREAM_MLST_VERSION here documents exactly which upstream release
 the byte-compatibility contract in docs/ARCHITECTURE.md was verified against.
 """
 
-__version__ = "1.1.1"
+__version__ = "1.2.0"
 
 #: The tseemann/mlst release whose output WMLST reproduces byte-for-byte.
 UPSTREAM_MLST_VERSION = "2.35.0"

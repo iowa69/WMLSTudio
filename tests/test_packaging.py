@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: GPL-2.0-only
-# Copyright (C) 2025-2026 IOWA-Tech - Giovanni Lorenzin
+# Copyright (C) 2025-2026 IOWA-BioTech - Giovanni Lorenzin
 # Copyright (C) Torsten Seemann (upstream `mlst`, from which WMLST is ported)
 """Packaging, licensing and repository-hygiene tests (docs/ARCHITECTURE.md 13.4).
 
@@ -435,26 +435,41 @@ def test_notice_credits_upstream_pubmlst_and_ncbi():
         "PubMLST",
         "BLAST+",
         "public domain",
-        "IOWA-Tech",
+        "IOWA-BioTech",
         "Giovanni Lorenzin",
         "GPL-2.0-only",
     ):
         assert needle in text, "NOTICE does not mention %r" % needle
 
 
-def test_readme_carries_the_attribution_and_the_branding():
-    """Acceptance check 12 and added bats case 51."""
+def test_readme_is_a_user_guide_and_names_the_vendor():
+    """README.md is for someone about to download and run WMLST.
+
+    The vendor strings come from wmlst.branding, so a rebrand never needs this
+    test edited. Third-party copyright notices are NOT required here -- their
+    home is NOTICE (see the test below), which is where the licence expects
+    them and where they are not competing with the instructions.
+    """
+    from wmlst import branding
+
     text = _read("README.md")
-    for needle in (
-        "IOWA-Tech",
-        "Giovanni Lorenzin",
-        "Torsten Seemann",
-        "tseemann/mlst",
-        "GPL-2.0-only",
-        "30345391",
-        "SmartScreen",
-    ):
+    for needle in (branding.VENDOR, branding.AUTHOR, "GPL-2.0-only", "SmartScreen"):
         assert needle in text, "README.md does not mention %r" % needle
+    # It must still point at where the notices actually are.
+    assert "NOTICE" in text and "LICENSE" in text
+
+
+def test_notice_carries_every_attribution_the_licence_requires():
+    """The notices moved out of README.md; they must not have been lost.
+
+    WMLST is GPL-2.0-only because it derives from GPL-2.0 code, and section 1
+    requires the copyright notices to travel with the distribution. NOTICE is
+    that file. It also records the components whose data and binaries ship
+    inside the download.
+    """
+    text = _read("NOTICE")
+    for needle in ("Torsten Seemann", "GPL-2.0", "PubMLST", "BLAST"):
+        assert needle in text, "NOTICE does not carry %r" % needle
 
 
 def test_readme_does_not_claim_the_build_is_signed():
@@ -645,7 +660,7 @@ def test_inno_setup_is_configured_the_way_13_1_requires():
     assert "ArchitecturesAllowed=x64compatible" in text
     assert "MinVersion=10.0.17763" in text
     assert "PrivilegesRequired=lowest" in text
-    assert "IOWA-Tech" in text and "Giovanni Lorenzin" in text
+    assert "IOWA-BioTech" in text and "Giovanni Lorenzin" in text
     assert "[UninstallDelete]" in text
 
 

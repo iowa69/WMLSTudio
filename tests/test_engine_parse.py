@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: GPL-2.0-only
-# Copyright (C) 2025-2026 IOWA-Tech - Giovanni Lorenzin
+# Copyright (C) 2025-2026 IOWA-BioTech - Giovanni Lorenzin
 # Copyright (C) Torsten Seemann (upstream `mlst`, from which WMLST is ported)
 """BLAST parsing, call building and the winner choice.
 docs/ARCHITECTURE.md 5.6, 5.7, 5.8, 5.9, 5.14, 5.15, 5.17, 5.19.

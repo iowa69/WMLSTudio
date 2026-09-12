@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: GPL-2.0-only
-# Copyright (C) 2025-2026 IOWA-Tech - Giovanni Lorenzin
+# Copyright (C) 2025-2026 IOWA-BioTech - Giovanni Lorenzin
 # Copyright (C) Torsten Seemann (upstream `mlst`, from which WMLST is ported)
 """WMLST desktop application — a single-module Tkinter/ttk GUI.
 
@@ -18,6 +18,7 @@ that it can be unit-tested on a machine with no display
 from __future__ import annotations
 
 import dataclasses
+import functools
 import json
 import logging
 import logging.handlers
@@ -27,12 +28,14 @@ import platform
 import queue
 import shutil
 import socket
+import struct
 import sys
 import threading
 import time
 import tkinter as tk
 import traceback
 import webbrowser
+import zlib
 from collections.abc import Sequence
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
@@ -41,7 +44,7 @@ from tkinter import filedialog, messagebox, ttk
 from tkinter import font as tkfont
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
-from . import branding, perf, schemerefs
+from . import branding, mst, perf, schemerefs
 from .engine import (
     AlleleCall,
     BlastFailedError,
@@ -90,6 +93,11 @@ PAD_XS, PAD_S, PAD_M, PAD_L, PAD_XL, PAD_XXL = 4, 8, 16, 24, 32, 48
 #: Corner radius of a card, in unscaled pixels (see :class:`Card`).
 RADIUS = 10
 
+#: The house wordmark, set inside the chromosome ring on the drop zone. Not in
+#: branding.py: that module carries the legal vendor string, and this is the
+#: mark as it is drawn.
+WORDMARK = "IOWA-BioTech"
+
 #: Font sizes in POINTS. These are never multiplied by :data:`SC` — Tk's own
 #: scaling already accounts for dpi, and doubling it is the classic HiDPI bug.
 #: At 96 dpi the ladder renders as roughly 11 / 12 / 13 / 15 / 21 / 35 px, which
@@ -121,12 +129,16 @@ PREFERRED_MONO = ("Cascadia Mono", "Consolas", "DejaVu Sans Mono", "Courier New"
 #: system grey. Every foreground here clears WCAG AA (>= 4.5:1) on ``surface``
 #: and on ``bg``; the ratios are asserted in tests/test_gui_headless.py.
 PALETTE = {
-    "bg": "#f4f6f9",
+    # The page ground sits a little further below the cards than it used to, and
+    # the hairline is a little darker: "mildly outlined", so that a panel, the
+    # results table and the drop zone each read as their own region without any
+    # of them turning into a boxed-in frame.
+    "bg": "#ecf0f6",
     "surface": "#ffffff",
-    "surface_alt": "#eef1f6",
-    "surface_sunk": "#f8fafc",
-    "border": "#dfe3ea",
-    "border_strong": "#c2c9d4",
+    "surface_alt": "#e3e8f0",
+    "surface_sunk": "#f6f8fc",
+    "border": "#c9d2e0",
+    "border_strong": "#a5b1c4",
     "text": "#121820",
     "text_soft": "#3d4754",
     "muted": "#5b6573",
@@ -144,10 +156,10 @@ PALETTE = {
     "warn_soft": "#fdf3e2",
     "bad_soft": "#fdeceb",
     "focus": "#1d4ed8",
-    "row_alt": "#f8fafc",
-    "drop_idle": "#c2c9d4",
+    "row_alt": "#f6f8fc",
+    "drop_idle": "#a5b1c4",
     "drop_hover": "#2563eb",
-    "shadow": "#e6e9ef",
+    "shadow": "#d8dfea",
 }
 
 #: Dark palette. Not an inversion: the surfaces stay separated by luminance the
@@ -156,10 +168,10 @@ PALETTE = {
 DARK_PALETTE = {
     "bg": "#111419",
     "surface": "#191d24",
-    "surface_alt": "#212732",
+    "surface_alt": "#232a36",
     "surface_sunk": "#14181e",
-    "border": "#2a313c",
-    "border_strong": "#3c4552",
+    "border": "#38424f",
+    "border_strong": "#4d5868",
     "text": "#e9edf4",
     "text_soft": "#c3cbd7",
     "muted": "#98a3b3",
@@ -178,7 +190,7 @@ DARK_PALETTE = {
     "bad_soft": "#2c1619",
     "focus": "#8db4ff",
     "row_alt": "#1d222a",
-    "drop_idle": "#3c4552",
+    "drop_idle": "#4d5868",
     "drop_hover": "#6ea0ff",
     "shadow": "#0d1014",
 }
@@ -234,6 +246,24 @@ def mix(a: str, b: str, t: float) -> str:
         int(round(ag + (bg_ - ag) * t)),
         int(round(ab + (bb - ab) * t)),
     )
+
+
+def ease_in_out(t: float) -> float:
+    """Smoothstep: 0 at 0, 1 at 1, zero slope at both ends.
+
+    Linear motion is what makes an animation look mechanical, and a linear
+    brightness ramp is what makes a glow look like a staircase. Every moving
+    quantity in the drop zone goes through this or :func:`ease_out`.
+    """
+    t = 0.0 if t < 0.0 else (1.0 if t > 1.0 else t)
+    return t * t * (3.0 - 2.0 * t)
+
+
+def ease_out(t: float) -> float:
+    """Cubic ease-out: fast at the start, settling at the end."""
+    t = 0.0 if t < 0.0 else (1.0 if t > 1.0 else t)
+    u = 1.0 - t
+    return 1.0 - u * u * u
 
 
 def detect_theme_mode() -> str:
@@ -1675,6 +1705,521 @@ class AnalysisController:
 
 
 # ===========================================================================
+# SECTION 6B — THE TREE PICTURE: COLOUR, RASTER, PNG  (section 10.10)
+# ===========================================================================
+#
+# Everything here is pure arithmetic on numbers and byte strings: no tkinter,
+# no file dialogs, no widget. The tree page draws the SAME scene twice — once
+# into a Tk canvas, once into a pixel buffer that is deflated into a PNG — so
+# "Save image" produces what the window shows without a third-party imaging
+# library, and every part of it can be checked on a machine with no display.
+
+
+# ---------------------------------------------------------------------------
+# A procedural categorical palette (OKLCH)
+# ---------------------------------------------------------------------------
+#
+# A hand-picked list of N colours stops working the moment there are N+1 clonal
+# groups, and the usual fix — stepping the HSV hue — is not perceptually even:
+# HSV yellow is far lighter than HSV blue at the same "value", so one group
+# vanishes against the page while another shouts. OKLCH varies hue at FIXED
+# perceptual lightness and chroma, which is exactly the promise a categorical
+# palette has to make. The conversion below is the published OKLab matrix pair;
+# out-of-gamut hues have their chroma walked down until they fit, so the
+# lightness — the part the eye reads as "these all belong to one set" — is the
+# quantity that is preserved.
+
+#: Lightness / chroma of a category swatch, per theme mode. Light mode wants
+#: mid-dark ink on white; dark mode wants a lighter, slightly quieter tint.
+CATEGORY_LCH = {
+    "light": (0.615, 0.148),
+    "dark": (0.760, 0.126),
+    "high-contrast": (0.870, 0.080),
+}
+#: Where the hue wheel starts, in degrees. 25 deg puts the first (and therefore
+#: biggest) group on a warm red rather than on a blue that would be confused
+#: with the interface accent.
+CATEGORY_HUE0 = 25.0
+
+
+def _srgb_channel(value: float) -> int:
+    """Linear light -> an 8-bit sRGB channel."""
+    if value <= 0.0031308:
+        value = 12.92 * value
+    else:
+        value = 1.055 * (value ** (1.0 / 2.4)) - 0.055
+    return max(0, min(255, int(round(value * 255.0))))
+
+
+def _oklab_to_linear(lightness: float, a: float, b: float) -> Tuple[float, float, float]:
+    """One OKLab triple to linear sRGB, unclamped (may fall outside 0..1)."""
+    l_ = lightness + 0.3963377774 * a + 0.2158037573 * b
+    m_ = lightness - 0.1055613458 * a - 0.0638541728 * b
+    s_ = lightness - 0.0894841775 * a - 1.2914855480 * b
+    lc, mc, sc = l_ * l_ * l_, m_ * m_ * m_, s_ * s_ * s_
+    return (4.0767416621 * lc - 3.3077115913 * mc + 0.2309699292 * sc,
+            -1.2684380046 * lc + 2.6097574011 * mc - 0.3413193965 * sc,
+            -0.0041960863 * lc - 0.7034186147 * mc + 1.7076147010 * sc)
+
+
+@functools.lru_cache(maxsize=512)
+def oklch_hex(lightness: float, chroma: float, hue_deg: float) -> str:
+    """``#rrggbb`` for an OKLCH colour, with chroma reduced until it is in gamut.
+
+    Memoised: the drop-zone animation asks for the same seven colours sixty
+    times a second, and a gamut walk per frame per locus is real work for a
+    result that cannot have changed.
+
+    Clipping the three channels instead would silently change BOTH hue and
+    lightness, which is how "perceptually even" palettes end up with one swatch
+    that reads as a different family.
+    """
+    rad = math.radians(hue_deg)
+    ca, sa = math.cos(rad), math.sin(rad)
+    step = chroma
+    for _ in range(24):
+        rgb = _oklab_to_linear(lightness, step * ca, step * sa)
+        if min(rgb) >= -0.0005 and max(rgb) <= 1.0005:
+            break
+        step *= 0.92
+    else:  # pragma: no cover - only for absurd inputs
+        rgb = _oklab_to_linear(lightness, 0.0, 0.0)
+    return "#{:02x}{:02x}{:02x}".format(*(_srgb_channel(max(0.0, min(1.0, v)))
+                                          for v in rgb))
+
+
+def categorical_palette(n: int, mode: Optional[str] = None) -> Tuple[str, ...]:
+    """``n`` maximally separated swatches at one lightness and one chroma.
+
+    The sequence is a pure function of ``n`` and the theme, so the same index
+    is the same colour in both tree views and in the saved PNG — which is the
+    whole point of generating it rather than storing a list.
+    """
+    n = max(1, int(n))
+    lightness, chroma = CATEGORY_LCH.get(mode or THEME_MODE, CATEGORY_LCH["light"])
+    # Two interleaved half-turns: with an even count, plain 360/n spacing puts
+    # two adjacent ids almost next to each other on the wheel, and adjacency is
+    # exactly where a reader needs the difference to be largest.
+    span = 360.0 / n
+    out = []
+    for i in range(n):
+        half = (n + 1) // 2
+        k = (i // 2) + (0 if i % 2 == 0 else half)
+        out.append(oklch_hex(lightness, chroma, (CATEGORY_HUE0 + span * k) % 360.0))
+    return tuple(out)
+
+
+# ---------------------------------------------------------------------------
+# A 5x7 bitmap font, so the PNG can carry text
+# ---------------------------------------------------------------------------
+#
+# A Tk canvas cannot hand its pixels back (that needs the Img extension), so the
+# saved image is rasterised here from the same scene the canvas drew — and a
+# picture of a tree whose isolates are not named is worthless. The font below is
+# ASCII 32..126, seven rows of five pixels, each row stored as one character
+# carrying five bits (``chr(48 + bits)``): 665 characters for the whole set,
+# decoded once into a lookup table at import.
+FONT5X7_GLYPHS = (
+    "0000000044444040::000000::O:O::04?D>5N40HI248C30<BD8EB=0440000002488"
+    "8420842224800E>O>E00044O440000000<48000O000000000<<0122488@0>ACEIA>0"
+    "4<4444>0>A1248O0O2421A>026:BO220O@N11A>068@NAA>0O1248880>AA>AA>0>AA?"
+    "12<00<<0<<0000<<0<48248@842000O0O00084212480>A124040>AGEG@?04:AAOAA0"
+    "NAANAAN0>A@@@A>0LBAAABL0O@@N@@O0O@@N@@@0>A@GAA?0AAAOAAA0>44444>07222"
+    "2B<0ABDHDBA0@@@@@@O0AKEEAAA0AAIECAA0>AAAAA>0NAAN@@@0>AAAEB=0NAANDBA0"
+    "?@@>11N0O4444440AAAAAA>0AAAAA:40AAAEEKA0AA:4:AA0AA:44440O1248@O0>888"
+    "88>0@8842210>22222>04:A00000000000O08400000000>1?A?0@@NAAAN000>@@A>0"
+    "11?AAA?000>AO@>0698L888000?AA?1>@@NAAAA040<444>0406222B<@@BDHDB0<444"
+    "44>000JEEEA000NAAAA000>AAA>000NAAN@@00?AA?1100FI@@@000?@>1N088L88960"
+    "00AAAC=000AAA:4000AEEE:000A:4:A000AAA?1>00O248O06448446044444440<442"
+    "44<0009EB000"
+)
+#: Glyph geometry, in font pixels: 5 wide, EIGHT tall, one pixel of side
+#: bearing. Eight and not seven because ``p``, ``g``, ``q``, ``y``, ``j`` and
+#: the comma need a row below the baseline; squeezed into a seven-row cell they
+#: lose their descenders and "groups" comes out reading as "9roups".
+GLYPH_W, GLYPH_H, GLYPH_ADVANCE = 5, 8, 6
+#: Rendered advance as a fraction of the nominal text height. Used to reserve
+#: room for a label BEFORE either renderer has been asked to draw it, so the
+#: canvas and the PNG agree about where a label may go.
+TEXT_ADVANCE = GLYPH_ADVANCE / float(GLYPH_H)
+
+
+def _decode_font() -> Dict[str, Tuple[int, ...]]:
+    table = {}
+    for code in range(32, 127):
+        chunk = FONT5X7_GLYPHS[(code - 32) * GLYPH_H:(code - 32 + 1) * GLYPH_H]
+        table[chr(code)] = tuple(ord(ch) - 48 for ch in chunk)
+    return table
+
+
+#: character -> seven row bitmasks, most significant bit leftmost.
+FONT5X7 = _decode_font()
+
+
+def text_width(text: str, size: float) -> float:
+    """Width in pixels of ``text`` drawn at nominal height ``size``.
+
+    Deliberately the BITMAP font's advance, which is wider than any proportional
+    UI font at the same height: the label placer reserves this box, so whatever
+    the canvas actually picks fits inside what was reserved.
+    """
+    if not text:
+        return 0.0
+    return (len(text) * GLYPH_ADVANCE - 1) * (size / float(GLYPH_H))
+
+
+def ascii_only(text: str) -> str:
+    """Fold to the glyphs the bitmap font has. Anything else becomes ``?``."""
+    return "".join(ch if 32 <= ord(ch) < 127 else "?" for ch in str(text))
+
+
+# ---------------------------------------------------------------------------
+# The scene: one list of primitives, two renderers
+# ---------------------------------------------------------------------------
+
+@dataclass(frozen=True)
+class Prim:
+    """One drawing instruction, in whatever coordinate space its list uses."""
+
+    kind: str                 # "line" | "disc" | "text" | "rect"
+    x: float = 0.0
+    y: float = 0.0
+    x2: float = 0.0
+    y2: float = 0.0
+    r: float = 0.0
+    text: str = ""
+    fill: str = ""
+    outline: str = ""
+    width: float = 1.0
+    size: float = 12.0
+    anchor: str = "c"         # "c" | "w" | "e"
+    bold: bool = False
+    dash: bool = False
+    tag: str = ""
+
+
+def _rgb(colour: str) -> Tuple[int, int, int]:
+    try:
+        return (int(colour[1:3], 16), int(colour[3:5], 16), int(colour[5:7], 16))
+    except (ValueError, IndexError):
+        return (0, 0, 0)
+
+
+class Raster:
+    """A plain RGB pixel buffer with analytic-coverage drawing and a PNG writer.
+
+    Coverage rather than supersampling: for a disc or a line the distance from
+    the pixel centre to the shape is known in closed form, so one pass gives a
+    clean edge at a fraction of the cost of rendering four times the pixels.
+    """
+
+    __slots__ = ("buf", "height", "width")
+
+    def __init__(self, width: int, height: int, background: str = "#ffffff"):
+        self.width = max(1, int(width))
+        self.height = max(1, int(height))
+        self.buf = bytearray(bytes(_rgb(background)) * (self.width * self.height))
+
+    # -- primitives ----------------------------------------------------------
+    def blend(self, x: int, y: int, rgb: Tuple[int, int, int], alpha: float) -> None:
+        if alpha <= 0.0 or x < 0 or y < 0 or x >= self.width or y >= self.height:
+            return
+        if alpha > 1.0:
+            alpha = 1.0
+        i = (y * self.width + x) * 3
+        buf = self.buf
+        buf[i] = int(buf[i] + (rgb[0] - buf[i]) * alpha)
+        buf[i + 1] = int(buf[i + 1] + (rgb[1] - buf[i + 1]) * alpha)
+        buf[i + 2] = int(buf[i + 2] + (rgb[2] - buf[i + 2]) * alpha)
+
+    def disc(self, cx: float, cy: float, r: float, fill: str = "",
+             outline: str = "", width: float = 1.0) -> None:
+        half = width / 2.0
+        reach = r + half + 1.0
+        fill_rgb = _rgb(fill) if fill else None
+        edge_rgb = _rgb(outline) if outline else None
+        for y in range(int(cy - reach), int(cy + reach) + 1):
+            dy = y + 0.5 - cy
+            for x in range(int(cx - reach), int(cx + reach) + 1):
+                dx = x + 0.5 - cx
+                d = math.sqrt(dx * dx + dy * dy)
+                if fill_rgb is not None:
+                    self.blend(x, y, fill_rgb, min(1.0, r - d + 0.5))
+                if edge_rgb is not None:
+                    self.blend(x, y, edge_rgb, min(1.0, half - abs(d - r) + 0.5))
+
+    def line(self, x1: float, y1: float, x2: float, y2: float,
+             colour: str, width: float = 1.0) -> None:
+        half = max(0.35, width / 2.0)
+        rgb = _rgb(colour)
+        vx, vy = x2 - x1, y2 - y1
+        length2 = vx * vx + vy * vy
+        lo_x, hi_x = int(min(x1, x2) - half - 1), int(max(x1, x2) + half + 1)
+        lo_y, hi_y = int(min(y1, y2) - half - 1), int(max(y1, y2) + half + 1)
+        for y in range(lo_y, hi_y + 1):
+            for x in range(lo_x, hi_x + 1):
+                px_, py_ = x + 0.5 - x1, y + 0.5 - y1
+                if length2 <= 1e-9:
+                    d = math.sqrt(px_ * px_ + py_ * py_)
+                else:
+                    t = (px_ * vx + py_ * vy) / length2
+                    t = 0.0 if t < 0.0 else (1.0 if t > 1.0 else t)
+                    ax, ay = px_ - vx * t, py_ - vy * t
+                    d = math.sqrt(ax * ax + ay * ay)
+                self.blend(x, y, rgb, min(1.0, half - d + 0.5))
+
+    def rect(self, x1: float, y1: float, x2: float, y2: float, *, fill: str = "",
+             outline: str = "", width: float = 1.0, radius: float = 0.0) -> None:
+        cx, cy = (x1 + x2) / 2.0, (y1 + y2) / 2.0
+        hw, hh = abs(x2 - x1) / 2.0, abs(y2 - y1) / 2.0
+        rad = max(0.0, min(radius, hw, hh))
+        half = width / 2.0
+        fill_rgb = _rgb(fill) if fill else None
+        edge_rgb = _rgb(outline) if outline else None
+        for y in range(int(cy - hh - half - 1), int(cy + hh + half + 2)):
+            for x in range(int(cx - hw - half - 1), int(cx + hw + half + 2)):
+                qx = abs(x + 0.5 - cx) - hw + rad
+                qy = abs(y + 0.5 - cy) - hh + rad
+                mx, my = max(qx, 0.0), max(qy, 0.0)
+                d = math.sqrt(mx * mx + my * my) + min(max(qx, qy), 0.0) - rad
+                if fill_rgb is not None:
+                    self.blend(x, y, fill_rgb, min(1.0, 0.5 - d))
+                if edge_rgb is not None:
+                    self.blend(x, y, edge_rgb, min(1.0, half - abs(d) + 0.5))
+
+    def text(self, x: float, y: float, message: str, colour: str, size: float,
+             anchor: str = "c", bold: bool = False) -> None:
+        """Draw ``message`` centred vertically on ``y``, ``anchor`` horizontally."""
+        message = ascii_only(message)
+        if not message:
+            return
+        # FLOOR, never round: the layout reserved ``text_width(text, size)`` for
+        # this string, and (len*6-1)*scale <= (len*6-1)*size/8 is true exactly
+        # when the scale is floored. Rounding up overran every reserved box by a
+        # third and pushed the legend title off the edge of the image.
+        scale = max(1, int(size / float(GLYPH_H)))
+        advance = GLYPH_ADVANCE * scale
+        total = len(message) * advance - scale
+        if anchor == "w":
+            left = x
+        elif anchor == "e":
+            left = x - total
+        else:
+            left = x - total / 2.0
+        # Centred on the cap box, not the cell: the descender row is blank in
+        # most glyphs, and centring on the cell pushes every word half a row up.
+        top = y - (GLYPH_H * scale) / 2.0 + scale * 0.5
+        rgb = _rgb(colour)
+        for index, ch in enumerate(message):
+            rows = FONT5X7.get(ch)
+            if not rows:
+                continue
+            gx = int(round(left + index * advance))
+            gy = int(round(top))
+            for row, bits in enumerate(rows):
+                if not bits:
+                    continue
+                for col in range(GLYPH_W):
+                    if not (bits >> (GLYPH_W - 1 - col)) & 1:
+                        continue
+                    px0 = gx + col * scale
+                    py0 = gy + row * scale
+                    for dy in range(scale):
+                        for dx in range(scale):
+                            self.blend(px0 + dx, py0 + dy, rgb, 1.0)
+                    if bold:
+                        for dy in range(scale):
+                            self.blend(px0 + scale, py0 + dy, rgb, 1.0)
+
+    # -- output --------------------------------------------------------------
+    def png_bytes(self) -> bytes:
+        """The buffer as a complete 8-bit truecolour PNG file."""
+        stride = self.width * 3
+        raw = bytearray()
+        for y in range(self.height):
+            raw.append(0)                       # filter type 0 (None)
+            raw += self.buf[y * stride:(y + 1) * stride]
+
+        def chunk(tag: bytes, data: bytes) -> bytes:
+            body = tag + data
+            return (struct.pack(">I", len(data)) + body
+                    + struct.pack(">I", zlib.crc32(body) & 0xFFFFFFFF))
+
+        return (b"\x89PNG\r\n\x1a\n"
+                + chunk(b"IHDR", struct.pack(">IIBBBBB", self.width, self.height,
+                                             8, 2, 0, 0, 0))
+                + chunk(b"IDAT", zlib.compress(bytes(raw), 6))
+                + chunk(b"IEND", b""))
+
+
+def render_prims(raster: Raster, prims: Sequence[Prim], *, scale: float = 1.0,
+                 dx: float = 0.0, dy: float = 0.0) -> None:
+    """Paint a primitive list into ``raster`` under an offset-and-scale."""
+    for prim in prims:
+        x = prim.x * scale + dx
+        y = prim.y * scale + dy
+        if prim.kind == "line":
+            raster.line(x, y, prim.x2 * scale + dx, prim.y2 * scale + dy,
+                        prim.fill or "#000000", max(1.0, prim.width * scale))
+        elif prim.kind == "disc":
+            raster.disc(x, y, prim.r * scale, fill=prim.fill, outline=prim.outline,
+                        width=max(1.0, prim.width * scale))
+        elif prim.kind == "rect":
+            raster.rect(x, y, prim.x2 * scale + dx, prim.y2 * scale + dy,
+                        fill=prim.fill, outline=prim.outline,
+                        width=max(1.0, prim.width * scale), radius=prim.r * scale)
+        elif prim.kind == "text":
+            raster.text(x, y, prim.text, prim.fill or "#000000", prim.size * scale,
+                        anchor=prim.anchor, bold=prim.bold)
+
+
+def prims_bbox(prims: Sequence[Prim]) -> Tuple[float, float, float, float]:
+    """Bounding box of a primitive list, text included."""
+    xs: List[float] = []
+    ys: List[float] = []
+    for prim in prims:
+        if prim.kind == "text":
+            half = text_width(ascii_only(prim.text), prim.size) / 2.0
+            centre = prim.x + (half if prim.anchor == "w"
+                               else (-half if prim.anchor == "e" else 0.0))
+            xs.extend((centre - half, centre + half))
+            ys.extend((prim.y - prim.size * 0.7, prim.y + prim.size * 0.7))
+        elif prim.kind == "disc":
+            reach = prim.r + prim.width
+            xs.extend((prim.x - reach, prim.x + reach))
+            ys.extend((prim.y - reach, prim.y + reach))
+        else:
+            xs.extend((prim.x, prim.x2))
+            ys.extend((prim.y, prim.y2))
+    if not xs:
+        return (0.0, 0.0, 1.0, 1.0)
+    return (min(xs), min(ys), max(xs), max(ys))
+
+
+# ---------------------------------------------------------------------------
+# Laying labels out so that they can be read
+# ---------------------------------------------------------------------------
+
+@dataclass
+class Label:
+    """A placed label: where the text goes, and whether it needs a leader line."""
+
+    index: int
+    text: str
+    x: float = 0.0
+    y: float = 0.0
+    anchor: str = "w"
+    size: float = 12.0
+    box: Tuple[float, float, float, float] = (0.0, 0.0, 0.0, 0.0)
+    leader: Optional[Tuple[float, float, float, float]] = None
+
+
+#: Where a label may sit relative to its node, best first. East and west first
+#: because a horizontal offset never sits on top of the word above or below it.
+LABEL_DIRECTIONS = ((1.0, 0.0), (-1.0, 0.0),
+                    (0.90, -0.44), (-0.90, -0.44), (0.90, 0.44), (-0.90, 0.44),
+                    (0.64, -0.77), (-0.64, -0.77), (0.64, 0.77), (-0.64, 0.77),
+                    (0.0, -1.0), (0.0, 1.0))
+#: How far out to try, in multiples of the TEXT HEIGHT — a label is fifteen
+#: times wider than a dot is, so rings measured in dot radii were never going to
+#: clear the neighbour. The last three are far enough out to need a leader line.
+LABEL_RINGS = (0.0, 1.3, 3.0, 5.4, 8.4)
+
+
+def _overlap(a: Tuple[float, float, float, float],
+             b: Tuple[float, float, float, float]) -> float:
+    """Area shared by two boxes."""
+    w = min(a[2], b[2]) - max(a[0], b[0])
+    h = min(a[3], b[3]) - max(a[1], b[1])
+    return w * h if w > 0.0 and h > 0.0 else 0.0
+
+
+def _segment_hits_box(x1: float, y1: float, x2: float, y2: float,
+                      box: Tuple[float, float, float, float]) -> bool:
+    """Liang-Barsky: does the segment enter the box at all?"""
+    t0, t1 = 0.0, 1.0
+    dx, dy = x2 - x1, y2 - y1
+    for p, q in ((-dx, x1 - box[0]), (dx, box[2] - x1),
+                 (-dy, y1 - box[1]), (dy, box[3] - y1)):
+        if abs(p) < 1e-12:
+            if q < 0.0:
+                return False
+            continue
+        t = q / p
+        if p < 0.0:
+            if t > t1:
+                return False
+            t0 = max(t0, t)
+        else:
+            if t < t0:
+                return False
+            t1 = min(t1, t)
+    return t0 <= t1
+
+
+def place_labels(points: Sequence[Tuple[float, float]], radii: Sequence[float],
+                 texts: Sequence[str], size: float,
+                 edges: Sequence[Tuple[float, float, float, float]] = (),
+                 *, gap: float = 4.0) -> List[Label]:
+    """Put every label somewhere it can be read.
+
+    Greedy, deterministic and O(n^2): each node in turn takes the cheapest free
+    slot around itself, where "cheapest" counts area shared with a label already
+    placed, area over a node, edges crossed, and how far the label had to be
+    pushed. A label that ends up beyond the second ring is given a leader line
+    back to its node, because at that distance nobody can tell which dot it
+    belongs to.
+    """
+    order = sorted(range(len(points)), key=lambda i: (-radii[i], texts[i], i))
+    placed: List[Label] = []
+    boxes: List[Tuple[float, float, float, float]] = []
+    node_boxes = [(points[i][0] - radii[i], points[i][1] - radii[i],
+                   points[i][0] + radii[i], points[i][1] + radii[i])
+                  for i in range(len(points))]
+    out: List[Optional[Label]] = [None] * len(points)
+    half_h = size * 0.72
+    for i in order:
+        text = texts[i]
+        width = text_width(ascii_only(text), size)
+        cx, cy = points[i]
+        best: Optional[Tuple[float, Label]] = None
+        for ring_index, ring in enumerate(LABEL_RINGS):
+            offset = radii[i] + gap + ring * size
+            for dir_index, (dx, dy) in enumerate(LABEL_DIRECTIONS):
+                ax, ay = cx + dx * offset, cy + dy * offset
+                if dx > 0.2:
+                    anchor, x0 = "w", ax
+                elif dx < -0.2:
+                    anchor, x0 = "e", ax - width
+                else:
+                    anchor, x0 = "c", ax - width / 2.0
+                box = (x0 - gap * 0.5, ay - half_h, x0 + width + gap * 0.5, ay + half_h)
+                cost = ring_index * 7.0 + dir_index * 0.5
+                for other in boxes:
+                    cost += _overlap(box, other) * 0.05
+                for j, nbox in enumerate(node_boxes):
+                    if j != i:
+                        cost += _overlap(box, nbox) * 0.12
+                for edge in edges:
+                    if _segment_hits_box(edge[0], edge[1], edge[2], edge[3], box):
+                        cost += 8.0
+                if best is None or cost < best[0]:
+                    leader = None
+                    if ring_index >= 2:
+                        leader = (cx + dx * (radii[i] + 1.0), cy + dy * (radii[i] + 1.0),
+                                  ax - dx * gap * 0.4, ay)
+                    best = (cost, Label(index=i, text=text, x=ax, y=ay, anchor=anchor,
+                                        size=size, box=box, leader=leader))
+            if best is not None and best[0] < ring_index * 7.0 + 4.0:
+                break
+        assert best is not None
+        out[i] = best[1]
+        boxes.append(best[1].box)
+        placed.append(best[1])
+    return [label for label in out if label is not None]
+
+
+# ===========================================================================
 # SECTION 7 — WIDGETS  (sections 10.1, 10.8)
 # ===========================================================================
 
@@ -2168,6 +2713,14 @@ def install_theme(root: tk.Misc) -> ttk.Style:
                     foreground=c("warn"), font=F["body_bold"])
     style.configure("NoticeBadge.TLabel", background=c("warn_soft"),
                     foreground=c("warn"), font=F["eyebrow"])
+    # The same band in the "nothing went wrong" colour, used by the database
+    # tab to report a clean update without dressing good news as a warning.
+    style.configure("Ok.TFrame", background=c("ok_soft"))
+    style.configure("OkBar.TFrame", background=c("ok"))
+    style.configure("Ok.TLabel", background=c("ok_soft"), foreground=c("ok"),
+                    font=F["body"])
+    style.configure("OkStrong.TLabel", background=c("ok_soft"), foreground=c("ok"),
+                    font=F["body_bold"])
 
     style.configure("TLabel", background=bg, foreground=text, font=F["body"])
     style.configure("Surface.TLabel", background=surface, foreground=text)
@@ -2984,10 +3537,14 @@ class DropZone(tk.Canvas):
     ``Shift-Return`` browses a folder.
     """
 
-    FPS_MS = 33             # ~30 fps
+    FPS_MS = 16             # ~60 fps: at 30 the sweep visibly stepped
     LOCI = 7                # the seven housekeeping loci of a classical scheme
-    SWEEP_PER_FRAME = 0.042  # loci per frame -> one full circuit in ~5.5 s
-    FLOURISH_FRAMES = 18
+    SWEEP_PER_FRAME = 0.0205  # loci per frame -> one full circuit in ~5.5 s
+    FLOURISH_FRAMES = 34    # same ~0.55 s as before, at twice the frame rate
+    #: The ring is a short, soft hue sweep rather than one flat blue: indigo
+    #: through to cyan, at ONE perceptual lightness and chroma so no locus
+    #: shouts louder than another. Both ends clear AA against either ground.
+    HUE_FROM, HUE_TO = 274.0, 192.0
 
     def __init__(self, parent: tk.Misc, *, on_files: Callable[[Sequence[str]], None],
                  on_browse: Callable[[], None], on_browse_folder: Callable[[], None],
@@ -3015,12 +3572,25 @@ class DropZone(tk.Canvas):
         self._anim_after: Optional[str] = None
         self._want_anim = True      # the view says the zone is the current focus
         self._mapped = True
+        #: Whether the TAB holding this zone is the one on screen. A notebook
+        #: hides a page by unmapping the page, and X does not send <Unmap> to
+        #: its children, so the canvas cannot see this for itself and the
+        #: window told it instead -- without which the sweep went on turning,
+        #: at sixty frames a second, on a tab nobody was looking at.
+        self._showing = True
         self._static = reduced_motion()
         self._phase = 0.0
         self._flourish = 0
         self._items: Dict[str, Any] = {}
         self._geo: Dict[str, float] = {}
         self._bugs: List[Dict[str, float]] = []
+        #: Kept alive here or Tk frees the font out from under the wordmark.
+        self._mark_font: Any = None
+        #: The per-locus hue sweep, rebuilt only when the theme changes.
+        self._hues: List[str] = []
+        self._hues_mode = ""
+        #: Wall time the last frame cost, in ms. Drives :meth:`frame_delay`.
+        self._frame_ms = 0.0
         self.bind("<Configure>", lambda e: self.redraw(), add="+")
         self.bind("<Button-1>", self._click, add="+")
         self.bind("<Return>", self._key_browse, add="+")
@@ -3107,6 +3677,14 @@ class DropZone(tk.Canvas):
         self._want_anim = bool(on)
         self._sync_anim()
 
+    def set_showing(self, showing: bool) -> None:
+        """Told by the window when this zone's tab is, or stops being, current."""
+        showing = bool(showing)
+        if showing == self._showing:
+            return
+        self._showing = showing
+        self._sync_anim()
+
     def _on_map(self, _event: Any = None) -> None:
         self._mapped = True
         self._sync_anim()
@@ -3117,7 +3695,7 @@ class DropZone(tk.Canvas):
 
     def should_animate(self) -> bool:
         """Everything that has to be true before a single frame is scheduled."""
-        if self._static or not self._mapped:
+        if self._static or not self._mapped or not self._showing:
             return False
         if self._flourish > 0:
             return True
@@ -3144,6 +3722,20 @@ class DropZone(tk.Canvas):
                 pass
             self._anim_after = None
 
+    def frame_delay(self) -> int:
+        """Milliseconds until the next frame, backed off on a slow display.
+
+        Sixty frames a second is what stops the sweep from stepping, but a timer
+        that re-arms faster than the machine can paint fills the event loop and
+        never gives it back -- ``update()`` then never returns and the window
+        stops responding. So the NEXT interval is chosen from what the LAST
+        frame actually cost, leaving at least a third of every interval idle.
+        Fast machines never leave 60 fps; slow ones degrade instead of locking.
+        """
+        if self._frame_ms <= self.FPS_MS * 0.6:
+            return self.FPS_MS
+        return int(min(160.0, max(float(self.FPS_MS), self._frame_ms * 1.7)))
+
     def _tick(self) -> None:
         self._anim_after = None
         if not self.should_animate():
@@ -3151,7 +3743,7 @@ class DropZone(tk.Canvas):
         # Re-armed BEFORE the frame is painted, never after: a frame that took
         # too long must not be able to drop the chain (the poll-chain rule).
         try:
-            self._anim_after = self.after(self.FPS_MS, self._tick)
+            self._anim_after = self.after(self.frame_delay(), self._tick)
         except tk.TclError:  # pragma: no cover
             return
         self._phase = (self._phase + self.SWEEP_PER_FRAME) % float(self.LOCI)
@@ -3159,7 +3751,9 @@ class DropZone(tk.Canvas):
             self._flourish -= 1
             if self._flourish == 0 and not (self._want_anim and self._enabled):
                 self._stop_anim()
+        started = time.monotonic()
         self._frame()
+        self._frame_ms = (time.monotonic() - started) * 1000.0
 
     def flourish(self) -> None:
         """A brief confirming pulse when files actually land."""
@@ -3195,6 +3789,34 @@ class DropZone(tk.Canvas):
                 "dash": True, "ink": c("accent"), "headline": c("text"),
                 "sub": c("muted")}
 
+    def locus_colours(self) -> List[str]:
+        """One colour per locus: a soft indigo-to-cyan sweep, procedurally.
+
+        Generated rather than listed so that the dark and high-contrast themes
+        get the same *relationship* between the loci at their own lightness,
+        instead of a light-theme blue dropped onto a dark ground.
+        """
+        if self._hues and self._hues_mode == THEME_MODE:
+            return self._hues
+        lightness, chroma = CATEGORY_LCH.get(THEME_MODE, CATEGORY_LCH["light"])
+        lightness = min(0.86, lightness + 0.02)
+        span = (self.HUE_TO - self.HUE_FROM) / float(max(1, self.LOCI - 1))
+        self._hues = [oklch_hex(lightness, chroma * 0.92, self.HUE_FROM + span * i)
+                      for i in range(self.LOCI)]
+        self._hues_mode = THEME_MODE
+        return self._hues
+
+    def sweep(self) -> float:
+        """The read head's position, eased so it settles on each locus.
+
+        The accumulator itself advances linearly (a frame must never depend on
+        how long the previous one took); the EASE is applied here, on the way
+        out, so the head slows into a locus and accelerates out of it instead of
+        sliding round at one speed like a clock hand.
+        """
+        base = math.floor(self._phase)
+        return base + ease_in_out(self._phase - base)
+
     def _seed_bugs(self, w: float, h: float, top: float) -> None:
         """Deterministic starting positions — no ``random`` import, no surprises."""
         self._bugs = []
@@ -3205,10 +3827,40 @@ class DropZone(tk.Canvas):
                 (0.48, 0.14, 0.6, 1.0, 5, "coccus", 0.0),
                 (0.92, 0.52, -0.9, -0.8, 6, "rod", 1.2))
         for fx, fy, vx, vy, size, kind, ang in spec:
-            self._bugs.append({"x": fx * w, "y": top * fy, "vx": vx * 0.16,
-                               "vy": vy * 0.16, "r": float(px(size)),
+            self._bugs.append({"x": fx * w, "y": top * fy, "vx": vx * 0.08,
+                               "vy": vy * 0.08, "r": float(px(size)),
                                "rod": 1.0 if kind == "rod" else 0.0,
-                               "ang": ang, "spin": 0.004 if kind == "rod" else 0.0})
+                               "ang": ang, "spin": 0.002 if kind == "rod" else 0.0})
+
+    def _draw_wordmark(self, cx: float, cy: float, radius: float,
+                       col: Dict[str, str]) -> None:
+        """Set the house wordmark inside the chromosome, sized to the ring.
+
+        Fitted by measurement, not by a guessed point size: the ring's radius
+        follows the window, and a fixed size would either rattle around inside a
+        large ring or spill over a small one. Below the size at which it would
+        be unreadable it is simply not drawn.
+        """
+        inner = radius * 1.32
+        if inner < float(px(64)):
+            return
+        family = F.get("display_family") or F.get("family") or "Helvetica"
+        size = max(9, int(radius * 0.42))
+        try:
+            font = tkfont.Font(root=self, family=family, size=-size, weight="bold")
+            measured = max(1, font.measure(WORDMARK))
+            if measured > inner:
+                size = max(9, int(size * inner / float(measured)))
+                font = tkfont.Font(root=self, family=family, size=-size,
+                                   weight="bold")
+                measured = max(1, font.measure(WORDMARK))
+            if measured > inner * 1.02 or size < 9:
+                return
+        except tk.TclError:  # pragma: no cover - teardown
+            return
+        self._mark_font = font
+        self._items["mark"] = self.create_text(
+            cx, cy, text=WORDMARK, font=font, fill=col["headline"], anchor="center")
 
     def _bug_points(self, bug: Dict[str, float]) -> List[float]:
         """A capsule (rod) or a circle (coccus), as a smoothed polygon."""
@@ -3278,8 +3930,7 @@ class DropZone(tk.Canvas):
 
         ink = col["ink"]
         base = col["fill"]
-        dim = mix(base, ink, 0.38)
-        ring = mix(base, ink, 0.52)
+        ring = mix(base, ink, 0.46)
 
         # -- drifting flora, behind everything ------------------------------
         if not tiny and not compact:
@@ -3300,28 +3951,43 @@ class DropZone(tk.Canvas):
         self._items["pulse"] = self.create_oval(cx, cy, cx, cy, outline="", width=px(2))
         self.create_oval(cx - radius * 0.72, cy - radius * 0.72,
                          cx + radius * 0.72, cy + radius * 0.72,
-                         outline=mix(base, ink, 0.22), width=1)
+                         outline=mix(base, ink, 0.18), width=1)
         self.create_oval(cx - radius, cy - radius, cx + radius, cy + radius,
                          outline=ring, width=max(1, px(2)))
 
         span = 360.0 / self.LOCI
         arc_span = span * 0.62
         box = (cx - radius, cy - radius, cx + radius, cy + radius)
-        arcs, nodes = [], []
+        hues = self.locus_colours()
+        # A wide, very faint arc UNDER each locus: the soft halo that turns a
+        # flat stroke into something with depth, and the thing a single mid-blue
+        # could never do on its own.
+        glows, arcs, nodes = [], [], []
+        for i in range(self.LOCI):
+            mid = 90.0 - i * span
+            glows.append(self.create_arc(box[0], box[1], box[2], box[3],
+                                         start=mid - arc_span / 2.0 - 3.0,
+                                         extent=arc_span + 6.0, style="arc",
+                                         width=px(15), outline=base))
         for i in range(self.LOCI):
             mid = 90.0 - i * span
             arcs.append(self.create_arc(box[0], box[1], box[2], box[3],
                                         start=mid - arc_span / 2.0, extent=arc_span,
-                                        style="arc", width=px(7), outline=dim))
+                                        style="arc", width=px(7),
+                                        outline=mix(base, hues[i], 0.30)))
             orbit = radius + float(px(11))
             ax = cx + orbit * math.cos(math.radians(mid))
             ay = cy - orbit * math.sin(math.radians(mid))
             nodes.append(self.create_oval(ax - px(4), ay - px(4), ax + px(4),
-                                          ay + px(4), fill=dim,
+                                          ay + px(4), fill=mix(base, hues[i], 0.34),
                                           outline=base, width=1))
+        self._items["glows"] = glows
         self._items["arcs"] = arcs
         self._items["nodes"] = nodes
-        self._items["head"] = self.create_oval(cx, cy, cx, cy, fill=ink, outline="")
+        self._items["head"] = self.create_oval(cx, cy, cx, cy, fill=ink,
+                                               outline=base, width=1)
+        self._items["halo"] = self.create_oval(cx, cy, cx, cy, outline="", width=px(2))
+        self._draw_wordmark(cx, cy, radius, col)
 
         if not tiny:
             # ASCII on purpose. A Tk canvas hands the string to the X font
@@ -3352,50 +4018,83 @@ class DropZone(tk.Canvas):
         self._sync_anim()
 
     def _frame(self) -> None:
-        """Update only what moves. Called every ~33 ms, and once per redraw."""
+        """Update only what moves. Called every ~16 ms, and once per redraw.
+
+        Every quantity that moves is a float and every ramp is eased: the arc
+        brightness, the locus dot's radius, the halo behind the read head and
+        the head's own position are all continuous functions of the sweep, so
+        nothing in here can step.
+        """
         arcs = self._items.get("arcs")
         if not arcs:
             return
         col = self._colours()
         ink, base = col["ink"], col["fill"]
-        dim = mix(base, ink, 0.38)
-        bright = ink
+        hues = self.locus_colours()
         lit_all = self.zone_state == "dragover" and self._enabled
         cx, cy, radius = self._geo["cx"], self._geo["cy"], self._geo["r"]
         span = 360.0 / self.LOCI
+        sweep = self.sweep()
         try:
             for i, item in enumerate(arcs):
+                hue = hues[i] if self._enabled else ink
+                dim = mix(base, hue, 0.30)
+                bright = hue
                 if self._static:
-                    level = 0.45
+                    level = 0.55
                 elif lit_all:
                     level = 1.0
                 else:
-                    d = (i - self._phase) % float(self.LOCI)
+                    d = (i - sweep) % float(self.LOCI)
                     d = min(d, self.LOCI - d)
-                    level = max(0.0, 1.0 - d / 1.45)
+                    level = ease_in_out(1.0 - min(1.0, d / 1.55))
                 self.itemconfigure(item, outline=mix(dim, bright, level),
-                                   width=px(7) + px(3) * level)
+                                   width=px(7) + px(3.2) * level)
+                glow = self._items.get("glows")
+                if glow:
+                    self.itemconfigure(glow[i],
+                                       outline=mix(base, bright, 0.16 * level))
                 node = self._items["nodes"][i]
-                nr = px(4) + px(2.4) * level
+                # Sized against the RING, not the screen: at 104 px the strip
+                # height leaves a 38 px ring, and a fixed 4 px dot on it was
+                # half the width of the arc it was supposed to annotate.
+                base_nr = min(float(px(4.5)), max(float(px(2.2)), radius * 0.05))
+                nr = base_nr * (1.0 + 0.6 * level)
                 mid = 90.0 - i * span
                 orbit = radius + float(px(11))
                 ax = cx + orbit * math.cos(math.radians(mid))
                 ay = cy - orbit * math.sin(math.radians(mid))
                 self.coords(node, ax - nr, ay - nr, ax + nr, ay + nr)
-                self.itemconfigure(node, fill=mix(dim, bright, min(1.0, level + 0.15)))
+                self.itemconfigure(node,
+                                   fill=mix(mix(base, hue, 0.34), bright, level))
 
-            # the travelling read head
+            # the travelling read head, and the soft halo that trails it
             head = self._items.get("head")
+            halo = self._items.get("halo")
             if head is not None:
                 if self._static or lit_all:
                     self.itemconfigure(head, fill="")
+                    if halo is not None:
+                        self.itemconfigure(halo, outline="")
                 else:
-                    ang = 90.0 - self._phase * span
+                    ang = 90.0 - sweep * span
+                    hue = hues[int(sweep) % self.LOCI]
                     hx = cx + radius * math.cos(math.radians(ang))
                     hy = cy - radius * math.sin(math.radians(ang))
-                    hr = float(px(4))
+                    hr = min(float(px(4.5)), max(float(px(2.4)), radius * 0.045))
+                    hr *= 1.0 + 0.22 * ease_in_out(
+                        1.0 - abs((self._phase % 1.0) - 0.5) * 2.0)
                     self.coords(head, hx - hr, hy - hr, hx + hr, hy + hr)
-                    self.itemconfigure(head, fill=bright)
+                    # A hairline in the ground colour around the head: without
+                    # it the head merges with the locus dot it is passing over
+                    # and the pair read as one dark blob.
+                    self.itemconfigure(head, fill=hue, outline=base,
+                                       width=max(1, px(1.5)))
+                    if halo is not None:
+                        gr = hr * 2.6
+                        self.coords(halo, hx - gr, hy - gr, hx + gr, hy + gr)
+                        self.itemconfigure(halo, outline=mix(base, hue, 0.22),
+                                           width=max(1, px(2)))
 
             for idx, item in enumerate(self._items.get("bugs") or []):
                 bug = self._bugs[idx]
@@ -3417,7 +4116,7 @@ class DropZone(tk.Canvas):
             pulse = self._items.get("pulse")
             if pulse is not None:
                 if self._flourish > 0:
-                    k = 1.0 - self._flourish / float(self.FLOURISH_FRAMES)
+                    k = ease_out(1.0 - self._flourish / float(self.FLOURISH_FRAMES))
                     pr = radius * (1.0 + 1.4 * k)
                     self.coords(pulse, cx - pr, cy - pr, cx + pr, cy + pr)
                     self.itemconfigure(pulse, outline=mix(bright, base, k),
@@ -3795,6 +4494,13 @@ class AnalyseView(ttk.Frame):
         self._sort_col: Optional[str] = None
         self._sort_desc = False
         self._pending_rows: List[SampleResult] = []
+        #: Every top-level row, in insertion order, INCLUDING the ones the
+        #: filter has currently detached — the Treeview cannot be asked for
+        #: those, and sorting has to keep them in the order too.
+        self._rows: List[str] = []
+        #: iid -> the lower-cased text the filter box searches.
+        self._haystack: Dict[str, str] = {}
+        self._filter = ""
         self._done = 0
         self._total = 0
         self._current_pct = 0.0
@@ -3955,15 +4661,37 @@ class AnalyseView(ttk.Frame):
             header, text="Click the arrow beside a file to see each locus.",
             style="Muted.TLabel")
         self.results_hint.pack(side="left", padx=px(PAD_M))
+        # Forty files is a scroll; a filter box is the difference between
+        # "where is that isolate" and "there it is". It matches the file name,
+        # the organism, the scheme, the ST and the status, so "novel", "258"
+        # and "saureus" are all useful things to type.
+        filter_box = ttk.Frame(header, style="TFrame")
+        filter_box.pack(side="right")
+        ttk.Label(filter_box, text="Filter", style="Muted.TLabel").pack(
+            side="left", padx=(0, px(PAD_S)))
+        self.filter_var = tk.StringVar()
+        self.filter_entry = ttk.Entry(filter_box, textvariable=self.filter_var,
+                                      width=22)
+        self.filter_entry.pack(side="left")
+        self.filter_var.trace_add("write", lambda *_a: self.set_filter(
+            self.filter_var.get()))
+        self.filter_entry.bind("<Escape>", lambda e: self.clear_filter(), add="+")
+        Tooltip(self.filter_entry, "Show only the rows containing what you type - "
+                                   "file name, organism, scheme, ST or status. "
+                                   "Press Escape to clear it.")
 
         ring = focus_ring(self.results_wrap)
         self.tree = ttk.Treeview(ring, columns=TREE_COLUMNS, show="tree headings",
                                  selectmode="browse", height=6)
         ring.track(self.tree)
         vsb = ttk.Scrollbar(ring, orient="vertical", command=self.tree.yview)
-        self.tree.pack(side="left", fill="both", expand=True)
+        # Inset by one pixel so the ring's own colour shows as the table's
+        # hairline: the focus ring was invisible at rest because the Treeview
+        # covered every pixel of it.
+        self.tree.pack(side="left", fill="both", expand=True, padx=(1, 0), pady=1)
         self.tree.configure(
-            yscrollcommand=autohide(vsb, self.tree, side="right", fill="y"))
+            yscrollcommand=autohide(vsb, self.tree, side="right", fill="y",
+                                    padx=(1, 1), pady=1))
         # #0 is the only stretching column, so it absorbs the window: a RefSeq
         # accession is 40 characters and used to be chopped mid-token.
         # The six starting widths must SUM to less than the narrowest window
@@ -4018,6 +4746,11 @@ class AnalyseView(ttk.Frame):
         self.btn_novel.pack(side="left", padx=(px(PAD_S), 0))
         self.btn_copy = ttk.Button(actions, text="Copy row", command=self.copy_row)
         self.btn_copy.pack(side="left", padx=(px(PAD_S), 0))
+        self.btn_tree = ttk.Button(actions, text="Show tree",
+                                   command=self.show_tree)
+        self.btn_tree.pack(side="left", padx=(px(PAD_S), 0))
+        Tooltip(self.btn_tree, "Draw a minimum spanning tree of every isolate "
+                               "typed with the same scheme, on the Tree tab.")
         self.btn_clear = ttk.Button(actions, text="Clear", command=self.clear)
         self.btn_clear.pack(side="right")
         Tooltip(self.btn_html, "Build a printable report of every file in this list "
@@ -4103,6 +4836,13 @@ class AnalyseView(ttk.Frame):
             btn.configure(state=state)
         if enabled and not any(s.novel for s in self.results):
             self.btn_novel.configure(state="disabled")
+        # The tree needs two isolates of one scheme, which is a different
+        # question from "are there results at all".
+        try:
+            ready = enabled and self.app.mst_view.available()
+        except AttributeError:  # pragma: no cover - during construction
+            ready = False
+        self.btn_tree.configure(state="normal" if ready else "disabled")
 
     def _fill_summary(self, res: SampleResult) -> None:
         """Fill the single-file card. Every value is copied, never recomputed.
@@ -4445,6 +5185,7 @@ class AnalyseView(ttk.Frame):
             tags=(self._row_tone(res.status), "row"), open=False)
         self._row_data[iid] = res
         self._row_names[iid] = name
+        self._remember_row(iid, (name, organism, res.scheme, res.st, res.status))
         if res.alleles or res.tied:
             # A dummy child makes the disclosure arrow appear; the real per-locus
             # rows are built lazily on <<TreeviewOpen>> (section 10.2).
@@ -4468,7 +5209,63 @@ class AnalyseView(ttk.Frame):
             tags=("failed", "row"))
         self._row_error[iid] = friendly
         self._row_names[iid] = name
+        self._remember_row(iid, (name, "COULD NOT READ", friendly.headline))
         self.tree.see(iid)
+
+    # -- the filter box ------------------------------------------------------
+    def _remember_row(self, iid: str, fields: Sequence[str]) -> None:
+        """Record a top-level row so it can be sorted and filtered later."""
+        self._rows.append(iid)
+        self._haystack[iid] = " ".join(str(f) for f in fields).lower()
+        if self._filter and self._filter not in self._haystack[iid]:
+            self.tree.detach(iid)
+        self._update_results_title()
+
+    def set_filter(self, text: str) -> None:
+        """Show only the rows that contain ``text`` (case-insensitively)."""
+        text = str(text or "").strip().lower()
+        if text == self._filter:
+            return
+        self._filter = text
+        self._apply_filter()
+
+    def clear_filter(self) -> str:
+        self.filter_var.set("")
+        return "break"
+
+    def _apply_filter(self) -> None:
+        shown = 0
+        for iid in self._rows:
+            if not self._filter or self._filter in self._haystack.get(iid, ""):
+                try:
+                    self.tree.move(iid, "", shown)   # re-attaches a detached row
+                except tk.TclError:  # pragma: no cover - row already gone
+                    continue
+                shown += 1
+            else:
+                try:
+                    self.tree.detach(iid)
+                except tk.TclError:  # pragma: no cover
+                    pass
+        self._update_results_title(shown)
+
+    def _update_results_title(self, shown: Optional[int] = None) -> None:
+        total = len(self._rows)
+        if shown is None:
+            shown = total if not self._filter else len(
+                [i for i in self._rows
+                 if self._filter in self._haystack.get(i, "")])
+        if self._filter:
+            self.results_title.configure(text="Results ({} of {})".format(shown,
+                                                                          total))
+            self.results_hint.configure(
+                text=("Nothing matches that filter." if shown == 0 else
+                      "Filtered. Press Escape in the box to show everything."))
+        else:
+            self.results_title.configure(
+                text="Results" if not total else "Results ({})".format(total))
+            self.results_hint.configure(
+                text="Click the arrow beside a file to see each locus.")
 
     def _on_open(self, _event: Any = None) -> None:
         iid = self.tree.focus()
@@ -4572,7 +5369,10 @@ class AnalyseView(ttk.Frame):
             self._sort_desc = not self._sort_desc
         else:
             self._sort_col, self._sort_desc = col, False
-        rows = list(self.tree.get_children(""))
+        # self._rows, not the Treeview's children: a filtered-out row is
+        # detached, and sorting only what is on screen would shuffle it back in
+        # at the end the moment the filter was cleared.
+        rows = list(self._rows)
         original = {iid: i for i, iid in enumerate(rows)}
 
         def key(iid: str) -> Any:
@@ -4599,8 +5399,8 @@ class AnalyseView(ttk.Frame):
                                            else self.tree.item(iid, "text")),
                                        original[iid]),
                       reverse=self._sort_desc)
-        for position, iid in enumerate(rows):
-            self.tree.move(iid, "", position)
+        self._rows = rows
+        self._apply_filter()
 
     # -- actions -------------------------------------------------------------
     def copy_row(self) -> None:
@@ -4642,6 +5442,14 @@ class AnalyseView(ttk.Frame):
         self.tie_banner.pack_forget()
         self.results.clear()
         self.failures.clear()
+        self._rows.clear()
+        self._haystack.clear()
+        self._filter = ""
+        try:
+            self.filter_var.set("")
+        except tk.TclError:  # pragma: no cover - teardown
+            pass
+        self._update_results_title()
         self._row_data.clear()
         self._row_error.clear()
         self._row_names.clear()
@@ -4651,8 +5459,13 @@ class AnalyseView(ttk.Frame):
             self.tree.delete(iid)
         self.app.state.to(IDLE)
         self.show_state(IDLE)
+        self.app.refresh_tree_tab()
         self.app.status.set("Ready.", resting=True)
         return True
+
+    def show_tree(self) -> None:
+        """Jump to the tree page (the button beside the export row)."""
+        self.app.show_tree()
 
     def open_html(self) -> None:
         self.app.export("html")
@@ -4665,6 +5478,943 @@ class AnalyseView(ttk.Frame):
 
     def save_novel(self) -> None:
         self.app.export("novel")
+
+
+# ===========================================================================
+# SECTION 8B — VIEWS: THE TREE TAB  (section 10.10)
+# ===========================================================================
+
+#: Two isolates typed with the same scheme is the smallest thing that has a
+#: relationship worth drawing; one isolate is a dot.
+MST_MIN_SAMPLES = 2
+
+#: The two ways of reading the same tree.
+VIEW_CLONAL, VIEW_LABELLED = "clonality", "labelled"
+
+#: Legend rows before the panel gives up and counts the rest.
+LEGEND_MAX_ROWS = 22
+
+#: Nominal text heights, in WORLD units (they zoom with the drawing).
+EDGE_TEXT, LABEL_TEXT, LEGEND_TEXT, CAPTION_TEXT = 11.0, 13.0, 11.5, 12.0
+
+#: Zoom limits and the step one click of the zoom buttons takes.
+ZOOM_MIN, ZOOM_MAX, ZOOM_STEP = 0.25, 4.0, 1.25
+
+
+def compact_label(name: str, limit: int = 24) -> str:
+    """Shorten ONE isolate name for a tree label. See :func:`compact_labels`."""
+    return compact_labels([name], limit)[0]
+
+
+def compact_labels(names: Sequence[str], limit: int = 24) -> List[str]:
+    """Shorten a whole set of isolate names, and keep them telling each other apart.
+
+    An assembly file name is ``identifier_description``
+    (``GCF_002278055.1_ASM227805v1_genomic``) and the identifier is at the
+    FRONT, so the trailing underscore-separated words are dropped first, one
+    round at a time — but only while every name in the set stays distinct. Two
+    labels that have been shortened into the same string are worse than two long
+    ones, so the round that would collide is the round that is refused, and what
+    is left over is elided through the middle instead.
+    """
+    out = []
+    for name in names:
+        text = ascii_only(name).strip()
+        for tail in ("_genomic", ".genomic", "_assembly"):
+            if text.lower().endswith(tail) and len(text) > len(tail) + 4:
+                text = text[:-len(tail)]
+        out.append(text)
+    for _round in range(8):
+        proposal = list(out)
+        changed = False
+        for i, text in enumerate(proposal):
+            if len(text) > limit and "_" in text.strip("_"):
+                head = text.rsplit("_", 1)[0]
+                if head:
+                    proposal[i] = head
+                    changed = True
+        if not changed or len(set(proposal)) != len(proposal):
+            break
+        out = proposal
+    final = []
+    for text in out:
+        if len(text) <= limit:
+            final.append(text)
+        else:
+            head = max(6, limit - 8)
+            final.append(text[:head] + ".." + text[-(limit - head - 2):])
+    return final
+
+
+def mst_st_key(st: str) -> Tuple[int, float, str]:
+    """Sort STs numerically where they are numbers, and last where they are not."""
+    text = str(st).strip()
+    try:
+        return (0, float(text), text)
+    except ValueError:
+        return (1, 0.0, text)
+
+
+def isolate_label(path_or_label: str) -> str:
+    """The name a tree node carries: the file's own name, no folder, no suffix.
+
+    ``SampleResult.label`` is the FILE column, which for a dropped file is its
+    whole path — 90 characters of scratch directory that say nothing about the
+    isolate. The tree shows what a reader would call the sample, and the side
+    panel still shows the full label when a dot is clicked.
+    """
+    name = os.path.basename(str(path_or_label)) or str(path_or_label)
+    for _ in range(2):
+        stem, ext = os.path.splitext(name)
+        if stem and ext.lower() in (".gz", ".bz2", ".zip", ".xz", ".fna", ".fa",
+                                    ".fasta", ".fsa", ".seq", ".gbk", ".gb",
+                                    ".genbank", ".embl", ".txt", ".dat"):
+            name = stem
+        else:
+            break
+    return name or str(path_or_label)
+
+
+def node_radius(shared: int, base: float = 7.5, step: float = 4.2,
+                cap: float = 20.0) -> float:
+    """Dot radius for an ST carried by ``shared`` isolates.
+
+    Area, not diameter, grows with the count: a doubled radius would read as
+    four times the isolates. Square-rooted and capped, so one very common ST
+    cannot swallow the tree.
+    """
+    return min(cap, base + step * (math.sqrt(max(1, int(shared))) - 1.0))
+
+
+class MstView(ttk.Frame):
+    """The minimum spanning tree, in two readings (section 10.10).
+
+    ``wmlst.mst`` does the whole of the maths; this class does nothing but
+    choose colours, place labels and paint — twice, once onto a Tk canvas and
+    once into :class:`Raster` for "Save image", from ONE list of primitives so
+    the file and the window can never disagree.
+    """
+
+    def __init__(self, parent: tk.Misc, app: WmlstApp):
+        super().__init__(parent, style="TFrame")
+        self.app = app
+        self.mode = VIEW_CLONAL
+        self.scheme = ""
+        self.tree_obj: Any = None
+        self._nodes: Tuple[Any, ...] = ()
+        self._scene: List[Prim] = []
+        self._hits: List[Tuple[float, float, float, int]] = []
+        self._by_label: Dict[str, SampleResult] = {}
+        self._colours: Dict[str, str] = {}
+        self._legend: List[Tuple[str, str]] = []
+        self._legend_title = ""
+        self._caption = ""
+        self._world = (800.0, 600.0)
+        self._zoom = 1.0
+        self._origin = [0.0, 0.0]
+        self._selected: Optional[str] = None
+        self._signature: Optional[Tuple[Any, ...]] = None
+        self._drag: Optional[Tuple[float, float, float, float]] = None
+        self._fonts: Dict[Tuple[int, bool], Any] = {}
+        self._show_legend = True
+        self._schemes: List[Tuple[str, int]] = []
+        #: Bounded retries for :meth:`fit` before the canvas has a size.
+        self._fit_tries = 0
+        self._build()
+
+    # -- construction --------------------------------------------------------
+    def _build(self) -> None:
+        outer = ttk.Frame(self, style="TFrame")
+        outer.pack(fill="both", expand=True, padx=px(PAD_L), pady=px(PAD_M))
+
+        head = card(outer)
+        head.master.pack(fill="x")
+        top = ttk.Frame(head, style="Surface.TFrame")
+        top.pack(fill="x", padx=px(PAD_M), pady=(px(PAD_M), px(PAD_S)))
+        titles = ttk.Frame(top, style="Surface.TFrame")
+        titles.pack(side="left", fill="x", expand=True)
+        ttk.Label(titles, text="MINIMUM SPANNING TREE",
+                  style="Eyebrow.TLabel").pack(anchor="w")
+        self.subtitle = ttk.Label(titles, text="", style="Heading.TLabel", anchor="w")
+        self.subtitle.pack(anchor="w", pady=(px(PAD_XS), 0))
+
+        picker = ttk.Frame(top, style="Surface.TFrame")
+        picker.pack(side="right")
+        ttk.Label(picker, text="Scheme", style="SurfaceMuted.TLabel").pack(side="left",
+                                                                          padx=(0, px(PAD_S)))
+        self.scheme_box = ttk.Combobox(picker, state="readonly", width=18,
+                                       values=(), exportselection=False)
+        self.scheme_box.pack(side="left")
+        self.scheme_box.bind("<<ComboboxSelected>>", self._scheme_chosen, add="+")
+        Tooltip(self.scheme_box, "Only isolates typed with the SAME scheme can be "
+                                 "compared locus by locus, so the tree is drawn for "
+                                 "one scheme at a time.")
+
+        bar = ttk.Frame(head, style="Surface.TFrame")
+        bar.pack(fill="x", padx=px(PAD_M), pady=(0, px(PAD_M)))
+        self.btn_clonal = ttk.Button(bar, text="Clonality",
+                                     command=lambda: self.set_mode(VIEW_CLONAL))
+        self.btn_clonal.pack(side="left")
+        self.btn_labelled = ttk.Button(bar, text="Labelled tree",
+                                       command=lambda: self.set_mode(VIEW_LABELLED))
+        self.btn_labelled.pack(side="left", padx=(px(PAD_XS), 0))
+        Tooltip(self.btn_clonal, "Coloured dots, one per isolate, grouped by clonal "
+                                 "complex and sized by how many isolates share the ST.")
+        Tooltip(self.btn_labelled, "The same tree with every isolate named, for reading "
+                                   "and for putting in a report.")
+
+        ttk.Separator(bar, orient="vertical").pack(side="left", fill="y",
+                                                   padx=px(PAD_M), pady=px(PAD_XS))
+        ttk.Button(bar, text="Zoom out",
+                   command=lambda: self.zoom_by(1.0 / ZOOM_STEP)).pack(side="left")
+        ttk.Button(bar, text="Fit", command=self.fit).pack(side="left",
+                                                           padx=(px(PAD_XS), 0))
+        ttk.Button(bar, text="Zoom in",
+                   command=lambda: self.zoom_by(ZOOM_STEP)).pack(side="left",
+                                                                 padx=(px(PAD_XS), 0))
+        self.zoom_label = ttk.Label(bar, text="100 %", style="SurfaceMuted.TLabel",
+                                    width=6, anchor="w")
+        self.zoom_label.pack(side="left", padx=(px(PAD_S), 0))
+
+        self.legend_box = CheckBox(bar, "Legend", command=self._legend_toggled,
+                                   surface=c("surface"))
+        self.legend_box.set(True)
+        self.legend_box.pack(side="left", padx=(px(PAD_M), 0))
+
+        self.btn_png = ttk.Button(bar, text="Save image (PNG)...",
+                                  style="Accent.TButton", command=self.save_png)
+        self.btn_png.pack(side="right")
+        Tooltip(self.btn_png, "Write exactly this picture — tree, labels and legend — "
+                              "to a PNG file at twice the screen resolution.")
+
+        # -- the picture, and the isolate panel beside it ---------------------
+        self.body = ttk.Frame(outer, style="TFrame")
+        self.body.pack(fill="both", expand=True, pady=(px(PAD_M), 0))
+
+        ring = focus_ring(self.body)
+        ring.pack(side="left", fill="both", expand=True)
+        # The legend is a STRIP along the bottom of the picture, not a panel
+        # floating over its top-right corner: a panel drawn on the canvas hid
+        # whichever isolate names happened to be under it, and at "Fit" — the
+        # view every reader starts from — there is nowhere to pan them out to.
+        # A strip costs about eighty pixels of height and gives back the whole
+        # width, which is the direction a spanning tree actually needs.
+        self.legend_strip = tk.Canvas(ring, background=c("surface"),
+                                      highlightthickness=0, borderwidth=0, height=1)
+        self.legend_strip.pack(side="bottom", fill="x", padx=1, pady=(0, 1))
+        self.canvas = tk.Canvas(ring, background=c("surface"), highlightthickness=0,
+                                borderwidth=0, takefocus=True, cursor="hand2")
+        self.canvas.pack(side="top", fill="both", expand=True, padx=1, pady=1)
+        self.legend_strip.bind("<Configure>", lambda e: self._draw_legend_strip(),
+                               add="+")
+        ring.track(self.canvas)
+        self.canvas.bind("<Configure>", lambda e: self._redraw(), add="+")
+        self.canvas.bind("<Button-1>", self._press, add="+")
+        self.canvas.bind("<B1-Motion>", self._motion, add="+")
+        self.canvas.bind("<ButtonRelease-1>", self._release, add="+")
+        self.canvas.bind("<MouseWheel>", self._wheel, add="+")
+        self.canvas.bind("<Button-4>", self._wheel, add="+")
+        self.canvas.bind("<Button-5>", self._wheel, add="+")
+        self.canvas.bind("<plus>", lambda e: self.zoom_by(ZOOM_STEP), add="+")
+        self.canvas.bind("<minus>", lambda e: self.zoom_by(1.0 / ZOOM_STEP), add="+")
+        self.canvas.bind("<Key-0>", lambda e: self.fit(), add="+")
+
+        side = card(self.body)
+        side.master.pack(side="left", fill="y", padx=(px(PAD_M), 0))
+        self.side = side
+        side.master.configure(width=px(286))
+        side.master.pack_propagate(False)
+        ttk.Label(side, text="SELECTED ISOLATE", style="Eyebrow.TLabel").pack(
+            anchor="w", padx=px(PAD_M), pady=(px(PAD_M), px(PAD_XS)))
+        self.pick_name = ttk.Label(side, text="Click a dot", style="Heading.TLabel",
+                                   anchor="w", justify="left")
+        self.pick_name.pack(anchor="w", fill="x", padx=px(PAD_M))
+        self.pick_name.bind("<Configure>", lambda e: self.pick_name.configure(
+            wraplength=max(px(160), e.width - px(4))), add="+")
+        self.pick_meta = ttk.Label(side, text="", style="SurfaceMuted.TLabel",
+                                   anchor="w", justify="left")
+        self.pick_meta.pack(anchor="w", fill="x", padx=px(PAD_M), pady=(px(PAD_XS), 0))
+        self.pick_meta.bind("<Configure>", lambda e: self.pick_meta.configure(
+            wraplength=max(px(160), e.width - px(4))), add="+")
+        ttk.Label(side, text="ALLELE PROFILE", style="Eyebrow.TLabel").pack(
+            anchor="w", padx=px(PAD_M), pady=(px(PAD_M), px(PAD_XS)))
+        # The neighbour line is claimed from the BOTTOM before the table is
+        # given the rest: packed after a table that expands, its last line was
+        # cut in half by the edge of the card.
+        self.pick_near = ttk.Label(side, text="", style="SurfaceMuted.TLabel",
+                                   anchor="w", justify="left")
+        self.pick_near.pack(side="bottom", anchor="w", fill="x", padx=px(PAD_M),
+                            pady=(px(PAD_S), px(PAD_M)))
+        self.pick_near.bind("<Configure>", lambda e: self.pick_near.configure(
+            wraplength=max(px(160), e.width - px(4))), add="+")
+        self.profile = ttk.Treeview(side, columns=("allele",), show="tree headings",
+                                    selectmode="none", height=7)
+        self.profile.heading("#0", text="LOCUS", anchor="w")
+        self.profile.heading("allele", text="ALLELE", anchor="e")
+        self.profile.column("#0", width=px(150), minwidth=px(80), stretch=True)
+        self.profile.column("allele", width=px(90), minwidth=px(50), anchor="e")
+        self.profile.pack(side="top", fill="both", expand=True, padx=px(PAD_M),
+                          pady=(0, px(PAD_S)))
+
+        # -- the empty state, shown instead of the picture --------------------
+        self.empty = ttk.Frame(outer, style="TFrame")
+        empty_card = card(self.empty)
+        empty_card.master.pack(fill="both", expand=True)
+        pad = ttk.Frame(empty_card, style="Surface.TFrame")
+        pad.pack(expand=True, padx=px(PAD_XL), pady=px(PAD_XL))
+        ttk.Label(pad, text="Nothing to compare yet", style="Title.TLabel",
+                  background=c("surface")).pack(anchor="center")
+        ttk.Label(pad, justify="center", style="SurfaceMuted.TLabel", text=(
+            "A minimum spanning tree shows how far apart isolates are, counted in "
+            "loci that differ.\n\n"
+            "Analyse at least TWO assemblies that the same scheme fits, on the "
+            "Analyse tab, and this page draws itself.\nIsolates typed with "
+            "different schemes cannot be compared, so each scheme gets its own "
+            "tree.")).pack(anchor="center", pady=(px(PAD_M), 0))
+        self._set_mode_buttons()
+
+    # -- availability --------------------------------------------------------
+    def usable_schemes(self) -> List[Tuple[str, int]]:
+        """Schemes with enough typed isolates to draw, biggest first."""
+        counts: Dict[str, int] = {}
+        for res in self.app.analyse_view.results:
+            if getattr(res, "failed", False):
+                continue
+            name = str(getattr(res, "scheme", "") or "")
+            if not name or name == "-":
+                continue
+            if not (getattr(res, "alleles", ()) or ()):
+                continue
+            counts[name] = counts.get(name, 0) + 1
+        return sorted(((k, v) for k, v in counts.items() if v >= MST_MIN_SAMPLES),
+                      key=lambda kv: (-kv[1], kv[0]))
+
+    def available(self) -> bool:
+        return bool(self.usable_schemes())
+
+    # -- rebuilding ----------------------------------------------------------
+    def activate(self) -> None:
+        """Called when the tab is shown, and after every finished batch."""
+        self._schemes = self.usable_schemes()
+        names = [name for name, _ in self._schemes]
+        self.scheme_box.configure(values=names)
+        if self.scheme not in names:
+            self.scheme = names[0] if names else ""
+        if self.scheme:
+            self.scheme_box.set(self.scheme)
+        signature = (self.scheme, self.mode,
+                     tuple((r.label, r.scheme, r.st) for r in
+                           self.app.analyse_view.results))
+        if signature == self._signature and self.tree_obj is not None:
+            self._show_body(bool(names))
+            return
+        self._signature = signature
+        if not names:
+            self._show_body(False)
+            return
+        self._rebuild()
+        self._show_body(True)
+        self.fit()
+
+    def _show_body(self, has_tree: bool) -> None:
+        if has_tree:
+            self.empty.pack_forget()
+            if not self.body.winfo_manager():
+                self.body.pack(fill="both", expand=True, pady=(px(PAD_M), 0))
+        else:
+            self.body.pack_forget()
+            if not self.empty.winfo_manager():
+                self.empty.pack(fill="both", expand=True, pady=(px(PAD_M), 0))
+            self.subtitle.configure(text="No isolates to compare yet")
+
+    def _scheme_chosen(self, _event: Any = None) -> None:
+        chosen = self.scheme_box.get()
+        if chosen and chosen != self.scheme:
+            self.scheme = chosen
+            self._signature = None
+            self.activate()
+
+    def set_mode(self, mode: str) -> None:
+        if mode == self.mode:
+            return
+        self.mode = mode
+        self._set_mode_buttons()
+        self._signature = None
+        self.activate()
+
+    def _set_mode_buttons(self) -> None:
+        for button, name in ((self.btn_clonal, VIEW_CLONAL),
+                             (self.btn_labelled, VIEW_LABELLED)):
+            button.configure(style="Accent.TButton" if self.mode == name
+                             else "TButton")
+
+    def _legend_toggled(self) -> None:
+        self._show_legend = self.legend_box.get()
+        self._redraw()
+
+    def _rebuild(self) -> None:
+        """Recompute the tree, its colours, its layout and its primitives."""
+        results = [r for r in self.app.analyse_view.results
+                   if not getattr(r, "failed", False)
+                   and str(getattr(r, "scheme", "")) == self.scheme]
+        samples = [dataclasses.replace(sample, label=isolate_label(sample.label))
+                   for sample in mst.samples_from_results(results)]
+        tree = mst.build_mst(samples)
+        self.tree_obj = tree
+        self._by_label = {}
+        for node, res in zip(tree.nodes, results):
+            self._by_label[node.label] = res
+
+        shared: Dict[str, int] = {}
+        for node in tree.nodes:
+            shared[node.st] = shared.get(node.st, 0) + 1
+
+        if self.mode == VIEW_LABELLED:
+            # Roomier on purpose: this view is for reading, and a label is an
+            # order of magnitude wider than the dot it belongs to.
+            nodes = mst.layout(tree, 1240.0, 840.0, min_sep=46.0, base=72.0,
+                               scale=12.0, cap=150.0, max_zoom=1.0)
+        else:
+            nodes = mst.layout(tree, 1000.0, 700.0, min_sep=44.0, base=74.0,
+                               scale=22.0, cap=270.0, max_zoom=1.0)
+        self._nodes = nodes
+        self._colours, self._legend, self._legend_title = self._colour_map(tree, shared)
+        self._scene, self._hits = self._build_scene(tree, nodes, shared)
+        x0, y0, x1, y1 = prims_bbox(self._scene)
+        self._world = (max(1.0, x1 - x0), max(1.0, y1 - y0))
+        for prim_index, prim in enumerate(self._scene):
+            self._scene[prim_index] = dataclasses.replace(
+                prim, x=prim.x - x0, y=prim.y - y0, x2=prim.x2 - x0, y2=prim.y2 - y0)
+        self._hits = [(hx - x0, hy - y0, hr, idx) for hx, hy, hr, idx in self._hits]
+        # The nodes carry the same coordinates the hit list and the scene do, or
+        # the selection ring lands where the dot used to be.
+        for node in nodes:
+            node.x -= x0
+            node.y -= y0
+        self._caption = self._caption_text(tree)
+        self.subtitle.configure(text=self._caption)
+        if self._selected not in self._by_label:
+            self._selected = None
+            self._fill_side(None)
+
+    def _caption_text(self, tree: Any) -> str:
+        organism = organism_name(self.scheme, self.app.env.dbdir)
+        groups = [g for g in tree.groups if g.size > 1]
+        lone = len(tree.groups) - len(groups)
+        bits = ["{} isolates".format(tree.n_nodes),
+                "{} loci compared".format(tree.n_loci_compared),
+                "{} clonal group{}".format(len(groups),
+                                           "" if len(groups) == 1 else "s")]
+        if groups:
+            bits.append("largest {}".format(max(g.size for g in groups)))
+        if lone:
+            bits.append("{} singleton{}".format(lone, "" if lone == 1 else "s"))
+        name = organism or self.scheme
+        if organism and organism != self.scheme:
+            name = "{} ({})".format(organism, self.scheme)
+        return "{}  ·  {}".format(name, "  ·  ".join(bits))
+
+    # -- colour --------------------------------------------------------------
+    def _colour_map(self, tree: Any, shared: Dict[str, int]
+                    ) -> Tuple[Dict[str, str], List[Tuple[str, str]], str]:
+        """label -> swatch, plus the legend rows, for the current view."""
+        if self.mode == VIEW_LABELLED:
+            order = sorted(shared.items(), key=lambda kv: (-kv[1], mst_st_key(kv[0])))
+            palette = categorical_palette(len(order))
+            by_st = {st: palette[i] for i, (st, _n) in enumerate(order)}
+            colours = {node.label: by_st[node.st] for node in tree.nodes}
+            legend = [(by_st[st], "ST {}  ({} isolate{})".format(
+                st, count, "" if count == 1 else "s")) for st, count in order]
+            return colours, legend, "SEQUENCE TYPES"
+        # A group of one is not a clonal complex, it is an isolate on its own.
+        # Giving each of them its own hue spent the palette on nothing and left
+        # a legend that was seven-eighths "(1 isolate)"; they share one quiet
+        # neutral instead, and the real groups keep the colours.
+        real = [group for group in tree.groups if group.size > 1]
+        singletons = [group for group in tree.groups if group.size == 1]
+        palette = categorical_palette(max(1, len(real)))
+        lone = mix(c("surface"), c("muted"), 0.86)
+        by_group = {group.id: palette[i] for i, group in enumerate(real)}
+        colours = {node.label: by_group.get(node.group, lone)
+                   for node in tree.nodes}
+        legend = [(by_group[group.id], "Group {}  ({} isolates)".format(
+            group.id, group.size)) for group in real]
+        if singletons:
+            legend.append((lone, "Singletons  ({} isolate{})".format(
+                len(singletons), "" if len(singletons) == 1 else "s")))
+        return colours, legend, "CLONAL GROUPS (at most {} locus apart)".format(
+            tree.threshold)
+
+    # -- the scene -----------------------------------------------------------
+    def _build_scene(self, tree: Any, nodes: Sequence[Any], shared: Dict[str, int]
+                     ) -> Tuple[List[Prim], List[Tuple[float, float, float, int]]]:
+        surface = c("surface")
+        edge_ink = mix(surface, c("text"), 0.42)
+        chip_ink = c("text_soft")
+        prims: List[Prim] = []
+        index_of = {node.label: i for i, node in enumerate(nodes)}
+        radii = [node_radius(shared.get(node.st, 1))
+                 if self.mode == VIEW_CLONAL else 7.0 for node in nodes]
+
+        segments: List[Tuple[float, float, float, float]] = []
+        for edge in tree.edges:
+            i, j = index_of.get(edge.a), index_of.get(edge.b)
+            if i is None or j is None:
+                continue
+            a, b = nodes[i], nodes[j]
+            segments.append((a.x, a.y, b.x, b.y))
+            prims.append(Prim("line", x=a.x, y=a.y, x2=b.x, y2=b.y,
+                              fill=edge_ink, width=1.6, tag="edge"))
+
+        # Edge numbers sit on a chip, so the digit is never read through the line.
+        for (ax, ay, bx, by), edge in zip(segments, tree.edges):
+            mx, my = (ax + bx) / 2.0, (ay + by) / 2.0
+            text = str(int(edge.distance))
+            half_w = text_width(text, EDGE_TEXT) / 2.0 + 3.0
+            half_h = EDGE_TEXT * 0.62
+            prims.append(Prim("rect", x=mx - half_w, y=my - half_h, x2=mx + half_w,
+                              y2=my + half_h, fill=surface, outline="",
+                              r=half_h, tag="chip"))
+            prims.append(Prim("text", x=mx, y=my, text=text, fill=chip_ink,
+                              size=EDGE_TEXT, anchor="c", tag="chip"))
+
+        hits: List[Tuple[float, float, float, int]] = []
+        for i, node in enumerate(nodes):
+            colour = self._colours.get(node.label, c("accent"))
+            prims.append(Prim("disc", x=node.x, y=node.y, r=radii[i], fill=colour,
+                              outline=surface, width=2.0, tag="node:" + node.label))
+            hits.append((node.x, node.y, radii[i] + 4.0, i))
+
+        if self.mode == VIEW_LABELLED:
+            limit = 30 if len(nodes) <= 10 else (25 if len(nodes) <= 18 else 21)
+            short = compact_labels([n.label for n in nodes], limit)
+            texts = ["{}  ST {}".format(short[i], n.st) for i, n in enumerate(nodes)]
+            labels = place_labels([(n.x, n.y) for n in nodes], radii, texts,
+                                  LABEL_TEXT, segments, gap=6.0)
+            leader_ink = mix(surface, c("muted"), 0.75)
+            for label in labels:
+                if label.leader is not None:
+                    prims.append(Prim("line", x=label.leader[0], y=label.leader[1],
+                                      x2=label.leader[2], y2=label.leader[3],
+                                      fill=leader_ink, width=1.0, tag="leader"))
+            for label in labels:
+                prims.append(Prim("rect", x=label.box[0], y=label.box[1],
+                                  x2=label.box[2], y2=label.box[3], fill=surface,
+                                  outline="", r=3.0, tag="labelbg"))
+                prims.append(Prim("text", x=label.x, y=label.y, text=label.text,
+                                  fill=c("text"), size=LABEL_TEXT,
+                                  anchor=label.anchor, tag="label"))
+        return prims, hits
+
+    # -- overlay (screen space: it never zooms, so the PNG carries it too) ---
+    OVERLAY_PAD = 14.0
+
+    def _legend_entries(self) -> List[Tuple[str, str]]:
+        rows = list(self._legend[:LEGEND_MAX_ROWS])
+        extra = len(self._legend) - len(rows)
+        if extra > 0:
+            rows.append(("", "+{} more".format(extra)))
+        return rows
+
+    def _legend_size(self) -> Tuple[float, float]:
+        """Width and height the legend panel will claim, or ``(0, 0)``.
+
+        Measured before anything is drawn so that :meth:`fit` can keep the tree
+        OUT of the legend's corner instead of centring a node underneath it.
+        """
+        if not self._show_legend or not self._legend:
+            return (0.0, 0.0)
+        entries = self._legend_entries()
+        row_h = LEGEND_TEXT * 1.85
+        title_h = LEGEND_TEXT * 2.2
+        width = max(text_width(self._legend_title, LEGEND_TEXT * 0.92),
+                    max(text_width(t, LEGEND_TEXT) for _s, t in entries) + 22.0) + 26.0
+        return (width, title_h + row_h * len(entries) + 12.0)
+
+    def _overlay_prims(self, width: float, height: float, *,
+                       caption: bool = False) -> List[Prim]:
+        """Screen-space furniture. The caption is drawn for the FILE only: on
+        screen the card header above the canvas already says all of it."""
+        surface, border = c("surface"), c("border")
+        prims: List[Prim] = []
+        pad = self.OVERLAY_PAD
+        top = pad
+        if caption:
+            prims.append(Prim("text", x=pad + 2.0, y=pad + CAPTION_TEXT * 0.7,
+                              text=self._caption.replace("\u00b7", "-"),
+                              fill=c("muted"), size=CAPTION_TEXT, anchor="w"))
+            top = pad + CAPTION_TEXT * 1.9
+        box_w, box_h = self._legend_size()
+        if box_w <= 0.0:
+            return prims
+        entries = self._legend_entries()
+        row_h = LEGEND_TEXT * 1.85
+        title_h = LEGEND_TEXT * 2.2
+        x1 = width - pad
+        x0 = max(pad, x1 - box_w)
+        y0 = top
+        y1 = min(height - pad, y0 + box_h)
+        prims.append(Prim("rect", x=x0, y=y0, x2=x1, y2=y1, fill=surface,
+                          outline=border, width=1.0, r=8.0))
+        prims.append(Prim("text", x=x0 + 13.0, y=y0 + title_h * 0.55,
+                          text=self._legend_title, fill=c("muted"),
+                          size=LEGEND_TEXT * 0.92, anchor="w"))
+        for i, (swatch, text) in enumerate(entries):
+            cy = y0 + title_h + row_h * (i + 0.5)
+            if cy > y1 - 4.0:
+                break
+            if swatch:
+                prims.append(Prim("disc", x=x0 + 19.0, y=cy, r=6.0, fill=swatch,
+                                  outline=surface, width=1.0))
+            prims.append(Prim("text", x=x0 + 32.0, y=cy, text=text, fill=c("text"),
+                              size=LEGEND_TEXT, anchor="w"))
+        return prims
+
+    # -- the legend strip (screen only; the file gets its own column) --------
+    #: Rows of entries the strip grows to before it says "+N more".
+    STRIP_MAX_ROWS = 4
+    STRIP_PAD = 7.0
+
+    def _strip_plan(self, width: float
+                    ) -> Tuple[List[Tuple[float, int, str, str]], float]:
+        """Where every legend entry goes, and how tall the strip has to be.
+
+        The entries FLOW: the title shares the first row with as many of them as
+        fit, and the rest wrap onto full-width rows. A strip is height taken off
+        the picture, so it is spent one row at a time and never on white space.
+        """
+        entries = list(self._legend)
+        pad, row_h = self.STRIP_PAD, LEGEND_TEXT * 1.5
+
+        def measure(text: str, size: float) -> float:
+            """The REAL width on this screen; the bitmap estimate is a fallback.
+
+            :func:`text_width` is the raster font's advance, deliberately wider
+            than any proportional face — right for reserving a label box, and a
+            third too wide here, which cost the picture a whole strip row.
+            """
+            try:
+                return float(self._font(size).measure(text))
+            except (tk.TclError, AttributeError, RuntimeError):  # pragma: no cover
+                return text_width(text, size)
+
+        title_w = measure(self._legend_title, LEGEND_TEXT * 0.92) + 20.0
+        cell = (max(measure(text, LEGEND_TEXT) for _s, text in entries)
+                + LEGEND_TEXT * 1.9 + 16.0)
+        right = max(width - pad, pad + cell)
+        placed: List[Tuple[float, int, str, str]] = []
+        x, row = pad + title_w, 0
+        for index, (swatch, text) in enumerate(entries):
+            if x + cell > right and x > pad:
+                x, row = pad, row + 1
+            if row >= self.STRIP_MAX_ROWS:
+                # No room for the tail: the last placed entry becomes the count.
+                if placed:
+                    lx, lrow, _s, _t = placed[-1]
+                    placed[-1] = (lx, lrow, "",
+                                  "+{} more".format(len(entries) - index + 1))
+                break
+            placed.append((x, row, swatch, text))
+            x += cell
+        rows = (placed[-1][1] + 1) if placed else 1
+        return placed, 2 * pad + rows * row_h
+
+    def _draw_legend_strip(self) -> None:
+        """Paint the legend along the bottom edge of the picture."""
+        strip = self.legend_strip
+        try:
+            strip.delete("all")
+        except tk.TclError:  # pragma: no cover - teardown
+            return
+        strip.configure(background=c("surface"))
+        if not self._show_legend or not self._legend:
+            strip.configure(height=1)
+            return
+        width = float(max(strip.winfo_width(), 10))
+        placed, height = self._strip_plan(width)
+        strip.configure(height=int(round(height)))
+        if width < 40:  # first layout pass; <Configure> calls back with a size
+            return
+        pad, row_h = self.STRIP_PAD, LEGEND_TEXT * 1.5
+        strip.create_line(0, 0, width, 0, fill=c("border"))
+        strip.create_text(pad + 2.0, pad + row_h * 0.5, text=self._legend_title,
+                          anchor="w", fill=c("muted"),
+                          font=self._font(LEGEND_TEXT * 0.92))
+        for x, row, swatch, text in placed:
+            cy = pad + row_h * (row + 0.5)
+            if swatch:
+                r = LEGEND_TEXT * 0.48
+                strip.create_oval(x + r, cy - r, x + 3 * r, cy + r, fill=swatch,
+                                  outline=c("surface"))
+            strip.create_text(x + LEGEND_TEXT * 1.9, cy, text=text, anchor="w",
+                              fill=c("text"), font=self._font(LEGEND_TEXT))
+
+
+    # -- painting ------------------------------------------------------------
+    def _font(self, size: float, bold: bool = False) -> Any:
+        key = (max(6, int(round(size))), bool(bold))
+        font = self._fonts.get(key)
+        if font is None:
+            font = tkfont.Font(root=self, family=F.get("family", "Helvetica"),
+                               size=-key[0], weight="bold" if bold else "normal")
+            self._fonts[key] = font
+        return font
+
+    def _redraw(self) -> None:
+        canvas = self.canvas
+        try:
+            canvas.delete("all")
+        except tk.TclError:  # pragma: no cover - teardown
+            return
+        width = float(max(canvas.winfo_width(), 10))
+        height = float(max(canvas.winfo_height(), 10))
+        canvas.configure(background=c("surface"))
+        zoom, (ox, oy) = self._zoom, self._origin
+        for prim in self._scene:
+            self._draw_prim(prim, zoom, ox, oy)
+        selected = self._selected
+        if selected is not None:
+            node = self._node_by_label(selected)
+            if node is not None:
+                r = self._radius_of(selected) + 6.0
+                canvas.create_oval(node.x * zoom + ox - r * zoom,
+                                   node.y * zoom + oy - r * zoom,
+                                   node.x * zoom + ox + r * zoom,
+                                   node.y * zoom + oy + r * zoom,
+                                   outline=c("focus"), width=max(2, px(2)))
+        self._draw_legend_strip()
+        if not self._scene:
+            canvas.create_text(width / 2.0, height / 2.0,
+                               text="Nothing to draw for this scheme.",
+                               fill=c("muted"), font=F.get("body"))
+        self.zoom_label.configure(text="{:.0f} %".format(self._zoom * 100.0))
+
+    def _draw_prim(self, prim: Prim, zoom: float, ox: float, oy: float) -> None:
+        canvas = self.canvas
+        x, y = prim.x * zoom + ox, prim.y * zoom + oy
+        if prim.kind == "line":
+            canvas.create_line(x, y, prim.x2 * zoom + ox, prim.y2 * zoom + oy,
+                               fill=prim.fill, width=max(1.0, prim.width * zoom))
+        elif prim.kind == "disc":
+            r = prim.r * zoom
+            canvas.create_oval(x - r, y - r, x + r, y + r, fill=prim.fill,
+                               outline=prim.outline or "",
+                               width=max(1.0, prim.width * zoom))
+        elif prim.kind == "rect":
+            x2, y2 = prim.x2 * zoom + ox, prim.y2 * zoom + oy
+            canvas.create_polygon(round_rect_points(x, y, x2, y2, prim.r * zoom),
+                                  smooth=True, splinesteps=12,
+                                  fill=prim.fill or "",
+                                  outline=prim.outline or "",
+                                  width=max(1.0, prim.width * zoom))
+        elif prim.kind == "text":
+            size = prim.size * zoom
+            if size < 6.5:
+                return
+            anchor = {"w": "w", "e": "e"}.get(prim.anchor, "center")
+            canvas.create_text(x, y, text=prim.text, fill=prim.fill, anchor=anchor,
+                               font=self._font(size, prim.bold))
+
+    # -- zoom and pan --------------------------------------------------------
+    def fit(self) -> None:
+        """Frame the whole drawing, without shrinking text past legibility."""
+        width = float(max(self.canvas.winfo_width(), 10))
+        height = float(max(self.canvas.winfo_height(), 10))
+        if width < 40 or height < 40:
+            # The canvas has not been laid out yet (the tab has never been
+            # shown). Retry a few times and then stop: an unbounded chain here
+            # would be a timer running for the life of a window nobody opened.
+            if self._fit_tries < 12:
+                self._fit_tries += 1
+                self.after(60, self.fit)
+            return
+        self._fit_tries = 0
+        margin = 18.0
+        world_w, world_h = self._world
+        # Nothing is drawn over the picture any more (the legend is a strip
+        # below it), so the whole canvas is the drawing's to use.
+        avail_w = max(80.0, width - 2 * margin)
+        avail_h = max(80.0, height - 2 * margin)
+        zoom = min(avail_w / world_w, avail_h / world_h)
+        # "Fit" has to FIT: a floor high enough to push an isolate off the
+        # bottom edge turned the button into a lie, and the isolate that went
+        # missing was the one furthest from everything — the interesting one.
+        # The only floor left is the size at which text stops being drawn at
+        # all; between that and comfortable the names are small but readable,
+        # and Zoom in is one click away.
+        floor = (6.6 / LABEL_TEXT) if self.mode == VIEW_LABELLED else ZOOM_MIN
+        self._zoom = max(floor, min(ZOOM_MAX, zoom))
+        draw_w = world_w * self._zoom
+        x = (width - draw_w) / 2.0
+        self._origin = [max(margin, x),
+                        margin + max(0.0, (avail_h - world_h * self._zoom) / 2.0)]
+        self._redraw()
+
+    def zoom_by(self, factor: float, cx: Optional[float] = None,
+                cy: Optional[float] = None) -> None:
+        width = float(max(self.canvas.winfo_width(), 10))
+        height = float(max(self.canvas.winfo_height(), 10))
+        cx = width / 2.0 if cx is None else cx
+        cy = height / 2.0 if cy is None else cy
+        old = self._zoom
+        new = max(ZOOM_MIN, min(ZOOM_MAX, old * factor))
+        if abs(new - old) < 1e-6:
+            return
+        self._origin[0] = cx - (cx - self._origin[0]) * (new / old)
+        self._origin[1] = cy - (cy - self._origin[1]) * (new / old)
+        self._zoom = new
+        self._redraw()
+
+    def _wheel(self, event: Any) -> str:
+        delta = getattr(event, "delta", 0)
+        num = getattr(event, "num", 0)
+        up = delta > 0 or num == 4
+        self.zoom_by(ZOOM_STEP if up else 1.0 / ZOOM_STEP,
+                     float(event.x), float(event.y))
+        return "break"
+
+    def _press(self, event: Any) -> None:
+        self.canvas.focus_set()
+        self._drag = (float(event.x), float(event.y),
+                      self._origin[0], self._origin[1])
+        label = self._hit(float(event.x), float(event.y))
+        if label is not None:
+            self.select(label)
+
+    def _motion(self, event: Any) -> None:
+        if self._drag is None:
+            return
+        sx, sy, ox, oy = self._drag
+        moved = abs(event.x - sx) + abs(event.y - sy)
+        if moved < 3:
+            return
+        self.canvas.configure(cursor="fleur")
+        self._origin = [ox + (event.x - sx), oy + (event.y - sy)]
+        self._redraw()
+
+    def _release(self, _event: Any = None) -> None:
+        self._drag = None
+        self.canvas.configure(cursor="hand2")
+
+    # -- selection -----------------------------------------------------------
+    def _hit(self, sx: float, sy: float) -> Optional[str]:
+        zoom, (ox, oy) = self._zoom, self._origin
+        best, best_d = None, None
+        for hx, hy, hr, index in self._hits:
+            dx = sx - (hx * zoom + ox)
+            dy = sy - (hy * zoom + oy)
+            d = math.hypot(dx, dy)
+            if d <= max(hr * zoom, 6.0) and (best_d is None or d < best_d):
+                best, best_d = self._nodes[index].label, d
+        return best
+
+    def _node_by_label(self, label: str) -> Any:
+        for node in self._nodes:
+            if node.label == label:
+                return node
+        return None
+
+    def _radius_of(self, label: str) -> float:
+        for prim in self._scene:
+            if prim.kind == "disc" and prim.tag == "node:" + label:
+                return prim.r
+        return 8.0
+
+    def select(self, label: Optional[str]) -> None:
+        self._selected = label
+        self._fill_side(label)
+        self._redraw()
+
+    def _fill_side(self, label: Optional[str]) -> None:
+        for iid in self.profile.get_children(""):
+            self.profile.delete(iid)
+        if label is None or self.tree_obj is None:
+            self.pick_name.configure(text="Click a dot")
+            self.pick_meta.configure(
+                text="Every dot is one isolate. Click it to read its full allele "
+                     "profile and its nearest neighbours.")
+            self.pick_near.configure(text="")
+            return
+        node = self.tree_obj.node(label)
+        res = self._by_label.get(label)
+        self.pick_name.configure(text=label)
+        meta = []
+        if node is not None:
+            meta.append("ST {}".format(node.st))
+            # A group of one is a singleton in the legend, so it is a singleton
+            # here too: "clonal group 4" for an isolate on its own read as if
+            # there were four complexes.
+            sizes = {g.id: g.size for g in getattr(self.tree_obj, "groups", ())}
+            meta.append("singleton" if sizes.get(node.group, 0) <= 1
+                        else "clonal group {}".format(node.group))
+            meta.append(node.scheme)
+        self.pick_meta.configure(text="  ·  ".join(meta))
+        if res is not None:
+            for call in getattr(res, "alleles", ()) or ():
+                self.profile.insert("", "end", text=str(getattr(call, "locus", "")),
+                                    values=(str(getattr(call, "code", "")),))
+        near = []
+        for edge in self.tree_obj.edges:
+            other = edge.b if edge.a == label else (edge.a if edge.b == label else None)
+            if other is not None:
+                near.append((int(edge.distance), other))
+        near.sort()
+        if near:
+            self.pick_near.configure(text="Nearest: " + "; ".join(
+                "{} ({} locus difference{})".format(compact_label(name, 22), d,
+                                                    "" if d == 1 else "s")
+                for d, name in near[:2]))
+        else:
+            self.pick_near.configure(text="No comparable neighbour in this tree.")
+
+    # -- saving --------------------------------------------------------------
+    def save_png(self) -> None:
+        """Write the picture to a real PNG, rasterised here, no libraries."""
+        if not self._scene:
+            self.app.status.set("There is no tree to save yet.", "warn",
+                                transient=True)
+            return
+        default = "{}-{}-tree.png".format(self.scheme or "mlst", self.mode)
+        path = filedialog.asksaveasfilename(
+            parent=self, title="Save the tree as a PNG image",
+            defaultextension=".png", initialfile=default,
+            filetypes=[("PNG image", "*.png")])
+        if not path:
+            return
+        try:
+            data = self.png_bytes()
+            with open(path, "wb") as handle:
+                handle.write(data)
+        except OSError as exc:
+            self.app.show_error(exc, name=os.path.basename(path))
+            return
+        self.app.status.set("Tree image saved: {} ({}).".format(
+            os.path.basename(path), human_bytes(len(data))), "ok", transient=True)
+        LOG.info("tree image written: %s (%d bytes)", path, len(data))
+
+    def png_bytes(self, scale: float = 2.5, margin: float = 26.0) -> bytes:
+        """The current scene as PNG bytes — the same primitives the canvas drew."""
+        world_w, world_h = self._world
+        legend_w, legend_h = self._legend_size()
+        caption_h = CAPTION_TEXT * 2.4
+        # The legend gets a COLUMN of its own in the file: overlaying it on the
+        # picture is a choice a window can make, because the reader can pan, and
+        # a saved image cannot.
+        reserve = (legend_w + 20.0) if legend_w > 0.0 else 0.0
+        logical_w = max(560.0, world_w + 2 * margin + reserve)
+        logical_h = max(380.0, world_h + 2 * margin + caption_h,
+                        legend_h + caption_h + 2 * margin)
+        scale = max(1.0, min(scale, 4000.0 / max(logical_w, logical_h)))
+        raster = Raster(int(logical_w * scale), int(logical_h * scale), c("surface"))
+        dx = margin + max(0.0, (logical_w - reserve - 2 * margin - world_w) / 2.0)
+        dy = caption_h + max(0.0, (logical_h - caption_h - 2 * margin - world_h) / 2.0)
+        dx *= scale
+        dy *= scale
+        render_prims(raster, self._scene, scale=scale, dx=dx, dy=dy)
+        render_prims(raster, self._overlay_prims(logical_w, logical_h, caption=True),
+                     scale=scale)
+        return raster.png_bytes()
+
 
 
 # ===========================================================================
@@ -4750,6 +6500,33 @@ class DatabaseView(ttk.Frame):
         self.db_where = ttk.Label(info, text="", style="SurfaceMuted.TLabel", anchor="w")
         self.db_where.pack(fill="x", padx=px(PAD_M), pady=(0, px(PAD_M)))
 
+        # -- what the last update actually did --------------------------------
+        # A database update touches 162 independent schemes, and one of them
+        # being unreachable is not a reason for the other 161 to go unrefreshed.
+        # updatedb.apply() now isolates each failure, so this band reports the
+        # three numbers and puts the names and reasons one click away instead of
+        # throwing the first bad scheme in the user's face as an error dialog.
+        self.outcome = ttk.Frame(info, style="Ok.TFrame")
+        self.outcome_bar = ttk.Frame(self.outcome, style="OkBar.TFrame", width=px(3))
+        self.outcome_bar.pack(side="left", fill="y")
+        self.outcome_body = ttk.Frame(self.outcome, style="Ok.TFrame")
+        self.outcome_body.pack(side="left", fill="x", expand=True, padx=px(PAD_M),
+                               pady=px(PAD_S))
+        self.outcome_label = ttk.Label(self.outcome_body, text="",
+                                       style="OkStrong.TLabel", anchor="w",
+                                       justify="left")
+        self.outcome_label.pack(anchor="w", fill="x")
+        self.outcome_toggle = ttk.Button(self.outcome_body, text="",
+                                         command=self._flip_failures)
+        self.outcome_list = tk.Text(self.outcome_body, height=6, wrap="word",
+                                    relief="flat", background=c("surface"),
+                                    foreground=c("text"), font=F.get("mono"),
+                                    highlightthickness=1,
+                                    highlightbackground=c("border"),
+                                    highlightcolor=c("focus"))
+        self.outcome_list.configure(state="disabled")
+        self._failures_open = False
+
         # -- selection controls ----------------------------------------------
         # "make the checkbox nicer in design and bigger, and put a couple of
         # select all / deselect all buttons": the checkbox on every row is the
@@ -4774,9 +6551,10 @@ class DatabaseView(ttk.Frame):
                                  selectmode="browse")
         ring.track(self.tree)
         vsb = ttk.Scrollbar(ring, orient="vertical", command=self.tree.yview)
-        self.tree.pack(side="left", fill="both", expand=True)
+        self.tree.pack(side="left", fill="both", expand=True, padx=(1, 0), pady=1)
         self.tree.configure(
-            yscrollcommand=autohide(vsb, self.tree, side="right", fill="y"))
+            yscrollcommand=autohide(vsb, self.tree, side="right", fill="y",
+                                    padx=(1, 1), pady=1))
         self.tree.column("#0", width=px(260), minwidth=px(160), stretch=True)
         self.tree.column("species", width=px(260), minwidth=px(140))
         for col in ("loci", "types", "alleles"):
@@ -5102,15 +6880,83 @@ class DatabaseView(ttk.Frame):
                                      with_progress=True,
                                      cancel=self._cancel)] = "apply"
 
+    def _flip_failures(self) -> None:
+        self._failures_open = not self._failures_open
+        if self._failures_open:
+            self.outcome_list.pack(fill="x", expand=True, pady=(px(PAD_XS), 0))
+            self.outcome_toggle.configure(text="\u25be Hide the schemes that failed")
+        else:
+            self.outcome_list.pack_forget()
+            self.outcome_toggle.configure(text="\u25b8 Show the schemes that failed")
+
+    def show_update_outcome(self, result: Any) -> str:
+        """Report what the run did: updated / already current / could not update.
+
+        Returns the one-line sentence, which is also what the status line says.
+        The failing scheme names and their reasons go into an expandable area:
+        visible on demand, never a modal, and never a reason to hide the 148
+        schemes that DID update.
+        """
+        committed = tuple(getattr(result, "committed", ()) or ())
+        unchanged = tuple(getattr(result, "unchanged", ()) or ())
+        failed = tuple(getattr(result, "failed_pairs", ()) or ())
+        if not (committed or unchanged or failed):
+            self.outcome.pack_forget()
+            return ""
+        sentence = "{} updated, {} already current".format(len(committed),
+                                                           len(unchanged))
+        if failed:
+            sentence += ", {} could not be updated".format(len(failed))
+        self.outcome_label.configure(text=sentence)
+        frame, bar, label = (("Notice.TFrame", "NoticeBar.TFrame",
+                              "NoticeStrong.TLabel") if failed else
+                             ("Ok.TFrame", "OkBar.TFrame", "OkStrong.TLabel"))
+        try:
+            self.outcome.configure(style=frame)
+            self.outcome_body.configure(style=frame)
+            self.outcome_bar.configure(style=bar)
+            self.outcome_label.configure(style=label)
+        except tk.TclError:  # pragma: no cover - the styles always exist
+            pass
+        self.outcome_list.configure(state="normal")
+        self.outcome_list.delete("1.0", "end")
+        if failed:
+            self.outcome_list.insert("1.0", "\n".join(
+                "{}: {}".format(scheme, reason) for scheme, reason in failed))
+            self.outcome_list.configure(height=min(10, max(3, len(failed) + 1)))
+            if not self.outcome_toggle.winfo_manager():
+                self.outcome_toggle.pack(anchor="w", pady=(px(PAD_XS), 0))
+            self._failures_open = False
+            self._flip_failures()
+            self._flip_failures()
+        else:
+            self.outcome_toggle.pack_forget()
+            self.outcome_list.pack_forget()
+            self._failures_open = False
+        self.outcome_list.configure(state="disabled")
+        if not self.outcome.winfo_manager():
+            self.outcome.pack(fill="x", padx=px(PAD_M), pady=(0, px(PAD_M)))
+        return sentence
+
     def _after_update(self, new_version: Any) -> None:
         """Reload the catalogue in place — no restart (section 10.3)."""
         self._busy(False)
         self.plan = None
         self.btn_update.configure(state="disabled")
         version = str(new_version or "")
-        self.db_detail.configure(text="Database updated.")
-        self.app.status.set("Database updated to {}.".format(version or "the latest data"),
-                            "ok", transient=True)
+        sentence = self.show_update_outcome(new_version)
+        failed = tuple(getattr(new_version, "failed_pairs", ()) or ())
+        self.db_detail.configure(text=sentence or "Database updated.")
+        if failed:
+            self.app.status.set(
+                "Database updated to {} \u2014 {}. Open the Database tab for the "
+                "names and reasons.".format(version or "the latest data", sentence),
+                "warn", resting=True)
+        else:
+            self.app.status.set(
+                "Database updated to {}.".format(version or "the latest data"),
+                "ok", transient=True)
+        LOG.info("update finished: %s", getattr(new_version, "summary", sentence))
         self.app.env.db_version = version or self.app.env.db_version
         self.loaded = False
         self.app.refresh_footer()
@@ -6037,12 +7883,15 @@ class WmlstApp:
 
         self.notebook = ttk.Notebook(root)
         self.analyse_view = AnalyseView(self.notebook, self)
+        self.mst_view = MstView(self.notebook, self)
         self.database_view = DatabaseView(self.notebook, self)
         self.settings_view = SettingsView(self.notebook, self)
         self.notebook.add(self.analyse_view, text="Analyse")
+        self.notebook.add(self.mst_view, text="Tree")
         self.notebook.add(self.database_view, text="Database")
         self.notebook.add(self.settings_view, text="Settings")
         self.notebook.bind("<<NotebookTabChanged>>", self._on_tab, add="+")
+        self.refresh_tree_tab()
 
         self.banner = ttk.Frame(root, style="TFrame")
         self.banner_label = ttk.Label(self.banner, text="", style="Muted.TLabel")
@@ -6071,6 +7920,10 @@ class WmlstApp:
         self.notebook.pack(fill="both", expand=True, padx=px(PAD_M),
                            pady=(px(PAD_M), 0))
 
+        for index in range(4):
+            root.bind("<Control-Key-{}>".format(index + 1),
+                      lambda e, i=index: self.select_tab(i), add="+")
+        root.bind("<Control-f>", lambda e: self.focus_filter(), add="+")
         root.bind("<Control-o>", lambda e: self.analyse_view.browse_files(), add="+")
         root.bind("<Control-O>", lambda e: self.analyse_view.browse_folder(), add="+")
         root.bind("<F5>", lambda e: self.rerun_all(), add="+")
@@ -6097,6 +7950,18 @@ class WmlstApp:
         file_menu.add_separator()
         file_menu.add_command(label="Exit", accelerator="Ctrl+Q", command=self.on_close)
         menubar.add_cascade(label="File", menu=file_menu)
+
+        view_menu = tk.Menu(menubar, tearoff=0)
+        for index, (label, key) in enumerate((("Analyse", "Ctrl+1"),
+                                              ("Tree", "Ctrl+2"),
+                                              ("Database", "Ctrl+3"),
+                                              ("Settings", "Ctrl+4"))):
+            view_menu.add_command(label=label, accelerator=key,
+                                  command=lambda i=index: self.select_tab(i))
+        view_menu.add_separator()
+        view_menu.add_command(label="Find in results", accelerator="Ctrl+F",
+                              command=self.focus_filter)
+        menubar.add_cascade(label="View", menu=view_menu)
 
         run_menu = tk.Menu(menubar, tearoff=0)
         run_menu.add_command(label="Re-run all files", accelerator="F5",
@@ -6335,8 +8200,63 @@ class WmlstApp:
             current = self.notebook.nametowidget(self.notebook.select())
         except (tk.TclError, KeyError):
             return
+        self.analyse_view.dropzone.set_showing(current is self.analyse_view)
         if current is self.database_view:
             self.database_view.activate()
+        elif current is self.mst_view:
+            self.mst_view.activate()
+
+    def show_tree(self) -> None:
+        """Select the tree tab, or say why it is not available yet."""
+        if not self.mst_view.available():
+            self.status.set(
+                "The tree needs at least two isolates typed with the SAME "
+                "scheme.", "warn", transient=True)
+            return
+        self.refresh_tree_tab()
+        self.notebook.select(self.mst_view)
+
+    def select_tab(self, index: int) -> None:
+        """Ctrl+1..4. A disabled tab says why rather than doing nothing."""
+        try:
+            tabs = self.notebook.tabs()
+            if not (0 <= index < len(tabs)):
+                return
+            if str(self.notebook.tab(tabs[index], "state")) == "disabled":
+                self.status.set(
+                    "The tree needs at least two isolates typed with the SAME "
+                    "scheme.", "warn", transient=True)
+                return
+            self.notebook.select(tabs[index])
+        except tk.TclError:  # pragma: no cover - teardown
+            pass
+
+    def refresh_tree_tab(self) -> None:
+        """Enable the tree tab only once there is something to draw (10.10).
+
+        A dead tab a novice can click into and find empty is worse than a greyed
+        one that says why, so the state is recomputed after every result, every
+        finished batch and every clear.
+        """
+        try:
+            ready = self.mst_view.available()
+            self.notebook.tab(self.mst_view, state="normal" if ready else "disabled")
+        except (tk.TclError, AttributeError):  # pragma: no cover - during teardown
+            return
+        if not ready:
+            self.mst_view._signature = None
+            # Clearing the results while the tree tab is the one on screen would
+            # otherwise leave a disabled tab selected and the window looking
+            # frozen. Step back to where the work happens.
+            try:
+                if self.notebook.nametowidget(self.notebook.select()) is self.mst_view:
+                    self.notebook.select(self.analyse_view)
+            except (tk.TclError, KeyError):  # pragma: no cover - teardown
+                pass
+        try:
+            self.analyse_view._set_actions_enabled(bool(self.analyse_view.results))
+        except (AttributeError, tk.TclError):  # pragma: no cover - teardown
+            pass
 
     # -- the run -------------------------------------------------------------
     def start_analysis(self, files: Sequence[str]) -> None:
@@ -6427,6 +8347,7 @@ class WmlstApp:
         if self.state.running:
             self.state.finish(reason)
         self.analyse_view.end_run(reason)
+        self.refresh_tree_tab()
         done = len(self.analyse_view.results)
         if reason == "done" and self._failed_count == 0:
             self.status.set("Finished: {} file{} analysed.".format(
@@ -6768,6 +8689,16 @@ class WmlstApp:
         LOG.info("wrote %s: %s", kind, path)
 
     # -- help ----------------------------------------------------------------
+    def focus_filter(self) -> str:
+        """Ctrl+F: put the caret in the results filter box."""
+        try:
+            self.notebook.select(self.analyse_view)
+            self.analyse_view.filter_entry.focus_set()
+            self.analyse_view.filter_entry.select_range(0, "end")
+        except tk.TclError:  # pragma: no cover - teardown
+            pass
+        return "break"
+
     def show_about(self) -> None:
         AboutDialog(self.root, self.env)
 

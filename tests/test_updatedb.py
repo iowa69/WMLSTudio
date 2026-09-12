@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: GPL-2.0-only
-# Copyright (C) 2025-2026 IOWA-Tech - Giovanni Lorenzin
+# Copyright (C) 2025-2026 IOWA-BioTech - Giovanni Lorenzin
 # Copyright (C) Torsten Seemann (upstream `mlst`, from which WMLST is ported)
 """Tests for wmlst/updatedb.py — docs/ARCHITECTURE.md sections 4.9, 6, 7.
 
@@ -17,6 +17,7 @@ unreachable or when WMLST_SKIP_NET is set.
 
 from __future__ import annotations
 
+import errno
 import glob
 import io
 import json
@@ -419,7 +420,7 @@ def test_exhausted_retries_raise_an_actionable_update_error():
 
 
 def test_the_user_agent_names_the_vendor_and_the_author():
-    assert "IOWA-Tech" in U.USER_AGENT and "Giovanni Lorenzin" in U.USER_AGENT
+    assert "IOWA-BioTech" in U.USER_AGENT and "Giovanni Lorenzin" in U.USER_AGENT
     assert U.USER_AGENT.startswith("WMLST/")
 
 
@@ -525,8 +526,8 @@ def test_a_failed_validation_leaves_the_live_directory_untouched():
                                        "def": ALLELES_V1["def"]})
         fetcher = _fetcher(routes)
         plan = U.check(dbdir, fetcher=fetcher)
-        with pytest.raises(UpdateError):
-            U.apply(dbdir, plan, None, fetcher=fetcher, tools=_FakeTools())
+        result = U.apply(dbdir, plan, None, fetcher=fetcher, tools=_FakeTools())
+        assert result.failed_names == ("tiny",)
         assert _snapshot(dbdir) == before
         assert not os.path.isdir(os.path.join(dbdir, "pubmlst", U.STAGING_DIRNAME,
                                               "tiny.%d" % os.getpid()))
@@ -540,11 +541,13 @@ def test_a_shrunken_download_is_refused():
                                for i in range(1, 60)),
                "def": ALLELES_V1["def"]}
         dbdir = _tiny_db(tmp, alleles=big)
+        before = _snapshot(dbdir)
         fetcher = _fetcher(_routes(PROFILES_V1, ALLELES_V1))
         plan = U.check(dbdir, fetcher=fetcher)
-        with pytest.raises(UpdateError) as excinfo:
-            U.apply(dbdir, plan, None, fetcher=fetcher, tools=_FakeTools())
-        assert "half the size" in str(excinfo.value)
+        result = U.apply(dbdir, plan, None, fetcher=fetcher, tools=_FakeTools())
+        assert [f.scheme for f in result.failed] == ["tiny"]
+        assert "half the size" in result.failed[0].reason
+        assert result.committed == () and _snapshot(dbdir) == before
 
 
 def test_rollback_restores_the_previous_content():
@@ -686,6 +689,334 @@ def test_write_version_files_is_opt_in():
         with open(os.path.join(dbdir, "pubmlst", "tiny",
                                "database_version.txt")) as fh:
             assert fh.read() == "2026-02-02\n"
+
+
+# ---------------------------------------------------------------------------
+# 7.3 per-scheme failure isolation
+#
+# Upstream is 162 independently curated databases on two hosts. On any given day
+# one of them can 404, serve a truncated FASTA or publish a profile table that
+# fails a section 7.6 gate. A run that aborts there leaves the other 161 schemes
+# stale for someone else's bad deploy, so apply() records the failure, leaves
+# that scheme untouched on disk, carries on, and reports once at the end.
+# ---------------------------------------------------------------------------
+
+TEXT = "text/plain; charset=UTF-8"
+
+
+def _api_of(name):
+    return "%s/db/pubmlst_%s_seqdef/schemes/1" % (ROOT, name)
+
+
+def _locus_url(name, locus):
+    return "%s/db/pubmlst_%s_seqdef/loci/%s/alleles_fasta" % (ROOT, name, locus)
+
+
+def _doc_for(name, last_updated="2026-02-02"):
+    return json.dumps({
+        "id": 1, "description": "MLST", "locus_count": 2,
+        "last_updated": last_updated, "records": 3,
+        "loci": ["%s/db/pubmlst_%s_seqdef/loci/%s" % (ROOT, name, locus)
+                 for locus in LOCI],
+        "fields": ["%s/fields/ST" % _api_of(name)],
+    }).encode("utf-8")
+
+
+def _healthy_routes(name):
+    """Every route one scheme needs to update cleanly to the V2 payload."""
+    routes = {_api_of(name): (200, "application/json", _doc_for(name)),
+              _api_of(name) + "/profiles_csv": (200, TEXT, PROFILES_V2)}
+    for locus, body in ALLELES_V2.items():
+        routes[_locus_url(name, locus)] = (200, TEXT, body)
+    return routes
+
+
+def _multi_db(tmp, names):
+    """A local database of several schemes, each on its own upstream database."""
+    dbdir = os.path.join(tmp, "db")
+    for name in names:
+        scheme_dir = os.path.join(dbdir, "pubmlst", name)
+        os.makedirs(scheme_dir)
+        with open(os.path.join(scheme_dir, name + ".txt"), "wb") as fh:
+            fh.write(PROFILES_V1)
+        for locus, body in ALLELES_V1.items():
+            with open(os.path.join(scheme_dir, locus + ".tfa"), "wb") as fh:
+                fh.write(body)
+        U.write_scheme_info(
+            os.path.join(scheme_dir, name + "_info.json"),
+            {"name": name, "description": "MLST", "locus": 2,
+             "download_date": "2026-01-01", "last_updated": "2026-01-01",
+             "source": "pubmlst", "API": _api_of(name), "authenticated": False})
+    U.stamp_db_version(dbdir, "2026-01-01")
+    U.write_manifest(dbdir, U.load_manifest(dbdir))
+    return dbdir
+
+
+#: alpha and beta are healthy; the other three break in the three ways the field
+#: actually produces: the scheme is gone, the FASTA is garbage, the profile
+#: table contradicts the scheme definition.
+BROKEN_NAMES = ("alpha", "beta", "garbled", "gone", "invalid")
+
+
+def _broken_routes():
+    routes = {}
+    for name in ("alpha", "beta", "garbled", "invalid"):
+        routes.update(_healthy_routes(name))
+    # "gone" has no routes at all: the fake upstream answers 404 with the
+    # BIGSdb "has not been defined" body, exactly as a retired scheme does.
+    routes[_locus_url("garbled", "abc")] = (
+        200, TEXT, b"this is not FASTA, it is an outage page\n")
+    routes[_api_of("invalid") + "/profiles_csv"] = (
+        200, TEXT, b"ST\tabc\tzzz\n1\t1\t1\n2\t1\t2\n")
+    return routes
+
+
+def test_a_broken_scheme_is_skipped_and_the_rest_still_commit():
+    with tempfile.TemporaryDirectory() as tmp:
+        dbdir = _multi_db(tmp, BROKEN_NAMES)
+        before = _snapshot(dbdir)
+        fetcher = _fetcher(_broken_routes())
+        plan = U.check(dbdir, fetcher=fetcher)
+        result = U.apply(dbdir, plan, list(BROKEN_NAMES), fetcher=fetcher,
+                         tools=_FakeTools())
+
+        assert sorted(result.committed) == ["alpha", "beta"]
+        assert result.unchanged == ()
+        assert sorted(result.failed_names) == ["garbled", "gone", "invalid"]
+        assert not result.ok
+
+        after = _snapshot(dbdir)
+        for name in ("alpha", "beta"):
+            assert after["pubmlst/%s/%s.txt" % (name, name)] == PROFILES_V2
+            assert after["pubmlst/%s/abc.tfa" % name] == ALLELES_V2["abc"]
+        # A failed scheme is left EXACTLY as it was: never half-written.
+        for name in ("garbled", "gone", "invalid"):
+            kept = {k: v for k, v in before.items()
+                    if k.startswith("pubmlst/%s/" % name)}
+            assert kept, name
+            assert {k: after[k] for k in kept} == kept, name
+        assert glob.glob(os.path.join(dbdir, "pubmlst", U.STAGING_DIRNAME, "*")) == []
+        assert U.db_version(dbdir) == result == U._today()
+
+
+def test_each_failure_records_the_scheme_the_stage_and_a_one_line_reason():
+    with tempfile.TemporaryDirectory() as tmp:
+        dbdir = _multi_db(tmp, BROKEN_NAMES)
+        fetcher = _fetcher(_broken_routes())
+        plan = U.check(dbdir, fetcher=fetcher)
+        result = U.apply(dbdir, plan, list(BROKEN_NAMES), fetcher=fetcher,
+                         tools=_FakeTools())
+        failed = {f.scheme: f for f in result.failed}
+
+        assert failed["gone"].stage == "download"
+        assert "404" in failed["gone"].reason
+        assert failed["garbled"].stage == "validate"
+        assert "does not start with" in failed["garbled"].reason
+        assert failed["invalid"].stage == "validate"
+        assert "does not match the scheme definition" in failed["invalid"].reason
+        for failure in result.failed:
+            assert "\n" not in failure.reason and len(failure.reason) <= 160
+            assert failure.line.startswith(failure.scheme + ": ")
+        assert result.failed_pairs == tuple((f.scheme, f.reason)
+                                            for f in result.failed)
+
+
+def test_the_failures_are_reported_once_at_the_end():
+    seen = []
+    with tempfile.TemporaryDirectory() as tmp:
+        dbdir = _multi_db(tmp, BROKEN_NAMES)
+        fetcher = _fetcher(_broken_routes())
+        plan = U.check(dbdir, fetcher=fetcher)
+        result = U.apply(dbdir, plan, list(BROKEN_NAMES), fetcher=fetcher,
+                         tools=_FakeTools(),
+                         progress=lambda f, m: seen.append((f, m)))
+
+    summary = result.summary
+    assert summary.startswith("2 schemes updated, 0 unchanged, "
+                              "3 could not be updated: ")
+    for name in ("garbled", "gone", "invalid"):
+        assert name + ": " in summary
+    # The progress callback keeps reporting THROUGH the failures, and the whole
+    # report is emitted exactly once, at the end.
+    assert [m for _f, m in seen if m.startswith("Skipped ")]
+    assert sum(1 for _f, m in seen if "could not be updated" in m) == 1
+    assert seen[-1] == (1.0, summary)
+    assert all(0.0 <= f <= 1.0 for f, _m in seen)
+
+
+def test_the_journal_carries_the_failures_for_a_partial_run():
+    with tempfile.TemporaryDirectory() as tmp:
+        dbdir = _multi_db(tmp, BROKEN_NAMES)
+        fetcher = _fetcher(_broken_routes())
+        plan = U.check(dbdir, fetcher=fetcher)
+        U.apply(dbdir, plan, list(BROKEN_NAMES), fetcher=fetcher,
+                tools=_FakeTools())
+        records = U.read_journal(dbdir)
+        ends = [r for r in records if r["event"] == "run_end"]
+        assert ends[-1]["status"] == "partial"
+        assert sorted(f["scheme"] for f in ends[-1]["failed"]) == \
+            ["garbled", "gone", "invalid"]
+        assert sorted(ends[-1]["changed"]) == ["alpha", "beta"]
+        errors = [r for r in records if r["event"] == "scheme_error"]
+        assert {r["scheme"] for r in errors} == {"garbled", "gone", "invalid"}
+        assert all(r.get("stage") for r in errors)
+
+
+def test_the_blast_index_is_rebuilt_from_what_committed():
+    """The skipped schemes keep the alleles they already had; nothing is lost."""
+    with tempfile.TemporaryDirectory() as tmp:
+        dbdir = _multi_db(tmp, BROKEN_NAMES)
+        fetcher = _fetcher(_broken_routes())
+        plan = U.check(dbdir, fetcher=fetcher)
+        U.apply(dbdir, plan, list(BROKEN_NAMES), fetcher=fetcher,
+                tools=_FakeTools())
+        with open(os.path.join(dbdir, "blast", "mlst.fa"), "rb") as fh:
+            headers = [ln for ln in fh.read().split(b"\n") if ln.startswith(b">")]
+        assert b">alpha.abc_2" in headers          # the new V2 allele
+        assert b">gone.abc_1" in headers           # the old payload, untouched
+        assert b">gone.abc_2" not in headers
+        assert not U.index_is_stale(dbdir)
+
+
+def test_an_unresolved_scheme_is_skipped_rather_than_aborting_the_run():
+    with tempfile.TemporaryDirectory() as tmp:
+        dbdir = _multi_db(tmp, ("alpha", "beta"))
+        refs = tuple(
+            U.SchemeRef(r.name, U.UNRESOLVED, "", "", r.nloci, None)
+            if r.name == "beta" else r
+            for r in U.load_manifest(dbdir))
+        fetcher = _fetcher(_healthy_routes("alpha"))
+        plan = U.check(dbdir, refs, fetcher=fetcher)
+        result = U.apply(dbdir, plan, ["alpha", "beta"], refs=refs,
+                         fetcher=fetcher, tools=_FakeTools())
+        assert result.committed == ("alpha",)
+        assert [(f.scheme, f.stage) for f in result.failed] == [("beta", "resolve")]
+
+
+def test_one_unreachable_host_is_isolated_like_any_other_failure(monkeypatch):
+    monkeypatch.setattr(U, "MAX_ATTEMPTS", 1)
+    routes = dict(_healthy_routes("alpha"))
+    routes.update(_healthy_routes("beta"))
+
+    class Flaky(FakeOpener):
+        def open(self, request, timeout=None):
+            if "beta" in request.full_url:
+                self.calls.append(request.full_url)
+                raise urllib.error.URLError("connection reset by peer")
+            return FakeOpener.open(self, request, timeout)
+
+    with tempfile.TemporaryDirectory() as tmp:
+        dbdir = _multi_db(tmp, ("alpha", "beta"))
+        before = _snapshot(dbdir)
+        fetcher = U._Fetcher(opener=Flaky(routes), delay=0.0, sleep=lambda s: None)
+        plan = U.UpdatePlan((), (), 0, U._now_iso(), "flaky")
+        result = U.apply(dbdir, plan, ["alpha", "beta"], fetcher=fetcher,
+                         tools=_FakeTools())
+        assert result.committed == ("alpha",)
+        assert result.failed_names == ("beta",)
+        assert _snapshot(dbdir)["pubmlst/beta/beta.txt"] == before["pubmlst/beta/beta.txt"]
+
+
+def test_no_network_at_all_stops_the_run(monkeypatch):
+    """'This scheme failed' and 'nothing can work' are not the same verdict."""
+    monkeypatch.setattr(U, "MAX_ATTEMPTS", 1)
+
+    class Dead:
+        def open(self, request, timeout=None):
+            raise urllib.error.URLError("no route to host")
+
+    with tempfile.TemporaryDirectory() as tmp:
+        dbdir = _multi_db(tmp, ("alpha", "beta"))
+        before = _snapshot(dbdir)
+        fetcher = U._Fetcher(opener=Dead(), delay=0.0, sleep=lambda s: None)
+        plan = U.UpdatePlan((), (), 0, U._now_iso(), "outage")
+        with pytest.raises(U.FatalUpdateError) as excinfo:
+            U.apply(dbdir, plan, ["alpha", "beta"], fetcher=fetcher,
+                    tools=_FakeTools())
+        assert "internet connection" in str(excinfo.value)
+        assert isinstance(excinfo.value, UpdateError)   # still catchable as before
+        assert _snapshot(dbdir) == before
+        assert U.db_version(dbdir) == "2026-01-01"
+
+
+def test_a_full_disk_stops_the_run_instead_of_failing_every_scheme(monkeypatch):
+    def no_space(*args, **kwargs):
+        raise OSError(errno.ENOSPC, "No space left on device")
+
+    routes = dict(_healthy_routes("alpha"))
+    routes.update(_healthy_routes("beta"))
+    with tempfile.TemporaryDirectory() as tmp:
+        dbdir = _multi_db(tmp, ("alpha", "beta"))
+        before = _snapshot(dbdir)
+        monkeypatch.setattr(U, "_materialise", no_space)
+        fetcher = _fetcher(routes)
+        plan = U.check(dbdir, fetcher=fetcher)
+        with pytest.raises(U.FatalUpdateError):
+            U.apply(dbdir, plan, ["alpha", "beta"], fetcher=fetcher,
+                    tools=_FakeTools())
+        assert _snapshot(dbdir) == before
+        ends = [r for r in U.read_journal(dbdir) if r["event"] == "run_end"]
+        assert ends[-1]["status"] == "error"
+
+
+def test_cancellation_still_stops_the_run_and_is_never_recorded_as_a_failure():
+    class Flag:
+        def __init__(self):
+            self.armed = False
+
+        def is_set(self):
+            return self.armed
+
+    with tempfile.TemporaryDirectory() as tmp:
+        dbdir = _multi_db(tmp, ("alpha", "beta"))
+        flag = Flag()
+        fetcher = _fetcher(_broken_routes())
+        plan = U.check(dbdir, fetcher=fetcher)
+        flag.armed = True
+        with pytest.raises(Cancelled):
+            U.apply(dbdir, plan, ["alpha", "beta"], fetcher=fetcher,
+                    tools=_FakeTools(), cancel=flag)
+        ends = [r for r in U.read_journal(dbdir) if r["event"] == "run_end"]
+        assert ends[-1]["status"] == "cancelled"
+        assert ends[-1]["failed"] == []
+
+
+def test_a_run_where_nothing_could_be_verified_does_not_advance_the_version():
+    with tempfile.TemporaryDirectory() as tmp:
+        dbdir = _multi_db(tmp, ("garbled",))
+        fetcher = _fetcher(_broken_routes())
+        plan = U.check(dbdir, fetcher=fetcher)
+        result = U.apply(dbdir, plan, ["garbled"], fetcher=fetcher,
+                         tools=_FakeTools())
+        assert result.failed_names == ("garbled",)
+        assert result == U.db_version(dbdir) == "2026-01-01"
+
+
+def test_the_result_is_still_the_version_string_every_caller_expects():
+    """cli.py and gui.py treat apply()'s return value as text; it still is."""
+    with tempfile.TemporaryDirectory() as tmp:
+        dbdir = _multi_db(tmp, ("alpha",))
+        fetcher = _fetcher(_healthy_routes("alpha"))
+        plan = U.check(dbdir, fetcher=fetcher)
+        result = U.apply(dbdir, plan, None, fetcher=fetcher, tools=_FakeTools())
+        assert isinstance(result, str)
+        assert result == U._today() == str(result) == "{}".format(result)
+        assert result.ok and result.failed == () and result.version == U._today()
+
+
+def test_format_update_summary_reads_the_way_the_user_asked_for_it():
+    failed = (U.SchemeFailure("kingella", "download",
+                              "The server refused the download (HTTP 404)."),
+              U.SchemeFailure("listeria_2", "validate",
+                              "listeria_2: the profile table has a blank line."))
+    text = U.format_update_summary(["s"] * 148, ["u"] * 3, failed)
+    assert text.startswith("148 schemes updated, 3 unchanged, "
+                           "2 could not be updated: ")
+    assert "kingella: The server refused the download (HTTP 404)." in text
+    assert "listeria_2: the profile table has a blank line." in text
+    assert text.count("listeria_2:") == 1      # the prefix is never doubled
+    assert U.format_update_summary(["one"], (), ()) == \
+        "1 scheme updated, 0 unchanged"
 
 
 # ---------------------------------------------------------------------------
@@ -1055,9 +1386,9 @@ def test_a_server_chosen_locus_url_may_not_leave_the_allowlist():
         routes[API] = (200, "application/json", json.dumps(doc).encode("utf-8"))
         fetcher = _fetcher(routes)
         plan = U.check(dbdir, fetcher=fetcher)
-        with pytest.raises(UpdateError) as excinfo:
-            U.apply(dbdir, plan, None, fetcher=fetcher, tools=_FakeTools())
-        assert "Refusing to fetch" in str(excinfo.value)
+        result = U.apply(dbdir, plan, None, fetcher=fetcher, tools=_FakeTools())
+        assert "Refusing to fetch" in result.failed[0].reason
+        assert result.failed_names == ("tiny",)
         assert not any(c.startswith("http://") for c in fetcher._opener.calls)
 
 

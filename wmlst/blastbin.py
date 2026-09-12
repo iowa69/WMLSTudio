@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: GPL-2.0-only
-# Copyright (C) 2025-2026 IOWA-Tech - Giovanni Lorenzin
+# Copyright (C) 2025-2026 IOWA-BioTech - Giovanni Lorenzin
 # Copyright (C) Torsten Seemann (upstream `mlst`, from which WMLST is ported)
 """BLAST+ discovery, bootstrap, process-launch policy and Windows path safety.
 
@@ -520,7 +520,7 @@ def temp_root() -> str:
     """A short, ANSI-safe, writable scratch directory (section 4.4).
 
     Ladder: ``%WMLST_TMPDIR%`` -> the system temp dir -> its 8.3 short name ->
-    ``%LOCALAPPDATA%\\IOWA-Tech\\WMLST\\tmp`` -> ``C:\\ProgramData\\IOWA-Tech\\WMLST\\tmp``
+    ``%LOCALAPPDATA%\\IOWA-BioTech\\WMLST\\tmp`` -> ``C:\\ProgramData\\IOWA-BioTech\\WMLST\\tmp``
     -> ``%SystemDrive%\\WMLST-tmp``.  Each candidate is validated by writing and
     deleting a probe file.
     """
@@ -536,7 +536,7 @@ def temp_root() -> str:
             candidates.append(short)
         candidates.append(os.path.join(install_root(), "tmp"))
         programdata = os.environ.get("ProgramData", r"C:\ProgramData")
-        candidates.append(os.path.join(programdata, "IOWA-Tech", "WMLST", "tmp"))
+        candidates.append(os.path.join(programdata, "IOWA-BioTech", "WMLST", "tmp"))
         sysdrive = os.environ.get("SystemDrive", "C:")
         candidates.append(os.path.join(sysdrive + os.sep, "WMLST-tmp"))
 
@@ -919,13 +919,29 @@ def _exe(name: str) -> str:
     return name + ".exe" if IS_WINDOWS else name
 
 
+#: The vendor folder WMLST installs BLAST+ into, newest first. "IOWA-BioTech" is
+#: kept because that is where every build up to 1.1.1 put the ~137 MB download:
+#: dropping it would make an existing install look empty and silently ask the
+#: user to fetch it all again. New installs use the current name.
+_VENDOR_DIRS = ("IOWA-BioTech", "IOWA-Tech")
+
+
 def install_root() -> str:
-    """``%LOCALAPPDATA%\\IOWA-Tech\\WMLST`` on Windows, ``~/.local/share/wmlst`` elsewhere."""
+    """``%LOCALAPPDATA%\\IOWA-BioTech\\WMLST`` on Windows, ``~/.local/share/wmlst``
+    elsewhere.
+
+    On Windows an EXISTING install under a previous vendor name wins, so an
+    upgrade keeps using the BLAST+ it already downloaded.
+    """
     if IS_WINDOWS:
         base = os.environ.get("LOCALAPPDATA") or os.path.expanduser(
             r"~\AppData\Local"
         )
-        return os.path.join(base, "IOWA-Tech", "WMLST")
+        for vendor in _VENDOR_DIRS:
+            candidate = os.path.join(base, vendor, "WMLST")
+            if os.path.isdir(candidate):
+                return candidate
+        return os.path.join(base, _VENDOR_DIRS[0], "WMLST")
     base = os.environ.get("XDG_DATA_HOME") or os.path.join(
         os.path.expanduser("~"), ".local", "share"
     )

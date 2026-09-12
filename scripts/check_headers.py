@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: GPL-2.0-only
-# Copyright (C) 2025-2026 IOWA-Tech - Giovanni Lorenzin
+# Copyright (C) 2025-2026 IOWA-BioTech - Giovanni Lorenzin
 # Copyright (C) Torsten Seemann (upstream `mlst`, from which WMLST is ported)
 """Enforce the per-file licence header mandated by docs/ARCHITECTURE.md 13.3.
 
@@ -9,7 +9,7 @@ GPL-2.0-only with no "or any later version" clause. GPLv2 section 2(b) licenses
 the derivative as a whole, so every source file must carry:
 
 1. ``SPDX-License-Identifier: GPL-2.0-only``
-2. a copyright line naming IOWA-Tech / Giovanni Lorenzin
+2. a copyright line naming IOWA-BioTech / Giovanni Lorenzin
 3. a copyright line naming Torsten Seemann
 
 and, for the modules that are direct line-by-line translations of upstream Perl,
@@ -37,7 +37,9 @@ SPDX = "GPL-2.0-only"
 HEADER_LINES = 60
 
 RE_SPDX = re.compile(r"SPDX-License-Identifier:\s*(?P<id>[^\s*#]+)")
-RE_VENDOR = re.compile(r"IOWA[- ]?Tech", re.IGNORECASE)
+# Accepts the former "IOWA-Tech" as well, so a file that predates the rename
+# is not rejected for carrying the copyright line it was written with.
+RE_VENDOR = re.compile(r"IOWA[- ]?(?:Bio)?Tech", re.IGNORECASE)
 RE_AUTHOR = re.compile(r"Giovanni\s+Lorenzin", re.IGNORECASE)
 RE_UPSTREAM = re.compile(r"Torsten\s+Seemann", re.IGNORECASE)
 
@@ -67,7 +69,7 @@ SKIP_DIRS = frozenset({"__pycache__", ".git", "build", "dist", ".venv", "venv",
 
 HEADER_TEMPLATE = (
     "# SPDX-License-Identifier: GPL-2.0-only\n"
-    "# Copyright (C) 2025-2026 IOWA-Tech - Giovanni Lorenzin\n"
+    "# Copyright (C) 2025-2026 IOWA-BioTech - Giovanni Lorenzin\n"
     "# Copyright (C) Torsten Seemann (upstream `mlst`, from which WMLST is ported)\n"
 )
 
@@ -98,7 +100,7 @@ def check_file(path, relpath):
         )
 
     if not (RE_VENDOR.search(text) and RE_AUTHOR.search(text)):
-        problems.append("missing the 'IOWA-Tech - Giovanni Lorenzin' copyright line")
+        problems.append("missing the 'IOWA-BioTech - Giovanni Lorenzin' copyright line")
 
     if not RE_UPSTREAM.search(text):
         problems.append(

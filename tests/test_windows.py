@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: GPL-2.0-only
-# Copyright (C) 2025-2026 IOWA-Tech - Giovanni Lorenzin
+# Copyright (C) 2025-2026 IOWA-BioTech - Giovanni Lorenzin
 # Copyright (C) Torsten Seemann (upstream `mlst`, from which WMLST is ported)
 """The Windows runtime matrix (docs/ARCHITECTURE.md 8, 9, 13.4).
 
@@ -389,7 +389,7 @@ def test_path_rung_survives_the_st_mode_windows_synthesises():
     above it.  %LOCALAPPDATA% is one of them and is the easy one to forget: it
     is not read directly but through install_root(), and on the Windows CI
     runner the earlier `--bootstrap-blast` step has filled
-    %LOCALAPPDATA%\IOWA-Tech\WMLST\blast with a checksummed, INSTALL_OK-stamped
+    %LOCALAPPDATA%\IOWA-BioTech\WMLST\blast with a checksummed, INSTALL_OK-stamped
     2.17.0+, so find_blast() returned origin "appdata" and never looked at PATH
     at all.  Point LOCALAPPDATA at an empty directory for the duration, and
     assert that the rung really is gone before relying on it being gone.

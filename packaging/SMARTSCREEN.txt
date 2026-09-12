@@ -1,5 +1,5 @@
 WMLST -- before you install
-IOWA-Tech - Giovanni Lorenzin
+IOWA-BioTech - Giovanni Lorenzin
 
 
 THIS INSTALLER IS NOT CODE-SIGNED, AND WE ARE NOT GOING TO PRETEND IT IS.

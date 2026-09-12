@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: GPL-2.0-only
-# Copyright (C) 2025-2026 IOWA-Tech - Giovanni Lorenzin
+# Copyright (C) 2025-2026 IOWA-BioTech - Giovanni Lorenzin
 # Copyright (C) Torsten Seemann (upstream `mlst`, from which WMLST is ported)
 """Tests for wmlst/blastbin.py (docs/ARCHITECTURE.md 4.4, 5.5, 8, 9).
 
@@ -419,7 +419,7 @@ def test_install_root_shape():
     root = blastbin.install_root()
     assert os.path.isabs(root)
     if blastbin.IS_WINDOWS:
-        assert root.endswith(os.path.join("IOWA-Tech", "WMLST"))
+        assert root.endswith(os.path.join("IOWA-BioTech", "WMLST"))
     else:
         assert root.endswith("wmlst")
 
@@ -566,7 +566,7 @@ def test_find_blast_raises_when_nothing_is_installed():
 
     The per-user install root is a rung too, and on a machine that has ever run
     ``--bootstrap-blast`` it is populated (the Windows CI job does exactly that,
-    into ``%LOCALAPPDATA%\\IOWA-Tech\\WMLST\\blast``), so emptying PATH alone left
+    into ``%LOCALAPPDATA%\\IOWA-BioTech\\WMLST\\blast``), so emptying PATH alone left
     find_blast() returning an "appdata" install and the test asserting nothing.
     install_root() reads LOCALAPPDATA on Windows and XDG_DATA_HOME elsewhere:
     pointing both at an empty directory empties that rung the same way PATH is

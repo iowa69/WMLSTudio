@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: GPL-2.0-only
-# Copyright (C) 2025-2026 IOWA-Tech - Giovanni Lorenzin
+# Copyright (C) 2025-2026 IOWA-BioTech - Giovanni Lorenzin
 # Copyright (C) Torsten Seemann (upstream `mlst`, from which WMLST is ported)
 """Shared pytest fixtures for the whole WMLST suite (docs/ARCHITECTURE.md 13.4).
 
@@ -61,7 +61,7 @@ def _candidate_blast_dirs():
         os.path.join(REPO_ROOT, os.pardir, "ncbi-blast-*", "bin"),
         os.path.join(REPO_ROOT, "packaging", "payload", "blast"),
         os.path.join(
-            os.path.expanduser("~"), "AppData", "Local", "IOWA-Tech", "WMLST", "blast"
+            os.path.expanduser("~"), "AppData", "Local", "IOWA-BioTech", "WMLST", "blast"
         ),
         os.path.join(os.path.expanduser("~"), ".local", "share", "wmlst", "blast"),
         os.path.join(os.sep + "tmp", "claude-*", "*", "*", "scratchpad", "ncbi-blast-*", "bin"),

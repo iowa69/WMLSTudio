@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: GPL-2.0-only
-# Copyright (C) 2025-2026 IOWA-Tech - Giovanni Lorenzin
+# Copyright (C) 2025-2026 IOWA-BioTech - Giovanni Lorenzin
 # Copyright (C) Torsten Seemann (upstream `mlst`, from which WMLST is ported)
 """The GitHub Pages download page, and the workflow that publishes it.
 
@@ -15,6 +15,14 @@ deploy fails (loudly, by design) or - worse, if the assertion were ever
 relaxed - the page keeps shipping a link to last year's build. So the sentinels
 are extracted from the workflow's own stamping script and checked against the
 page, which means the two files can never drift apart unnoticed.
+
+The second failure this file prevents is the *dead end*. Installer builds are
+paused (release.yml), so the newest release normally carries no setup.exe and a
+secondary link aimed at ``releases/latest`` would drop the reader on a release
+page with no installer on it. The page therefore keeps the stamper's sentinel in
+``data-latest`` and points the visible href at the full releases list, which is
+always true; the browser script upgrades it to the most recent release that
+actually has an installer. All three layers are asserted below.
 
 Runnable two ways::
 
@@ -61,6 +69,14 @@ RE_VERSIONISH = re.compile(r"\b\d+\.\d+\.\d+\b|\bv\d+\.\d+\b")
 #: packaging/wmlst.iss. Lower-cased, because the stamper matches case-blind.
 PORTABLE_SUFFIX = "-win64-portable.zip"
 INSTALLER_SUFFIX = "-win64-setup.exe"
+
+#: Where an unstamped, script-less page must send somebody who wants each one.
+PORTABLE_FALLBACK = "https://github.com/iowa69/WMLST/releases/latest"
+INSTALLER_FALLBACK = "https://github.com/iowa69/WMLST/releases"
+
+#: The sentinel pages.yml swaps for the latest release's installer, if it has
+#: one. It lives in data-latest, not in the href -- see the module docstring.
+INSTALLER_SENTINEL = "https://github.com/iowa69/WMLST/releases/latest#installer"
 
 
 def read(path):
@@ -149,15 +165,59 @@ def test_the_one_button_says_what_it_gives_you():
     assert label == "Download WMLST for Windows (portable)"
 
 
+def _installer_link():
+    found = [a for a in tags("a") if a.get("id") == "get-installer"]
+    assert len(found) == 1, "expected exactly one #get-installer link"
+    return found[0]
+
+
 def test_installer_is_a_small_secondary_link_not_a_button():
-    installer = [a for a in tags("a") if a.get("id") == "get-installer"]
-    assert len(installer) == 1
-    assert "btn" not in classes(installer[0])
+    installer = _installer_link()
+    assert "btn" not in classes(installer)
     # It lives inside the <small class="secondary"> block, below the button.
     assert re.search(
         r'<small class="secondary">.*?id="get-installer".*?</small>', HTML, re.S
     ), "the installer link must sit inside the secondary block"
     assert HTML.index('id="get-portable"') < HTML.index('id="get-installer"')
+
+
+def test_installer_link_does_not_dead_end_on_a_release_without_one():
+    """Installer builds are paused: `releases/latest` is the wrong target.
+
+    The newest release ships a portable zip and nothing else, so a link to
+    `releases/latest#installer` would open a page with no installer on it - not
+    a 404 the browser reports, just a reader who cannot find the thing the link
+    promised. The href therefore names the whole releases list, which always
+    contains the most recent release that does have an installer.
+    """
+    href = _installer_link()["href"]
+    assert href == INSTALLER_FALLBACK, href
+    assert "/releases/latest" not in href, (
+        "the secondary link must not point at the latest release while "
+        "installer builds are paused; it would land on a release with no "
+        "installer attached"
+    )
+
+
+def test_installer_link_still_carries_the_stampers_sentinel():
+    """Pausing the build must not unwire the deploy-time stamper.
+
+    pages.yml swaps the sentinel for the latest release's installer *when that
+    release has one*. Keeping it in data-latest means the day the installer
+    comes back (release.yml, BUILD_INSTALLER) the stamped page hands out the
+    direct link again with no JavaScript and no edit to this page.
+    """
+    assert _installer_link().get("data-latest") == INSTALLER_SENTINEL
+    assert HTML.count(INSTALLER_SENTINEL) == 1
+
+
+def test_the_secondary_copy_says_why_the_link_is_a_list():
+    """A reader who clicks it lands on a list; the page must have warned them."""
+    block = re.search(r'<small class="secondary">(.*?)</small>', HTML, re.S)
+    assert block is not None
+    prose = re.sub(r"<[^>]+>|\s+", " ", block.group(1)).lower()
+    assert "paused" in prose, prose
+    assert "most recent release" in prose, prose
 
 
 def test_nothing_else_competes_with_the_portable_zip():
@@ -193,11 +253,17 @@ def test_no_hard_coded_asset_filename():
 
 def test_the_fallback_href_is_the_version_less_latest_redirect():
     """With no stamping and no JS, the button must still reach the download."""
-    for attrs in tags("a"):
-        if attrs.get("id") in ("get-portable", "get-installer"):
-            href = attrs["href"]
-            assert href.startswith("https://github.com/iowa69/WMLST/releases/latest"), href
-            assert not RE_VERSIONISH.search(href)
+    button = next(a for a in tags("a") if a.get("id") == "get-portable")
+    assert button["href"].startswith(PORTABLE_FALLBACK), button["href"]
+    assert not RE_VERSIONISH.search(button["href"])
+
+
+def test_neither_resolved_link_is_version_less_by_accident():
+    """Both hrefs, and the installer sentinel, must survive the next release."""
+    installer = _installer_link()
+    for value in (installer["href"], installer["data-latest"]):
+        assert value.startswith("https://github.com/iowa69/WMLST/releases"), value
+        assert not RE_VERSIONISH.search(value), value
 
 
 # --------------------------------------------------------------------------
@@ -272,7 +338,7 @@ def test_metadata_fields_have_sensible_unstamped_defaults():
 
 
 def test_branding_and_attribution():
-    assert "IOWA-Tech" in HTML
+    assert "IOWA-BioTech" in HTML
     assert "Giovanni Lorenzin" in HTML
     assert "Torsten Seemann" in HTML
     assert "GPL-2.0-only" in HTML
@@ -401,6 +467,132 @@ def test_browser_refresh_script_matches_the_same_asset_names():
     assert "api.github.com/repos/iowa69/WMLST/releases/latest" in script
     # Failure must be a no-op, never a broken link.
     assert ".catch(" in script
+
+
+def test_browser_script_walks_back_for_a_release_that_has_an_installer():
+    """The bit that makes the secondary link land on a real .exe.
+
+    /releases/latest alone is not enough any more: it is precisely the release
+    that has no installer. The script must also be able to ask for the list of
+    recent releases and take the first one carrying a setup.exe.
+    """
+    script = "\n".join(DOM.scripts)
+    assert "api.github.com/repos/iowa69/WMLST/releases?per_page=" in script, (
+        "the script cannot find an older installer without listing releases"
+    )
+    assert "data-latest" in script, "the stamped installer URL is never read"
+    assert "get-installer" in script and "get-portable" in script
+
+
+def test_browser_script_is_plain_es5_like_the_rest_of_the_page():
+    """No transpiler, no build step - it has to run as written, everywhere."""
+    script = "\n".join(DOM.scripts)
+    assert not re.search(r"\b(const|let)\s", script), "ES5 only"
+    assert "=>" not in script, "no arrow functions"
+    assert "`" not in script, "no template literals"
+
+
+# --------------------------------------------------------------------------
+# 6. release.yml: the portable zip ships, the installer is paused not deleted.
+# --------------------------------------------------------------------------
+@pytest.fixture(scope="module")
+def release_workflow():
+    yaml = pytest.importorskip("yaml")
+    return yaml.safe_load(read(RELEASE_WORKFLOW))
+
+
+def _windows_steps(release_workflow):
+    return release_workflow["jobs"]["windows"]["steps"]
+
+
+def _step(release_workflow, needle):
+    matches = [s for s in _windows_steps(release_workflow)
+               if needle.lower() in (s.get("name") or "").lower()]
+    assert len(matches) == 1, "expected one %r step, found %d" % (needle, len(matches))
+    return matches[0]
+
+
+def test_a_tag_always_builds_the_portable_zip(release_workflow):
+    """The zip is the product. Nothing may make it conditional."""
+    zip_step = _step(release_workflow, "Portable zip")
+    assert "if" not in zip_step, (
+        "the portable zip must be built unconditionally; it is the only Windows "
+        "asset a tag now produces"
+    )
+    assert "win64-portable.zip" in zip_step["run"]
+
+
+def test_the_wheel_and_sdist_still_ship(release_workflow):
+    jobs = release_workflow["jobs"]
+    assert "sdist-wheel" in jobs
+    assert "if" not in jobs["sdist-wheel"]
+    assert set(jobs["publish"]["needs"]) == {"sdist-wheel", "windows"}
+
+
+def test_the_installer_step_is_paused_not_deleted(release_workflow):
+    """Guarded, so a tag skips it - but the recipe stays in the file."""
+    step = _step(release_workflow, "Inno Setup installer")
+    assert "wmlst.iss" in step["run"], "the installer recipe was gutted, not paused"
+    guard = step.get("if")
+    assert guard, "the Inno Setup step must be guarded, or every tag builds it"
+    assert "inputs.build_installer" in guard, guard
+    assert "vars.BUILD_INSTALLER" in guard, guard
+
+
+def test_the_installer_guard_defaults_to_off(release_workflow):
+    """Both switches are opt-in: a plain `git push --tags` builds no installer.
+
+    The dispatch input defaults to false, and an unset repository variable is
+    the empty string, which is not the ``'true'`` the guard compares against.
+    """
+    triggers = release_workflow.get("on", release_workflow.get(True))
+    build_installer = triggers["workflow_dispatch"]["inputs"]["build_installer"]
+    assert build_installer["type"] == "boolean"
+    assert build_installer["default"] is False
+
+    guard = _step(release_workflow, "Inno Setup installer")["if"]
+    assert "== 'true'" in guard or '== "true"' in guard, (
+        "BUILD_INSTALLER must be compared against an explicit 'true'; an unset "
+        "variable is '' and must read as OFF"
+    )
+
+
+def test_the_pause_is_explained_where_somebody_will_look():
+    """A guard with no comment is a mystery in six months' time."""
+    text = read(RELEASE_WORKFLOW)
+    lowered = text.lower()
+    assert "paused" in lowered, "say that the installer is intentionally paused"
+    assert "build_installer" in text
+    # And how to switch it back on, both ways.
+    assert "run workflow" in lowered, "document the one-off workflow_dispatch route"
+    assert "variables" in lowered, "document the repository-variable route"
+
+
+def test_pausing_the_installer_did_not_break_the_existing_release_gates():
+    """The assertions other suites make about this file must still hold."""
+    text = read(RELEASE_WORKFLOW)
+    for required in ("pytest", "SHA256SUMS.txt", "pyinstaller", "wmlst.iss"):
+        assert required in text, required
+    assert "twine upload" not in text, "PyPI upload stays a manual step"
+
+
+def test_publish_refuses_a_release_with_no_portable_zip():
+    """Now that the zip is the only Windows asset, its absence must be loud."""
+    text = read(RELEASE_WORKFLOW)
+    assert re.search(r"-win64-portable\.zip.*\n.*::error", text), (
+        "the publish job must fail if no portable zip was built, rather than "
+        "quietly publishing a release with nothing in it for Windows users"
+    )
+
+
+def test_the_release_body_does_not_promise_an_absent_installer():
+    """The SmartScreen note is attached to every release, installer or not."""
+    text = read(RELEASE_WORKFLOW)
+    body = text[text.index("Verifying this download"):]
+    assert "run the installer" not in body, (
+        "the release notes still tell people to run an installer that a paused "
+        "build no longer attaches"
+    )
 
 
 if __name__ == "__main__":

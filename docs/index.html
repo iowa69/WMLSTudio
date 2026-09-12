@@ -1,7 +1,7 @@
 <!DOCTYPE html>
 <!--
   SPDX-License-Identifier: GPL-2.0-only
-  Copyright (C) 2025-2026 IOWA-Tech - Giovanni Lorenzin
+  Copyright (C) 2025-2026 IOWA-BioTech - Giovanni Lorenzin
   Copyright (C) Torsten Seemann (upstream `mlst`, from which WMLST is ported)
 
   WMLST download page. One job: put the CURRENT portable zip one click away.
@@ -13,14 +13,23 @@
   releases page, where the zip is the first asset.
 
   Sentinels, each of which MUST appear exactly once (the deploy fails loudly
-  otherwise): the href of #get-portable, the href of #get-installer, and the
-  three one-line elements with class f-version, f-size and f-date.
+  otherwise): the href of #get-portable, the data-latest of #get-installer, and
+  the three one-line elements with class f-version, f-size and f-date.
+
+  Why the installer sentinel lives in data-latest rather than in the href:
+  installer builds are paused, so the newest release usually has no setup.exe
+  and "releases/latest#installer" would land the reader on a release page with
+  no installer on it. The href is therefore the full releases list -- always
+  true, never a dead end -- and data-latest carries the one thing the deploy
+  stamper knows, namely the latest release's installer *if it has one*. The
+  script promotes that when present, and otherwise walks back through the
+  releases until it finds the most recent one that does ship an installer.
 -->
 <html lang="en">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Download WMLST for Windows &mdash; IOWA-Tech</title>
+<title>Download WMLST for Windows &mdash; IOWA-BioTech</title>
 <meta name="description" content="WMLST: MLST typing for Windows. Download the portable build, unzip it, drop a FASTA on the window.">
 <meta name="color-scheme" content="light dark">
 <style>
@@ -123,7 +132,7 @@ footer p{margin:.45rem 0}
     <div class="logo" aria-hidden="true">MLST</div>
     <h1>WMLST</h1>
     <p class="tagline">MLST typing for Windows. No install, no command line, no internet.</p>
-    <p class="vendor">IOWA-Tech &mdash; Giovanni Lorenzin</p>
+    <p class="vendor">IOWA-BioTech &mdash; Giovanni Lorenzin</p>
   </header>
 
   <main>
@@ -137,7 +146,10 @@ footer p{margin:.45rem 0}
 
       <small class="secondary">
         Would you rather have a Start-menu entry?
-        <a id="get-installer" href="https://github.com/iowa69/WMLST/releases/latest#installer">Get the Windows installer instead</a>.
+        <a id="get-installer"
+           data-latest="https://github.com/iowa69/WMLST/releases/latest#installer"
+           href="https://github.com/iowa69/WMLST/releases">Get the Windows installer instead</a>.
+        New installers are paused, so this opens the most recent release that has one.
       </small>
     </div>
 
@@ -176,27 +188,46 @@ footer p{margin:.45rem 0}
       by Torsten Seemann &mdash; please cite that first. Allele data from
       <a href="https://pubmlst.org">PubMLST</a> (Jolley, Bray &amp; Maiden 2018, PMID 30345391).
     </p>
-    <p>Packaged for Windows by IOWA-Tech &mdash; Giovanni Lorenzin.</p>
+    <p>Packaged for Windows by IOWA-BioTech &mdash; Giovanni Lorenzin.</p>
   </footer>
 
 </div>
 
 <script>
-/* Refresh the download link from the GitHub API.
-   The href is already correct when the page was stamped at deploy time; this
-   only closes the gap if a release was published after the last Pages deploy.
+/* Refresh the download links from the GitHub API.
+
+   The portable href is already correct when the page was stamped at deploy
+   time; re-checking only closes the gap if a release was published after the
+   last Pages deploy.
+
+   The installer href is different: installer builds are paused, so the newest
+   release usually has none and the page ships the releases list as a href that
+   is never wrong. Three chances to do better, cheapest first: the data-latest
+   the deploy stamped, then the latest release's own assets, then a walk back
+   through recent releases for the most recent one that still has an installer.
+
    Every failure path is a no-op: we never downgrade a working link. */
 (function () {
   "use strict";
-  var API = "https://api.github.com/repos/iowa69/WMLST/releases/latest";
-  var WANT = [
-    { id: "get-portable", re: /-win64-portable\.zip$/i, meta: true },
-    { id: "get-installer", re: /-win64-setup\.exe$/i, meta: false }
-  ];
+  var LATEST = "https://api.github.com/repos/iowa69/WMLST/releases/latest";
+  var RECENT = "https://api.github.com/repos/iowa69/WMLST/releases?per_page=30";
+  var PORTABLE = /-win64-portable\.zip$/i;
+  var INSTALLER = /-win64-setup\.exe$/i;
+  /* What data-latest still says when the deploy did NOT stamp an installer. */
+  var UNSTAMPED = /\/releases\/latest#installer$/;
 
   function text(sel, value) {
     var nodes = document.querySelectorAll(sel);
     for (var i = 0; i < nodes.length; i++) { nodes[i].textContent = value; }
+  }
+
+  function asset(release, re) {
+    var assets = (release && release.assets) || [];
+    for (var i = 0; i < assets.length; i++) {
+      var a = assets[i];
+      if (a && a.name && re.test(a.name) && a.browser_download_url) { return a; }
+    }
+    return null;
   }
 
   function size(bytes) {
@@ -215,28 +246,47 @@ footer p{margin:.45rem 0}
     }
   }
 
+  function get(url) {
+    return fetch(url, { headers: { Accept: "application/vnd.github+json" } })
+      .then(function (r) { return r.ok ? r.json() : Promise.reject(r.status); });
+  }
+
+  var portableLink = document.getElementById("get-portable");
+  var installerLink = document.getElementById("get-installer");
+
+  /* The deploy stamps the latest release's installer into data-latest when it
+     has one. That is already the answer; no request needed. */
+  var stamped = installerLink && installerLink.getAttribute("data-latest");
+  var needInstaller = true;
+  if (stamped && !UNSTAMPED.test(stamped)) {
+    installerLink.href = stamped;
+    needInstaller = false;
+  }
+
   if (typeof fetch !== "function") { return; }
 
-  fetch(API, { headers: { Accept: "application/vnd.github+json" } })
-    .then(function (r) { return r.ok ? r.json() : Promise.reject(r.status); })
+  get(LATEST)
     .then(function (rel) {
-      var assets = (rel && rel.assets) || [];
-      WANT.forEach(function (want) {
-        var el = document.getElementById(want.id);
-        if (!el) { return; }
-        for (var i = 0; i < assets.length; i++) {
-          var a = assets[i];
-          if (!a.name || !want.re.test(a.name) || !a.browser_download_url) { continue; }
-          el.href = a.browser_download_url;
-          if (want.meta) {
-            if (rel.tag_name) { text(".f-version", rel.tag_name); }
-            var s = size(a.size);
-            if (s) { text(".f-size", s + " ZIP"); }
-            var d = day(rel.published_at || rel.created_at);
-            if (d) { text(".f-date", "released " + d); }
-          }
-          return;
+      var zip = asset(rel, PORTABLE);
+      if (zip && portableLink) {
+        portableLink.href = zip.browser_download_url;
+        if (rel.tag_name) { text(".f-version", rel.tag_name); }
+        var s = size(zip.size);
+        if (s) { text(".f-size", s + " ZIP"); }
+        var d = day(rel.published_at || rel.created_at);
+        if (d) { text(".f-date", "released " + d); }
+      }
+      if (!needInstaller || !installerLink) { return null; }
+      var exe = asset(rel, INSTALLER);
+      if (exe) { installerLink.href = exe.browser_download_url; return null; }
+      /* Paused: fall back through the recent releases, newest first. */
+      return get(RECENT).then(function (list) {
+        if (!list || !list.length) { return; }
+        for (var i = 0; i < list.length; i++) {
+          var older = asset(list[i], INSTALLER);
+          if (older) { installerLink.href = older.browser_download_url; return; }
         }
+        /* None left anywhere: the releases list we shipped stays. */
       });
     })
     .catch(function () { /* offline, rate-limited, or blocked: keep what we have */ });
