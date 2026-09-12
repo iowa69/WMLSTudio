@@ -14,7 +14,12 @@
 - [x] Execute native Windows SKESA and HYDRA, with real-data Linux/Wine agreement.
 - [x] Guard stale AMR, failed profile reuse and unverified external allele tokens.
 - [x] Validate native workflows, rebuild Windows package and push the source.
-- [ ] Publish and download-verify the private Windows retest release.
+- [x] Publish and download-verify the private Windows retest release.
+
+Published `v0.2.0-workbench.1` with the unchanged CI Windows ZIP and checksum.
+A fresh authenticated release download passed SHA-256 and full ZIP CRC checks;
+the repository and release remain private. Artifact SHA-256:
+`695818d74f1021abf6c3691f4c0150748235d8b84529be2639acc864203b0923`.
 
 Design and acceptance contract: [WORKBENCH_DESIGN](../docs/WORKBENCH_DESIGN.md).
 
