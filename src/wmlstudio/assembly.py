@@ -240,6 +240,8 @@ def run_skesa(read1, read2, output_dir, *, executable=None, threads=4, memory_gb
     for name, value in (("threads", threads), ("memory_gb", memory_gb), ("min_contig", min_contig)):
         if isinstance(value, bool) or not isinstance(value, int) or value < 1:
             raise ValueError(f"{name} must be a positive integer.")
+    if memory_gb < 3:
+        raise ValueError("SKESA's sorted counter reserves 2 GB internally; choose a memory budget of at least 3 GB.")
     check_cancelled(cancelled)
     first, second, destination = (Path(p).expanduser().resolve() for p in (read1, read2, output_dir))
     if not first.is_file() or not second.is_file():

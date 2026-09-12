@@ -21,17 +21,18 @@ def reverse_complement(sequence):
     return sequence.translate(str.maketrans("ACGT", "TGCA"))[::-1]
 
 
-def check(executable, output=None, adapter_source=None):
+def check(executable, output=None, adapter_source=None, expected_version="2.4.0"):
     executable = Path(executable).resolve()
     version = subprocess.check_output([str(executable), "--version"], stderr=subprocess.STDOUT,
                                       text=True, timeout=20).strip()
-    if "2.4.0" not in version:
+    if expected_version not in version:
         raise RuntimeError(f"Unexpected SKESA version: {version}")
     rng = random.Random(41027)
     genome = "".join(rng.choices("ACGT", k=12000))
     with tempfile.TemporaryDirectory(prefix="wmlstudio-skesa-smoke-") as temporary:
         directory = Path(temporary)
-        with (directory / "mate1.fastq").open("w") as first, (directory / "mate2.fastq").open("w") as second:
+        with (directory / "mate1.fastq").open("w", newline="\n") as first, \
+                (directory / "mate2.fastq").open("w", newline="\n") as second:
             for number, start in enumerate(range(0, len(genome) - 400 + 1, 5)):
                 for mate, handle, sequence in (
                     (1, first, genome[start:start + 150]),
@@ -39,13 +40,16 @@ def check(executable, output=None, adapter_source=None):
                 ):
                     handle.write(f"@pair{number}/{mate}\n{sequence}\n+\n{'I' * len(sequence)}\n")
         command = [str(executable), "--reads", "mate1.fastq,mate2.fastq", "--cores", "2",
-                   "--memory", "2", "--min_contig", "200", "--contigs_out", "contigs.fasta"]
+                   "--memory", "4", "--min_contig", "200", "--contigs_out", "contigs.fasta"]
         environment = os.environ.copy()
         if os.name == "nt":
             system = environment.get("SystemRoot", r"C:\Windows")
             environment["PATH"] = str(executable.parent) + os.pathsep + system + r"\System32"
         completed = subprocess.run(command, cwd=directory, capture_output=True, text=True,
-                                   env=environment, timeout=180, check=True)
+                                   env=environment, timeout=180, check=False)
+        if completed.returncode:
+            raise RuntimeError(f"Real SKESA smoke exited {completed.returncode}:\n"
+                               f"{completed.stdout}\n{completed.stderr}")
         contigs = []
         for line in (directory / "contigs.fasta").read_text().splitlines():
             if line.startswith(">"):
@@ -79,7 +83,7 @@ def check(executable, output=None, adapter_source=None):
                 original_reads.append(path)
             before = [hashlib.sha256(path.read_bytes()).hexdigest() for path in original_reads]
             result = run_skesa(*original_reads, reads_directory / "assembled λ",
-                               executable=executable, threads=2, memory_gb=2)
+                               executable=executable, threads=2, memory_gb=4)
             assembled = [record.sequence for record in iter_sequences(result["assembly_path"])]
             if not assembled or max(map(len, assembled)) < 9000 or any(
                     seq not in genome and reverse_complement(seq) not in genome for seq in assembled):
@@ -103,5 +107,6 @@ if __name__ == "__main__":
     parser.add_argument("executable")
     parser.add_argument("--output")
     parser.add_argument("--adapter-source", help="WMLSTudio checkout to test its real native process adapter")
+    parser.add_argument("--expected-version", default="2.4.0")
     arguments = parser.parse_args()
-    check(arguments.executable, arguments.output, arguments.adapter_source)
+    check(arguments.executable, arguments.output, arguments.adapter_source, arguments.expected_version)

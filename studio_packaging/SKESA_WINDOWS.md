@@ -36,6 +36,8 @@ unverified until this workflow has passed on a Windows runner.
 The second smoke phase runs WMLSTudio's real Python adapter with Unicode and
 comma-containing FASTQ paths, checks full pairing/provenance, and verifies that
 the originals are unchanged and the assembled sequence matches ground truth.
+The smoke requests a 4 GB sorted-counter budget: upstream internally subtracts
+a 2 GB allocation reserve, so a 2 GB setting cannot assemble even tiny inputs.
 
 ## Licensing and distribution
 
