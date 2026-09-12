@@ -50,6 +50,23 @@ independently of the software version. Both appear in every JSON and HTML report
   same on the summary card, in an expansion row and in the status line. The
   compat TSV/CSV/JSON row formats are byte-identity surfaces and are unchanged.
 
+## [1.2.1] - 2026-09-12
+
+### Changed
+
+- **The download link works.** It pointed at a GitHub Pages site that had never
+  been enabled, so every Pages run had failed and the URL returned 404. Pages is
+  enabled and deployed, and the README now leads with the releases page, which
+  cannot break, offering the landing page as the alternative.
+- **The Tree page is documented** in the README, with a screenshot of each view,
+  what the numbers on the edges mean and what a clonal group is.
+- **No third-party citations on any user-visible surface.** The banner, `--help`,
+  the About box, the Settings footer, the HTML report and the landing page no
+  longer name or cite other projects. The Settings line claiming the defaults
+  matched another tool is gone; it now simply states the reference defaults.
+  The copyright notices the licence requires remain in the source headers and in
+  NOTICE, which travels inside the download.
+
 ## [1.2.0] - 2026-09-12
 
 ### Added

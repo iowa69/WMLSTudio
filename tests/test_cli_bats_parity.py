@@ -714,7 +714,6 @@ def test_port10_branding_is_on_the_banner():
     proc = run("--no-quiet", "--skipcheck", "--list")
     assert branding.VENDOR in proc.stderr
     assert branding.AUTHOR in proc.stderr
-    assert branding.UPSTREAM_AUTHOR in proc.stderr
     # ...and never in the machine-readable payload (section 4.2).
     assert branding.VENDOR not in proc.stdout
 

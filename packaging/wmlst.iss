@@ -36,7 +36,7 @@
 ; ---------------------------------------------------------------------------
 
 #define MyAppName        "WMLST"
-#define MyAppVersion     "1.2.0"
+#define MyAppVersion     "1.2.1"
 #define MyAppPublisher   "IOWA-BioTech"
 #define MyAppAuthor      "Giovanni Lorenzin"
 #define MyAppURL         "https://github.com/iowa69/WMLST"

@@ -1719,7 +1719,7 @@ def _run_meta_section(result: RunResult, brand: Dict[str, Any]) -> str:
     out.write('<p class="small muted">\u2020 marks a setting that differs from the default.</p>')
     if getattr(cfg, "repair_locus_ids", False):
         out.write('<p class="notice"><strong>--repair-locus-ids was used.</strong> '
-                  'Results will NOT match tseemann/mlst. This option recovers alleles whose '
+                  'Results will differ from the reference defaults. This option recovers alleles whose '
                   'identifiers the upstream parser discards; do not compare these calls with '
                   'output from the original tool.</p>')
     out.write('</section>')

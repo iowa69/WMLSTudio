@@ -255,7 +255,7 @@ def _opts():
              "Seconds before a stuck blastn is killed"),
         _Opt("repair-locus-ids!", "repair_locus_ids", False,
              "Recover alleles whose id the sseqid regex drops"
-             " - results will NOT match tseemann/mlst"),
+             " - results will differ from the reference defaults"),
         _Opt("html-evidence=s", "html_evidence", "best",
              "How much BLAST evidence the HTML report shows: none|best|all"),
     ]
@@ -307,8 +307,6 @@ def usage_text() -> str:
             opt += " NUM"
         out.append("  --%-15s %s%s\n" % (opt, entry.desc, suffix))
     out.append("HOMEPAGE\n  %s - %s\n" % (branding.HOMEPAGE, branding.ATTRIBUTION))
-    out.append("UPSTREAM\n  %s - %s\n"
-               % (branding.UPSTREAM_URL, branding.UPSTREAM_AUTHOR))
     return "".join(out)
 
 

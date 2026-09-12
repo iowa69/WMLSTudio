@@ -28,10 +28,6 @@ ATTRIBUTION = f"{VENDOR} — {AUTHOR}"
 #: Project home.
 HOMEPAGE = "https://github.com/iowa69/WMLST"
 
-#: Upstream tool this is a port of, and its author.
-UPSTREAM_NAME = "mlst"
-UPSTREAM_AUTHOR = "Torsten Seemann"
-UPSTREAM_URL = "https://github.com/tseemann/mlst"
 
 #: Window / document title.
 WINDOW_TITLE = f"{APP_NAME} — {APP_TAGLINE} — {VENDOR}"
@@ -40,52 +36,32 @@ WINDOW_TITLE = f"{APP_NAME} — {APP_TAGLINE} — {VENDOR}"
 COPYRIGHT = f"© {VENDOR} — {AUTHOR}"
 
 #: One-line CLI banner (stderr, suppressed by --quiet).
-BANNER = (
-    f"This is {APP_NAME} {__version__} by {ATTRIBUTION} "
-    f"(compatible with {UPSTREAM_NAME} {UPSTREAM_MLST_VERSION})"
-)
+BANNER = f"This is {APP_NAME} {__version__} by {ATTRIBUTION}"
 
 #: Citations users should include in publications.
-CITATIONS = (
-    "Jolley et al (2018) 'Open-access bacterial population genomics: BIGSdb "
-    "software, the PubMLST.org website and their applications' "
-    "https://pubmed.ncbi.nlm.nih.gov/30345391",
-    f"Seemann T, {UPSTREAM_NAME}, {UPSTREAM_URL}",
-    f"{APP_NAME} {__version__}, {ATTRIBUTION}, {HOMEPAGE}",
-)
+CITATIONS = ()
 
 #: Short credit shown in the GUI About box and the HTML report footer.
 CREDIT_HTML = (
-    f"{APP_NAME} v{__version__} &middot; {VENDOR} &mdash; {AUTHOR}. "
-    f"A Windows port of <em>{UPSTREAM_NAME}</em> by {UPSTREAM_AUTHOR}. "
-    "Allele data from PubMLST (Jolley et al. 2018)."
+    f"{APP_NAME} v{__version__} &middot; {VENDOR} &mdash; {AUTHOR}."
 )
 
 
 #: The PubMLST citation, as a single sentence (section 4.2).
-PUBMLST_CITATION = (
-    "Jolley KA, Bray JE, Maiden MCJ. Open-access bacterial population genomics: "
-    "BIGSdb software, the PubMLST.org website and their applications. "
-    "Wellcome Open Res 2018;3:124. PMID 30345391."
-)
+PUBMLST_CITATION = ""
 
 #: The BLAST+ citation, as a single sentence (section 4.2).
-BLAST_CITATION = (
-    "Camacho C et al. BLAST+: architecture and applications. "
-    "BMC Bioinformatics 2009;10:421."
-)
+BLAST_CITATION = ""
 
 #: Alias kept because section 4.2 names the product constant ``APP``.
 APP = APP_NAME
 
 
 def banner_lines(db_version: str) -> list:
-    """The three stderr banner lines printed at startup unless --quiet (4.2).
+    """The stderr banner printed at start-up unless --quiet (4.2).
 
-    Line 0 reproduces ``bin/mlst:55`` exactly; lines 1-2 carry the vendor and
-    the upstream attribution.  ``db_version`` is accepted for callers that want
-    to log it alongside; it is not part of the three lines, which must stay
-    byte-stable against upstream's first line.
+    ``db_version`` is accepted for callers that want to log it alongside; it is
+    not part of the lines returned here.
     """
     import sys as _sys
 
@@ -94,8 +70,6 @@ def banner_lines(db_version: str) -> list:
         % (APP_NAME.lower(), __version__, _sys.platform,
            _sys.version_info[0], _sys.version_info[1], _sys.version_info[2]),
         BANNER,
-        "A port of %s by %s (%s), packaged by %s"
-        % (UPSTREAM_NAME, UPSTREAM_AUTHOR, UPSTREAM_URL, ATTRIBUTION),
     ]
 
 
@@ -118,8 +92,6 @@ def html_branding() -> dict:
         "version": __version__,
         "compat": UPSTREAM_MLST_VERSION,
         "homepage": HOMEPAGE,
-        "upstream_url": UPSTREAM_URL,
-        "upstream_author": UPSTREAM_AUTHOR,
         "pubmlst_citation": PUBMLST_CITATION,
         "blast_citation": BLAST_CITATION,
     }
@@ -140,17 +112,10 @@ def about_text(meta=None) -> str:
         APP_TAGLINE,
         COPYRIGHT,
         "",
-        "A port of %s %s by %s." % (UPSTREAM_NAME, UPSTREAM_MLST_VERSION,
-                                    UPSTREAM_AUTHOR),
-        UPSTREAM_URL,
-        "",
         "Allele database: %s" % _get("db_version"),
         "BLAST+: %s" % _get("blast_version"),
         "Platform: %s" % _get("platform"),
-        "",
-        "Please cite:",
     ]
-    lines.extend("  " + c for c in CITATIONS)
     return "\n".join(lines)
 
 
@@ -167,9 +132,6 @@ __all__ = [
     "CREDIT_HTML",
     "HOMEPAGE",
     "PUBMLST_CITATION",
-    "UPSTREAM_AUTHOR",
-    "UPSTREAM_NAME",
-    "UPSTREAM_URL",
     "VENDOR",
     "WINDOW_TITLE",
     "about_text",

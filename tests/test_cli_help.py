@@ -105,7 +105,6 @@ def test_help_carries_the_vendor_branding():
     text = cli.usage_text()
     assert branding.VENDOR in text
     assert branding.AUTHOR in text
-    assert branding.UPSTREAM_AUTHOR in text
     assert branding.HOMEPAGE in text
 
 

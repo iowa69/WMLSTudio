@@ -207,7 +207,6 @@ def test_branding_is_present():
     assert "IOWA-BioTech" in html
     assert "Giovanni Lorenzin" in html
     assert "WMLST" in html
-    assert "Torsten Seemann" in html
     assert "PubMLST" in html
 
 
@@ -705,7 +704,7 @@ def test_repair_locus_ids_is_labelled_loudly():
     cfg = RunConfig(dbdir=DBDIR, repair_locus_ids=True)
     html = report.render_html(mk_result([mk_sample("x.fa", "saureus", "1", "PERFECT", 100,
                                                    "arcC(1)")], cfg))
-    assert "Results will NOT match tseemann/mlst" in html
+    assert "differ from the reference defaults" in html
 
 
 def test_title_option_is_honoured_and_escaped():

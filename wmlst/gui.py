@@ -7125,8 +7125,8 @@ class SettingsView(ttk.Frame):
         footer.pack(fill="x", pady=px(PAD_M))
         ttk.Button(footer, text="Restore reference defaults",
                    command=self.restore_defaults).pack(side="left")
-        ttk.Label(footer, text="Defaults match tseemann/mlst {}: identity 95, "
-                              "coverage 50, score 50.".format(UPSTREAM_MLST_VERSION),
+        ttk.Label(footer, text="Reference defaults: identity 95, coverage 50, "
+                              "score 50.",
                   style="Muted.TLabel").pack(side="left", padx=px(PAD_M))
 
     def _spin(self, parent: tk.Misc, key: str, label: str, lo: float, hi: float,
@@ -7473,10 +7473,6 @@ class AboutDialog(ModalDialog):
         self.heading("{} {}".format(branding.APP_NAME, __version__))
         self.paragraph(branding.APP_TAGLINE)
         self.paragraph(branding.ATTRIBUTION, style="Heading.TLabel")
-        self.paragraph(
-            "A Windows port of {} {} by {}, reproducing its results exactly."
-            .format(branding.UPSTREAM_NAME, UPSTREAM_MLST_VERSION,
-                    branding.UPSTREAM_AUTHOR))
         if env is not None:
             self.paragraph("Database {} · {} schemes\nSearch engine {}".format(
                 env.db_version, env.scheme_count,

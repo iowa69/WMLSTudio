@@ -47,9 +47,7 @@ WMLST EXTRAS
   --make-blast-db   Rebuild the derived BLAST index from db/pubmlst (default OFF)
   --bootstrap-blast Download and verify NCBI BLAST+ into your user profile (default OFF)
   --blast-timeout NUM Seconds before a stuck blastn is killed (default '900')
-  --repair-locus-ids Recover alleles whose id the sseqid regex drops - results will NOT match tseemann/mlst (default OFF)
+  --repair-locus-ids Recover alleles whose id the sseqid regex drops - results will differ from the reference defaults (default OFF)
   --html-evidence STR How much BLAST evidence the HTML report shows: none|best|all (default 'best')
 HOMEPAGE
   https://github.com/iowa69/WMLST - IOWA-BioTech — Giovanni Lorenzin
-UPSTREAM
-  https://github.com/tseemann/mlst - Torsten Seemann

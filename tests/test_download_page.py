@@ -337,13 +337,19 @@ def test_metadata_fields_have_sensible_unstamped_defaults():
         assert '<span class="%s">%s</span>' % (cls, default) in HTML
 
 
-def test_branding_and_attribution():
+def test_branding_and_the_landing_page_stays_a_download_page():
+    """The page exists to get one person to one file.
+
+    Third-party names are deliberately absent: the copyright notices the
+    licence requires live in NOTICE, which travels inside the download, not on
+    a marketing page competing with the download button.
+    """
     assert "IOWA-BioTech" in HTML
     assert "Giovanni Lorenzin" in HTML
-    assert "Torsten Seemann" in HTML
     assert "GPL-2.0-only" in HTML
-    assert "PubMLST" in HTML
     assert "Not a medical device" in HTML
+    for absent in ("Torsten Seemann", "tseemann", "Jolley", "30345391"):
+        assert absent not in HTML, "the landing page should not cite %r" % absent
 
 
 def test_responsive_and_both_colour_schemes():
