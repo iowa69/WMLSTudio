@@ -49,6 +49,8 @@ recipe and available installed dependency-license texts. Distributors must
 review and meet the applicable source/license obligations, including those of
 the dynamically linked compiler/runtime libraries; this note is not a legal
 certification. Keep the source archive beside the executable in redistribution.
+The unmodified AGPL text is vendored from https://www.gnu.org/licenses/agpl-3.0.txt
+and checksum-verified so packaging does not depend on that website being online.
 
 WMLSTudio invokes this separately distributed engine as a subprocess. Original
 FASTQ files are never modified. Basic contiguity and read-QC metrics do not

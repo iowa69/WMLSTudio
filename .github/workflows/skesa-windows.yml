@@ -7,6 +7,9 @@ on:
       - '.github/workflows/skesa-windows.yml'
       - 'studio_packaging/*skesa*'
       - 'studio_packaging/SKESA_WINDOWS.md'
+      - 'studio_packaging/licenses/AGPL-3.0.txt'
+      - 'src/wmlstudio/assembly.py'
+      - 'src/wmlstudio/sequence.py'
   workflow_dispatch:
   workflow_call:
 

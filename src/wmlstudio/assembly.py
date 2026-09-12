@@ -138,6 +138,14 @@ def _tail(path, limit=12000):
         return handle.read().decode("utf-8", errors="replace")
 
 
+def _write_json(path, value):
+    with Path(path).open("w", encoding="utf-8") as report:
+        json.dump(value, report, indent=2, allow_nan=False)
+        report.write("\n")
+        report.flush()
+        os.fsync(report.fileno())
+
+
 def _tool_info(executable, directory, cancelled):
     log = directory / "version.log"
     code = _run_process([str(executable), "--version"], directory, log, cancelled, timeout=20)
@@ -266,6 +274,16 @@ def run_skesa(read1, read2, output_dir, *, executable=None, threads=4, memory_gb
             command = [str(tool), "--reads", "mate1.fastq,mate2.fastq", "--cores", str(threads),
                        "--memory", str(memory_gb), "--min_contig", str(min_contig),
                        "--contigs_out", "contigs.fasta"]
+            # A crash leaves a complete launch plan beside the task-owned inputs
+            # and log. Never infer success or resume from a PID or stale FASTA.
+            launch_plan = {
+                "state": "prepared_not_completed", "started_at": started,
+                "output_directory": str(destination), "command": command, "engine": tool_info,
+                "inputs": inputs, "pairing": pairing, "read_qc": read_qc,
+                "threads": threads, "memory_gb": memory_gb, "min_contig": min_contig,
+                "recovery_policy": "Review logs and validate outputs; no automatic PID reuse or success inference.",
+            }
+            _write_json(directory / "run-plan.json", launch_plan)
             _notify(progress, 50, "Running native SKESA short-read isolate assembly.")
             log = directory / "skesa.log"
             code = _run_process(command, directory, log, cancelled, progress)
@@ -301,11 +319,7 @@ def run_skesa(read1, read2, output_dir, *, executable=None, threads=4, memory_gb
                 notes.append("Read IDs match completely but lack explicit mate markers; biological pairing is user-assigned.")
             payload = {"assembly_path": str(destination / "contigs.fasta"), "provenance": provenance,
                        "qc": result["qc"], "read_qc": read_qc, "pairing": pairing, "notes": notes}
-            with (directory / "assembly.json").open("w", encoding="utf-8") as report:
-                json.dump(payload, report, indent=2, allow_nan=False)
-                report.write("\n")
-                report.flush()
-                os.fsync(report.fileno())
+            _write_json(directory / "assembly.json", payload)
             (directory / "mate1.fastq").unlink()
             (directory / "mate2.fastq").unlink()
             check_cancelled(cancelled)
@@ -331,8 +345,15 @@ def run_skesa(read1, read2, output_dir, *, executable=None, threads=4, memory_gb
                         output.write(str(error) + "\n")
                         for log in logs:
                             output.write(f"\n{log.name}\n{_tail(log)}\n")
+                    if (directory / "run-plan.json").is_file():
+                        failure_plan = json.loads((directory / "run-plan.json").read_text(encoding="utf-8"))
+                        failure_plan.update(state="cancelled" if isinstance(error, AnalysisCancelled) else "failed",
+                                            error=str(error), log_path=str(failure_log))
+                        _write_json(failure_log.with_suffix(".json"), failure_plan)
                     if not isinstance(error, AnalysisCancelled):
                         error.add_note(f"Diagnostic log: {failure_log}")
+                        if isinstance(error, AssemblyError):
+                            error.args = (f"{error}\nDiagnostic log: {failure_log}",)
                 except OSError:
                     pass
             raise

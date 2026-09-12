@@ -10,7 +10,6 @@ import re
 import shutil
 import subprocess
 import tarfile
-import urllib.request
 from pathlib import Path
 
 PIN = "c1413581e4f37211892d3c4310d01f3d9a9b3490"
@@ -66,8 +65,8 @@ def stage(executable, runtime_bin, source, recipe_dir, commit):
     target = executable.parent
     shutil.copy2(source / "LICENSE", target / "SKESA-LICENSE.txt")
     shutil.copy2(recipe_dir / "SKESA_WINDOWS.md", target / "README.txt")
-    with urllib.request.urlopen("https://www.gnu.org/licenses/agpl-3.0.txt", timeout=30) as response:
-        license_text = response.read(100000)
+    # Vendor the immutable license text; package builds need no GNU-site access.
+    license_text = (recipe_dir / "licenses" / "AGPL-3.0.txt").read_bytes()
     if hashlib.sha256(license_text).hexdigest() != "0d96a4ff68ad6d4b6f1f30f713b18d5184912ba8dd389f86aa7710db079abcb0":
         raise ValueError("AGPL license text checksum changed; review before redistribution.")
     (target / "AGPL-3.0.txt").write_bytes(license_text)
@@ -76,7 +75,7 @@ def stage(executable, runtime_bin, source, recipe_dir, commit):
             if path.is_file() and ".git" not in path.relative_to(source).parts:
                 archive.add(path, arcname="skesa/" + path.relative_to(source).as_posix())
         for name in ("build_skesa_windows.sh", "skesa_windows.patch", "stage_skesa_runtime.py",
-                     "check_skesa.py", "SKESA_WINDOWS.md"):
+                     "check_skesa.py", "SKESA_WINDOWS.md", "licenses/AGPL-3.0.txt"):
             archive.add(recipe_dir / name, arcname="wmlstudio-port/" + name)
     packages = subprocess.check_output(["pacman", "-Q"], text=True)
     (target / "build-packages.txt").write_text(packages, encoding="utf-8")
