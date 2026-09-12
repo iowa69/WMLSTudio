@@ -25,8 +25,11 @@ def sha256(path):
 
 
 def run(command, **kwargs):
-    return subprocess.run(command, check=True, text=True, capture_output=True,
-                          encoding="utf-8", errors="replace", timeout=180, **kwargs)
+    process = subprocess.run(command, text=True, capture_output=True,
+                             encoding="utf-8", errors="replace", timeout=180, **kwargs)
+    if process.returncode:
+        raise RuntimeError(f"Command failed ({process.returncode}): {command}\n{process.stderr}\n{process.stdout}")
+    return process
 
 
 def smoke(binary):
@@ -41,10 +44,13 @@ def smoke(binary):
         for name, bases in (("a", sequence), ("b", sequence), ("c", "".join(mutated))):
             (work / f"{name}.fa").write_text(f">contig\n{bases}\n", encoding="ascii")
         files = work / "inputs.tsv"
-        files.write_text("".join(f"{name}\t{work / (name + '.fa')}\n" for name in ("a", "b", "c")), encoding="utf-8")
-        build = run([str(binary), "build", "-f", str(files), "-o", str(work / "cohort"),
-                     "-k", "31", "--threads", "2"])
-        distance = run([str(binary), "distance", str(work / "cohort.skf"), "--threads", "2"])
+        # Upstream parses its list on whitespace; use safe aliases relative to
+        # a cwd that may itself contain spaces/Unicode. The application wrapper
+        # uses the same scheme without changing original input files or labels.
+        files.write_text("".join(f"{name}\t{name}.fa\n" for name in ("a", "b", "c")), encoding="utf-8")
+        build = run([str(binary), "build", "-f", "inputs.tsv", "-o", "cohort",
+                     "-k", "31", "--threads", "2"], cwd=work)
+        distance = run([str(binary), "distance", "cohort.skf", "--threads", "2"], cwd=work)
         rows = distance.stdout.strip().splitlines()
         if len(rows) != 4:
             raise ValueError(f"Unexpected SKA2 pairwise output: {distance.stdout}")
