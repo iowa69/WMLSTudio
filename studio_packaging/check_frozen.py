@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import csv
 import importlib.util
 import json
 import os
@@ -18,7 +19,10 @@ from wmlstudio.typing import load_scheme
 def check_hydra(bundle, root, suffix):
     """Exercise the actual frozen worker, BLAST binaries and bundled references."""
     database = bundle / "_internal/wmlstudio/resources/hydra/starter"
-    reference = next(iter_sequences(database / "nucl/ncbi/sequences.fna"))
+    with (database / "nucl/ncbi/meta.tsv").open(encoding="utf-8", newline="") as handle:
+        control_id = next(row["seqid"] for row in csv.DictReader(handle, delimiter="\t") if row["gene"] == "blaZ")
+    reference = next(record for record in iter_sequences(database / "nucl/ncbi/sequences.fna")
+                     if record.name == control_id)
     sample = root / "synthetic_amr_positive.fasta"
     sample.write_text(f">synthetic_reference_gene\n{reference.sequence}\n", encoding="utf-8")
     destination = root / "hydra-smoke"
@@ -39,6 +43,8 @@ def check_hydra(bundle, root, suffix):
                  and float(hit.get("coverage_pct", 0)) == 100]
     if not positives:
         raise ValueError("Frozen HYDRA did not recover its exact synthetic reference gene.")
+    if not any(hit.get("method") in {"BLASTX", "EXACTX", "ALLELEX"} for hit in hits):
+        raise ValueError("Frozen HYDRA did not return the expected protein-search evidence.")
     return {"status": "passed", "control": "One synthetic sequence copied from the bundled NCBI catalog",
             "reference_id": reference.name, "engine_version": report["hydra_version"],
             "hits": hits, "database_versions": report["parameters"]["databases"]}

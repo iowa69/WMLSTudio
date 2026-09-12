@@ -11,8 +11,9 @@ cgMLST.org database contents and local sequence inputs are not bundled.
 
 ## Observed scientific and engineering checks
 
-- Final Linux core batch: **365 tests passed**, including real BLAST integration;
-  evidence: `artifacts/workbench-final-core.xml`.
+- Final Linux suites: **442 tests passed**, none skipped: 365 core checks,
+  including real BLAST integration, and 77 native UI/workflow checks. Evidence:
+  `artifacts/workbench-final-core.xml` and `artifacts/workbench-final-ui.xml`.
 - S. epidermidis: ST184; three P. aeruginosa assemblies: ST155, ST2952 and
   ST1858, with all 21 allele calls matching the preserved WMLST comparator.
 - Real E. faecium 1,423-locus control: 1,410 exact, one CDS-validated novel,
