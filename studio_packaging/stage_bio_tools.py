@@ -23,6 +23,19 @@ PACKAGES = {
                   "suffix": ""},
 }
 PROGRAMS = ("blastn", "blastp", "blastx", "tblastn", "makeblastdb", "blastdbcmd")
+WINDOWS_AMBIENT_QT_TLS = frozenset({"qopensslbackend.dll", "libcrypto-3-x64.dll", "libssl-3-x64.dll"})
+
+
+def filter_windows_qt_tls(entries):
+    """Keep Schannel and Python's pinned SSL provider, not ambient Qt OpenSSL.
+
+    PyInstaller's Qt hook can discover these optional DLLs on the build runner's
+    PATH. Windows Qt has its native Schannel backend; WMLSTudio's downloads use
+    Python urllib and its separate official-interpreter OpenSSL DLL names.
+    This operates on Analysis TOCs only and never alters installed dependencies.
+    """
+    return [entry for entry in entries
+            if str(entry[0]).replace("\\", "/").rsplit("/", 1)[-1].casefold() not in WINDOWS_AMBIENT_QT_TLS]
 
 
 def digest(path):

@@ -67,6 +67,7 @@ def verify_directory(directory, *, recursive=False, excluded_roots=()):
 
 def audit(bundle):
     bundle = Path(bundle).resolve()
+    tls = verify_tls_providers(bundle)
     reports = {
         "blast_isolated": verify_directory(bundle / "_internal/Tools/blast/bin"),
         "skesa_isolated": verify_directory(bundle / "_internal/wmlstudio/resources/tools/skesa"),
@@ -83,7 +84,22 @@ def audit(bundle):
         if hashlib.sha256(path.read_bytes()).hexdigest() != item["sha256"]:
             raise ValueError(f"Native runtime differs from its official-wheel provenance: {item['name']}")
     return {"bundle": str(bundle), "status": "passed", "policy": "Windows11 system allowlist, never runner DLL inventory",
-            "groups": reports, "native_runtime": runtime}
+            "groups": reports, "native_runtime": runtime, "tls_providers": tls}
+
+
+def verify_tls_providers(bundle):
+    """Reject optional Qt OpenSSL binaries discovered outside pinned providers."""
+    bundle = Path(bundle)
+    files = {path.name.casefold(): path for path in bundle.rglob("*") if path.is_file()}
+    forbidden = {"qopensslbackend.dll", "libcrypto-3-x64.dll", "libssl-3-x64.dll"} & files.keys()
+    if forbidden:
+        raise ValueError("Unpinned ambient Qt TLS libraries must not be redistributed: " + ", ".join(sorted(forbidden)))
+    required = {"qschannelbackend.dll", "libcrypto-3.dll", "libssl-3.dll"}
+    if not required.issubset(files):
+        raise ValueError("Windows native Schannel or official Python TLS provider is missing: "
+                         + ", ".join(sorted(required - files.keys())))
+    return {"qt": "Windows Schannel", "python": "Official interpreter OpenSSL",
+            "files": [files[name].relative_to(bundle).as_posix() for name in sorted(required)]}
 
 
 if __name__ == "__main__":

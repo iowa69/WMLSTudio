@@ -9,7 +9,7 @@ from PyInstaller.utils.hooks import collect_data_files, collect_submodules, copy
 
 root = Path(SPECPATH).parent
 sys.path.insert(0, str(root / "studio_packaging"))
-from stage_bio_tools import stage_hydra_database, verify_skesa_bundle
+from stage_bio_tools import filter_windows_qt_tls, stage_hydra_database, verify_skesa_bundle
 schemes = root / "src/wmlstudio/resources/schemes"
 manifest = schemes / "manifest.json"
 if not manifest.is_file() or json.loads(manifest.read_text(encoding="utf-8"))["scheme_count"] == 0:
@@ -92,6 +92,10 @@ hydra_exe = EXE(
     name="WMLSTudio-HYDRA", debug=False, bootloader_ignore_signals=False,
     strip=False, upx=False, console=True,
 )
+if sys.platform == "win32":
+    for analysis in (gui, cli, hydra):
+        analysis.binaries = filter_windows_qt_tls(analysis.binaries)
+        analysis.datas = filter_windows_qt_tls(analysis.datas)
 COLLECT(
     gui_exe, cli_exe, hydra_exe, gui.binaries, gui.datas, cli.binaries, cli.datas, hydra.binaries, hydra.datas,
     strip=False, upx=False, name="WMLSTudio",

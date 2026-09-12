@@ -81,12 +81,14 @@ def stage_schemes(source: Path, destination: Path, provenance: dict | None = Non
         raise ValueError("Source and destination must be separate, non-nested directories")
     files = []
     schemes = []
-    for directory in sorted(source.iterdir()):
+    # pathlib ordering case-folds on Windows. Snapshot identity must instead
+    # use the same case-sensitive string order on every build platform.
+    for directory in sorted(source.iterdir(), key=lambda item: item.name):
         if directory.is_symlink():
             raise ValueError(f"Scheme source must not contain symlinks: {directory}")
         if not directory.is_dir():
             continue
-        data_files = [item for item in sorted(directory.iterdir())
+        data_files = [item for item in sorted(directory.iterdir(), key=lambda item: item.name)
                       if item.suffix.lower() in ALLOWED_SUFFIXES]
         if not any(item.suffix.lower() in {".tfa", ".fasta", ".fa", ".fna"}
                    for item in data_files):
@@ -102,6 +104,9 @@ def stage_schemes(source: Path, destination: Path, provenance: dict | None = Non
         schemes.append({"id": directory.name, "source_metadata": metadata})
     if not schemes:
         raise ValueError("No scheme allele FASTA files were found")
+    # Sort complete POSIX paths too: directory prefixes containing punctuation
+    # (e.g. alpha-2 versus alpha/) need not retain grouped-directory ordering.
+    files.sort(key=lambda entry: entry["path"])
     allowed = {entry["path"] for entry in files} | {"manifest.json"}
     if destination.exists():
         for existing in destination.rglob("*"):

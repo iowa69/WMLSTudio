@@ -35,6 +35,14 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y libegl1 libopengl0 libxkbcommon0 libxcb-cursor0
       - name: Install locked application and build dependencies
         run: uv sync --locked --group dev
+      - name: Expose installed Windows fonts to headless Qt
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          "QT_QPA_FONTDIR=$($env:SystemRoot -replace '\\', '/')/Fonts" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+      - name: Verify readable headless Windows UI fonts
+        if: runner.os == 'Windows'
+        run: uv run python studio_packaging/check_qt_fonts.py --output artifacts/windows-qt-fonts.json
       - name: Stage pinned reference data
         run: uv run python studio_scripts/stage_schemes.py --download
       - name: Stage pinned native BLAST for Windows
@@ -53,6 +61,8 @@ jobs:
         if: runner.os == 'Windows'
         run: uv run python studio_packaging/stage_bio_tools.py --platform windows-x64 --require-skesa
       - name: Preserve dependency license texts
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: uv run python studio_packaging/stage_notices.py
       - name: Lint
         run: uv run ruff check src/wmlstudio studio_scripts studio_packaging studio_tests
@@ -65,6 +75,9 @@ jobs:
         run: uv run python studio_packaging/audit_windows_runtime.py dist/WMLSTudio --output artifacts/windows-runtime-closure.json
       - name: Frozen reference typing and native desktop
         run: uv run python studio_packaging/check_frozen.py dist/WMLSTudio --output artifacts/frozen-check.json
+      - name: Independently probe bundled Windows CDS modules without installed-wheel fallback
+        if: runner.os == 'Windows'
+        run: uv run python studio_packaging/check_bundled_cds.py dist/WMLSTudio --output artifacts/bundled-cds.json
       - name: Archive portable Linux build
         if: runner.os == 'Linux'
         run: |

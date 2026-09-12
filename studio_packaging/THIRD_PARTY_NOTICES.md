@@ -9,7 +9,16 @@ license; pyahocorasick uses BSD-3-Clause. PySide6 and Shiboken provide LGPLv3,
 GPLv3, and commercial licensing options. Qt components have their own notices.
 See the authoritative [Qt licensing page](https://www.qt.io/licensing/) and the
 license files accompanying the exact binary versions in this package. The
-one-folder layout keeps Qt libraries separate. Distribution maintainers must
+Windows target interpreter's complete `LICENSE.txt` is preserved separately
+as `Python-Windows-runtime-LICENSE.txt`, including its bundled OpenSSL, bzip2,
+libffi and native runtime notices; the shorter CPython source LICENSE alone
+does not replace those notices. Windows Qt uses its native Schannel TLS
+backend. The optional Qt OpenSSL backend and ambient runner-discovered
+`libcrypto-3-x64.dll` / `libssl-3-x64.dll` are excluded. Python retains its own
+official-interpreter `libcrypto-3.dll` / `libssl-3.dll` for explicit downloads.
+The build preserves license/NOTICE files from all installed isolated build
+distributions, including incidental transitive helper modules collected by
+PyInstaller. The one-folder layout keeps Qt libraries separate. Distribution maintainers must
 retain notices and satisfy the applicable license obligations, including
 corresponding-source and replacement/relinking requirements where applicable.
 

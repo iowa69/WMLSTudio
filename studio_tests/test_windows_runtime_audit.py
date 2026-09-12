@@ -52,3 +52,17 @@ def test_unreviewed_system32_filename_is_not_implicitly_trusted(tmp_path, monkey
     monkeypatch.setattr(audit, "imported_dlls", lambda path: ["unreviewed-redist.dll"])
     with pytest.raises(ValueError, match="unreviewed-redist"):
         audit.verify_directory(tmp_path)
+
+
+def test_windows_tls_gate_rejects_ambient_runner_openssl(tmp_path):
+    for name in ("qschannelbackend.dll", "libcrypto-3.dll", "libssl-3.dll"):
+        (tmp_path / name).write_bytes(b"fixture")
+    assert audit.verify_tls_providers(tmp_path)["qt"] == "Windows Schannel"
+    (tmp_path / "LIBSSL-3-X64.DLL").write_bytes(b"runner DLL")
+    with pytest.raises(ValueError, match="ambient Qt TLS"):
+        audit.verify_tls_providers(tmp_path)
+
+
+def test_windows_tls_gate_requires_real_retained_providers(tmp_path):
+    with pytest.raises(ValueError, match="provider is missing"):
+        audit.verify_tls_providers(tmp_path)

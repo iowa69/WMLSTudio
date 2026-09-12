@@ -15,6 +15,17 @@ staging = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(staging)
 
 
+def test_windows_tls_filter_preserves_pinned_python_and_native_schannel():
+    retain = [(name, "source", "BINARY") for name in (
+        "PySide6/plugins/tls/qschannelbackend.dll", "PySide6/plugins/tls/qcertonlybackend.dll",
+        "libcrypto-3.dll", "libssl-3.dll", "_ssl.pyd", "Tools/blast/bin/vcruntime140.dll")]
+    ambient = [(name, "runner-PATH", "BINARY") for name in (
+        "PySide6\\plugins\\tls\\qopensslbackend.dll", "libcrypto-3-x64.dll", "LIBSSL-3-X64.DLL")]
+    original = retain + ambient
+    assert staging.filter_windows_qt_tls(original) == retain
+    assert len(original) == 9  # No mutation of installed files or original TOC.
+
+
 def archive(tmp_path, monkeypatch, extras=None):
     path = tmp_path / "official-test.tar.gz"
     entries = {f"bin/{name}.exe": b"MZ-test-fixture" for name in staging.PROGRAMS}

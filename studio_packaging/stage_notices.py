@@ -6,21 +6,64 @@ import argparse
 import hashlib
 import io
 import json
+import os
 import platform
 import re
+import sys
 import urllib.request
 import zipfile
 from concurrent.futures import ThreadPoolExecutor
-from importlib.metadata import PackageNotFoundError, distribution, version
+from importlib.metadata import distribution, distributions, version
 from pathlib import Path
+from urllib.parse import urlsplit
 
 ROOT = Path(__file__).resolve().parents[1]
 
 
 def fetch(url: str) -> bytes:
     request = urllib.request.Request(url, headers={"User-Agent": "WMLSTudio-build-notices"})
+    parsed = urlsplit(url)
+    token = os.environ.get("GH_TOKEN") or os.environ.get("GITHUB_TOKEN")
+    if parsed.scheme == "https" and parsed.hostname == "api.github.com" and parsed.port in (None, 443) and token:
+        # Unredirected headers are deliberately not forwarded by urllib to a
+        # redirected URL, including a raw-content/provider host.
+        request.add_unredirected_header("Authorization", "Bearer " + token)
     with urllib.request.urlopen(request, timeout=60) as response:
         return response.read(2 * 1024 * 1024)
+
+
+def preserve_installed_notices(destination, manifest):
+    """Retain transitive-helper attributions without guessing the freeze graph."""
+    for package in distributions():
+        name = str(package.metadata.get("Name", "unknown")).lower().replace("_", "-")
+        manifest["packages"][name] = package.version
+        for relative in package.files or []:
+            if not any(word in str(relative).lower() for word in ("license", "copying", "notice")):
+                continue
+            source = Path(package.locate_file(relative))
+            if not source.is_file() or ".." in relative.parts:
+                continue
+            target = destination / "packages" / name / str(relative)
+            target.parent.mkdir(parents=True, exist_ok=True)
+            content = source.read_bytes()
+            target.write_bytes(content)
+            manifest["files"].append({"path": target.relative_to(destination).as_posix(),
+                                      "source": f"installed wheel: {name}=={package.version}",
+                                      "sha256": hashlib.sha256(content).hexdigest()})
+
+
+def preserve_windows_python_notices(destination, manifest):
+    """The Windows interpreter's combined notices exceed CPython's source LICENSE."""
+    candidates = (Path(sys.base_prefix) / "LICENSE.txt", Path(sys.executable).resolve().parent / "LICENSE.txt")
+    source = next((path for path in candidates if path.is_file()), None)
+    if source is None:
+        raise ValueError("The target Windows Python interpreter is missing its bundled LICENSE.txt")
+    content = source.read_bytes()
+    target = destination / "Python-Windows-runtime-LICENSE.txt"
+    target.write_bytes(content)
+    manifest["files"].append({"path": target.name,
+        "source": f"Target Windows Python {platform.python_version()} interpreter LICENSE.txt (bundled runtime notices)",
+        "sha256": hashlib.sha256(content).hexdigest()})
 
 
 def main() -> int:
@@ -61,28 +104,11 @@ def main() -> int:
             path.write_bytes(content)
             manifest["files"].append({"path": relative, "source": url,
                                       "sha256": hashlib.sha256(content).hexdigest()})
-    # Preserve the installed wheels' own license directories, including bundled
-    # numerical-library notices which differ between Windows and Linux wheels.
-    for name in ("hydra-amr", "numpy", "pandas", "python-dateutil", "six", "pyrodigal",
-                 "archspec", "pyahocorasick", "tzdata"):
-        try:
-            package = distribution(name)
-        except PackageNotFoundError:
-            continue
-        manifest["packages"][name] = package.version
-        for relative in package.files or []:
-            if not any(word in str(relative).lower() for word in ("license", "copying", "notice")):
-                continue
-            source = Path(package.locate_file(relative))
-            if not source.is_file() or ".." in relative.parts:
-                continue
-            target = destination / "packages" / name / str(relative)
-            target.parent.mkdir(parents=True, exist_ok=True)
-            content = source.read_bytes()
-            target.write_bytes(content)
-            manifest["files"].append({"path": target.relative_to(destination).as_posix(),
-                                      "source": f"installed wheel: {name}=={package.version}",
-                                      "sha256": hashlib.sha256(content).hexdigest()})
+    # Include every isolated build distribution: pandas/setuptools may pull
+    # incidental helper modules into PYZ through imports not listed by the app.
+    preserve_installed_notices(destination, manifest)
+    if platform.system() == "Windows":
+        preserve_windows_python_notices(destination, manifest)
     # Pyrodigal is GPL-3.0-or-later, including its Prodigal implementation.
     # Ship the exact corresponding upstream source archive, not just a URL.
     if "pyrodigal" in manifest["packages"]:
