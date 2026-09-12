@@ -1,0 +1,48 @@
+name: Native Windows SKESA
+
+on:
+  push:
+    branches: [workbench-v0.2]
+    paths:
+      - '.github/workflows/skesa-windows.yml'
+      - 'studio_packaging/*skesa*'
+      - 'studio_packaging/SKESA_WINDOWS.md'
+  workflow_dispatch:
+  workflow_call:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: windows-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install native UCRT64 toolchain and libraries
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: UCRT64
+          update: true
+          install: >-
+            git
+            mingw-w64-ucrt-x86_64-gcc
+            mingw-w64-ucrt-x86_64-binutils
+            mingw-w64-ucrt-x86_64-boost
+            mingw-w64-ucrt-x86_64-zlib
+            mingw-w64-ucrt-x86_64-python
+      - name: Build pinned SKESA, package DLLs and assemble synthetic paired reads
+        shell: msys2 {0}
+        run: bash studio_packaging/build_skesa_windows.sh
+      - name: Test portable executable without MSYS2 on PATH
+        shell: pwsh
+        run: |
+          $env:PATH = "$env:SystemRoot\system32;$env:SystemRoot"
+          & "$env:GITHUB_WORKSPACE\artifacts\Tools\skesa\skesa.exe" --version
+          if ($LASTEXITCODE -ne 0) { throw "Portable SKESA dependency test failed" }
+      - name: Upload native tool, exact source, build manifest and smoke evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: SKESA-2.4.0-Windows-x64
+          path: artifacts/Tools/skesa
+          if-no-files-found: error

@@ -1,0 +1,30 @@
+diff --git a/LargeInt.hpp b/LargeInt.hpp
+--- a/LargeInt.hpp
++++ b/LargeInt.hpp
+@@ -65,6 +65,13 @@
+ 
+ #include "config.hpp"
+ 
++// WMLSTudio native Windows port: BSD integer aliases are not supplied by UCRT.
++#ifdef _WIN32
++typedef uint8_t u_int8_t;
++typedef uint32_t u_int32_t;
++typedef uint64_t u_int64_t;
++#endif
++
+ /********************************************************************************/
+ namespace DeBruijn {
+ /********************************************************************************/
+diff --git a/common_util.hpp b/common_util.hpp
+--- a/common_util.hpp
++++ b/common_util.hpp
+@@ -347,7 +347,8 @@
+                 auto mism = mismatch(seq1p, last, seq2p);
+                 size_t extend = 32*(mism.first-seq1p);
+                 if(mism.first != last)
+-                    extend += (ffsll(*mism.first ^ *mism.second)-1)/2; // after ^ all matches are 0s; ffs returns 1-based position of the first bit set to 1
++                    // WMLSTudio MinGW port: GCC intrinsic, identical 1-based ffs semantics.
++                    extend += (__builtin_ffsll(*mism.first ^ *mism.second)-1)/2;
+             
+                 return extend;
+             }
