@@ -118,9 +118,11 @@ def test_a_derived_index_is_never_offered_as_an_installable_scheme(tmp_path):
     write_organism_index(root, scheme_entries([root / "kp"]))
     (root / ".hidden").mkdir()
     locations = [path for path in scheme_locations(tmp_path) if path.parent == root]
-    # Documents today's unfiltered behaviour: paths.scheme_locations returns every
-    # subdirectory, so a caller must apply this filter until that one line changes.
-    assert (root / INDEX_DIRNAME) in locations
+    # That one line has now changed: scheme_locations filters at the source, so a
+    # derived index cannot reach the typing code even through a caller that forgets
+    # to filter. The filter stays idempotent for callers that already applied it.
+    assert (root / INDEX_DIRNAME) not in locations
+    assert [path.name for path in locations] == ["kp"]
     filtered = filter_scheme_locations(locations)
     assert [path.name for path in filtered] == ["kp"]
     assert all(not path.name.startswith(("_", ".")) for path in filter_scheme_locations(

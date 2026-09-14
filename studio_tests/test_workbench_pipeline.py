@@ -78,13 +78,19 @@ def test_pairing_suggestions_are_explicit_and_duplicate_mates_refused(qtbot):
 
 def test_launch_review_does_not_allow_unavailable_amr_runtime(qtbot, monkeypatch):
     import wmlstudio.hydra_runtime as runtime
-    monkeypatch.setattr(runtime, "runtime_capabilities", lambda root: {"available": False, "message": "Missing native engine"})
+    monkeypatch.setattr(runtime, "runtime_capabilities",
+                        lambda db_root=None: {"available": False, "message": "Missing native engine",
+                                              "tools": {}, "databases": {}})
     dialog = RunPlanDialog([{"id": "one", "name": "Unknown isolate"}])
     qtbot.addWidget(dialog)
     dialog.hydra.setChecked(True)
     dialog.accept()
     assert dialog.result() != QDialog.DialogCode.Accepted
-    assert "Missing native engine" in dialog.feedback.text()
+    # The refusal now names the missing piece and the one action that fixes it,
+    # rather than echoing a runtime string the user cannot act on.
+    refusal = dialog.feedback.text()
+    assert "HYDRA cannot start" in refusal and "nothing was run" in refusal
+    assert "Install" in refusal
     dialog.hydra.setChecked(False)
     dialog.accept()
     assert dialog.plan["hydra"] is False
@@ -96,7 +102,8 @@ def test_launch_review_keeps_resource_controls_in_collapsed_advanced(qtbot):
     qtbot.addWidget(dialog)
     dialog.show()
     assert not dialog.advanced.isVisible()
-    assert "samples" in dialog.resource_summary.text()
+    assert "sample" in dialog.resource_summary.text()
+    assert "threads each" in dialog.resource_summary.text()
     dialog.advanced_button.setChecked(True)
     assert dialog.advanced.isVisible()
     assert dialog.threads.isVisible() and dialog.memory.isVisible()
