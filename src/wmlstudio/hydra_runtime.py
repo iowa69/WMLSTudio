@@ -24,7 +24,13 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 from wmlstudio.hydra import load_hydra_report
-from wmlstudio.sequence import AnalysisCancelled, SequenceReader, file_sha256, file_signature
+from wmlstudio.sequence import (
+    AnalysisCancelled,
+    SequenceReader,
+    file_sha256,
+    file_signature,
+    sample_name,
+)
 
 HYDRA_COMMIT = "6d36c109491c16544e8919fe6962b4b62e97d3d7"
 HYDRA_VERSION = "1.4.0"
@@ -134,6 +140,11 @@ def _child_environment():
     environment["PATH"] = os.pathsep.join(directories + [environment.get("PATH", "")])
     environment["PYTHONUTF8"] = "1"
     environment["HYDRA_NO_BANNER"] = "1"
+    # BLAST receives its explicit per-sample --threads allocation. Prevent
+    # numerical helper libraries from creating an additional machine-wide pool
+    # in every concurrently running HYDRA worker.
+    for key in ("OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS", "NUMEXPR_NUM_THREADS", "VECLIB_MAXIMUM_THREADS"):
+        environment[key] = "1"
     # Frozen Linux applications prepend their own shared libraries. BLAST must
     # resolve its native dependencies from its own runtime, not Qt's libraries.
     if "LD_LIBRARY_PATH_ORIG" in environment:
@@ -262,14 +273,15 @@ def run_assemblies(inputs, db_root, databases=None, *, sample_names=None, organi
         raise HydraRuntimeError("Sample names must be unique nonempty labels, one per assembly.")
     signatures = {}
     input_provenance = []
-    for path in paths:
+    for index, path in enumerate(paths):
         if not path.is_file():
             raise HydraRuntimeError(f"Assembly was not found: {path}")
         with SequenceReader(path, cancelled) as reader:
             if reader.kind != "fasta":
                 raise HydraRuntimeError(f"HYDRA execution accepts FASTA assemblies only: {path.name}")
         signatures[path] = file_signature(path)
-        input_provenance.append({"path": str(path), "sha256": file_sha256(path, cancelled)})
+        input_provenance.append({"path": str(path), "sha256": file_sha256(path, cancelled),
+                                 "sample_name": names[index] if names is not None else sample_name(path)})
     available = capabilities["databases"]
     names_db = list(databases) if databases is not None else [name for name in ("ncbi", "protein") if name in available]
     if not names_db or any(not isinstance(name, str) or not name or name.startswith("-") for name in names_db):

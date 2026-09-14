@@ -8,7 +8,7 @@ import pytest
 from PySide6.QtCore import QItemSelectionModel, Qt
 from PySide6.QtWidgets import QComboBox, QDialog, QMessageBox, QTableWidget
 
-from wmlstudio.app import BaseWindow, MainWindow
+from wmlstudio.app import MainWindow
 from wmlstudio.library import export_bundle
 from wmlstudio.project import Project
 from wmlstudio.sample_workflow import set_cluster
@@ -55,12 +55,14 @@ def assembly(path):
 
 
 def add_profile(window, name, genus="Klebsiella", species="pneumoniae", st="17", digest="MLST"):
-    return window.project.add_profile(name, {
+    sid = window.project.add_profile(name, {
         "sample_name": name, "kind": "profile", "scheme": "MLST", "scheme_digest": digest,
         "status": "profile_imported", "st": st, "alleles": {"arcA": "1", "gyrB": "1"},
         "calls": [{"locus": "arcA", "allele": "1", "status": "external_exact"},
                   {"locus": "gyrB", "allele": "1", "status": "external_exact"}],
     }, {"organism": {"genus": genus, "species": species}})
+    window.cohort_ids = set(window.cohort_ids or ()) | {sid}
+    return sid
 
 
 def select_ids(window, identifiers):
@@ -253,20 +255,21 @@ def test_selected_html_and_actual_pdf_use_same_highlighted_cohort(workbench, tmp
     destination = tmp_path / "selected.html"
     monkeypatch.setattr("wmlstudio.ui_reports.QFileDialog.getSaveFileName",
                         lambda *args: (str(destination), "HTML"))
-    workbench.export_project("html")
+    workbench.export_report("html")
     report = destination.read_text()
     assert "CHOSEN_ISOLATE" in report and "EXCLUDED_ISOLATE" not in report
     assert "Investigation &lt;A&gt;" in report
     captured = []
-    real_pdf = BaseWindow.write_pdf_report
+    from wmlstudio import ui_reports
+    real_report = ui_reports.review_report_html
 
-    def audited_pdf(self, path, samples=None):
+    def audited_report(samples, **kwargs):
         captured.extend(sample["id"] for sample in samples)
-        return real_pdf(self, path, samples=samples)
+        return real_report(samples, **kwargs)
 
-    monkeypatch.setattr(BaseWindow, "write_pdf_report", audited_pdf)
+    monkeypatch.setattr(ui_reports, "review_report_html", audited_report)
     destination = tmp_path / "selected.pdf"
-    workbench.export_project("pdf")
+    workbench.export_report("pdf")
     assert destination.read_bytes().startswith(b"%PDF")
     assert captured == [chosen]
     assert workbench.test_errors == []
@@ -293,6 +296,7 @@ def test_hydra_mapping_ui_keeps_ambiguous_names_unlinked_and_primary_matrix_corr
         return QDialog.DialogCode.Accepted
 
     monkeypatch.setattr(QDialog, "exec", map_dialog)
+    workbench.feature_ids = {first, second}
     workbench.link_hydra_samples()
     assert defaults == [None]
     assert workbench.project.get_sample(first)["metadata"]["hydra"]["source_sample"] == "duplicate"

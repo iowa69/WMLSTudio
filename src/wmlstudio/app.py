@@ -43,6 +43,7 @@ from wmlstudio.jobs import AnalysisWorker, SchemeImportWorker
 from wmlstudio.paths import data_root, scheme_locations
 from wmlstudio.project import Project
 from wmlstudio.theme import STYLE
+from wmlstudio.ui_characterization import CharacterizationWorkspaceMixin
 from wmlstudio.widgets import DropZone, Helix, Metric, TreeView, button, card, label
 
 FILE_FILTER = "Sequence files (*.fasta *.fa *.fna *.fastq *.fq *.gz *.bz2);;All files (*)"
@@ -102,8 +103,12 @@ class BaseWindow(QMainWindow):
         self.breadcrumb = label("WORKSPACE  /  OVERVIEW", "eyebrow")
         top.addWidget(self.breadcrumb)
         top.addStretch()
+        self.scope_label = label("0 isolates in project", "small")
+        self.scope_label.setToolTip("Each analysis, comparison and report reviews its own isolate cohort.")
+        top.addWidget(self.scope_label)
         top.addWidget(label("●  Local & private", "badge"))
         top.addWidget(button("Open project", self.open_project_dialog))
+        top.addWidget(button("Settings", self.open_interface_settings))
         body.addLayout(top)
         self.pages = QStackedWidget()
         body.addWidget(self.pages, 1)
@@ -158,7 +163,7 @@ class BaseWindow(QMainWindow):
         layout.addWidget(self.project_label)
         layout.addSpacing(18)
         self.nav_buttons = []
-        self.nav_names = ["Overview", "Samples", "Compare", "Scheme library", "HYDRA insights", "Reports", "Settings and help"]
+        self.nav_names = ["Overview", "Isolate library", "Compare", "Scheme library", "Characterization", "Reports", "Settings"]
         symbols = ["◫", "▤", "⌘", "▥", "◈", "↗", "⚙"]
         for index, (name, symbol) in enumerate(zip(self.nav_names, symbols, strict=True)):
             item = button(f"{symbol}   {name}", lambda checked=False, i=index: self.navigate(i))
@@ -395,6 +400,7 @@ class BaseWindow(QMainWindow):
         content.addWidget(self.motion)
         content.addWidget(label("Data location: " + str(self.root), "small", True))
         content.addWidget(button("Create a new project…", self.new_project))
+        content.addWidget(button("Problem → solution guide", self.open_workflow_guide, True))
         layout.addWidget(frame)
         guide = QTextBrowser()
         guide.setHtml("""<h2>From files to a comparison</h2>
@@ -928,7 +934,8 @@ class BaseWindow(QMainWindow):
                 copy_lock.unlock()
 
     def check_output(self, path):
-        protected = [self.project_path, *(sample["input_path"] for sample in self.project.samples())]
+        from wmlstudio.export import protected_input_paths
+        protected = [self.project_path, *protected_input_paths(self.project.samples())]
         report = self.project.get_setting("hydra_report", None)
         if report:
             protected.append(report.get("import_provenance", {}).get("source_path", ""))
@@ -1061,7 +1068,7 @@ from wmlstudio.ui_reports import ReportWorkspaceMixin  # noqa: E402
 from wmlstudio.ui_workbench import WorkbenchMixin  # noqa: E402
 
 
-class MainWindow(WorkbenchMixin, ComparisonWorkspaceMixin, ReportWorkspaceMixin, BaseWindow):
+class MainWindow(WorkbenchMixin, ComparisonWorkspaceMixin, CharacterizationWorkspaceMixin, ReportWorkspaceMixin, BaseWindow):
     """Native workbench composed from focused workflow controllers."""
 
 

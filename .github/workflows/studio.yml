@@ -11,8 +11,10 @@ permissions:
 jobs:
   skesa:
     uses: ./.github/workflows/skesa-windows.yml
+  ska:
+    uses: ./.github/workflows/ska-windows.yml
   native:
-    needs: [skesa]
+    needs: [skesa, ska]
     name: Test and freeze (${{ matrix.os }})
     strategy:
       fail-fast: false
@@ -24,6 +26,7 @@ jobs:
       QT_QPA_PLATFORM: offscreen
       PYTHONUTF8: "1"
       WMLSTUDIO_TEST_BLAST_DIR: ${{ github.workspace }}/src/wmlstudio/resources/tools/blast/bin
+      WMLSTUDIO_TEST_FASTQC_ROOT: ${{ github.workspace }}/src/wmlstudio/resources/tools/fastqc
     steps:
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v6
@@ -32,7 +35,7 @@ jobs:
           python-version: "3.12"
       - name: Install Qt runtime libraries
         if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y libegl1 libopengl0 libxkbcommon0 libxcb-cursor0
+        run: sudo apt-get update && sudo apt-get install -y libegl1 libopengl0 libxkbcommon0 libxcb-cursor0 libfontconfig1 fonts-dejavu-core
       - name: Install locked application and build dependencies
         run: uv sync --locked --group dev
       - name: Expose installed Windows fonts to headless Qt
@@ -45,6 +48,26 @@ jobs:
         run: uv run python studio_packaging/check_qt_fonts.py --output artifacts/windows-qt-fonts.json
       - name: Stage pinned reference data
         run: uv run python studio_scripts/stage_schemes.py --download
+      - name: Stage pinned characterization references
+        run: uv run python studio_scripts/stage_characterization.py
+      - name: Download verified native Windows SKA2
+        if: runner.os == 'Windows'
+        uses: actions/download-artifact@v4
+        with:
+          name: SKA2-0.5.1-Windows-x64
+          path: artifacts/ska2-windows
+      - name: Stage verified Windows SKA2 with source and notices
+        if: runner.os == 'Windows'
+        run: uv run python studio_packaging/stage_ska.py --platform windows-x64 --source artifacts/ska2-windows
+      - name: Stage original pinned Linux SKA2
+        if: runner.os == 'Linux'
+        run: uv run python studio_packaging/stage_ska.py --platform linux-x64
+      - name: Stage original FastQC and private Windows Java with sources and notices
+        if: runner.os == 'Windows'
+        run: uv run python studio_packaging/stage_fastqc.py --platform windows-x64
+      - name: Stage original FastQC and private Linux Java with sources and notices
+        if: runner.os == 'Linux'
+        run: uv run python studio_packaging/stage_fastqc.py --platform linux-x64
       - name: Stage pinned native BLAST for Windows
         if: runner.os == 'Windows'
         run: uv run python studio_packaging/stage_bio_tools.py --platform windows-x64 --download-hydra-starter

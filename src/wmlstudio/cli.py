@@ -34,8 +34,70 @@ def main(argv=None):
     compare.add_argument("input", type=Path)
     compare.add_argument("--min-overlap", type=float, default=0.95)
     compare.add_argument("--output", "-o", type=Path)
+    fastqc = commands.add_parser("fastqc", help="Original FastQC complete-file reports with bundled Java; no trimming")
+    fastqc.add_argument("inputs", nargs="+", type=Path)
+    fastqc.add_argument("--output", "-o", type=Path, required=True)
+    fastqc.add_argument("--threads", type=int, default=2)
+    fastqc.add_argument("--memory-gb", type=int, default=1)
+    characterization = commands.add_parser("characterize", help="Independent ANI, virulence and explicitly linked accessory evidence")
+    characterization.add_argument("input", type=Path)
+    characterization.add_argument("--references", type=Path)
+    characterization.add_argument("--no-species", action="store_true")
+    characterization.add_argument("--no-virulence", action="store_true")
+    characterization.add_argument("--hydra-report", type=Path)
+    characterization.add_argument("--hydra-sample")
+    characterization.add_argument("--threads", type=int, default=2)
+    characterization.add_argument("--output", "-o", type=Path)
+    ska = commands.add_parser("ska", help="Research-only native split-kmer SNP evidence; not a transmission decision")
+    ska.add_argument("inputs", nargs="+", type=Path)
+    ska.add_argument("--output", "-o", type=Path, required=True)
+    ska.add_argument("--threads", type=int, default=4)
+    ska.add_argument("--k", type=int, default=31)
+    ska.add_argument("--min-shared-fraction", type=float, default=.95)
+    ska.add_argument("--reference", type=Path)
+    ska.add_argument("--annotation", type=Path)
+    ska.add_argument("--annotation-reference-sha256", help="Explicit user-declared reference binding for GFF3 lacking embedded FASTA")
+    ska.add_argument("--mask-bed", type=Path)
+    ska.add_argument("--coding-only", action="store_true")
+    ska.add_argument("--no-repeat-mask", action="store_true")
     args = parser.parse_args(argv)
     try:
+        if args.command == "ska":
+            from wmlstudio.sequence import file_sha256, sample_name
+            from wmlstudio.ska_runtime import run_ska
+            sources = [path.resolve() for path in args.inputs]
+            if len(set(sources)) != len(sources):
+                raise ValueError("Select distinct assembly files for SKA2")
+            samples = [{"id": f"cli-{index+1}", "name": sample_name(path), "input_path": str(path),
+                        "input_sha256": file_sha256(path)} for index, path in enumerate(sources)]
+            result = run_ska(samples, args.output, threads=args.threads, k=args.k,
+                min_shared_fraction=args.min_shared_fraction, reference_path=args.reference,
+                annotation_path=args.annotation, annotation_reference_sha256=args.annotation_reference_sha256,
+                mask_bed=args.mask_bed, coding_only=args.coding_only, repeat_mask=not args.no_repeat_mask)
+            print(json.dumps(result, indent=2))
+            return 0
+        if args.command == "fastqc":
+            from wmlstudio.fastqc import run_fastqc
+            result = run_fastqc(args.inputs, args.output, threads=args.threads, memory_gb=args.memory_gb)
+            print(json.dumps(result, indent=2))
+            return 0
+        if args.command == "characterize":
+            from wmlstudio.characterization import characterize_assembly
+            from wmlstudio.characterization_refs import bundled_reference_root
+            if args.threads < 1:
+                raise ValueError("Threads must be positive")
+            if args.output:
+                ensure_separate_destination(args.output, [args.input, *([args.hydra_report] if args.hydra_report else [])])
+            result = characterize_assembly(args.input, args.references or bundled_reference_root(),
+                args.hydra_report, threads=args.threads, hydra_sample_name=args.hydra_sample,
+                species=not args.no_species, virulence=not args.no_virulence)
+            encoded = json.dumps(result, indent=2)
+            if args.output:
+                args.output.parent.mkdir(parents=True, exist_ok=True)
+                args.output.write_text(encoded + "\n", encoding="utf-8")
+            else:
+                print(encoded)
+            return 1 if result["status"] == "failed" else 0
         if args.command == "check-pair":
             print(json.dumps(validate_read_pair(args.r1, args.r2, args.max_reads), indent=2))
             return 0
@@ -70,7 +132,7 @@ def main(argv=None):
         else:
             print(json.dumps({"application": f"WMLSTudio {__version__}", "samples": results}, indent=2))
         return 1 if failed else 0
-    except (ValueError, OSError, KeyError, TypeError) as exc:
+    except (ValueError, OSError, KeyError, TypeError, RuntimeError) as exc:
         print(f"WMLSTudio: {exc}", file=sys.stderr)
         return 1
 

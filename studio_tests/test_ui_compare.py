@@ -26,11 +26,13 @@ def window(qtbot, tmp_path, monkeypatch):
 
 
 def profile(window, index):
-    return window.project.add_profile(f'isolate-{index}', {
+    sid = window.project.add_profile(f'isolate-{index}', {
         'sample_name': f'isolate-{index}', 'scheme': 'Example cgMLST', 'scheme_digest': 'same-reference',
         'status': 'profile_imported', 'alleles': {'a': str(1 + index % 2), 'b': '1'},
         'calls': [],
     }, {'organism': {'genus': 'Enterococcus', 'species': 'faecium'}})
+    window.cohort_ids = set(window.cohort_ids or ()) | {sid}
+    return sid
 
 
 def test_project_comparison_revision_changes_for_results_metadata_and_secondary(tmp_path):

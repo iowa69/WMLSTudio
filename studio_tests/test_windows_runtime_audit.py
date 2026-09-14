@@ -66,3 +66,17 @@ def test_windows_tls_gate_rejects_ambient_runner_openssl(tmp_path):
 def test_windows_tls_gate_requires_real_retained_providers(tmp_path):
     with pytest.raises(ValueError, match="provider is missing"):
         audit.verify_tls_providers(tmp_path)
+
+
+def test_java_uses_its_private_runtime_and_preloaded_jvm_only(tmp_path, monkeypatch):
+    java = tmp_path / "jre/bin"
+    (java / "server").mkdir(parents=True)
+    for path in (java / "java.exe", java / "awt.dll", java / "server/jvm.dll"):
+        path.write_bytes(b"synthetic binary")
+    (tmp_path / "msvcp140.dll").write_bytes(b"host copy must not satisfy Java")
+    monkeypatch.setattr(audit, "imported_dlls", lambda path:
+                        ["jvm.dll", "msvcp140.dll", "winscard.dll", "wsock32.dll"] if path.name == "awt.dll" else [])
+    with pytest.raises(ValueError, match="msvcp140.dll"):
+        audit.verify_java_runtime(java.parent)
+    (java / "msvcp140.dll").write_bytes(b"private Java runtime")
+    assert len(audit.verify_java_runtime(java.parent)) == 4

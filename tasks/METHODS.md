@@ -133,3 +133,16 @@ checks after a screenshot-only animation-settling adjustment. The 198-test sourc
 suites preceded that adjustment. Detailed context and evidence are retained in
 `artifacts/windows-build-context.json`, `artifacts/frozen-windows-wine-check.json`
 and `artifacts/frozen-windows-relocated.json`. No clean Windows 11 host was available.
+# Investigation-first revision (2026-09-12)
+
+Objective: turn the user's 100-isolate outbreak questions into connected native
+Windows research workflows. Starting revision `2135c3e`; development branch
+`investigation-v0.3`. Existing locked application environment and native runtime
+artifacts are reused; new tool/reference acquisition must be pinned, attributed
+and documented before compute. No user sequences will be uploaded or committed.
+
+The reproducibility and scientific-reasoning skills guide immutable inputs,
+restartable drivers, explicit assay states, alternative hypotheses and distinction
+between computational evidence and clinical inference. The original project
+layout is preserved. This section will record validation commands and evidence
+as the implementation progresses; older recorded runs below are historical.

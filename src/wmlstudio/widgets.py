@@ -243,12 +243,14 @@ def _graph_font(size, weight=QFont.Weight.DemiBold):
 
 
 class GraphLabel(QGraphicsSimpleTextItem):
-    def __init__(self, text, edge=False):
+    def __init__(self, text, edge=False, callback=None):
         super().__init__(text)
         self.edge = edge
+        self.callback = callback
+        self.node_key = None
         self.setFont(_graph_font(11 if edge else 14))
         self.setBrush(QColor("#C7D8E8" if edge else INK))
-        self.setAcceptedMouseButtons(Qt.MouseButton.NoButton)
+        self.setAcceptedMouseButtons(Qt.MouseButton.LeftButton if callback else Qt.MouseButton.NoButton)
         self.setZValue(1 if edge else 3)
 
     def paint(self, painter, option, widget=None):
@@ -261,6 +263,13 @@ class GraphLabel(QGraphicsSimpleTextItem):
     def boundingRect(self):
         bounds = super().boundingRect()
         return bounds.adjusted(-5, -2, 5, 2) if self.edge else bounds
+
+    def mousePressEvent(self, event):
+        if self.callback:
+            self.callback(event.modifiers())
+            event.accept()
+        else:
+            super().mousePressEvent(event)
 
 
 class TreeNode(QGraphicsEllipseItem):
@@ -326,6 +335,8 @@ class TreeView(QGraphicsView):
     layoutChanged = Signal(dict)
     legendChanged = Signal(dict)
     labelsChanged = Signal(dict)
+    reportRequested = Signal(list)
+    proximityRequested = Signal(str)
 
     def __init__(self, parent=None):
         self.canvas = QGraphicsScene()
@@ -343,12 +354,15 @@ class TreeView(QGraphicsView):
         self._results, self._source_edges, self._display_edges = {}, [], []
         self._members, self._manual_colors, self._aliases = {}, {}, {}
         self._cluster_groups, self._halos = [], []
+        self._group_definitions, self._halo_labels = [], {}
+        self.label_fields = ["sample_name", "primary_st"]
         self._label_guides = {}
         self._legend, self._positions = {}, {}
         self._palette = [QColor(color).name() for color in PALETTE]
         self.color_by = "cluster"
         self.show_labels = self.show_st = self.show_edge_labels = True
-        self.merge_identical = self.show_halos = False
+        self.merge_identical = False
+        self.show_halos = True
         self.cluster_threshold = 1
         self._highlight = ""
         self._drawing = False
@@ -415,6 +429,8 @@ class TreeView(QGraphicsView):
 
     def mouseDoubleClickEvent(self, event):
         node = self.itemAt(event.position().toPoint())
+        if isinstance(node, GraphLabel) and node.node_key in self.nodes:
+            node = self.nodes[node.node_key]
         if isinstance(node, TreeNode):
             self.nodeActivated.emit(self._members[node.key][0])
         else:
@@ -434,9 +450,18 @@ class TreeView(QGraphicsView):
 
     def contextMenuEvent(self, event):
         node = self.itemAt(event.pos())
+        if isinstance(node, GraphLabel) and node.node_key in self.nodes:
+            node = self.nodes[node.node_key]
         if isinstance(node, TreeNode) and not node.isSelected():
             self.select_ids(self._members[node.key])
         menu = QMenu(self)
+        cluster = menu.addAction("Select this threshold group")
+        cluster.setEnabled(isinstance(node, TreeNode))
+        report = menu.addAction("Report selected isolates…")
+        report.setEnabled(bool(self.selected_ids()))
+        proximity = menu.addAction("Inspect nearest neighbours…")
+        proximity.setEnabled(isinstance(node, TreeNode))
+        menu.addSeparator()
         color = menu.addAction("Set selected node color…")
         color.setEnabled(bool(self.selected_ids()))
         rename = menu.addAction("Edit display label…")
@@ -448,7 +473,13 @@ class TreeView(QGraphicsView):
         fit = menu.addAction("Fit graph")
         action = menu.exec(event.globalPos())
         menu.deleteLater()
-        if action == color:
+        if action == cluster:
+            self.select_cluster(self._members[node.key][0])
+        elif action == report:
+            self.reportRequested.emit(self.selected_ids())
+        elif action == proximity:
+            self.proximityRequested.emit(self._members[node.key][0])
+        elif action == color:
             chosen = QColorDialog.getColor(QColor(PALETTE[0]), self, "Node color",
                                             QColorDialog.ColorDialogOption.DontUseNativeDialog)
             if chosen.isValid():
@@ -471,7 +502,7 @@ class TreeView(QGraphicsView):
         # Do not equate zero differences over shared loci with identical complete genotypes.
         alleles, calls = result.get("alleles", {}), result.get("calls", [])
         digest = result.get("scheme_digest")
-        if not digest or not alleles or not calls:
+        if not digest or not alleles or not calls or result.get("status") == "mixed":
             return None
         if any(call.get("status") != "exact" for call in calls):
             return None
@@ -483,22 +514,23 @@ class TreeView(QGraphicsView):
             return None
         return str(digest), tuple(sorted((str(k), str(v)) for k, v in alleles.items()))
 
-    def draw_results(self, results, edges, cluster_threshold=1):
+    def draw_results(self, results, edges, cluster_threshold=1, *, groups=None):
         records = {}
         for result in results:
             key = str(result.get("sample_id", result.get("id", result["sample_name"])))
             if key in records:
                 raise ValueError(f"Duplicate sample identifier in graph: {key}")
             records[key] = dict(result)
-        previous_ids = set(self._results)
         selected = self.selected_ids()
         self._positions.update({key: (node.pos().x(), node.pos().y()) for key, node in self.nodes.items()})
         self._results = dict(sorted(records.items()))
         self._source_edges = [dict(e) for e in edges]
         self.cluster_threshold = cluster_threshold
+        self._group_definitions = [dict(group) for group in groups] if groups is not None else []
         self._drawing = True
         self.canvas.blockSignals(True)
         self.nodes, self.edges, self.labels, self._halos, self._label_guides = {}, [], {}, [], {}
+        self._halo_labels = {}
         self.canvas.clear()
         self._members = {}
         signatures = {}
@@ -519,6 +551,15 @@ class TreeView(QGraphicsView):
             self._display_edges.append(dict(edge, source=a, target=b))
         self._cluster_groups = _components(self._members, [e for e in self._display_edges
                                                            if e["distance"] <= cluster_threshold])
+        if self._group_definitions:
+            self._cluster_groups = [sorted({mapping[sid] for sid in group["members"] if sid in mapping})
+                                    for group in self._group_definitions]
+            self._cluster_groups = [group for group in self._cluster_groups if group]
+        else:
+            self._group_definitions = [{"name": f"Group {index + 1}", "number": index + 1,
+                                       "members": [member for key in group for member in self._members[key]],
+                                       "status": "cluster" if len(group) > 1 else "singleton"}
+                                      for index, group in enumerate(self._cluster_groups)]
         fresh_positions = forest_layout(self._members, self._display_edges)
         for key, members in self._members.items():
             result = self._results[key]
@@ -527,9 +568,9 @@ class TreeView(QGraphicsView):
                             self.update_edges, key=key, count=len(members))
             self.nodes[key] = node
             self.canvas.addItem(node)
-            node.setPos(*self._positions.get(key, fresh_positions[key]) if previous_ids == set(records)
-                        else fresh_positions[key])
-            title = GraphLabel("")
+            node.setPos(*self._positions.get(key, fresh_positions[key]))
+            title = GraphLabel("", callback=lambda modifiers, k=key: self._select_label(k, modifiers))
+            title.node_key = key
             self.canvas.addItem(title)
             self.labels[key] = title
             guide_pen = QPen(QColor("#36516C"), 0.8, Qt.PenStyle.DotLine)
@@ -555,8 +596,7 @@ class TreeView(QGraphicsView):
             text.setVisible(self.show_edge_labels)
             self.edges.append((edge["source"], edge["target"], line, text))
         for index, group in enumerate(self._cluster_groups):
-            if len(group) < 2:
-                continue
+            definition = self._group_definitions[index]
             fill = QColor(self._palette[index % len(self._palette)])
             border = QColor(fill)
             fill.setAlpha(15)
@@ -568,6 +608,12 @@ class TreeView(QGraphicsView):
                             "A visual grouping, not evidence of an outbreak or transmission.")
             halo.setVisible(self.show_halos)
             self._halos.append((group, halo))
+            caption = GraphLabel(str(definition["name"]) + (" · chaining" if definition.get("chained") else ""), edge=True)
+            caption.setZValue(-1)
+            caption.setVisible(self.show_halos)
+            caption.setToolTip(halo.toolTip())
+            self.canvas.addItem(caption)
+            self._halo_labels[index] = caption
         if not records:
             message = GraphLabel("Analyse at least two assemblies with the same scheme to compare profiles.")
             message.setBrush(QColor(MUTED))
@@ -584,7 +630,18 @@ class TreeView(QGraphicsView):
         self.fit_tree()
 
     def _redraw(self):
-        self.draw_results(list(self._results.values()), self._source_edges, self.cluster_threshold)
+        self.draw_results(list(self._results.values()), self._source_edges, self.cluster_threshold,
+                          groups=self._group_definitions)
+
+    def _select_label(self, key, modifiers):
+        ids = set(self.selected_ids()) if modifiers & Qt.KeyboardModifier.ControlModifier else set()
+        members = set(self._members[key])
+        ids = ids - members if members <= ids else ids | members
+        self.select_ids(ids)
+
+    def select_cluster(self, sample_id):
+        group = next((g for g in self._group_definitions if sample_id in g["members"]), None)
+        self.select_ids(group["members"] if group else [sample_id])
 
     def set_merge_identical(self, enabled):
         self.merge_identical = bool(enabled)
@@ -594,6 +651,8 @@ class TreeView(QGraphicsView):
         self.show_halos = bool(visible)
         for _group, halo in self._halos:
             halo.setVisible(self.show_halos)
+        for caption in self._halo_labels.values():
+            caption.setVisible(self.show_halos)
         self.viewport().update()
 
     def available_color_fields(self):
@@ -606,13 +665,30 @@ class TreeView(QGraphicsView):
 
         def collect(mapping, prefix="", depth=0):
             for key, value in mapping.items():
+                if not prefix and key in {'hydra', 'characterization', 'assembly'}:
+                    continue
                 field = prefix + str(key)
                 if isinstance(value, dict) and value and depth < 4:
                     collect(value, field + ".", depth + 1)
-                else:
+                elif isinstance(value, (str, int, float, bool)) or value is None:
                     values[field] = value
 
         collect(result.get("metadata") or {})
+        if not (result.get('metadata') or {}).get('characterization'):
+            return values
+        from wmlstudio.characterization import current_characterization
+        state = current_characterization(result)
+        values['characterization.state'] = state['status']
+        evidence = state.get('evidence') or {}
+        species = evidence.get('species_evidence') or {}
+        organism = ' '.join(str(species.get(k) or '') for k in ('genus', 'species', 'subspecies')).strip()
+        values['characterization.species'] = (organism + ' · ' + species.get('status', 'not_run')) if organism else state['status']
+        for key, source, field in [('virulence', 'hits', 'gene'), ('plasmid_hypotheses', 'replicons', 'gene'),
+                                    ('drug_associations', 'associations', 'class')]:
+            module = evidence.get(key) or {}
+            names = sorted({str(row[field]) for row in module.get(source, []) if isinstance(row, dict) and row.get(field)})
+            values['characterization.' + key] = (', '.join(names[:12]) if module.get('status') in {'completed', 'detected', 'not_detected'} and names
+                                                  else module.get('status', state['status']))
         return values
 
     def set_color_by(self, field):
@@ -632,24 +708,30 @@ class TreeView(QGraphicsView):
         if self.color_by == "cluster":
             return clusters[key]
         if self.color_by == "st":
-            return f"ST {result['st']}" if result.get("st") is not None else "ST unassigned"
+            st = result.get('primary_st') or result.get('st')
+            return f"ST {st}" if st is not None else "ST unassigned"
         value = self._metadata_values(result).get(self.color_by.removeprefix("metadata:"))
         return "Not recorded" if value is None or value == "" else (
             json.dumps(value, ensure_ascii=False, sort_keys=True) if isinstance(value, (dict, list)) else str(value))
 
     def _apply_colors(self):
-        clusters = {member: f"Group {index + 1}" for index, group in enumerate(self._cluster_groups)
-                    for key in group for member in self._members[key]}
+        clusters = {member: group["name"] for group in self._group_definitions for member in group["members"]}
         categories = {key: self._category(key, clusters) for key in self._results}
         self._legend = {category: self._palette[index % len(self._palette)]
                         for index, category in enumerate(sorted(set(categories.values())))}
+        if self.color_by == "cluster":
+            self._legend = {g["name"]: (self._palette[((g.get("number") or 1) - 1) % len(self._palette)]
+                                       if g.get("status") == "cluster" else "#73869A")
+                            for g in self._group_definitions}
         for key, members in self._members.items():
             colors = Counter(self._manual_colors.get(member, self._legend[categories[member]]) for member in members)
             self.nodes[key].slices = sorted(colors.items())
             self.nodes[key].setBrush(QColor(self.nodes[key].slices[0][0]))
             self.nodes[key].update()
-        for group, halo in self._halos:
-            color = QColor(self._palette[self._cluster_groups.index(group) % len(self._palette)])
+        for index, (group, halo) in enumerate(self._halos):
+            definition = self._group_definitions[index]
+            color = QColor(self._palette[((definition.get("number") or 1) - 1) % len(self._palette)]
+                           if definition.get("status") == "cluster" else "#73869A")
             border = QColor(color)
             color.setAlpha(15)
             border.setAlpha(65)
@@ -697,17 +779,46 @@ class TreeView(QGraphicsView):
     def _refresh_labels(self):
         for key, item in self.labels.items():
             members = self._members[key]
-            text = self._aliases.get(key, self._results[key]["sample_name"])
-            if len(text) > 32:
-                text = text[:29] + "…"
+            result = self._results[key]
+            lines = []
+            for field in self.label_fields:
+                if field == "sample_name":
+                    value = self._aliases.get(key, result["sample_name"])
+                elif field in {"st", "primary_st"}:
+                    if not self.show_st:
+                        continue
+                    value = "ST " + str(result.get("primary_st", result.get("st")) or "unassigned")
+                elif field == "amr_genes":
+                    state = result.get('amr_evidence_status')
+                    value = "AMR" + (f" ({state})" if state and state != 'current' else '') + ": " + (", ".join(result.get("amr_genes") or []) or "not recorded")
+                elif field.startswith("metadata:"):
+                    name = field.removeprefix("metadata:")
+                    value = name.rsplit(".", 1)[-1] + ": " + str(self._metadata_values(result).get(name) or "not recorded")
+                else:
+                    value = str(result.get(field) or "not recorded")
+                value = str(value).replace("\n", " ")
+                lines.append(value if len(value) <= 64 else value[:61] + "…")
+            text = "\n".join(lines)
             if len(members) > 1:
                 text += f" +{len(members) - 1}"
-            if self.show_st:
-                text += f"\nST {self._results[key].get('st') or 'unassigned'}"
             item.setText(text)
             item.setVisible(self.show_labels)
             item.setToolTip("\n".join(self._results[member]["sample_name"] for member in members))
         self.update_edges()
+
+    def available_label_fields(self):
+        return ["sample_name", "primary_st", "scheme", "amr_genes"] + [
+            field for field in self.available_color_fields() if field.startswith("metadata:")]
+
+    def set_label_fields(self, fields):
+        fields = list(dict.fromkeys(map(str, fields)))
+        if not fields or len(fields) > 8:
+            raise ValueError("Choose one to eight graph label fields.")
+        if any(field not in {"sample_name", "primary_st", "st", "scheme", "amr_genes"}
+               and not field.startswith("metadata:") for field in fields):
+            raise ValueError("Unknown graph label field.")
+        self.label_fields = fields
+        self._refresh_labels()
 
     def set_labels_visible(self, visible):
         self.show_labels = bool(visible)
@@ -781,12 +892,14 @@ class TreeView(QGraphicsView):
             middle = (start + end) / 2
             text.setPos(middle.x() - text.boundingRect().width() / 2,
                         middle.y() - text.boundingRect().height() / 2)
-        for group, halo in self._halos:
+        for index, (group, halo) in enumerate(self._halos):
             bounds = QRectF()
             for key in group:
                 rect = self.nodes[key].sceneBoundingRect().united(self.labels[key].sceneBoundingRect())
                 bounds = bounds.united(rect)
             halo.setRect(bounds.adjusted(-28, -24, 28, 24))
+            caption = self._halo_labels[index]
+            caption.setPos(halo.rect().left() + 12, halo.rect().top() - caption.boundingRect().height() / 2)
         self._positions.update({key: (node.pos().x(), node.pos().y()) for key, node in self.nodes.items()})
         self.layoutChanged.emit({key: list(value) for key, value in self._positions.items() if key in self.nodes})
         self.viewport().update()
@@ -819,7 +932,8 @@ class TreeView(QGraphicsView):
                 "labels": {key: value for key, value in self._aliases.items() if key in self._results},
                 "color_by": self.color_by, "palette": list(self._palette), "show_labels": self.show_labels,
                 "show_st": self.show_st, "show_edge_labels": self.show_edge_labels,
-                "merge_identical": self.merge_identical, "show_halos": self.show_halos}
+                "merge_identical": self.merge_identical, "show_halos": self.show_halos,
+                "label_fields": list(self.label_fields)}
 
     def restore_state(self, state):
         if state == {}:
@@ -835,7 +949,8 @@ class TreeView(QGraphicsView):
         self.show_labels = bool(state.get("show_labels", True))
         self.show_st = bool(state.get("show_st", True))
         self.show_edge_labels = bool(state.get("show_edge_labels", True))
-        self.show_halos = bool(state.get("show_halos", False))
+        self.show_halos = bool(state.get("show_halos", True))
+        self.label_fields = list(state.get("label_fields", ["sample_name", "primary_st"]))
         self.merge_identical = bool(state.get("merge_identical", False))
         if state.get("palette"):
             self.set_palette(state["palette"])
@@ -888,12 +1003,15 @@ class TreeView(QGraphicsView):
             x += space
 
     def save_png(self, path):
+        return self.save_image(path)
+
+    def save_image(self, path, *, format=None):
         image = QImage(1800, 1200, QImage.Format.Format_ARGB32)
         image.fill(QColor(BACKGROUND))
         painter = QPainter(image)
         self._render(painter, 1800, 1200)
         painter.end()
-        if not image.save(str(path)):
+        if not image.save(str(path), format):
             raise OSError(f"Could not save image: {path}")
 
     def save_svg(self, path):

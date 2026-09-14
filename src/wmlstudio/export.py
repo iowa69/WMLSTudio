@@ -30,6 +30,9 @@ _FIELDS = (
     "hydra_source_sample", "hydra_report_sha256", "cluster_label", "cluster_highlight",
     "additional_profiles",
     "hydra_evidence_status", "hydra_evidence_reason",
+    "investigation_cluster", "investigation_cluster_id", "investigation_cluster_status",
+    "nearest_allele_distance", "nearest_isolates", "within_threshold_isolates",
+    "comparison_scheme_digest", "comparison_threshold", "comparison_min_overlap",
 )
 
 
@@ -43,7 +46,12 @@ def ensure_separate_destination(destination: str | Path, protected_paths: Iterab
 
 def _snapshot(
     records: Iterable[Mapping[str, Any]], selected_ids=None, highlight_clusters=None,
+    investigation=None,
 ) -> list[dict[str, Any]]:
+    proximity = {}
+    if investigation:
+        from wmlstudio.investigation import proximity_rows
+        proximity = {p['sample_id']: p for p in proximity_rows(investigation)}
     rows = []
     for record in select_records(records, selected_ids):
         if "result" in record:
@@ -66,6 +74,14 @@ def _snapshot(
         if "result" in record or "sample_name" in record:
             sample_id = str(row.get("sample_id", ""))
             row.update(feature_fields(record, (highlight_clusters or {}).get(sample_id)))
+            if sample_id in proximity:
+                close = proximity[sample_id]
+                row.update(investigation_cluster=close['group_name'], investigation_cluster_id=close['group_id'],
+                           investigation_cluster_status=close['group_status'], nearest_allele_distance=close['nearest_distance'],
+                           nearest_isolates=[p['neighbour_name'] for p in close['nearest']],
+                           within_threshold_isolates=[p['neighbour_name'] for p in close['within_threshold']],
+                           comparison_scheme_digest=investigation['scheme_digest'], comparison_threshold=investigation['threshold'],
+                           comparison_min_overlap=investigation['min_overlap'])
         rows.append(row)
     # Validate and detach nested data before opening any destination.
     return json.loads(json.dumps(rows, ensure_ascii=False, allow_nan=False))
@@ -79,6 +95,25 @@ def _protected_paths(rows):
             workflow = metadata.get("workflow", {})
             if isinstance(workflow, dict):
                 yield workflow.get("source_path", "")
+                yield workflow.get('managed_path', '')
+            reads = metadata.get('reads') or {}
+            if isinstance(reads, dict):
+                for entry in reads.get('reads', []):
+                    if isinstance(entry, dict):
+                        yield entry.get('path', '')
+            assembly = metadata.get('assembly') or {}
+            if isinstance(assembly, dict):
+                for entry in (assembly.get('provenance') or {}).get('inputs', []):
+                    if isinstance(entry, dict):
+                        yield entry.get('path', '')
+            evidence = metadata.get('hydra') or {}
+            if isinstance(evidence, dict):
+                yield (evidence.get('provenance') or {}).get('source_path', '')
+
+
+def protected_input_paths(records):
+    """Original reads/assemblies and linked source evidence, not only active inputs."""
+    return _protected_paths(records)
 
 
 @contextmanager
@@ -123,11 +158,11 @@ def _csv_cell(value: Any) -> str | int | float:
 
 def _write_delimited(
     records: Iterable[Mapping[str, Any]], path: str | Path, delimiter: str,
-    selected_ids=None, highlight_clusters=None,
+    selected_ids=None, highlight_clusters=None, investigation=None,
 ) -> Path:
     all_records = list(records)
     ensure_separate_destination(path, _protected_paths(all_records))
-    rows = _snapshot(all_records, selected_ids, highlight_clusters)
+    rows = _snapshot(all_records, selected_ids, highlight_clusters, investigation)
     loci = sorted({str(locus) for row in rows for locus in row.get("alleles", {})})
     columns = [*_FIELDS, *(f"allele:{locus}" for locus in loci)]
     with _atomic_text(path, newline="") as handle:
@@ -141,19 +176,19 @@ def _write_delimited(
     return Path(path).expanduser().resolve()
 
 
-def write_csv(records: Iterable[Mapping[str, Any]], path: str | Path, *, selected_ids=None, highlight_clusters=None) -> Path:
+def write_csv(records: Iterable[Mapping[str, Any]], path: str | Path, *, selected_ids=None, highlight_clusters=None, investigation=None) -> Path:
     """Write Excel-friendly UTF-8 CSV with guarded textual formula cells."""
-    return _write_delimited(records, path, ",", selected_ids, highlight_clusters)
+    return _write_delimited(records, path, ",", selected_ids, highlight_clusters, investigation)
 
 
-def write_tsv(records: Iterable[Mapping[str, Any]], path: str | Path, *, selected_ids=None, highlight_clusters=None) -> Path:
-    return _write_delimited(records, path, "\t", selected_ids, highlight_clusters)
+def write_tsv(records: Iterable[Mapping[str, Any]], path: str | Path, *, selected_ids=None, highlight_clusters=None, investigation=None) -> Path:
+    return _write_delimited(records, path, "\t", selected_ids, highlight_clusters, investigation)
 
 
-def write_json(records: Iterable[Mapping[str, Any]], path: str | Path, *, selected_ids=None, highlight_clusters=None) -> Path:
+def write_json(records: Iterable[Mapping[str, Any]], path: str | Path, *, selected_ids=None, highlight_clusters=None, investigation=None) -> Path:
     all_records = list(records)
     ensure_separate_destination(path, _protected_paths(all_records))
-    rows = _snapshot(all_records, selected_ids, highlight_clusters)
+    rows = _snapshot(all_records, selected_ids, highlight_clusters, investigation)
     document = {
         "format_version": 1,
         "application": f"WMLSTudio {__version__}",
@@ -162,6 +197,8 @@ def write_json(records: Iterable[Mapping[str, Any]], path: str | Path, *, select
         "report_scope": {"mode": "selected" if selected_ids is not None else "provided",
                          "sample_ids": [row.get("sample_id") for row in rows]},
     }
+    if investigation:
+        document['investigation'] = investigation_document(investigation, [r['sample_id'] for r in rows])
     with _atomic_text(path) as handle:
         json.dump(document, handle, ensure_ascii=False, allow_nan=False, indent=2)
         handle.write("\n")
@@ -200,11 +237,218 @@ def _escape(value: Any) -> str:
     return html.escape(_display(value), quote=True)
 
 
-def write_html(records: Iterable[Mapping[str, Any]], path: str | Path, *, selected_ids=None, highlight_clusters=None) -> Path:
+def investigation_document(snapshot, selected_ids=None):
+    """Explicit focal isolates plus labelled cohort context; no scope ambiguity."""
+    from wmlstudio.investigation import proximity_rows
+    profiles = {p['sample_id']: p for p in snapshot.get('profiles', [])}
+    selected = set(profiles) if selected_ids is None else set(selected_ids)
+    focus = selected & profiles.keys()
+    metadata = {key: snapshot.get(key) for key in ('snapshot_id', 'created_at', 'investigation_id',
+        'investigation_name', 'protocol', 'scheme', 'scheme_digest', 'threshold', 'min_overlap',
+        'missing_policy', 'metric_version', 'interpretation', 'preview', 'saved_threshold', 'saved_min_overlap', 'reuse', 'threshold_evidence')}
+    metadata.update(focal_sample_ids=sorted(focus), outside_snapshot_ids=sorted(selected - profiles.keys()),
+                    cohort_size=len(profiles), focal_profiles=[profiles[sid] for sid in sorted(focus)],
+                    groups=[g for g in snapshot.get('groups', []) if focus.intersection(g['members'])],
+                    review_groups=[g for g in snapshot.get('review_groups', []) if focus.intersection(g['sample_ids'])],
+                    proximity=proximity_rows(snapshot, focus),
+                    scope_note='Only focal isolates are sample records. Named neighbours and group members are explicitly labelled comparison-cohort context.')
+    return json.loads(json.dumps(metadata, ensure_ascii=False, allow_nan=False))
+
+
+def investigation_html(snapshot, selected_ids=None, sections=None):
+    """Offline, escaped investigation and isolate-proximity section, also printable."""
+    doc = investigation_document(snapshot, selected_ids)
+    parts = ['<section><h2>Investigation · ' + _escape(doc.get('investigation_name') or 'Unsaved cohort') + '</h2>',
+             '<p>' + _escape(doc['scope_note']) + '</p>',
+             '<p><b>Reference:</b> ' + _escape(doc['scheme']) + '<br><b>Scheme SHA-256:</b> ' + _escape(doc['scheme_digest']) +
+             '<br><b>Snapshot:</b> ' + _escape(doc['snapshot_id']) + ' · ' + _escape(doc['created_at']) + '</p>',
+             f"<p><b>Single-link threshold:</b> ≤ {_escape(doc['threshold'])} allele differences. "
+             f"<b>Minimum shared / total loci:</b> {_escape(doc['min_overlap'])}. "
+             f"<b>Cohort:</b> {doc['cohort_size']} isolates; {len(doc['focal_sample_ids'])} focal isolates.</p>",
+             '<p><b>Local protocol:</b> ' + _escape(doc.get('protocol') or 'Exploratory; not clinically calibrated') + '</p>',
+             '<p class="notice">' + _escape(doc['interpretation']) + '</p>']
+    if doc.get('preview'):
+        parts.append('<p class="notice"><b>Unsaved threshold preview.</b> The saved protocol threshold was ' +
+                     _escape(doc.get('saved_threshold')) + '; this report explicitly uses the threshold shown above.</p>')
+    evidence = doc.get('threshold_evidence') or {}
+    if evidence:
+        from wmlstudio.investigation import threshold_guidance_status
+        binding = threshold_guidance_status(snapshot)
+        parts.append('<h3>Published threshold guidance and local application</h3>')
+        parts.append('<p class="notice"><b>' + _escape(binding['status'].replace('_', ' ')) + ':</b> ' + _escape(binding['reason']) + '</p>')
+        for key, value in evidence.items():
+            if isinstance(value, (str, int, float, bool)) or value is None:
+                parts.append('<p><b>' + _escape(key.replace('_', ' ')) + ':</b> ' + _escape(value) + '</p>')
+            elif key in {'citation', 'citations', 'scheme_scope', 'context'}:
+                parts.append('<p><b>' + _escape(key.replace('_', ' ')) + ':</b> ' + _escape(value) + '</p>')
+        parts.append('<p>A published cutoff is scoped to its study, scheme version and method; a local variant requires an explicit justification and is not automatic clinical validation.</p>')
+    if doc['outside_snapshot_ids']:
+        parts.append(f"<p>{len(doc['outside_snapshot_ids'])} selected sample(s) have no profile in this snapshot; no distance was assigned.</p>")
+    parts.append('<h3>Threshold groups and membership changes</h3><table border="1" cellpadding="5" cellspacing="0"><tr><th>Group / stable ID</th><th>State</th><th>Members</th><th>Change</th><th>Within-group evidence</th></tr>')
+    for group in doc['groups']:
+        warning = ('Chaining: direct distance can exceed link threshold. ' if group.get('chained') else '')
+        values = [group['name'] + ' · ' + group['id'], group['status'], len(group['members']),
+                  group['change'], warning + f"Maximum direct distance: {group['max_direct_distance']}; "
+                  f"unassessed pairs: {group['unassessed_within_pairs']}. " + group.get('reason', '')]
+        parts.append('<tr>' + ''.join('<td>' + _escape(value) + '</td>' for value in values) + '</tr>')
+    parts.append('</table>')
+    for group in doc['review_groups']:
+        parts.append('<p><b>Frozen review group:</b> ' + _escape(group['name']) + ' · ' + _escape(group['frozen_at']) +
+                     ' · ' + str(len(group['sample_ids'])) + ' fixed isolate IDs. Automatic clustering does not rewrite these members.</p>')
+    profile_map = {p['sample_id']: p for p in doc['focal_profiles']}
+    for focal in doc['proximity']:
+        profile = profile_map[focal['sample_id']]
+        parts.append('<h3>Isolate proximity · ' + _escape(focal['sample_name']) + '</h3>')
+        parts.append('<p><b>Primary MLST/ST:</b> ' + _escape(profile.get('primary_st') or profile.get('st') or 'Unassigned') +
+                     ' · <b>Callable loci:</b> ' + str(profile['callable_loci']) + '/' + str(profile['total_loci']) +
+                     (' · <b>AMR context:</b> ' + _escape(profile.get('amr_genes') or 'Not recorded') + ' · ' + _escape(profile.get('amr_evidence_status') or 'Identity unverified') if sections is None or sections.get('amr') else '') + '</p>')
+        parts.append('<p>Nearest accepted distance: ' + _escape(focal['nearest_distance'] if focal['nearest_distance'] is not None else 'Not comparable') +
+                     f". {focal['compared_count']} neighbours compared; {focal['excluded_count']} comparisons excluded.</p>")
+        rows = focal['within_threshold'] or focal['nearest']
+        if rows:
+            parts.append('<table border="1" cellpadding="5" cellspacing="0"><tr><th>Comparison-cohort neighbour</th><th>Allele differences</th><th>Shared / total loci</th><th>Overlap</th></tr>')
+            for pair in rows:
+                parts.append('<tr>' + ''.join('<td>' + _escape(value) + '</td>' for value in (
+                    pair['neighbour_name'], pair['distance'], f"{pair['shared_loci']}/{pair['total_loci']}",
+                    f"{pair['overlap']:.3f}")) + '</tr>')
+            parts.append('</table>')
+        if focal['excluded']:
+            reasons = sorted({row['reason'] for row in focal['excluded']})
+            parts.append('<p><b>Exclusions:</b> ' + _escape('; '.join(reasons)) + '</p>')
+    parts.append('<h3>Core and accessory evidence are separate</h3><p>The distances above use only the pinned allele-profile scheme. '
+                 'AMR, virulence, plasmid markers and custom annotations are context, not extra distance loci. '
+                 'Identical AMR or replicon names do not establish identical plasmids or transfer; genomic drug associations are not susceptibility testing.</p></section>')
+    return ''.join(parts)
+
+
+def characterization_html(record, sections=None):
+    """Compact characterization evidence with an input-identity gate, not raw arrays."""
+    from wmlstudio.characterization import current_characterization
+    state = current_characterization(record)
+    if state['status'] == 'missing':
+        return ''
+    evidence = state['evidence']
+    if not evidence:
+        return '<h3>Characterization evidence</h3><p>Archived or unverified input identity: concrete characterization calls are not presented as current.</p>'
+    parts = ['<h3>Independent species and accessory evidence</h3>']
+    species = evidence.get('species_evidence') or {}
+    parts.append('<p><b>Species evidence:</b> ' + _escape(species.get('status', 'not_run')) + ' · ' +
+                 _escape(' '.join(str(species.get(k) or '') for k in ('genus', 'species', 'subspecies')).strip()) +
+                 ' · ' + _escape(species.get('method') or '') + '</p>')
+    for key, title, rows_key, name_key in [('virulence', 'Virulence assay', 'hits', 'gene'),
+                                          ('plasmid_hypotheses', 'Plasmid-marker assay', 'replicons', 'gene'),
+                                          ('drug_associations', 'Reference-reported drug associations', 'associations', 'class')]:
+        if sections is not None and not sections.get(key, True):
+            continue
+        module = evidence.get(key) or {}
+        names = sorted({str(row.get(name_key)) for row in module.get(rows_key, []) if isinstance(row, dict) and row.get(name_key)}) if module.get('status') in {'completed', 'detected', 'not_detected'} else []
+        parts.append('<p><b>' + title + ':</b> ' + _escape(module.get('status', 'not_run')) + ' · ' +
+                     _escape('; '.join(names[:30]) or module.get('reason') or 'No determinants reported for this assay.') + '</p>')
+        if len(names) > 30:
+            parts.append(f'<p>{len(names)} annotations total; complete evidence retained in JSON.</p>')
+        for limitation in module.get('limitations', [])[:3]:
+            parts.append('<p class="muted">' + _escape(limitation) + '</p>')
+    return ''.join(parts)
+
+
+REPORT_PRESETS = {
+    'isolate': {'title': 'Isolate evidence review', 'investigation': False, 'qc': True, 'amr': True,
+                'virulence': True, 'plasmid_hypotheses': True, 'drug_associations': True, 'graph': False, 'provenance': False},
+    'cohort': {'title': 'Selected cohort review', 'investigation': True, 'qc': True, 'amr': True,
+               'virulence': True, 'plasmid_hypotheses': True, 'drug_associations': True, 'graph': True, 'provenance': False},
+    'ipc': {'title': 'IPC cluster review', 'investigation': True, 'qc': True, 'amr': True,
+            'virulence': True, 'plasmid_hypotheses': True, 'drug_associations': True, 'graph': True, 'provenance': False},
+    'proximity': {'title': 'Isolate proximity review', 'investigation': True, 'qc': True, 'amr': True,
+                  'virulence': False, 'plasmid_hypotheses': False, 'drug_associations': False, 'graph': True, 'provenance': False},
+}
+
+
+def review_report_html(records, *, selected_ids, investigation=None, options=None, graph_png=None):
+    """Readable research/IPC report with explicit scope and opt-in raw appendix."""
+    import base64
+    settings = {**REPORT_PRESETS['cohort'], **(options or {})}
+    rows = _snapshot(records, selected_ids, investigation=investigation)
+    parts = ['<!doctype html><html><head><meta charset="utf-8">',
+             '<meta http-equiv="Content-Security-Policy" content="default-src \'none\'; style-src \'unsafe-inline\'; img-src data:">',
+             '<title>' + _escape(settings['title']) + '</title>',
+             '<style>body{font-family:Segoe UI,Arial,sans-serif;color:#203c45;max-width:1080px;margin:auto;padding:28px;line-height:1.45}'
+             'h1,h2,h3{color:#156e65}h2{border-bottom:2px solid #d6e7e3;padding-bottom:8px}'
+             'table{border-collapse:collapse;width:100%;font-size:12px}td,th{border:1px solid #d6e0e4;padding:7px;text-align:left;vertical-align:top}'
+             'th{background:#edf5f3}.notice{padding:12px;background:#fff4dd;border-left:4px solid #c89031}'
+             '.muted{color:#5c6f76}section{margin:24px 0}pre{white-space:pre-wrap;overflow-wrap:anywhere;font-size:10px}'
+             'img{max-width:100%;height:auto}@media print{body{padding:0}tr{break-inside:avoid}h2,h3{break-after:avoid}}</style></head><body>',
+             '<h1>' + _escape(settings['title']) + '</h1>',
+             f'<p>WMLSTudio {_escape(__version__)} · {_escape(datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC"))} · {len(rows)} explicitly selected isolate(s)</p>',
+             '<p class="notice"><b>Research / review evidence, not a clinical diagnosis.</b> Genomic similarity does not prove transmission. '
+             'Resistance determinants are not measured susceptibility; use validated laboratory testing and epidemiological review.</p>']
+    parts.append('<h2>At a glance</h2><table cellpadding="6" cellspacing="0" border="1"><tr><th>Isolate</th><th>Organism</th><th>Primary ST</th><th>Typing / QC state</th>' +
+                 ('<th>AMR evidence</th>' if settings['amr'] else '') + '</tr>')
+    for row in rows:
+        values = [row.get('sample_name'), row.get('organism') or 'Unassigned', row.get('st') or 'Unassigned', row.get('status') or row.get('job_status') or 'Not analysed']
+        if settings['amr']:
+            genes = row.get('amr_genes') or []
+            values.append('; '.join(genes) if genes else 'No determinants reported' if row.get('hydra_evidence_status') == 'current' else row.get('hydra_evidence_status') or 'Not assessed')
+        parts.append('<tr>' + ''.join('<td>' + _escape(value) + '</td>' for value in values) + '</tr>')
+    parts.append('</table>')
+    if settings['graph']:
+        if graph_png:
+            encoded = base64.b64encode(graph_png).decode('ascii')
+            parts.append('<h2>Comparison-cohort context</h2><p>Selected focal isolates are highlighted. Other nodes are context only, not additional reported sample records. Layout is not a transmission tree.</p>'
+                         '<img width="920" src="data:image/png;base64,' + encoded + '" alt="Allele-distance graph with focal isolates highlighted">')
+        else:
+            parts.append('<p class="muted">Graph omitted: no matching comparison snapshot is currently available.</p>')
+    if settings['investigation']:
+        parts.append(investigation_html(investigation, [r['sample_id'] for r in rows], settings) if investigation else
+                     '<p class="notice">No comparison snapshot selected. No proximity or cluster inference was made.</p>')
+    for row in rows:
+        parts.append('<section><h2>' + _escape(row.get('sample_name')) + '</h2>')
+        if row.get('cluster_label'):
+            parts.append('<p class="notice"><b>User-defined review highlight:</b> ' + _escape(row['cluster_label']) + ' (not an inferred transmission assignment)</p>')
+        parts.append('<p><b>Primary typing:</b> ' + _escape(row.get('scheme') or 'Not assessed') + ' · ST ' + _escape(row.get('st') or 'Unassigned') + '</p>')
+        if row.get('error') or row.get('missing_input'):
+            parts.append('<p class="notice">' + _escape(row.get('error') or 'Original sequence input unavailable; stored profile evidence only.') + '</p>')
+        if settings['qc']:
+            qc = row.get('qc') or {}
+            summary = {key: value for key, value in qc.items() if isinstance(value, (int, float, str, bool)) or value is None}
+            parts.append('<h3>Input quality evidence</h3><p>' + ('; '.join(_escape(k.replace('_', ' ')) + ': ' + _escape(v) for k, v in summary.items()) or 'No sequence QC recorded (profile-only imports do not imply QC passed).') + '</p>')
+        if settings['amr']:
+            parts.append('<h3>AMR determinants</h3><p><b>Evidence state:</b> ' + _escape(row.get('hydra_evidence_status') or 'Not assessed') + '. ' + _escape(row.get('hydra_evidence_reason') or '') + '</p><p>' +
+                         _escape('; '.join(row.get('amr_genes') or []) or 'No current determinants to report. Not assessed is not a negative result.') + '</p>')
+        parts.append(characterization_html(row, settings))
+        profiles = [r for r in row.get('additional_profiles', []) if r.get('scheme_digest') != row.get('scheme_digest')]
+        if profiles:
+            parts.append('<h3>Additional allele profiles</h3><ul>')
+            for profile in profiles:
+                alleles = profile.get('alleles') or {}
+                parts.append('<li>' + _escape(profile.get('scheme')) + f" · {sum(v is not None for v in alleles.values())}/{len(alleles)} called loci · " + _escape(profile.get('status')) + '</li>')
+            parts.append('</ul>')
+        custom = {key: value for key, value in (row.get('metadata') or {}).items()
+                  if key not in {'workflow', 'assembly', 'hydra', 'characterization', 'input_identity'} and not isinstance(value, (dict, list))}
+        custom.update({key: value for key, value in ((row.get('metadata') or {}).get('annotations') or {}).items()
+                       if isinstance(value, (str, int, float, bool))})
+        if custom:
+            parts.append('<h3>Isolate annotations</h3><p>' + '<br>'.join(_escape(k) + ': ' + _escape(v) for k, v in custom.items()) + '</p>')
+        if settings['provenance']:
+            parts.append('<h3>Provenance appendix</h3><p>Full stored evidence below is archival; current/stale assessment above controls interpretation.</p><pre>' + _escape(row) + '</pre>')
+        parts.append('</section>')
+    parts.append('<footer>Core allele differences, AMR, virulence and plasmid hypotheses are separate evidence domains. Report sections are customizable; omitted assays must not be interpreted as absent.</footer></body></html>')
+    return ''.join(parts)
+
+
+def write_review_report(records, path, *, selected_ids, investigation=None, options=None, graph_png=None):
+    records = list(records)
+    ensure_separate_destination(path, _protected_paths(records))
+    markup = review_report_html(records, selected_ids=selected_ids, investigation=investigation, options=options, graph_png=graph_png)
+    with _atomic_text(path) as handle:
+        handle.write(markup)
+    return Path(path).expanduser().resolve()
+
+
+def write_html(records: Iterable[Mapping[str, Any]], path: str | Path, *, selected_ids=None, highlight_clusters=None, investigation=None) -> Path:
     """Write an escaped, self-contained report that also prints without scripts."""
     all_records = list(records)
     ensure_separate_destination(path, _protected_paths(all_records))
-    rows = _snapshot(all_records, selected_ids, highlight_clusters)
+    rows = _snapshot(all_records, selected_ids, highlight_clusters, investigation)
     exported = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
     output = [
         '<!doctype html><html lang="en"><head><meta charset="utf-8">',
@@ -238,6 +482,7 @@ def write_html(records: Iterable[Mapping[str, Any]], path: str | Path, *, select
         '<p class="notice">Results describe the supplied sequence data and scheme snapshot. '
         'Missing, mixed, or ambiguous calls must not be treated as allele matches. '
         'Allele similarity alone does not establish an outbreak or transmission.</p>',
+        investigation_html(investigation, [row['sample_id'] for row in rows]) if investigation else '',
         '<section><h2>Sample overview</h2><div class="scroll"><table><thead><tr>'
         '<th>Sample</th><th>Job</th><th>Typing result</th><th>Scheme</th><th>ST</th>'
         '<th>Known alleles</th><th>Organism</th><th>AMR genes</th><th>Group</th></tr></thead><tbody>',
@@ -270,6 +515,7 @@ def write_html(records: Iterable[Mapping[str, Any]], path: str | Path, *, select
         ):
             output.append(f"<dt>{title}</dt><dd>{_escape(row.get(key)) or '—'}</dd>")
         output.append("</dl>")
+        output.append(characterization_html(row))
         if row.get("missing_input"):
             output.append('<p class="notice">The original input is currently unavailable; '
                           'this report contains the stored result snapshot.</p>')
@@ -278,7 +524,10 @@ def write_html(records: Iterable[Mapping[str, Any]], path: str | Path, *, select
             if row.get(key):
                 if key == "metadata" and row.get("hydra_evidence_status") == "stale":
                     title = "Archived metadata (old AMR evidence, not current calls)"
-                output.append(f"<h3>{title}</h3><pre>{_escape(row[key])}</pre>")
+                shown = row[key]
+                if key == 'metadata':
+                    shown = {field: value for field, value in row[key].items() if field not in {'characterization', 'hydra'}}
+                output.append(f"<h3>{title}</h3><pre>{_escape(shown)}</pre>")
         additional = [profile for profile in row.get("additional_profiles", [])
                       if profile.get("scheme_digest") != row.get("scheme_digest")]
         if additional:
@@ -310,7 +559,7 @@ def write_html(records: Iterable[Mapping[str, Any]], path: str | Path, *, select
 
 def export_results(
     records: Iterable[Mapping[str, Any]], destination: str | Path, format: str | None = None,
-    *, selected_ids=None, highlight_clusters=None,
+    *, selected_ids=None, highlight_clusters=None, investigation=None,
 ) -> Path:
     """Export CSV, TSV, JSON, or HTML, inferring format from the suffix by default."""
     selected = (format or Path(destination).suffix.lstrip(".")).lower()
@@ -319,4 +568,4 @@ def export_results(
     if selected not in writers:
         raise ValueError("Choose a CSV, TSV, JSON, or HTML export format.")
     return writers[selected](records, destination, selected_ids=selected_ids,
-                             highlight_clusters=highlight_clusters)
+                             highlight_clusters=highlight_clusters, investigation=investigation)

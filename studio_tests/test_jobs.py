@@ -113,10 +113,11 @@ def test_per_sample_full_cds_and_exact_route_explicitly(qtbot, tmp_path, scheme_
     import copy
     calls = []
     real = jobs.call_assembly
-    def cg(path, scheme, cancelled, progress, genetic_code):
+    def cg(path, scheme, cancelled, progress, genetic_code, threads):
         calls.append('full_cds')
         assert callable(cancelled)
         assert genetic_code == 11
+        assert 1 <= threads <= 2
         return real(path, scheme, cancelled=cancelled, progress=progress)
     monkeypatch.setattr(jobs, 'call_cgassembly', cg)
     first = sample(tmp_path, 'sample.fa', f'>a\n{ARC1}\n>b\n{GYR1}\n', 'first')

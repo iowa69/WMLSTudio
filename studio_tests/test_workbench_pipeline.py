@@ -91,6 +91,17 @@ def test_launch_review_does_not_allow_unavailable_amr_runtime(qtbot, monkeypatch
     assert dialog.plan["thresholds"]["protein_min_coverage"] == 90
 
 
+def test_launch_review_keeps_resource_controls_in_collapsed_advanced(qtbot):
+    dialog = RunPlanDialog([{"id": "one", "name": "Reviewed isolate"}])
+    qtbot.addWidget(dialog)
+    dialog.show()
+    assert not dialog.advanced.isVisible()
+    assert "samples" in dialog.resource_summary.text()
+    dialog.advanced_button.setChecked(True)
+    assert dialog.advanced.isVisible()
+    assert dialog.threads.isVisible() and dialog.memory.isVisible()
+
+
 def test_typing_storage_and_hydra_execute_in_order_with_stable_ids(window, qtbot, tmp_path, monkeypatch):
     import wmlstudio.hydra_runtime as runtime
     source = tmp_path / "isolate.fasta"
@@ -222,6 +233,7 @@ def test_stale_amr_is_visible_as_archived_not_current_matrix_or_report(window, t
     report = hydra_report(tmp_path, identifier)
     report["execution_provenance"]["inputs"] = [{"path": str(source), "sha256": original_hash}]
     link_hydra(window.project, report, {identifier: identifier})
+    window.feature_ids = {identifier}
     window.refresh()
     assert window.amr_model.rows[0]["blaTEST"] == "Present"
     source.write_text(">contig\nTTTTCCCC\n")

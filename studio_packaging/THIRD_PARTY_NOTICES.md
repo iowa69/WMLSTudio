@@ -54,6 +54,30 @@ The snapshot is static: the application makes no automatic database downloads.
 
 ## Added native analysis components
 
+SKA2 0.5.1 is Apache-2.0, with original LICENSE/NOTICE retained in `Tools/ska2`.
+The Windows build uses pinned source `fcf9413d2768dc6538d31f664a4bf310651449e7`,
+Rust 1.90.0 and a static Microsoft C runtime; its manifest, Cargo.lock,
+vendored dependency sources/notices and exact source archive travel together.
+The Linux tool is the separate official upstream Linux release, hash-pinned
+with its original notices and source snapshot; the Windows dependency lock
+is not represented as the Linux build's lock. SKA2 split-kmer SNP distances
+are a separate assay, not cgMLST allele distances or a transmission verdict.
+
+FastQC 0.12.1 is the original Babraham distribution, pinned to the binary
+archive checksum in `Tools/fastqc/manifest.json`. It is GPL-3.0-or-later;
+its GPL and component license texts remain in that directory. The exact
+upstream source revision `e7ef390bf10382f60786bdd0cf28abd4f8683ffd` is included
+under `Tools/fastqc/sources`. Bundled JAR archives retain their component
+license/NOTICE resources; FastQC is not represented as MIT software.
+FastQC runs in its own process with app-local Eclipse Temurin OpenJDK
+17.0.20.1+1, without requiring a system Java installation. The original
+JRE legal tree, NOTICE, release information and complete matching OpenJDK
+source archive accompany it. OpenJDK is GPL-2.0 with the Classpath Exception
+and applicable additional component terms; consult `Tools/fastqc/jre/legal`.
+No custom QC calculation is labeled FastQC, and FastQC reports do not imply
+automatic trimming or clinical suitability. The full source archives are
+intentionally retained despite the additional portable archive size.
+
 HYDRA 1.4.0 is bundled from the pinned source revision
 [`6d36c109491c16544e8919fe6962b4b62e97d3d7`](https://github.com/iowa69/hydra/tree/6d36c109491c16544e8919fe6962b4b62e97d3d7)
 under its MIT license. Its original assembly calling pipeline runs in the

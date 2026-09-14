@@ -13,6 +13,7 @@ dependencies = [
     "hydra-amr",
     "pyahocorasick>=2.1,<3",
     "pyrodigal>=3.6,<4",
+    "pyskani==0.2.0",
 ]
 
 [project.gui-scripts]

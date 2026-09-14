@@ -103,3 +103,4 @@ studio_packaging/generated_notices/
 *.wmlstudio-journal
 *.wmlstudio.lock
 artifacts/
+src/wmlstudio/resources/characterization/

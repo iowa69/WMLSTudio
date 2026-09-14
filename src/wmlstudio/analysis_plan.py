@@ -14,10 +14,13 @@ from PySide6.QtWidgets import (
     QHBoxLayout,
     QLineEdit,
     QPushButton,
+    QScrollArea,
     QSpinBox,
     QVBoxLayout,
+    QWidget,
 )
 
+from wmlstudio.scheduler import GIB, detect_hardware, plan_resources
 from wmlstudio.ui_common import cell, make_table, organism_for
 from wmlstudio.widgets import label
 
@@ -30,7 +33,14 @@ class RunPlanDialog(QDialog):
         self.setWindowTitle("Review analysis plan")
         self.resize(850, 670)
         self.plan = {}
-        layout = QVBoxLayout(self)
+        self.hardware = detect_hardware()
+        outer = QVBoxLayout(self)
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        content = QWidget()
+        layout = QVBoxLayout(content)
+        scroll.setWidget(content)
+        outer.addWidget(scroll)
         layout.addWidget(label(f"Run plan · {len(samples)} sample inputs", "title"))
         layout.addWidget(
             label(
@@ -58,6 +68,12 @@ class RunPlanDialog(QDialog):
         layout.addWidget(label("Typing / quality", "cardTitle"))
         self.assemble = QCheckBox("Assemble paired short reads with SKESA before typing")
         layout.addWidget(self.assemble)
+        from wmlstudio.fastqc import runtime_capabilities as fastqc_capabilities
+        fastqc = fastqc_capabilities()
+        self.fastqc = QCheckBox("Generate complete FastQC read reports (no trimming)")
+        self.fastqc.setEnabled(fastqc["available"])
+        self.fastqc.setToolTip(fastqc["message"])
+        layout.addWidget(self.fastqc)
         layout.addWidget(
             label(
                 "Assemblies follow the assigned MLST workflow; additional cgMLST/wgMLST schemes are selected in Compare. FASTQ inputs receive quality checks unless assembled first.",
@@ -67,7 +83,15 @@ class RunPlanDialog(QDialog):
         )
         self.hydra = QCheckBox("Also run HYDRA AMR analysis on the selected assemblies")
         layout.addWidget(self.hydra)
-        form = QFormLayout()
+        self.resource_summary = label("", "small", True)
+        layout.addWidget(self.resource_summary)
+        self.advanced_button = QPushButton("Advanced settings…")
+        self.advanced_button.setCheckable(True)
+        layout.addWidget(self.advanced_button)
+        self.advanced = QWidget()
+        form = QFormLayout(self.advanced)
+        self.advanced.setVisible(False)
+        self.advanced_button.toggled.connect(self.advanced.setVisible)
         self.database = QLineEdit(str(db_root or ""))
         database_row = QHBoxLayout()
         database_row.addWidget(self.database)
@@ -105,15 +129,38 @@ class RunPlanDialog(QDialog):
             self.threshold_controls[key] = field
         form.addRow("AMR thresholds", thresholds)
         self.threads = QSpinBox()
-        self.threads.setRange(1, 64)
-        self.threads.setValue(4)
-        form.addRow("CPU threads", self.threads)
+        self.threads.setRange(1, self.hardware.cpus)
+        self.threads.setValue(min(4, self.hardware.cpus))
+        form.addRow("Threads per sample", self.threads)
         self.memory = QSpinBox()
         self.memory.setRange(3, 512)
-        self.memory.setValue(8)
+        self.memory.setValue(3)
         self.memory.setSuffix(" GB")
-        form.addRow("Assembly memory limit", self.memory)
-        layout.addLayout(form)
+        form.addRow("RAM reservation per sample", self.memory)
+        self.resource_policy = QComboBox()
+        for title, value in [("Balanced", "balanced"), ("Fast · smaller RAM reserve", "fast"),
+                             ("Low memory · one sample at a time", "low_memory")]:
+            self.resource_policy.addItem(title, value)
+        form.addRow("Scheduling policy", self.resource_policy)
+        resource_row = QHBoxLayout()
+        self.cpu_budget = QSpinBox()
+        self.cpu_budget.setRange(1, self.hardware.cpus)
+        self.cpu_budget.setValue(self.hardware.cpus)
+        resource_row.addWidget(label("Total CPU budget", "small"))
+        resource_row.addWidget(self.cpu_budget)
+        self.parallel = QSpinBox()
+        self.parallel.setRange(0, self.hardware.cpus)
+        self.parallel.setSpecialValueText("Automatic")
+        resource_row.addWidget(label("Concurrent samples", "small"))
+        resource_row.addWidget(self.parallel)
+        form.addRow("Queue limits", resource_row)
+        layout.addWidget(self.advanced)
+        self.resource_feedback = label("", "small", True)
+        form.addRow(self.resource_feedback)
+        for field in (self.threads, self.memory, self.cpu_budget, self.parallel):
+            field.valueChanged.connect(self.refresh_resources)
+        self.resource_policy.currentIndexChanged.connect(self.refresh_resources)
+        self.refresh_resources()
         self.feedback = label(
             "No databases are downloaded during analysis. AMR detections are sequence evidence, not measured susceptibility.",
             "small",
@@ -128,12 +175,33 @@ class RunPlanDialog(QDialog):
         actions.button(QDialogButtonBox.StandardButton.Ok).setText("Start analysis")
         actions.accepted.connect(self.accept)
         actions.rejected.connect(self.reject)
-        layout.addWidget(actions)
+        outer.addWidget(actions)
 
     def browse_database(self):
         path = QFileDialog.getExistingDirectory(self, "Select HYDRA reference snapshot")
         if path:
             self.database.setText(path)
+
+    def calculate_resources(self):
+        return plan_resources(threads_per_sample=self.threads.value(), memory_gb=self.memory.value(),
+                              cpu_budget=self.cpu_budget.value(), max_parallel=self.parallel.value() or None,
+                              policy=self.resource_policy.currentData(), hardware=self.hardware)
+
+    def refresh_resources(self):
+        try:
+            plan = self.calculate_resources()
+            self.resource_summary.setText(
+                f"Automatic queue: up to {plan.max_parallel} samples × {plan.threads_per_sample} threads. "
+                "CPU and available memory are checked again when work starts.")
+            available = f"{self.hardware.available_memory / GIB:.1f} GiB available" if self.hardware.available_memory is not None else "RAM unavailable: single-job fallback"
+            self.resource_feedback.setText(
+                f"Detected {self.hardware.cpus} available CPUs · {available}. "
+                f"Up to {plan.max_parallel} samples × {plan.threads_per_sample} threads; "
+                f"{plan.memory_gb} GiB reserved per sample, {plan.reserve_gb:.1f} GiB left for other work. "
+                "RAM is an admission estimate, not an OS-enforced process limit. Cancellation remains available.")
+        except ValueError as exc:
+            self.resource_summary.setText(str(exc))
+            self.resource_feedback.setText(str(exc))
 
     def refresh_databases(self):
         from wmlstudio.hydra_runtime import installed_databases
@@ -149,6 +217,11 @@ class RunPlanDialog(QDialog):
             self.feedback.setText(str(exc))
 
     def accept(self):
+        try:
+            allocation = self.calculate_resources()
+        except ValueError as exc:
+            self.feedback.setText(str(exc))
+            return
         if self.assemble.isChecked():
             from wmlstudio.assembly import resolve_skesa
             try:
@@ -174,6 +247,7 @@ class RunPlanDialog(QDialog):
                 return
         choice = self.database_choice.currentData()
         self.plan = {
+            "fastqc": self.fastqc.isChecked(),
             "hydra": self.hydra.isChecked(),
             "assemble": self.assemble.isChecked(),
             "memory_gb": self.memory.value(),
@@ -183,5 +257,6 @@ class RunPlanDialog(QDialog):
             "point_mutations": self.point_mutations.isChecked(),
             "thresholds": {key: field.value() for key, field in self.threshold_controls.items()},
             "threads": self.threads.value(),
+            "resource_plan": allocation.to_dict(),
         }
         super().accept()

@@ -1,4 +1,4 @@
-param([string]$SchemeSource = "", [string]$HydraSource = "", [string]$SkesaSource = "", [switch]$SkipTests)
+param([string]$SchemeSource = "", [string]$HydraSource = "", [string]$SkesaSource = "", [string]$SkaSource = "", [switch]$SkipTests)
 $ErrorActionPreference = "Stop"
 $projectRoot = Split-Path -Parent $PSScriptRoot
 Push-Location $projectRoot
@@ -14,6 +14,15 @@ try {
         & uv run python studio_scripts/stage_schemes.py --download
     }
     if ($LASTEXITCODE -ne 0) { throw "Scheme staging failed" }
+    & uv run python studio_scripts/stage_characterization.py
+    if ($LASTEXITCODE -ne 0) { throw "Characterization reference staging failed" }
+    & uv run python studio_packaging/stage_fastqc.py --platform windows-x64
+    if ($LASTEXITCODE -ne 0) { throw "FastQC and private Java staging failed" }
+    $env:WMLSTUDIO_TEST_FASTQC_ROOT = Join-Path $projectRoot "src/wmlstudio/resources/tools/fastqc"
+    $skaArguments = @("studio_packaging/stage_ska.py", "--platform", "windows-x64")
+    if ($SkaSource) { $skaArguments += @("--source", $SkaSource) }
+    & uv run python @skaArguments
+    if ($LASTEXITCODE -ne 0) { throw "A verified native SKA2 bundle is required. Supply -SkaSource from the native Windows SKA2 workflow artifact." }
     if ($HydraSource) {
         & uv run python studio_packaging/stage_bio_tools.py --platform windows-x64 --hydra-source $HydraSource
     } else {
