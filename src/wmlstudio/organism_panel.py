@@ -29,12 +29,13 @@ PANEL_FORMAT_VERSION = 1
 PANEL_DIRECTORY = 'species-panel'
 PANEL_PREFIX = 'species-panel-'
 # The snapshot identity: bump this when the pinned accession set changes.
-PANEL_REVISION = 'ncbi-refseq-species-panel-2026-09-14'
+PANEL_REVISION = 'ncbi-refseq-species-panel-2026-09-14.2'
 NCBI_BASE = 'https://ftp.ncbi.nlm.nih.gov/genomes/all/'
 MAX_FILE_BYTES = 16 * 1024 * 1024
 MAX_TOTAL_BYTES = 64 * 1024 * 1024
 PANEL_LIMITATIONS = (
-    'One reference per taxon is a triage panel, not a representation of within-species diversity.',
+    'A small reference set is a triage panel, not a representation of within-species diversity.',
+    'Most taxa carry one reference. L. monocytogenes carries two, because its lineages straddle the 95% ANI species line and one reference leaves common genomes unresolved. Other species with comparable internal diversity may be under-covered in the same way.',
     'This panel does not distinguish Escherichia coli from Shigella.',
     'An organism folder created from these labels records where a copy is stored; it is not a laboratory identification.',
     'Organism names are the labels NCBI records for these assemblies; they were not independently verified here.',
@@ -42,7 +43,7 @@ PANEL_LIMITATIONS = (
 LICENSE_NOTICE = (
     'NCBI RefSeq genome records. NCBI places no restrictions on the use or distribution of '
     'these data, although individual submitters may retain rights in their submissions. '
-    'This panel is one assembly per taxon and is not an exhaustive species database.'
+    'This panel is a small curated set, mostly one assembly per taxon, and is not an exhaustive species database.'
 )
 # (accession, assembly_dir, genus, species, strain, gz_bytes, gz_sha256, fasta_sha256)
 # Every row was fetched from the NCBI FTP path below, its published MD5 recomputed
@@ -87,6 +88,14 @@ SPECIES_PANEL = (
     ('GCF_000008285.1', 'GCF_000008285.1_ASM828v1', 'Listeria', 'monocytogenes', '4b F2365', 857567,
      'd2684c7aa24f9373c2ee02510b6c9ef1e0d0b6c1ccaaa6a88063b96d76d244b5',
      '999b109bccfb358ed50a1382ee3839e4449cee04849480456fd7b31d8a98a582'),
+    # A second L. monocytogenes reference, deliberately. Lineages I and II sit
+    # either side of the 95% ANI species line: a lineage II genome measured only
+    # 94.83% against the 4b F2365 reference above and was correctly, but
+    # unhelpfully, left unresolved. 10403S is lineage II serotype 1/2a and is not
+    # the EGD-e genome in the practice cohort, so the match is not a self-match.
+    ('GCF_000168695.2', 'GCF_000168695.2_ASM16869v2', 'Listeria', 'monocytogenes', '1/2a 10403S', 856931,
+     '2be4f2809f0f487da4b7673c80c8ada7ac9b99ca4d7e09170d855ed34b3a3251',
+     '5d030d46e3104a3e014809ca352e5d9d64724b4566fba87a33239e2e7d23a30f'),
     ('GCF_000009105.1', 'GCF_000009105.1_ASM910v1', 'Neisseria', 'meningitidis', 'Z2491', 629571,
      '7c36f924111f1122d592815fb271fa3e159623bdc0caaa92c4eeed09520b830e',
      '2f138b39ace68b954ec807ae32785224c1d9e6b36013abc9649841f7e8a418dd'),

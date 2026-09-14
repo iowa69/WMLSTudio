@@ -54,7 +54,8 @@ def mirrored(tmp_path, monkeypatch):
 
 
 def test_every_pinned_row_is_a_complete_verifiable_record():
-    assert len(SPECIES_PANEL) == 17
+    # A literal count, so adding or losing a reference is a deliberate edit.
+    assert len(SPECIES_PANEL) == 18
     assert len({row[0] for row in SPECIES_PANEL}) == len(SPECIES_PANEL)
     assert len({row[1] for row in SPECIES_PANEL}) == len(SPECIES_PANEL)
     for accession, assembly_dir, genus, species, strain, size, gz_sha, fasta_sha in SPECIES_PANEL:
@@ -65,7 +66,13 @@ def test_every_pinned_row_is_a_complete_verifiable_record():
         assert re.fullmatch(r"[0-9a-f]{64}", gz_sha) and re.fullmatch(r"[0-9a-f]{64}", fasta_sha)
         assert gz_sha != fasta_sha
     assert sum(row[5] for row in SPECIES_PANEL) < organism_panel.MAX_TOTAL_BYTES
-    assert len({(row[2], row[3]) for row in SPECIES_PANEL}) == len(SPECIES_PANEL)
+    # A taxon may carry more than one reference where its lineages straddle the
+    # species line, but never the same strain twice, and the exceptions are named
+    # so a second reference elsewhere has to be a deliberate edit.
+    assert len({(row[2], row[3], row[4]) for row in SPECIES_PANEL}) == len(SPECIES_PANEL)
+    repeated = {(row[2], row[3]) for row in SPECIES_PANEL
+                if sum(1 for other in SPECIES_PANEL if other[2:4] == row[2:4]) > 1}
+    assert repeated == {("Listeria", "monocytogenes")}
     assert len({row[2] for row in SPECIES_PANEL}) >= 13
 
 
@@ -82,7 +89,7 @@ def test_the_manifest_states_the_panels_limits_and_never_claims_a_species_databa
     manifest = panel_manifest("pinned_https")
     assert manifest["license_notice"] == LICENSE_NOTICE and "RefSeq" in LICENSE_NOTICE
     assert list(PANEL_LIMITATIONS) == manifest["limitations"]
-    assert ("One reference per taxon is a triage panel, not a representation of "
+    assert ("A small reference set is a triage panel, not a representation of "
             "within-species diversity.") in manifest["limitations"]
     assert "This panel does not distinguish Escherichia coli from Shigella." in manifest["limitations"]
     assert all(entry["outgroup"] for entry in manifest["species"])
@@ -95,7 +102,7 @@ def test_a_provisioned_panel_validates_and_is_accepted_as_an_ani_database(tmp_pa
     report = provision_species_panel(tmp_path / "installed", source_root=mirrored)
     path = Path(report["path"])
     manifest = validate_characterization_references(path)
-    assert manifest["virulence"] == {} and len(manifest["species"]) == 17
+    assert manifest["virulence"] == {} and len(manifest["species"]) == len(SPECIES_PANEL)
     assert manifest["reference_digest"] == panel_digest(manifest) == report["reference_digest"]
     assert path.name == "species-panel-" + manifest["reference_digest"][:20]
     assert installed_species_panel(tmp_path) is None
@@ -182,8 +189,8 @@ def test_the_panel_fingerprint_is_stable_and_a_different_one_is_never_overwritte
 
 def test_verify_pins_reads_only_the_published_checksums(tmp_path, mirrored):
     report = verify_pins(source_root=mirrored)
-    assert report["checked"] == 17 and not report["missing"]
-    assert len(report["available"]) == 17
+    assert report["checked"] == len(SPECIES_PANEL) and not report["missing"]
+    assert len(report["available"]) == len(SPECIES_PANEL)
     row = organism_panel.SPECIES_PANEL[0]
     (mirrored / assembly_source(row[1], "md5checksums.txt")).write_text("\n")
     degraded = verify_pins(source_root=mirrored)
@@ -230,3 +237,22 @@ def test_the_real_pinned_panel_downloads_and_matches_every_hash(tmp_path):
         assert entry["sha256"] == pinned[accession][6]
         assert entry["uncompressed_sha256"] == pinned[accession][7]
         assert entry["bytes"] == pinned[accession][5]
+
+
+def test_listeria_carries_both_lineages_because_they_straddle_the_species_line():
+    """One reference per taxon silently fails where a species is internally diverse.
+
+    L. monocytogenes lineages I and II sit either side of the 95% ANI species
+    cutoff: a lineage II genome measured 94.83% against the lineage I reference
+    and was left unresolved, which is honest but useless to the user. Two
+    references fix that without weakening the ANI gate, which must not move.
+    """
+    from wmlstudio.organism_panel import SPECIES_PANEL
+    listeria = [row for row in SPECIES_PANEL if row[2] == "Listeria" and row[3] == "monocytogenes"]
+    assert len(listeria) == 2, "both L. monocytogenes lineages must be represented"
+    strains = {row[4] for row in listeria}
+    assert any("4b" in s for s in strains) and any("1/2a" in s for s in strains)
+    # Never a self-match against the practice cohort: that would prove nothing.
+    from wmlstudio.practice_cohorts import COHORTS
+    cohort = {row[0] for entry in COHORTS.values() for row in entry["genomes"]}
+    assert not cohort & {row[0] for row in SPECIES_PANEL}

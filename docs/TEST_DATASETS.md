@@ -147,6 +147,31 @@ hidden. What you should look for:
   imported and kept, not discarded and not renamed, and its original is never
   touched.
 
+### What running this cohort actually produced
+
+All twenty genomes were run against the staged species panel during development.
+Seventeen were proposed with genomic reference support; three were not, and each
+of those three is correct:
+
+| Isolate | Outcome | Why |
+| --- | --- | --- |
+| *Klebsiella variicola* | unresolved, 94.54% ANI | Species-complex member with no reference of its own. It was **not** called *K. pneumoniae*, which is the point of including it |
+| *Enterobacter cloacae* | unresolved | No species reference in the panel |
+| *Serratia marcescens* | unresolved | No species reference in the panel |
+
+*Escherichia coli* was proposed at 98.08% ANI but held at complex level, as
+described above.
+
+That run also found a real gap. *Listeria monocytogenes* EGD-e first came back
+**unresolved at 94.83% ANI**, because the panel held only a lineage I reference
+and the two *L. monocytogenes* lineages sit either side of the 95% ANI species
+line. The software was right to refuse — but for a listeriosis investigation it
+was useless. The fix was to add a second, lineage II reference to the panel
+rather than to lower the ANI gate, which would have traded a visible refusal for
+an invisible wrong answer. EGD-e now resolves at 99.03%. A species whose lineages
+are that divergent may be under-covered by one reference; that limitation is
+recorded in the panel's own manifest.
+
 Anything that reaches you as a folder name is a **filing decision**. It is not a
 laboratory identification, and it is not a susceptibility or virulence statement.
 Confirm the organism before any clinical interpretation.
