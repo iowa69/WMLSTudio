@@ -1,3 +1,61 @@
+# WMLSTudio 0.3 investigation revision — capability and reach
+
+Audit date: 2026-09-14. This revision adds the interconnected tab shell, adjustable
+display scaling, automatic organism filing, a registry of organism-specific typing
+modules, a dual-tree change comparison, a plain-language summary report, practice
+cohorts and a documented threshold catalogue.
+
+The **Reach** column says where each capability can actually be used, because a
+capability that exists only in `studio_tests` is not one a microbiologist has.
+
+| Capability | What is implemented | Boundary | Reach |
+| --- | --- | --- | --- |
+| Interconnected tabs | Seven keyed tabs, each with a purpose sentence, a next-step button and a per-tab help entry | Tab navigation is not a workflow guarantee; a tab can be opened out of order | Interface |
+| Shared focus and per-tab cohorts | Selection anywhere sets a visible focus with its origin and time; a tab adopts it only on an explicit button press, and states the cohort's provenance | Focus never writes a cohort; two tabs may legitimately hold different cohorts | Interface |
+| Display scaling | Text size 80–150% applied live; whole-interface scale applied before the application starts, offering only sizes the screen can show the whole window at; `--display-scale` recovery | High-DPI behaviour is not verified on a clean Windows 11 host. The graph text size is saved but not yet applied to the drawn graph | Interface, except the graph text scale |
+| Right-click actions | Twenty-nine handlers across fifteen views, with counts shown, single-selection actions disabled with a reason, and project-writing actions disabled while a job runs | Menu entries appear only where their handler exists | Interface |
+| Archive instead of delete | Archiving retains the row, results, analyses, history and the user's file; removal writes the full record and every analysis into history first and can be restored | An archived isolate is hidden from working views, not deleted, and is still carried by explicit project exports | Interface |
+| Automatic organism filing | Layered identification (broad ANI panel, focused complex panel, MLST panel compatibility) run before any copy is written, a reviewed proposal per file, `Genus/species` folders, a six-bucket `_Unresolved` tree, re-filing, manual override and CSV assignment import | A folder is a filing decision, not a laboratory identification; nothing below genus is ever auto-confirmed; originals are never moved | Interface |
+| Organism-specific modules | Registry with a three-state match rule; SCCmec typing, *Klebsiella* locus STs and *wzi*/*wzc* capsule markers; multi-source pinned staging with manifest format 2; plan-dialog selection, results column, drill-down, report section and CLI flags | Not equivalent to Kleborate, Kaptive, staphopia-sccmec or SCCmecFinder; mecC not assayed; no K locus inferred; a format 1 snapshot reports `not_run`, never a negative | Interface and command line |
+| Dual-tree change comparison | Baseline snapshot pointer, exact replay of a stored snapshot beside the current one, and a diff carrying distance, denominator, edge and cluster changes | Incomparable snapshots report "not assessed", never "no change"; an MST is not a phylogeny | Interface |
+| Simple summary report | Five-section plain-language layout with an embedded tree image, resistance genes, closest matches and a fixed limitations block | Two to four pages, not one; the susceptibility caveat cannot be switched off | Interface |
+| Practice cohorts and species panel | Two pinned public cohorts (10 single-species, 20 mixed-genus) and a 17-taxon species panel, downloaded and checksum-verified on request | No sequence enters the repository or the ZIP; no expected answer ships with either cohort | Interface and command line |
+| Threshold catalogue | 29 organisms listed, 28 entries, 7 cited sources; 8 organisms with a scheme-bound cutoff | No cutoff is ever auto-applied; 12 listed organisms have no curated cutoff; no bundled scheme can bind a cgMLST cutoff | Interface and [audit](THRESHOLDS.md) |
+| Flat exports | `organism_typing` as a single per-isolate field beside the AMR fields | Not implemented yet: the field is specified and not present in the CSV/TSV/JSON column set | Not yet reachable |
+
+Nothing in this table is a clinical validity claim, a benchmark result or a clean
+Windows 11 acceptance claim. The frozen-build checks described below are
+self-consistency controls against bundled references, not independent biological
+validation.
+
+## Frozen-build verification added in this revision
+
+`studio_packaging/check_frozen.py` now re-verifies the reference panels inside the
+built bundle rather than assuming staging succeeded:
+
+- The bundled characterization snapshot is re-hashed file by file in the frozen
+  bundle and its manifest fingerprint recomputed, so a panel truncated by
+  packaging fails the build instead of later reading as a negative assay result.
+- The report records the panel's format version, its per-source pinned revisions
+  and licences, and whether the organism-module sections are `staged` or `absent`
+  **with the reason**.
+- The organism-module registry is proved to have loaded inside the frozen process.
+  Its assay modules are reached through a computed import that the packaging
+  module scan cannot follow, so they are declared explicitly; without that, every
+  characterization run in the portable build would fail to import.
+- When the panel and the command line both support it, a SCCmec self-comparison
+  runs against the panel's own type IVa cassette reference. It is labelled
+  *bundled reference self-comparison; not an independent biological validation*,
+  exactly as the species control is.
+- Practice-cohort genomes and the broad species panel are rejected at packaging
+  time and their absence is re-checked in the built bundle. Both are the user's
+  own downloads and never travel in the ZIP.
+
+See [organism modules](ORGANISM_MODULES.md), [thresholds](THRESHOLDS.md) and
+[practice cohorts](TEST_DATASETS.md).
+
+---
+
 # WMLSTudio 0.2 capability and acceptance audit
 
 Audit date: 2026-09-12. The current workbench implements the following workflows.
@@ -66,6 +124,17 @@ The complete Kleborate/Kaptive, AMRFinderPlus, agr/SCCmec/spa, MOB-recon and
 abricate execution stack is not included. Species-complex resolution,
 contamination quantification, long-read assembly, fastp preprocessing, validated
 phenotype flags and multi-user clinical deployment remain separate work.
+
+The 0.3 organism modules narrow that gap without closing it, and the distinction
+matters. WMLSTudio runs its own exact-allele and BLAST+ screens against *pinned
+public reference data* from those projects; it does not execute those tools and
+does not reproduce their outputs. Kleborate's aggregate virulence and resistance
+scores are not computed. Kaptive's whole K and O locus references, its
+match-confidence grading and its O-locus special logic are not implemented, and
+the deferral is recorded with its reason in
+[organism modules](ORGANISM_MODULES.md). No SCCmec result is an MRSA designation,
+and mecC is outside the pinned panel entirely. spa typing, agr typing and
+MOB-recon remain absent.
 
 cgMLST.org data are **not bundled**. Its
 [server policy](https://www.cgmlst.org/serverpolicy.html) restricts use and requires

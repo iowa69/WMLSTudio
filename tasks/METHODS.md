@@ -146,3 +146,103 @@ restartable drivers, explicit assay states, alternative hypotheses and distincti
 between computational evidence and clinical inference. The original project
 layout is preserved. This section will record validation commands and evidence
 as the implementation progresses; older recorded runs below are historical.
+
+## Acceptance revision: reference panels, packaging and attribution — 2026-09-14
+
+### Pinned upstream sources
+
+Three repositories now supply reference data, each pinned to one commit, each
+fetched with its own `LICENSE`, and each recorded in the staged manifest's
+`sources` block with repository, revision and licence identifier.
+
+| Source | Revision | Licence | Staged content |
+| --- | --- | --- | --- |
+| klebgenomics/Kleborate | `550ce22a2c01c76064f4dabf403704ee2293356e` | GPL-3.0-or-later | Species references, virulence allele FASTAs, five locus-ST `profiles.tsv` |
+| rpetit3/sccmec v1.2.0 | `b901cc618be8eb17284ccb0cf6ef9ee428d909c3` | MIT | 20 target FASTAs, 32 cassette regions, rule document and cross-check table |
+| klebgenomics/Kaptive v2.0.9 | `b3856eac6e76b3017aa993319da2a8ea967a1ba0` | GPL-3.0-or-later | `wzi` (484 alleles) and `wzc` (120 alleles) only |
+
+The Kleborate `LICENSE` staged in the current tree is 35,141 bytes, SHA-256
+`589ed823e9a84c56feb95ac58e7cf384626b9cbf4fda2a907bc36e103de1bad2`. The
+rpetit3/sccmec `LICENSE` is 1,076 bytes, SHA-256
+`5545cae984ae5abd56b68d66ddf1811be5219ec3804c237da14a9eee067d0e82`. The Kaptive
+licence hash is recorded in the manifest when that source is staged; it is not
+restated here from memory. All three entries are now in
+`studio_packaging/THIRD_PARTY_NOTICES.md`, which the build gates on. Kleborate
+data were already shipping unattributed before this revision.
+
+Genome references for identification and practice come from NCBI RefSeq and are
+**not redistributed**: only accession and checksum tables are held in this
+repository. The broad species panel is pinned as revision
+`ncbi-refseq-species-panel-2026-09-14` (17 taxa, about 15.7 MiB). The practice
+cohorts are pinned by content digest over their accession tables:
+`kpneumoniae-10`, 10 assemblies, 16,746,561 bytes, digest
+`238aae60e7f48449aec656cf4e4a500c6ad0136d6e9dc71ecf4fee3c545e6dbc`;
+`mixed-genus-20`, 20 assemblies, 21,703,421 bytes, digest
+`459071d13922ec70677618e35c5ddab0b1629cf46a8fec6b53424e3b8a5b5b97`.
+
+### Reference manifest format 2
+
+`reference_digest` now selects its fingerprinted key tuple by
+`format_version`, so an installed format 1 snapshot keeps its original digest
+byte for byte while format 2 additionally covers `sources`, `locus_profiles`,
+`sccmec` and `capsule`. A format 2 manifest must declare all four even when
+empty, so a section cannot be silently stripped. On a format 1 snapshot the
+organism modules report `not_run` naming the missing section — a diagnosable
+reference state, deliberately distinct from a negative assay result.
+
+The starter staged in this tree is still format 1 (38,856,523 stored bytes, 15
+species references, 6 virulence loci, digest
+`9ecdd7207af2c43634d643d017dbdd7cdd3a3baf21abdf950f08daae6fa8d964`). Measured
+size delta for a format 2 re-stage is about +3.0 MB, not the +1.6 MB first
+estimated: the manifest retains every upstream file verbatim for auditability
+*and* stages the derived splits.
+
+```sh
+python studio_scripts/stage_characterization.py --destination <a fresh path>
+python studio_scripts/stage_species_panel.py --verify-pins
+python studio_scripts/fetch_practice_cohort.py --cohort mixed-genus-20 --verify-pins
+```
+
+`stage_snapshot` refuses to replace an existing snapshot with a different digest,
+so a re-stage goes to a fresh directory and is swapped in.
+
+### Packaging gates added
+
+- The bundled characterization snapshot is re-hashed file by file and its
+  manifest fingerprint recomputed **before** it is copied into the bundle, and
+  again inside the frozen bundle by `check_frozen.py`.
+- `organism_modules._load` reaches its assay modules through
+  `__import__(f"{__package__}.{name}")`. Verified by disassembly: `_load` emits no
+  `IMPORT_NAME` opcode, and an AST scan of the whole package finds no static
+  reference to `sccmec_evidence` or `klebsiella_evidence`. PyInstaller therefore
+  could not see them, and because `characterize_assembly` calls `module_tasks`
+  unconditionally, **every** characterization run in the frozen build would have
+  raised `ModuleNotFoundError` — including the existing frozen species control.
+  The spec now derives the hidden imports from `runner.__module__` over the live
+  registry, so a new assay module cannot be forgotten.
+- The build refuses to package a practice cohort or a staged broad species panel,
+  and `check_frozen.py` re-checks their absence in the built bundle.
+- `check_frozen.py` records the panel's format version, per-source pins and
+  whether the organism-module sections are staged, and runs a SCCmec
+  self-comparison against the panel's own type IVa cassette reference when the
+  panel and the command line both support it. It is labelled a bundled reference
+  self-comparison, not an independent biological validation, exactly as the
+  species control is.
+
+`pyyaml` is declared in `[dependency-groups] dev` only: the SCCmec rule document
+is parsed at staging time and the derived rules live in the reference manifest,
+so no YAML is read at runtime or inside the frozen bundle. **`uv.lock` still has
+to be regenerated for it**; `uv sync --locked` and the characterization staging
+step in CI both fail until that happens.
+
+### Threshold catalogue audit
+
+Audited against `threshold_guidance.py` at catalogue version `2026-09-12.1`:
+29 organisms listed, 28 entries, 7 cited sources, 17 organisms with at least one
+entry. Eight organisms have a cutoff bound to a named scheme and target count and
+can therefore supply an approved threshold; nine more carry a published number
+that `record_decision` refuses because no scheme is bound; twelve listed organisms
+have no entry at all. No number is auto-applied, and none of the 162 bundled
+schemes (all classical, seven to ten loci) can bind a cgMLST cutoff. The full
+per-organism audit, including the paediatric gaps, is in `docs/THRESHOLDS.md`.
+No threshold was added or invented in this revision.

@@ -191,3 +191,28 @@ def test_failed_rerun_does_not_upgrade_saved_hash_match_to_current_evidence(tmp_
         link_hydra(project, upstream, {'isolate': sid})
         project.set_status(sid, 'failed', 'Current typing attempt failed')
         assert hydra_evidence_status(project.get_sample(sid))['status'] == 'unverified'
+
+
+def test_organism_evidence_does_not_displace_the_hydra_provenance_fields(tmp_path):
+    """Both records reach the same row, so neither may overwrite the other's fields.
+
+    The organism decision and the HYDRA evidence are separate provenance: one says
+    how a label was chosen, the other says which report an AMR gene came from and
+    against which input hash. A row that quietly dropped the second would make an
+    unverifiable AMR call look like a sourced one.
+    """
+    with Project(tmp_path / 'study.sqlite') as project:
+        sid = add(project, tmp_path / 'assembly.fa', 'isolate')
+        project.set_result(sid, {'input_sha256': 'a' * 64, 'st': '7'})
+        upstream = report('isolate')
+        upstream['execution_provenance'] = {'inputs': [{'sha256': 'a' * 64}]}
+        link_hydra(project, upstream, {'isolate': sid})
+        project.update_metadata(sid, {'organism_evidence': {
+            'basis': 'reference_ani', 'confidence': 'strong', 'status': 'resolved'}})
+        fields = feature_fields(project.get_sample(sid))
+        assert fields['organism_basis'] == 'reference_ani'
+        assert fields['organism_confidence'] == 'strong'
+        assert fields['organism_status'] == 'resolved'
+        assert fields['hydra_source_sample'] == 'isolate'
+        assert fields['hydra_report_sha256'] == 'abc'
+        assert fields['hydra_amr_genes'] == 1

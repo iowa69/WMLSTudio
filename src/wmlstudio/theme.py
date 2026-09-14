@@ -126,6 +126,17 @@ QTabWidget::pane { border: 1px solid #354A65; background: #121E30; }
 QTabBar::tab { background: #152236; color: #A0B1C5; padding: 9px 15px; border-bottom: 2px solid transparent; }
 QTabBar::tab:selected { background: #20374A; color: #86EDD7; border-bottom-color: #48DCC0; }
 QTabBar::tab:hover { background: #24394F; }
+/* Scoped to the workspace tab bar by id, and written without descendant
+   selectors: Qt re-polishes every live widget on setStyleSheet, and a
+   descendant rule makes that walk every ancestor chain. */
+QTabWidget#workspaceTabs::pane { border: none; border-top: 1px solid #25354C; background: #0B1220; }
+QTabBar#workspaceTabBar { background: transparent; }
+QTabBar#workspaceTabBar::tab { background: transparent; padding: 8px 12px; font-weight: 600; }
+QTabBar#workspaceTabBar::tab:selected { background: #142739; color: #86EDD7; }
+QFrame#purposeStrip { background: #101B2C; border: 1px solid #25354C; border-radius: 9px; }
+QLabel#purpose { color: #C2D3E6; font-size: 12px; }
+QLabel#cohortScope { color: #86EDD7; font-size: 11px; background: transparent; }
+QPushButton#nextStep, QPushButton#pageGuide, QPushButton#cohortAdopt { padding: 4px 10px; font-size: 12px; }
 QStatusBar { background: #0F1929; color: #A0B1C5; border-top: 1px solid #25354C; font-size: 11px; }
 QStatusBar::item { border: none; }
 QSplitter::handle { background: #2B3C54; width: 2px; height: 2px; }

@@ -283,3 +283,51 @@ def test_cli_export_cannot_overwrite_original_sequence(typing_inputs, format):
     assert completed.returncode == 1
     assert first.read_bytes() == original
     assert "Traceback" not in completed.stderr
+
+
+def test_cli_lists_organism_modules_with_their_taxa_and_stated_limits():
+    listed = cli("characterize", "--list-modules")
+    assert listed.returncode == 0, listed.stderr
+    document = json.loads(listed.stdout)
+    modules = {entry["key"]: entry for entry in document["modules"]}
+    assert {"sccmec", "klebsiella_locus_st", "klebsiella_capsule"} <= set(modules)
+    assert modules["sccmec"]["genera"] == ["Staphylococcus"]
+    assert modules["sccmec"]["species"] == ["aureus"]
+    assert modules["klebsiella_capsule"]["genera"] == ["Klebsiella"]
+    for entry in modules.values():
+        assert "does not establish" in entry["purpose"]
+        assert entry["limitations"]
+    # The claim boundary is printed where a command-line user actually sees it.
+    for project in ("Kleborate", "Kaptive", "AMRFinderPlus", "SCCmecFinder"):
+        assert project in document["boundary"]
+    assert "none is equivalent to those tools" in document["boundary"]
+
+
+def test_cli_module_selection_records_applicability_and_never_fakes_a_negative(tmp_path):
+    source = tmp_path / "assembly.fasta"
+    source.write_text(">contig\nACGTACGTACGT\n")
+    completed = cli("characterize", source, "--no-species", "--no-virulence",
+                    "--module", "sccmec", "--organism", "Staphylococcus aureus")
+    assert completed.returncode == 0, completed.stderr
+    output = json.loads(completed.stdout)
+    assert output["sccmec"]["applicability"] == "recommended"
+    assert output["sccmec"]["status"] == "not_run"
+    # A snapshot without the panel is diagnosable, not a negative SCCmec result.
+    assert "sccmec.targets" in output["sccmec"]["reason"]
+    assert "not_detected" not in json.dumps(output["sccmec"])
+    assert output["klebsiella_capsule"]["applicability"] == "off_panel"
+    assert output["klebsiella_capsule"]["reason"] == "Assay not selected."
+
+
+def test_cli_rejects_an_unknown_module_key_without_a_traceback(tmp_path):
+    source = tmp_path / "assembly.fasta"
+    source.write_text(">contig\nACGT\n")
+    rejected = cli("characterize", source, "--module", "kleborate")
+    assert rejected.returncode == 1
+    assert "Unknown organism module kleborate" in rejected.stderr
+    assert "klebsiella_locus_st" in rejected.stderr
+    assert "Traceback" not in rejected.stderr
+    assert rejected.stdout == ""
+    without_input = cli("characterize")
+    assert without_input.returncode == 1
+    assert "--list-modules" in without_input.stderr and "Traceback" not in without_input.stderr

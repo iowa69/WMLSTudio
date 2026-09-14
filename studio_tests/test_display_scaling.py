@@ -187,3 +187,135 @@ def test_scaling_is_a_viewing_preference_and_says_so_where_the_user_reads_it():
     assert "same on every computer" in display.EXPORT_NOTICE
     assert "cannot fit the whole window" in display.HIDDEN_CHOICES_NOTICE
     assert set(display.ROUNDING) == set(display.ROUNDING_LABELS)
+
+
+# ---------------------------------------------------------------------------
+# The Settings tab: the same controls, on a real window, writing to the two
+# different preference files this application deliberately keeps apart.
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def window(qtbot, tmp_path):
+    from wmlstudio.app import MainWindow
+    widget = MainWindow(storage_root=tmp_path / "workspace")
+    qtbot.addWidget(widget)
+    yield widget
+    widget.close()
+
+
+@pytest.fixture
+def big_screen(monkeypatch):
+    """Offer every scale: the offscreen platform reports a screen too small for any."""
+    monkeypatch.setattr(display, "available_scale_choices", lambda size: display.SCALE_CHOICES)
+
+
+def panel(window, tmp_path):
+    from wmlstudio.interface_settings import InterfaceSettingsPanel
+    return InterfaceSettingsPanel(window, display_root=tmp_path / "dataroot")
+
+
+def test_the_settings_tab_hosts_the_same_panel_the_dialog_shows(window):
+    from wmlstudio.interface_settings import InterfaceSettingsDialog, InterfaceSettingsPanel
+    assert isinstance(window.interface_panel, InterfaceSettingsPanel)
+    assert window.settings_tabs.widget(0) is window.interface_panel
+    dialog = InterfaceSettingsDialog(window)
+    assert isinstance(dialog.panel, InterfaceSettingsPanel)
+    assert dialog.scale.currentData() == window.ui_scale
+    dialog.close()
+    dialog.deleteLater()
+
+
+def test_only_scales_this_screen_can_show_the_whole_window_at_are_offered(window, tmp_path,
+                                                                          monkeypatch):
+    monkeypatch.setattr(display, "available_scale_choices", lambda size: (100, 125, 150))
+    control = panel(window, tmp_path)
+    assert [control.display_scale.itemData(index)
+            for index in range(control.display_scale.count())] == [0, 125, 150]
+    assert control.hidden_notice.isVisibleTo(control) is True
+    assert "cannot fit the whole window" in control.hidden_notice.text()
+
+
+def test_every_scale_is_offered_when_the_screen_can_show_them(window, tmp_path, big_screen):
+    control = panel(window, tmp_path)
+    offered = [control.display_scale.itemData(index)
+               for index in range(control.display_scale.count())]
+    assert offered == [0, *[value for value in display.SCALE_CHOICES if value != 100]]
+    assert control.hidden_notice.isVisibleTo(control) is False
+
+
+def test_choosing_a_whole_interface_scale_is_saved_and_waits_for_a_restart(window, tmp_path,
+                                                                          big_screen):
+    control = panel(window, tmp_path)
+    before = window.ui_scale
+    assert control.restart_notice.isVisibleTo(control) is False
+    control.display_scale.setCurrentIndex(control.display_scale.findData(150))
+    assert display.read_display_settings(tmp_path / "dataroot") == {
+        "mode": "fixed", "scale_percent": 150, "rounding": "exact"}
+    assert control.restart_notice.isVisibleTo(control) is True
+    assert "Close and reopen" in control.restart_notice.text()
+    # A display scale is not a text scale: nothing about the running interface moved.
+    assert window.ui_scale == before
+
+
+def test_the_text_scale_stays_with_the_project_and_the_display_scale_with_the_data_root(
+        window, tmp_path, big_screen):
+    from wmlstudio.interface_settings import interface_preferences
+    control = panel(window, tmp_path)
+    control.scale.setCurrentIndex(control.scale.findData(125))
+    assert window.ui_scale == 125
+    assert int(interface_preferences(window.root).value("scale")) == 125
+    # The display keys must be readable before a project is open, so they never
+    # land in the project's own Interface.ini.
+    assert display.read_display_settings(window.root)["mode"] == "system"
+    control.display_scale.setCurrentIndex(control.display_scale.findData(125))
+    assert display.read_display_settings(tmp_path / "dataroot")["scale_percent"] == 125
+    assert display.read_display_settings(window.root)["mode"] == "system"
+
+
+def test_the_rounding_choice_is_advanced_and_also_needs_a_restart(window, tmp_path):
+    control = panel(window, tmp_path)
+    assert control.advanced.isVisibleTo(control) is False
+    control.advanced_button.setChecked(True)
+    control.toggle_advanced()
+    assert control.advanced.isVisibleTo(control) is True
+    control.rounding.setCurrentIndex(control.rounding.findData("whole-steps"))
+    assert display.read_display_settings(tmp_path / "dataroot")["rounding"] == "whole-steps"
+    assert control.restart_notice.isVisibleTo(control) is True
+    assert "rounding: whole-steps" in control.state_line.text()
+
+
+def test_the_panel_states_the_recovery_path_for_an_unusable_size(window, tmp_path):
+    from PySide6.QtWidgets import QLabel
+    control = panel(window, tmp_path)
+    lines = [child.text() for child in control.findChildren(QLabel)]
+    assert any("--display-scale 100" in line for line in lines)
+
+
+def test_the_preview_strip_answers_what_will_this_size_look_like(window, tmp_path):
+    control = panel(window, tmp_path)
+    control.refresh_preview()
+    assert str(window.ui_scale) in control.preview_note.text()
+    assert control.preview_button.isEnabled() is False
+    window.preview_interface_scale()
+    assert window.pages.currentIndex() == window.page_index["settings"]
+    assert window.settings_tabs.currentIndex() == 0
+
+
+def test_the_graph_text_size_is_saved_and_says_exports_do_not_follow_it(window, tmp_path):
+    from PySide6.QtWidgets import QLabel
+
+    from wmlstudio.interface_settings import interface_preferences
+    control = panel(window, tmp_path)
+    control.graph_scale.setCurrentIndex(control.graph_scale.findData(150))
+    assert int(interface_preferences(window.root).value("graph_scale")) == 150
+    lines = [child.text() for child in control.findChildren(QLabel)]
+    assert display.EXPORT_NOTICE in lines
+
+
+def test_the_recovery_option_refuses_a_scale_that_is_not_one_of_the_offered_ones(capsys):
+    """--display-scale is the way out of an unusable window, so it must be strict."""
+    from wmlstudio.app import main
+    with pytest.raises(SystemExit):
+        main(["--display-scale", "133"])
+    assert "--display-scale" in capsys.readouterr().err

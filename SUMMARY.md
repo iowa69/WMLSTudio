@@ -1,5 +1,13 @@
 # WMLSTudio 0.2 — native research workbench
 
+This summary describes the **published 0.2 release artifact**. The 0.3
+investigation revision — tabbed shell, adjustable display scaling, automatic
+organism filing, organism-specific typing modules, the dual-tree comparison, the
+plain-language summary report, practice cohorts and the threshold audit — is in
+development on `investigation-v0.3` and **has no released artifact**. Nothing
+below has been re-measured for it. Its current state is recorded in
+[the capability audit](docs/STUDIO_CAPABILITIES.md) and [tasks/todo.md](tasks/todo.md).
+
 The revision implements native paired-read assembly, conservative automatic
 MLST discovery, additional cgMLST/wgMLST profiles and local ad-hoc schemes,
 actual HYDRA assembly analysis, managed storage, saved-library reuse, explicit

@@ -9,8 +9,10 @@ from PyInstaller.utils.hooks import collect_data_files, collect_submodules, copy
 
 root = Path(SPECPATH).parent
 sys.path.insert(0, str(root / "studio_packaging"))
+sys.path.insert(0, str(root / "src"))
 from stage_bio_tools import filter_windows_qt_tls, stage_hydra_database, verify_skesa_bundle
 from stage_fastqc import verify as verify_fastqc
+from stage_reference_panels import assay_module_imports, panel_summary, verify_bundle_payload
 from stage_ska import verify as verify_ska
 schemes = root / "src/wmlstudio/resources/schemes"
 manifest = schemes / "manifest.json"
@@ -31,6 +33,9 @@ datas = [
     (str(root / "docs/MICROBIOLOGY_WORKFLOWS.md"), "docs"),
     (str(root / "docs/WORKBENCH_DESIGN.md"), "docs"),
     (str(root / "docs/WORKFLOW_GUIDE.md"), "docs"),
+    (str(root / "docs/ORGANISM_MODULES.md"), "docs"),
+    (str(root / "docs/THRESHOLDS.md"), "docs"),
+    (str(root / "docs/TEST_DATASETS.md"), "docs"),
 ]
 if (root / "LICENSE").is_file():
     datas.append((str(root / "LICENSE"), "notices"))
@@ -61,6 +66,10 @@ datas.append((str(hydra_database), "wmlstudio/resources/hydra/starter"))
 characterization_database = root / "src/wmlstudio/resources/characterization/starter"
 if not (characterization_database / "manifest.json").is_file():
     raise SystemExit("Stage the independent species/virulence starter with studio_scripts/stage_characterization.py before packaging")
+# Re-hash the whole snapshot before it is copied: a truncated or edited panel must
+# fail the build, not ship and then read as a negative assay result.
+characterization_panel = panel_summary(characterization_database)
+print("Bundled characterization panel: " + json.dumps(characterization_panel))
 datas.append((str(characterization_database), "wmlstudio/resources/characterization/starter"))
 if sys.platform == "win32":
     skesa = root / "src/wmlstudio/resources/tools/skesa"
@@ -75,12 +84,20 @@ if sys.platform == "win32":
             raise SystemExit(f"The official Qt wheel is missing required native runtime {name}")
         datas.append((str(source), "Tools/blast/bin"))
 
+# Practice cohorts and the broad species panel are downloaded to the user's Data
+# root on request. A copy staged into the source tree must stop the build.
+print("Unbundled reference payload: " + json.dumps(verify_bundle_payload(source for source, _ in datas)))
+
 common = dict(
     pathex=[str(root / "src")],
     binaries=[],
     datas=datas,
     # impl is a namespace package: collecting only 'pyrodigal' skips it.
-    hiddenimports=["ahocorasick", *collect_submodules("pyrodigal.impl"), *collect_submodules("pyskani")],
+    # The organism-module assays are reached through a computed __import__, which
+    # leaves no IMPORT_NAME opcode for the module scan; name them explicitly or
+    # every characterization run in the frozen build raises ModuleNotFoundError.
+    hiddenimports=["ahocorasick", *collect_submodules("pyrodigal.impl"), *collect_submodules("pyskani"),
+                   *assay_module_imports()],
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],

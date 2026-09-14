@@ -6,12 +6,22 @@ from pathlib import Path
 
 import pytest
 from PySide6.QtCore import QItemSelectionModel, Qt
-from PySide6.QtWidgets import QComboBox, QDialog, QMessageBox, QTableWidget
+from PySide6.QtWidgets import (
+    QComboBox,
+    QDialog,
+    QInputDialog,
+    QMenu,
+    QMessageBox,
+    QTableWidget,
+)
 
+from wmlstudio import archive
 from wmlstudio.app import MainWindow
+from wmlstudio.context_menus import SEPARATOR, Selection
 from wmlstudio.library import export_bundle
 from wmlstudio.project import Project
 from wmlstudio.sample_workflow import set_cluster
+from wmlstudio.storage import import_samples
 from wmlstudio.typing import load_scheme
 from wmlstudio.workflow_dialogs import BatchAssignmentDialog, ImportSamplesDialog
 
@@ -196,7 +206,7 @@ def test_import_dialog_actual_worker_copy_typing_and_st_filename(workbench, qtbo
     assert workbench.test_errors == []
 
 
-def test_batch_assignment_ui_keeps_annotations_and_stable_selection(workbench, monkeypatch):
+def test_batch_assignment_ui_keeps_annotations_and_stable_selection(workbench, qtbot, monkeypatch):
     first = add_profile(workbench, "first")
     second = add_profile(workbench, "second")
     workbench.project.update_metadata(first, {"annotations": {"ward": "ICU"}})
@@ -213,6 +223,7 @@ def test_batch_assignment_ui_keeps_annotations_and_stable_selection(workbench, m
 
     monkeypatch.setattr(BatchAssignmentDialog, "exec", assign)
     workbench.assign_selected()
+    idle(qtbot, workbench)
     assert workbench.selection_ids == {first, second}
     assert all(sample["metadata"]["organism"]["genus"] == "Enterococcus"
                for sample in workbench.project.samples())
@@ -366,4 +377,144 @@ def test_secondary_scheme_worker_preserves_primary_mlst_and_builds_saved_matrix(
     assert workbench.profile_model.columnCount() == 5
     assert "core001" in workbench.profile_model.headers
     assert len(workbench.distance_rows) == 1 and workbench.distance_rows[0]["distance"] == 0
+    assert workbench.test_errors == []
+
+
+def library_rows(window):
+    return {window.sample_table.item(row, 0).text() for row in range(window.sample_table.rowCount())}
+
+
+def tree_labels(window):
+    return [window.library_tree.topLevelItem(index).text(0)
+            for index in range(window.library_tree.topLevelItemCount())]
+
+
+def test_right_click_archive_hides_an_isolate_and_restores_it_with_its_evidence(workbench, monkeypatch):
+    add_profile(workbench, "kept")
+    stored = add_profile(workbench, "stored")
+    workbench.refresh()
+    monkeypatch.setattr(QInputDialog, "getText", lambda *args, **kwargs: ("Closed investigation", True))
+
+    workbench.context_archive(Selection("library", (stored,)))
+    assert library_rows(workbench) == {"kept"}
+    assert "Archived  (1)" in tree_labels(workbench)
+    assert "1 archived" in workbench.selection_label.text()
+    archived = workbench.project.get_sample(stored)
+    assert archived["result"]["st"] == "17", "archiving keeps every stored result"
+    assert archive.archive_record(archived)["reason"] == "Closed investigation"
+    assert {entry["action"] for entry in workbench.project.history(stored)} >= {"sample_archived"}
+
+    workbench.context_restore(Selection("library", (stored,)))
+    assert library_rows(workbench) == {"kept", "stored"}
+    assert "Archived  (1)" not in tree_labels(workbench)
+    assert archive.archive_record(workbench.project.get_sample(stored)) is None
+    assert workbench.test_errors == []
+
+
+def test_right_click_assign_organism_moves_the_managed_copy_and_keeps_the_original(workbench, qtbot, tmp_path):
+    source = assembly(tmp_path / "inbox" / "isolate.fasta")
+    before = source.read_bytes()
+    managed = tmp_path / "managed"
+    sid = import_samples(workbench.project, [{"path": str(source), "typing_mode": "manual",
+                                              "genus": "Klebsiella", "species": "pneumoniae"}],
+                         str(managed))[0]
+    workbench.refresh()
+
+    workbench.context_assign_organism_quick(Selection("library", (sid,)), ("Enterobacter", "cloacae"))
+    idle(qtbot, workbench)
+
+    filed = Path(workbench.project.get_sample(sid)["input_path"])
+    assert filed.relative_to(managed).parts[:3] == ("Enterobacter", "cloacae", "ST_unassigned")
+    assert sid in filed.parts and filed.is_file()
+    assert not (managed / "Klebsiella").exists(), "the vacated organism folder is pruned"
+    assert source.read_bytes() == before and source.is_file()
+    evidence = workbench.project.get_sample(sid)["metadata"]["organism_evidence"]
+    assert evidence["basis"] == "user_assigned" and evidence["confidence"] == "unresolved"
+    assert evidence["accepted"] == {"genus": "Enterobacter", "species": "cloacae"}
+    assert workbench.test_errors == []
+
+
+def test_removing_an_isolate_keeps_the_original_file_and_can_be_undone(workbench, tmp_path, monkeypatch):
+    source = assembly(tmp_path / "inbox" / "gone.fasta")
+    sid = workbench.project.add_sample(source, "gone")
+    workbench.project.set_result(sid, {"sample_name": "gone", "kind": "fasta", "scheme": "MLST",
+                                       "scheme_digest": "digest", "status": "complete", "st": "17",
+                                       "alleles": {"arcA": "1"}, "calls": []})
+    workbench.refresh()
+    monkeypatch.setattr(QMessageBox, "exec", lambda self: QMessageBox.StandardButton.Yes)
+
+    workbench.context_remove(Selection("library", (sid,)))
+    assert workbench.project.samples() == []
+    assert source.is_file(), "removal never deletes the user's own file"
+
+    menu = QMenu(workbench)
+    workbench.fill_recently_removed(menu)
+    entries = [action for action in menu.actions() if action.isEnabled()]
+    assert len(entries) == 1 and entries[0].text().startswith("gone · removed ")
+    entries[0].trigger()
+    restored = workbench.project.samples()[0]
+    assert restored["name"] == "gone" and restored["result"]["st"] == "17"
+    assert library_rows(workbench) == {"gone"}
+    assert workbench.test_errors == []
+
+
+def test_the_library_right_click_offers_only_commands_this_window_can_run(workbench):
+    selection = Selection("library", ("first", "second"))
+    plan = [entry for entry in workbench.context_menu_plan(selection) if entry is not SEPARATOR]
+    titles = [entry.format_title(selection) for entry in plan]
+
+    assert all(callable(getattr(workbench, entry.handler, None)) for entry in plan)
+    assert "Archive 2 isolates (keeps all evidence)…" in titles
+    assert titles.index("Archive 2 isolates (keeps all evidence)…") < \
+        titles.index("Remove 2 isolates from this project…"), "removal is last, never the default"
+    assert set(workbench.context_menu_report()) <= {"context_select_group"}
+    for view in ("library", "library.tree", "overview.recent"):
+        assert workbench._context_adapters[view].view_id == view
+
+
+def test_the_cohort_picker_folder_nodes_resolve_to_isolates_and_leave_archived_out(workbench, qtbot):
+    from wmlstudio.cohort_picker import PICKER_HANDLERS, CohortPickerDialog
+    first = add_profile(workbench, "kp1", "Klebsiella", "pneumoniae")
+    second = add_profile(workbench, "kp2", "Klebsiella", "oxytoca")
+    third = add_profile(workbench, "ec", "Escherichia", "coli")
+    archive.archive_samples(workbench.project, [third], "not this investigation")
+    workbench.refresh()
+
+    dialog = CohortPickerDialog(workbench.project.samples(), workbench.project,
+                                "Which isolates?", None, workbench)
+    qtbot.addWidget(dialog)
+    assert {sample["id"] for sample in dialog.samples} == {first, second}
+    assert sorted(dialog.folder_members("Klebsiella")) == sorted([first, second])
+    assert dialog.folder_members("Klebsiella", "oxytoca") == [second]
+    assert dialog.folder_members("Escherichia") == []
+    assert all(callable(getattr(workbench, name, None)) for name in PICKER_HANDLERS)
+    assert dialog.table.contextMenuPolicy() == Qt.ContextMenuPolicy.CustomContextMenu
+    assert dialog.folders.contextMenuPolicy() == Qt.ContextMenuPolicy.CustomContextMenu
+
+
+def test_refiling_shows_where_each_managed_copy_goes_before_moving_it(workbench, qtbot, tmp_path, monkeypatch):
+    from wmlstudio.storage import confirm_organism
+    source = assembly(tmp_path / "inbox" / "isolate.fasta")
+    managed = tmp_path / "managed"
+    sid = import_samples(workbench.project, [{"path": str(source), "typing_mode": "manual",
+                                              "genus": "Klebsiella", "species": "pneumoniae"}],
+                         str(managed))[0]
+    confirm_organism(workbench.project, [sid], "Enterobacter", "cloacae")
+    workbench.refresh()
+    workbench.selection_ids = {sid}
+    asked = {}
+
+    def confirm(parent, title, text, *args, **kwargs):
+        asked["text"] = text
+        return QMessageBox.StandardButton.Yes
+
+    monkeypatch.setattr(QMessageBox, "question", confirm)
+    workbench.refile_selected()
+    idle(qtbot, workbench)
+
+    assert "Enterobacter/cloacae/ST_unassigned" in asked["text"]
+    assert "filing decision rather than a laboratory identification" in asked["text"]
+    filed = Path(workbench.project.get_sample(sid)["input_path"])
+    assert filed.relative_to(managed).parts[0] == "Enterobacter" and filed.is_file()
+    assert source.is_file()
     assert workbench.test_errors == []

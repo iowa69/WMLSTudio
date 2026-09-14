@@ -2,6 +2,8 @@
 
 from PySide6.QtCore import QPoint, QRect, QSize, Qt
 from PySide6.QtWidgets import (
+    QFrame,
+    QHBoxLayout,
     QHeaderView,
     QLayout,
     QTableWidget,
@@ -78,6 +80,59 @@ class FlowLayout(QLayout):
             x += width + self.spacing()
             height = max(height, hint.height())
         return y + height - rect.y()
+
+
+def workspace_header(window, layout, key, *, index=None):
+    """The orientation strip for one tab: what it is for, and one obvious next step.
+
+    Someone who is not a bioinformatician should be able to read a tab and know what
+    it answers without opening the guide, so every page carries the same three things
+    in the same place: the plain-language purpose, the next action, and the guide.
+
+    The strip is inserted rather than built into `build_*`, because the evidence and
+    scheme pages rearrange their own layout items by position; adding this after the
+    pages are built keeps that surgery working untouched.
+    """
+    from wmlstudio.ui_tabs import NEXT_STEP, PAGE_PURPOSE
+    from wmlstudio.widgets import button, label
+    from wmlstudio.workspace_focus import COHORT_ATTRIBUTES, cohort_bar
+
+    purpose_text = PAGE_PURPOSE.get(key, "")
+    strip = QFrame()
+    strip.setObjectName("purposeStrip")
+    strip.setProperty("pageKey", key)
+    row = QHBoxLayout(strip)
+    row.setContentsMargins(12, 4, 12, 4)
+    row.setSpacing(8)
+    purpose = label(purpose_text, "purpose", True)
+    purpose.setToolTip(purpose_text)
+    row.addWidget(purpose, 1)
+    if key in COHORT_ATTRIBUTES and getattr(window, "focus", None) is not None:
+        # A tab that owns a cohort says here what it is reviewing and where that
+        # came from. The focus is only ever copied in by the button beside it.
+        strip.cohort_bar = cohort_bar(window, key, compact=True)
+        row.addWidget(strip.cohort_bar)
+    text, method = NEXT_STEP.get(key, ("", ""))
+    # Several next-step methods are added by later work; a missing one must not
+    # raise while the window is being built, so the button simply does not appear.
+    handler = getattr(window, method, None) if method else None
+    if text and callable(handler):
+        step = button(text, handler)
+        step.setObjectName("nextStep")
+        step.setToolTip(f"The usual next step on this tab: {text}")
+        row.addWidget(step)
+    guide = getattr(window, "open_workflow_guide", None)
+    if callable(guide):
+        help_button = button("?", lambda checked=False, topic=key: guide(topic))
+        help_button.setObjectName("pageGuide")
+        help_button.setAccessibleName(f"Guide for {key}")
+        help_button.setToolTip("Open the problem → solution guide for this tab")
+        row.addWidget(help_button)
+    if index is None:
+        layout.addWidget(strip)
+    else:
+        layout.insertWidget(index, strip)
+    return strip
 
 
 def make_table(headers, multiple=True):

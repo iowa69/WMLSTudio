@@ -4,12 +4,14 @@ import html
 import json
 import threading
 from collections import Counter
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 
 from PySide6.QtCore import QAbstractTableModel, QModelIndex, Qt, QThread, QTimer, Signal
 from PySide6.QtGui import QColor
 from PySide6.QtWidgets import (
+    QApplication,
     QCheckBox,
     QColorDialog,
     QComboBox,
@@ -38,18 +40,31 @@ from PySide6.QtWidgets import (
 )
 
 from wmlstudio.comparison import forest_from_distances, pairwise_distances
+from wmlstudio.context_menus import TableWidgetAdapter
 from wmlstudio.identification import cached_scheme, scheme_organism
 from wmlstudio.investigation import (
+    DIFF_ROW_FIELDS,
     InvestigationStore,
     build_snapshot,
     incremental_distances,
     proximity_rows,
+    snapshot_diff,
+    snapshot_diff_caption,
+    snapshot_diff_html,
+    snapshot_diff_rows,
+    snapshot_graph,
 )
 from wmlstudio.jobs import AnalysisWorker
 from wmlstudio.sample_workflow import current_input_sha256, hydra_evidence_status
 from wmlstudio.sequence import AnalysisCancelled, SequenceReader, check_cancelled, file_sha256
 from wmlstudio.ui_common import FlowLayout, cell, gene_names, make_table, organism_for
-from wmlstudio.widgets import TreeView, button, label
+from wmlstudio.widgets import TreeView, button, label, render_side_by_side
+
+# Laying out a forest is measurably slow well before it stops being readable:
+# roughly 0.4 s at 120 nodes and 6.6 s at 500 on a development machine. Above
+# this many stored profiles the baseline is drawn only when the user asks, with
+# the wait stated on the button rather than spent silently.
+BASELINE_AUTODRAW_LIMIT = 120
 
 
 def _available_profiles(project, sample):
@@ -283,6 +298,29 @@ class EvidenceMatrixModel(QAbstractTableModel):
         self.layoutChanged.emit()
 
 
+class _ClusterTableAdapter(TableWidgetAdapter):
+    """Group rows carry a group id, but the actions act on isolates.
+
+    Reading the row's stored identifier as a sample id would send group ids to
+    handlers that archive or export isolates, so the members are resolved from
+    the snapshot the table was filled from.
+    """
+
+    def __init__(self, view_id, table, window):
+        super().__init__(view_id, table)
+        self._window = window
+
+    def group_members(self, group_ids):
+        snapshot = getattr(self._window, '_current_snapshot', None) or {}
+        return tuple(dict.fromkeys(str(sid) for group in snapshot.get('groups', [])
+                                   if group['id'] in group_ids for sid in group['members']))
+
+    def resolve(self, point):
+        base = super().resolve(point)
+        return replace(base, sample_ids=self.group_members(set(base.sample_ids)),
+                       clicked_id=None, group_id=base.clicked_id)
+
+
 class ComparisonWorkspaceMixin:
     def investigation_summary(self):
         """Small, JSON-safe status for the guided overview; never loads a matrix."""
@@ -311,6 +349,14 @@ class ComparisonWorkspaceMixin:
             return
         store = InvestigationStore(self.project)
         self._report_investigation_snapshot = None
+        # Switching project brings a different baseline, arrangement and dual-view
+        # preference; none of the old project's state may survive the swap.
+        self._reset_baseline_state()
+        self._legends = {'current': {}, 'baseline': {}}
+        self._pending_baseline_graph_state = self.project.get_setting('graph_style.baseline', {'version': 1})
+        self.dual_toggle.blockSignals(True)
+        self.dual_toggle.setChecked(bool(self.project.get_setting('compare.dual_graph', False)))
+        self.dual_toggle.blockSignals(False)
         active = self.project.get_setting('investigations.active', None)
         self.active_investigation_id = active if active in {p['id'] for p in store.list()} else None
         if not self.active_investigation_id and self.cohort_ids is None:
@@ -324,6 +370,7 @@ class ComparisonWorkspaceMixin:
         self.investigation_combo.blockSignals(False)
         if self.active_investigation_id:
             self.select_investigation(self.active_investigation_id)
+        self.set_dual_graph(self.dual_toggle.isChecked())
 
     def _investigation_chosen(self, *_args):
         self.select_investigation(self.investigation_combo.currentData())
@@ -333,7 +380,9 @@ class ComparisonWorkspaceMixin:
         self.project.set_setting('investigations.active', investigation_id)
         self._comparison_cache = None
         self._current_snapshot = None
+        self._reset_baseline_state()
         if not investigation_id:
+            self.refresh_baseline_graph()
             return
         plan = InvestigationStore(self.project).get(investigation_id)
         self.threshold_evidence = plan.get('threshold_evidence', {})
@@ -481,34 +530,81 @@ class ComparisonWorkspaceMixin:
         if ids:
             self.tree.select_cluster(ids[0])
 
-    def graph_selection_changed(self, ids):
+    def graph_selection_changed(self, ids, role='current'):
         if not hasattr(self, 'graph_selection_label'):
             return
-        self.graph_report_button.setEnabled(bool(ids))
-        text = f"{len(ids)} selected"
-        if len(ids) == 1 and self._current_snapshot:
-            rows = proximity_rows(self._current_snapshot, ids)
+        self.sync_graph_selection(ids, role)
+        if role == 'current':
+            self.graph_report_button.setEnabled(bool(ids))
+        snapshot = self._baseline_snapshot if role == 'baseline' else self._current_snapshot
+        text = f"{len(ids)} selected" + (' in the baseline tree' if role == 'baseline' else '')
+        if len(ids) == 1 and snapshot:
+            rows = proximity_rows(snapshot, ids)
             if rows:
                 nearest = rows[0]['nearest_distance']
                 text += f" · nearest: {nearest if nearest is not None else 'not comparable'} allele differences"
+        text += self._selection_overlap(ids, role)
         self.graph_selection_label.setText(text + ' · Ctrl-click adds; click a cluster row selects its members.')
 
-    def report_graph_selection(self, ids=None):
-        ids = set(ids if isinstance(ids, (list, tuple, set)) else self.tree.selected_ids())
+    def _selection_overlap(self, ids, role):
+        """Say plainly how much of a selection the other tree even contains."""
+        other = self._graph_view('current' if role == 'baseline' else 'baseline')
+        if not self.dual_toggle.isChecked() or not ids or not getattr(other, '_results', None):
+            return ''
+        shared = len(set(map(str, ids)) & set(other._results))
+        if role == 'baseline':
+            return (f" · {shared} still in the current comparison · {len(ids) - shared} no longer in it")
+        return f" · {shared} also in the baseline tree · {len(ids) - shared} added since the baseline"
+
+    def sync_graph_selection(self, ids, role):
+        """Mirror a selection into the other tree, for the isolates it actually holds."""
+        if self._syncing_graph_selection or not self.link_selection.isChecked():
+            return
+        if not self.dual_toggle.isChecked():
+            return
+        other = self._graph_view('current' if role == 'baseline' else 'baseline')
+        if other is None or not getattr(other, '_results', None):
+            return
+        self._syncing_graph_selection = True
+        try:
+            other.select_ids(set(map(str, ids)) & set(other._results))
+        finally:
+            self._syncing_graph_selection = False
+
+    def highlight_graphs(self, text):
+        """Highlight matching isolates in both trees; a view aid, never a filter."""
+        counts = {}
+        for role, view in self._graph_views().items():
+            if view is not None and hasattr(view, 'highlight'):
+                counts[role] = len(view.highlight(text))
+        if not str(text).strip():
+            return counts
+        message = f"{counts.get('current', 0)} matched here"
+        if self.dual_toggle.isChecked():
+            message += f" · {counts.get('baseline', 0)} in the baseline tree"
+        self.graph_selection_label.setText(message + ' · highlighting changes no stored evidence.')
+        return counts
+
+    def report_graph_selection(self, ids=None, role='current'):
+        view = self._graph_view(role)
+        ids = set(ids if isinstance(ids, (list, tuple, set)) else view.selected_ids())
         if not ids:
             self.notify('Select graph nodes, labels or a cluster row first.')
             return
         self.report_ids = ids
         self.report_scope.setCurrentIndex(0)
-        self._report_investigation_snapshot = self._current_snapshot
+        # A report sourced from the baseline tree must carry the baseline snapshot,
+        # or its distances would not be the ones in the picture beside them.
+        self._report_investigation_snapshot = (self._baseline_snapshot if role == 'baseline'
+                                               else self._current_snapshot)
         self.refresh_report_table()
         self.navigate(5)
 
-    def report_isolate_proximity(self, sid):
-        self.tree.select_ids([sid])
+    def report_isolate_proximity(self, sid, role='current'):
+        self._graph_view(role).select_ids([sid])
         if hasattr(self, 'report_preset'):
             self.report_preset.setCurrentIndex(self.report_preset.findData('proximity'))
-        self.report_graph_selection([sid])
+        self.report_graph_selection([sid], role=role)
 
     def freeze_investigation_selection(self):
         ids = self.tree.selected_ids()
@@ -538,7 +634,8 @@ class ComparisonWorkspaceMixin:
             missing = set(group['sample_ids']) - self.tree._results.keys()
             self.notify(f"Selected {len(group['sample_ids']) - len(missing)} frozen members; {len(missing)} are outside the current graph.")
 
-    def open_investigation_history(self):
+    def open_investigation_history(self, snapshot_id=None):
+        """The frozen evidence behind any stored snapshot, optionally opened at one."""
         if not self.active_investigation_id:
             self.notify('Save an investigation before opening its snapshot history.')
             return
@@ -554,8 +651,12 @@ class ComparisonWorkspaceMixin:
         layout = QVBoxLayout(dialog)
         layout.addWidget(label('Past membership, thresholds and pairwise evidence are frozen. Viewing or exporting history does not replace the current cohort.', 'small', True))
         chooser = QComboBox()
+        baseline = store.baseline_snapshot_id(plan['id'])
         for number, sid in reversed(list(enumerate(plan['snapshots'], 1))):
-            chooser.addItem(f'Snapshot {number} · {sid[:12]}', sid)
+            chooser.addItem(f'Snapshot {number} · {sid[:12]}'
+                            + (' · baseline tree' if sid == baseline else ''), sid)
+        if isinstance(snapshot_id, str) and chooser.findData(snapshot_id) >= 0:
+            chooser.setCurrentIndex(chooser.findData(snapshot_id))
         layout.addWidget(chooser)
         view = QTextBrowser()
         layout.addWidget(view, 1)
@@ -681,7 +782,14 @@ class ComparisonWorkspaceMixin:
                            'QComboBox, QLineEdit, QSpinBox, QDoubleSpinBox '
                            '{ padding-top: 5px; padding-bottom: 5px; }')
         layout.setSpacing(8)
-        self.heading(layout, "Investigate related isolates", "Choose a cohort, review its groups, and report the isolates that matter. Core and accessory evidence stay separate.")
+        # The tab's orientation strip already carries the purpose sentence and the
+        # "Choose cohort…" step, so only the title is repeated here. The ~40 px this
+        # saves is what lets two trees each keep a usable height at 1080x720.
+        page_title = label("Investigate related isolates", "title")
+        page_title.setToolTip('Core allele evidence and accessory evidence such as AMR genes are '
+                              'reported separately; accessory findings are never added into the '
+                              'core allele distance.')
+        layout.addWidget(page_title)
         self.comparison_settings = QDialog(self)
         self.comparison_settings.setWindowTitle('Comparison settings')
         self.comparison_settings.resize(760, 340)
@@ -818,11 +926,46 @@ class ComparisonWorkspaceMixin:
         menu.addAction('Open frozen review group…', self.choose_frozen_review_group)
         menu.addAction('Label fields…', self.edit_graph_label_fields)
         menu.addSeparator()
+        menu.addAction('Choose baseline snapshot…', self.choose_baseline_snapshot)
+        menu.addAction('Pin the current comparison as the baseline', self.pin_current_as_baseline)
+        menu.addAction('What changed since the baseline…', self.show_changes_tab)
+        menu.addAction('View full baseline evidence…',
+                       lambda: self.open_investigation_history(self.baseline_reference()[1]))
+        # A checkable menu entry instead of a toolbar checkbox: the graph toolbar
+        # wraps at 1080 px, and a wrapped row is taken straight out of the graph.
+        self.link_selection = menu.addAction('Link selection across both trees')
+        self.link_selection.setCheckable(True)
+        self.link_selection.setChecked(True)
+        menu.addSeparator()
         graph_options.setMenu(menu)
         toolbar.addWidget(graph_options)
+        self.dual_toggle = QCheckBox('Compare with baseline tree')
+        self.dual_toggle.setToolTip('Show the tree as it was first built beside the tree as it is now.\n'
+                                    'Both are layouts of allele differences, not family trees, and two trees '
+                                    'can differ because the cohort changed rather than because evidence did.')
+        self.dual_toggle.toggled.connect(self.set_dual_graph)
+        toolbar.addWidget(self.dual_toggle)
+        self.graph_search = QLineEdit()
+        self.graph_search.setPlaceholderText('Highlight isolates…')
+        self.graph_search.setMinimumWidth(120)
+        self.graph_search.setToolTip('Highlight matching isolates in both trees. Highlighting is a view aid; '
+                                     'it changes no stored evidence and no group membership.')
+        self.graph_search.textChanged.connect(self.highlight_graphs)
+        toolbar.addWidget(self.graph_search)
+        self.export_tree_choice = QComboBox()
+        self.export_tree_choice.setProperty('compactCharacters', 9)
+        self.export_tree_choice.addItem('Export: current tree', 'current')
+        self.export_tree_choice.addItem('Export: baseline tree', 'baseline')
+        self.export_tree_choice.setToolTip('Which of the two trees the export entries act on.')
+        self.export_tree_choice.hide()
+        toolbar.addWidget(self.export_tree_choice)
         export = QComboBox()
         export.setProperty('compactCharacters', 9)
-        export.addItems(["Export…", "PNG image", "SVG vector", "GraphML", "Newick (MST topology)", "Distance JSON", "Distance matrix TSV", "JPEG image", "Profile matrix TSV", "Group table TSV"])
+        export.addItems(["Export…", "PNG image", "SVG vector", "GraphML", "Newick (MST topology)",
+                         "Distance JSON", "Distance matrix TSV", "JPEG image", "Profile matrix TSV",
+                         "Group table TSV", "Baseline + current image (PNG)",
+                         "Baseline + current image (JPEG)", "Change summary (TSV)",
+                         "Change summary (JSON)"])
         export.activated.connect(lambda index: self.export_graph_action(index, export))
         toolbar.addWidget(export)
         content.addLayout(toolbar)
@@ -837,7 +980,31 @@ class ComparisonWorkspaceMixin:
         tabs.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
         self.tree = ComparisonTreeView()
         self.tree.setMinimumHeight(200)
-        tabs.addTab(self.tree, "Graph")
+        self.baseline_tree = ComparisonTreeView()
+        self.baseline_tree.setMinimumHeight(200)
+        # The baseline half is hidden until it is asked for, so the single-tree
+        # page is laid out exactly as it was before the second tree existed.
+        self.graph_split = QSplitter(Qt.Orientation.Horizontal)
+        self.graph_split.setChildrenCollapsible(False)
+        self.baseline_pane, baseline_column = self._graph_pane()
+        self.baseline_caption = self._graph_caption()
+        baseline_column.addWidget(self.baseline_caption)
+        baseline_column.addWidget(self.baseline_tree, 1)
+        self.baseline_notice = label('', 'small', True)
+        self.baseline_notice.hide()
+        baseline_column.addWidget(self.baseline_notice)
+        self.baseline_action = button('', self._baseline_action_clicked)
+        self.baseline_action.hide()
+        baseline_column.addWidget(self.baseline_action)
+        self.current_pane, current_column = self._graph_pane()
+        self.current_caption = self._graph_caption()
+        current_column.addWidget(self.current_caption)
+        current_column.addWidget(self.tree, 1)
+        self.graph_split.addWidget(self.baseline_pane)
+        self.graph_split.addWidget(self.current_pane)
+        self.baseline_pane.hide()
+        self.current_caption.hide()
+        tabs.addTab(self.graph_split, "Graph")
         tabs.addTab(self.cluster_table, 'Groups')
         self.profile_table = QTableView()
         self.profile_model = EvidenceMatrixModel(self.profile_table)
@@ -847,6 +1014,11 @@ class ComparisonWorkspaceMixin:
         tabs.addTab(self.profile_table, "Profiles")
         self.statistics_view = QTextBrowser()
         tabs.addTab(self.statistics_view, "Quality / statistics")
+        self.changes_view = QTextBrowser()
+        tabs.addTab(self.changes_view, "Changes")
+        self.graph_tabs = tabs
+        if hasattr(self.pages, 'register_subtabs'):
+            self.pages.register_subtabs('compare', tabs)
         content.addWidget(tabs, 1)
         self.graph_legend = QLabel()
         self.graph_legend.setWordWrap(True)
@@ -882,17 +1054,59 @@ class ComparisonWorkspaceMixin:
         self._current_snapshot = None
         self._cluster_filling = False
         self.comparison_mode = 'unspecified'
+        self._legends = {'current': {}, 'baseline': {}}
+        self._syncing_graph_selection = False
+        self._pending_baseline_graph_state = None
+        self._reset_baseline_state()
         self._comparison_timer = QTimer(self)
         self._comparison_timer.setSingleShot(True)
         self._comparison_timer.timeout.connect(self._start_pending_comparison)
-        for name, callback in [("colorsChanged", self.persist_graph_style), ("layoutChanged", self.persist_graph_style),
-                               ("legendChanged", self.update_graph_legend), ("nodeActivated", self.inspect_graph_sample),
+        for view, role in ((self.tree, 'current'), (self.baseline_tree, 'baseline')):
+            self._bind_graph_view(view, role)
+        self.install_graph_menus()
+        QTimer.singleShot(0, self.restore_investigations)
+
+    def _graph_pane(self):
+        """One half of the dual graph: a caption row above a tree, no extra margin."""
+        pane = QWidget()
+        column = QVBoxLayout(pane)
+        column.setContentsMargins(0, 0, 0, 0)
+        column.setSpacing(4)
+        return pane, column
+
+    def _graph_caption(self):
+        caption = label('', 'small')
+        # Ignored width: a long pane caption must never widen the comparison page
+        # into a horizontal scroll. The full sentence stays in the tooltip.
+        caption.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
+        return caption
+
+    def _bind_graph_view(self, view, role):
+        """Wire one tree, remembering which snapshot its signals speak for."""
+        for name, callback in [("colorsChanged", self.persist_graph_style),
+                               ("layoutChanged", self.persist_graph_style),
+                               ("legendChanged", self.update_graph_legend),
                                ("selectionChanged", self.graph_selection_changed),
                                ("reportRequested", self.report_graph_selection),
                                ("proximityRequested", self.report_isolate_proximity)]:
-            if hasattr(self.tree, name):
-                getattr(self.tree, name).connect(callback)
-        QTimer.singleShot(0, self.restore_investigations)
+            if hasattr(view, name):
+                getattr(view, name).connect(
+                    lambda *args, callback=callback, role=role: callback(*args, role=role))
+        if hasattr(view, 'nodeActivated'):
+            view.nodeActivated.connect(self.inspect_graph_sample)
+
+    def _graph_views(self):
+        return {'current': self.tree, 'baseline': self.baseline_tree}
+
+    def _graph_view(self, role):
+        return self.baseline_tree if role == 'baseline' else self.tree
+
+    def _reset_baseline_state(self):
+        self._baseline_snapshot = None
+        self._baseline_key = None
+        self._baseline_drawn = False
+        self._baseline_diff = None
+        self._baseline_draw_requested = False
 
     def available_profiles(self, sample):
         return _available_profiles(self.project, sample)
@@ -1075,7 +1289,13 @@ class ComparisonWorkspaceMixin:
         self.tree.blockSignals(True)
         self.tree.draw_results([], [], self.cluster_threshold.value())
         self.tree.blockSignals(False)
+        self._legends['current'] = {}
         self.graph_legend.clear()
+        # The drawn baseline stays: it is a stored snapshot, independent of the
+        # current cohort. Only the comparison between the two is now unknown.
+        self._baseline_diff = None
+        self.refresh_changes_view()
+        self.refresh_graph_captions()
         self.refresh_profile_matrix([])
         self.refresh_statistics([], [])
         self.refresh_cluster_table()
@@ -1210,6 +1430,8 @@ class ComparisonWorkspaceMixin:
                         self.color_by.addItem(str(field), field)
                 self.color_by.setCurrentIndex(max(0, self.color_by.findData(current)))
                 self.color_by.blockSignals(False)
+            self.refresh_baseline_graph()
+            self.refresh_graph_captions()
         except Exception as exc:
             self.tree_status.setText(str(exc))
 
@@ -1280,8 +1502,11 @@ class ComparisonWorkspaceMixin:
 
     def refresh_profile_matrix(self, results):
         loci = sorted({locus for result in results for locus in result.get("alleles", {})})
+        # "_sample_id" is not a column; it is how a right-click on a sorted matrix
+        # resolves the isolate under the cursor instead of trusting the row number.
         self.profile_model.replace(["Sample", "ST", "Scheme", *loci],
-                                  [{"Sample": r["sample_name"], "ST": r.get("st"), "Scheme": r.get("scheme"), **r.get("alleles", {})} for r in results])
+                                  [{"_sample_id": r["sample_id"], "Sample": r["sample_name"], "ST": r.get("st"),
+                                    "Scheme": r.get("scheme"), **r.get("alleles", {})} for r in results])
 
     def refresh_statistics(self, results, edges):
         comparable = [p for p in self.distance_rows if p["comparable"]]
@@ -1302,14 +1527,21 @@ class ComparisonWorkspaceMixin:
         self.statistics_view.setHtml("".join(parts))
 
     def graph_option(self, name, value):
-        if hasattr(self.tree, name):
-            getattr(self.tree, name)(value)
-            self.persist_graph_style()
+        # Two trees with different label or halo settings are much harder to read
+        # against each other, so a presentation toggle applies to both.
+        for role, view in self._graph_views().items():
+            if hasattr(view, name):
+                getattr(view, name)(value)
+                self.persist_graph_style(role=role)
+        self.refresh_graph_captions()
 
     def set_graph_color_by(self):
-        if hasattr(self.tree, "set_color_by"):
-            self.tree.set_color_by(self.color_by.currentData() or "cluster")
-            self.persist_graph_style()
+        field = self.color_by.currentData() or "cluster"
+        for role, view in self._graph_views().items():
+            if hasattr(view, "set_color_by") and field in view.available_color_fields():
+                view.set_color_by(field)
+                self.persist_graph_style(role=role)
+        self._apply_shared_legend()
 
     def color_graph_selection(self):
         color = QColorDialog.getColor(parent=self, title="Colour selected graph nodes")
@@ -1324,11 +1556,23 @@ class ComparisonWorkspaceMixin:
                 self.selection_ids = ids
         self.highlight_selected()
 
-    def persist_graph_style(self, *_args):
+    def persist_graph_style(self, *_args, role='current'):
+        # Separate keys: the baseline tree's own layout must never overwrite the
+        # arrangement the user made of the current tree.
+        if role == 'baseline':
+            if self._pending_baseline_graph_state is None and hasattr(self.baseline_tree, "export_state"):
+                self.project.set_setting("graph_style.baseline", self.baseline_tree.export_state())
+            return
         if self._pending_graph_state is None and hasattr(self.tree, "export_state"):
             self.project.set_setting("graph_style", self.tree.export_state())
 
-    def update_graph_legend(self, values):
+    def update_graph_legend(self, values, role='current'):
+        self._legends[role] = dict(values)
+        self._render_graph_legend()
+
+    def _render_graph_legend(self):
+        """One legend row for both trees; a pinned colour makes it a shared key."""
+        values = {**self._legends.get('baseline', {}), **self._legends.get('current', {})}
         entries = []
         for name, value in list(values.items())[:8]:
             color = QColor(str(value))
@@ -1338,6 +1582,299 @@ class ComparisonWorkspaceMixin:
             entries.append(f'+ {len(values) - 8} categories · all groups in the Groups tab')
         self.graph_legend.setText(' &nbsp; '.join(entries))
         self.graph_legend.setToolTip('\n'.join(str(key) for key in values))
+
+    # --- right-click on the comparison views --------------------------------
+    def install_graph_menus(self):
+        """Give every comparison view the shared right-click actions.
+
+        An action whose handler this window does not implement is left out of the
+        menu rather than offered and then failing, so the views can be wired
+        before every handler exists.
+        """
+        if not callable(getattr(self, 'install_view_menu', None)):
+            return
+        from wmlstudio.context_menus import install_context_menu
+        self.install_view_menu('compare.cohort', self.cohort_table)
+        self.install_view_menu('compare.profiles', self.profile_table)
+        groups = _ClusterTableAdapter('compare.groups', self.cluster_table, self)
+        install_context_menu(self.cluster_table, groups, self.show_context_menu)
+        getattr(self, '_context_adapters', {})['compare.groups'] = groups
+        for view in self._graph_views().values():
+            view.context_extension = self.graph_context_entries
+
+    def graph_context_entries(self, view, menu, node_key):
+        """Append the shared isolate actions under the graph's own presentation entries."""
+        from wmlstudio.context_menus import SEPARATOR, Selection, action_state, submenu_entries
+        ids = tuple(view.selected_ids())
+        members = tuple(view._members.get(node_key, ())) if node_key else ()
+        selection = Selection('compare.graph', ids, members[0] if len(members) == 1 else None,
+                              group_id=node_key, on_blank=node_key is None and not ids)
+        entries = self.context_menu_plan(selection)
+        if not entries:
+            return {}
+        menu.addSeparator()
+        busy = bool(self.busy()) if callable(getattr(self, 'busy', None)) else False
+        samples = self.context_samples(selection)
+        dispatch = {}
+        for entry in entries:
+            if entry is SEPARATOR:
+                menu.addSeparator()
+                continue
+            enabled, reason = action_state(entry, selection, window=self, busy=busy, samples=samples)
+            if entry.submenu:
+                options = submenu_entries(entry.submenu, self, selection)
+                if not options:
+                    continue
+                sub = menu.addMenu(entry.format_title(selection))
+                sub.setEnabled(enabled)
+                for title, value in options:
+                    dispatch[sub.addAction(title)] = (
+                        lambda handler=entry.handler, value=value: getattr(self, handler)(selection, value))
+                continue
+            action = menu.addAction(entry.format_title(selection))
+            action.setEnabled(enabled)
+            if reason:
+                action.setToolTip(reason)
+            dispatch[action] = lambda handler=entry.handler: getattr(self, handler)(selection)
+        return dispatch
+
+    # context_add_to_comparison / context_remove_from_comparison are implemented on
+    # WorkbenchMixin (ui_workbench.update_comparison_cohort), which also records
+    # where the cohort change came from. One implementation, one wording.
+
+    def context_select_group(self, selection):
+        """Select the isolates of the group that was right-clicked, not the group id."""
+        snapshot = self._current_snapshot or {}
+        members = {sid for group in snapshot.get('groups', [])
+                   if group['id'] == selection.group_id for sid in group['members']}
+        if not members and selection.sample_ids:
+            self.tree.select_cluster(selection.sample_ids[0])
+            return
+        self.tree.select_ids(members)
+
+    # --- the baseline ("first/original") tree -------------------------------
+    def set_dual_graph(self, enabled):
+        """Show or hide the baseline tree; hidden it costs no layout and no scene."""
+        enabled = bool(enabled)
+        self.baseline_pane.setVisible(enabled)
+        self.current_caption.setVisible(enabled)
+        self.export_tree_choice.setVisible(enabled)
+        self.project.set_setting('compare.dual_graph', enabled)
+        if enabled:
+            self.graph_split.setSizes([1, 1])
+            self.refresh_baseline_graph()
+        else:
+            self.clear_baseline_graph()
+        self.refresh_graph_captions()
+
+    def clear_baseline_graph(self):
+        """Free the second scene but keep the pointer: the baseline itself is stored."""
+        self._baseline_drawn = False
+        self._baseline_draw_requested = False
+        self.baseline_tree.blockSignals(True)
+        self.baseline_tree.draw_results([], [], self.cluster_threshold.value())
+        self.baseline_tree.blockSignals(False)
+        self._legends['baseline'] = {}
+        self._render_graph_legend()
+
+    def baseline_reference(self):
+        """(investigation_id, snapshot_id) for the pinned baseline, else (None, None)."""
+        investigation_id = self.active_investigation_id
+        if not investigation_id:
+            return None, None
+        try:
+            return investigation_id, InvestigationStore(self.project).baseline_snapshot_id(investigation_id)
+        except KeyError:
+            return None, None
+
+    def refresh_baseline_graph(self):
+        """Load, diff and draw the baseline. Never raises into the current tree's path."""
+        if not self.dual_toggle.isChecked():
+            return
+        try:
+            investigation_id, snapshot_id = self.baseline_reference()
+            if not snapshot_id:
+                self._baseline_snapshot = self._baseline_diff = self._baseline_key = None
+                self._show_baseline_empty_state()
+                self.refresh_changes_view()
+                return
+            key = (str(self.project.path), investigation_id, snapshot_id)
+            if key != self._baseline_key:
+                self._baseline_snapshot = InvestigationStore(self.project).snapshot(investigation_id, snapshot_id)
+                self._baseline_key, self._baseline_drawn = key, False
+                self._baseline_draw_requested = False
+            self._baseline_diff = (snapshot_diff(self._baseline_snapshot, self._current_snapshot)
+                                   if self._baseline_snapshot and self._current_snapshot else None)
+            self.refresh_changes_view()
+            if not self._baseline_drawn:
+                count = len(self._baseline_snapshot.get('profiles', []))
+                if count > BASELINE_AUTODRAW_LIMIT and not self._baseline_draw_requested:
+                    self._show_baseline_draw_button(count)
+                    self.refresh_graph_captions()
+                    return
+                self._draw_baseline()
+            self._apply_shared_legend()
+            self.refresh_graph_captions()
+        except Exception as error:
+            self._baseline_drawn = False
+            self._show_baseline_empty_state('The baseline tree could not be opened: ' + str(error))
+
+    def _draw_baseline(self):
+        results, edges, groups = snapshot_graph(self._baseline_snapshot)
+        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+        try:
+            self.baseline_tree.blockSignals(True)
+            self.baseline_tree.draw_results(results, edges, self._baseline_snapshot.get('threshold', 1),
+                                            groups=groups)
+            if self._pending_baseline_graph_state is not None and hasattr(self.baseline_tree, 'restore_state'):
+                try:
+                    self.baseline_tree.restore_state(self._pending_baseline_graph_state)
+                except ValueError:
+                    pass  # A stored arrangement from another version is presentation only.
+                self._pending_baseline_graph_state = None
+            self.baseline_tree.blockSignals(False)
+        finally:
+            QApplication.restoreOverrideCursor()
+        self._baseline_drawn = True
+        self._legends['baseline'] = self.baseline_tree.legend()
+        self._render_graph_legend()
+        self.baseline_notice.hide()
+        self.baseline_action.hide()
+        self.baseline_tree.show()
+
+    def _show_baseline_empty_state(self, message=''):
+        self.baseline_tree.hide()
+        self.baseline_notice.setText(message or
+            'No baseline tree yet. A baseline is a frozen copy of an earlier comparison: save this '
+            'comparison as an investigation and its first build is pinned automatically.')
+        self.baseline_notice.show()
+        self.baseline_action.setText('Save this comparison as an investigation…')
+        self.baseline_action.setProperty('baselineAction', 'save')
+        self.baseline_action.show()
+        self.baseline_caption.setText('Baseline · none pinned')
+        self.baseline_caption.setToolTip(self.baseline_notice.text())
+
+    def _show_baseline_draw_button(self, count):
+        self.baseline_tree.hide()
+        self.baseline_notice.setText(
+            f'This baseline holds {count} isolates. Arranging that many nodes takes several seconds, '
+            'so it is drawn only when you ask for it.')
+        self.baseline_notice.show()
+        self.baseline_action.setText(f'Draw the baseline tree ({count} isolates; this can take several seconds)')
+        self.baseline_action.setProperty('baselineAction', 'draw')
+        self.baseline_action.show()
+
+    def _baseline_action_clicked(self):
+        if self.baseline_action.property('baselineAction') == 'draw':
+            self._baseline_draw_requested = True
+            self.refresh_baseline_graph()
+            return
+        self.create_investigation_dialog()
+
+    def refresh_graph_captions(self):
+        """Say which cohort and which moment each tree is, in both captions."""
+        current = self._current_snapshot or {}
+        threshold = self.cluster_threshold.value()
+        self.current_caption.setText(
+            f"Current · {len(current.get('profiles', []))} isolates · link ≤ {threshold}"
+            if current else 'Current · no comparison built yet')
+        self.current_caption.setToolTip(
+            f"The comparison as it is now · link ≤ {threshold} allele differences · "
+            f"shared ≥ {self.overlap.value():.0%} of loci. "
+            'This is a layout of allele differences, not a phylogeny and not a transmission chain.')
+        if not self._baseline_snapshot:
+            return
+        snapshot = self._baseline_snapshot
+        when = str(snapshot.get('created_at') or '')[:16].replace('T', ' ')
+        summary = snapshot_diff_caption(self._baseline_diff) if self._baseline_diff else ''
+        self.baseline_caption.setText(
+            f"Baseline · {when or 'date not recorded'} · {len(snapshot.get('profiles', []))} isolates "
+            f"· link ≤ {snapshot.get('threshold')}" + (f" · {summary}" if summary else ''))
+        tooltip = [f"Baseline snapshot {str(snapshot.get('snapshot_id') or '')[:12]} of "
+                   f"{snapshot.get('investigation_name') or 'this investigation'}, frozen "
+                   f"{snapshot.get('created_at') or 'at an unrecorded time'}.",
+                   f"Reference {snapshot.get('scheme') or 'not recorded'} "
+                   f"({str(snapshot.get('scheme_digest') or 'no fingerprint')[:12]}) · "
+                   f"link ≤ {snapshot.get('threshold')} · shared ≥ "
+                   f"{(snapshot.get('min_overlap') or 0):.0%}.",
+                   'Stored evidence: nothing here is recalculated, and nothing here can be edited.']
+        if self.tree.merge_identical:
+            tooltip.append('Identical-genotype merging is unavailable for a stored snapshot, which keeps '
+                           'per-locus call evidence out of the frozen record.')
+        if self._baseline_diff and not self._baseline_diff['policy']['comparable']:
+            tooltip.append(self._baseline_diff['policy']['reason'])
+        self.baseline_caption.setToolTip('\n'.join(tooltip))
+
+    def refresh_changes_view(self):
+        if not hasattr(self, 'changes_view'):
+            return
+        if self._baseline_diff is None:
+            reason = ('Build a comparison to see what changed since the baseline.'
+                      if self._baseline_snapshot else
+                      'No baseline tree is pinned. Save this comparison as an investigation; its first '
+                      'build becomes the baseline, and later builds are compared against it.')
+            self.changes_view.setHtml('<h2>What changed since the baseline</h2><p>' + html.escape(reason)
+                                      + '</p>')
+            return
+        self.changes_view.setHtml(snapshot_diff_html(self._baseline_diff))
+
+    def show_changes_tab(self):
+        index = self.graph_tabs.indexOf(self.changes_view)
+        if index >= 0:
+            self.graph_tabs.setCurrentIndex(index)
+
+    def _apply_shared_legend(self):
+        """Pin one colour per category across both trees, so the legend is shared."""
+        views = [view for view in self._graph_views().values()
+                 if view is not None and getattr(view, '_results', None)]
+        if len(views) < 2 or (self.color_by.currentData() or 'cluster') == 'cluster':
+            # Cluster colour already derives from the lineage-stable group number,
+            # so the two trees agree by construction and pinning would only lie.
+            for view in views:
+                view.set_pinned_legend({})
+            return
+        categories = sorted({category for view in views for category in view.color_categories()})
+        palette = views[0]._palette
+        pinned = {category: palette[index % len(palette)] for index, category in enumerate(categories)}
+        for view in views:
+            view.set_pinned_legend(pinned)
+
+    def choose_baseline_snapshot(self):
+        if not self.active_investigation_id:
+            self.notify('Save this comparison as an investigation first. Its first build becomes the baseline.')
+            return
+        store = InvestigationStore(self.project)
+        catalog = store.snapshot_catalog(self.active_investigation_id)
+        if not catalog:
+            self.notify('Build the saved investigation once to create its first snapshot.')
+            return
+        labels = [f"#{entry['number']} · {str(entry['created_at'] or 'date not recorded')[:16].replace('T', ' ')}"
+                  f" · {entry['cohort_size'] or 'unknown'} isolates · link ≤ {entry['threshold']}"
+                  + (' · current baseline' if entry['is_baseline'] else '') for entry in catalog]
+        current = next((index for index, entry in enumerate(catalog) if entry['is_baseline']), 0)
+        chosen, accepted = QInputDialog.getItem(self, 'Choose baseline snapshot',
+            'The left tree shows this frozen snapshot. Stored snapshots are never modified:', labels, current, False)
+        if not accepted:
+            return
+        entry = catalog[labels.index(chosen)]
+        store.set_baseline(self.active_investigation_id, entry['snapshot_id'])
+        self._reset_baseline_state()
+        self.refresh_baseline_graph()
+
+    def pin_current_as_baseline(self):
+        if not self.active_investigation_id or not self._current_snapshot:
+            self.notify('Save this comparison as an investigation and build it once before pinning a baseline.')
+            return
+        snapshot_id = self._current_snapshot.get('snapshot_id')
+        try:
+            InvestigationStore(self.project).set_baseline(self.active_investigation_id, snapshot_id)
+        except KeyError:
+            self.notify('This comparison is an unsaved preview, so it is not a stored snapshot yet. '
+                        'Build the saved investigation to store it, then pin it.')
+            return
+        self._reset_baseline_state()
+        self.refresh_baseline_graph()
+        self.notify('Baseline pinned. The stored snapshot is unchanged; only which one is shown changed.')
 
     def inspect_graph_sample(self, sid):
         callback = getattr(self, 'open_isolate_record', None)
@@ -1351,15 +1888,32 @@ class ComparisonWorkspaceMixin:
                 self.sample_table.setCurrentCell(row, 0)
         self.navigate(1)
 
+    def export_role(self):
+        """Which tree the export entries act on; 'current' unless the user chose otherwise."""
+        if not self.dual_toggle.isChecked():
+            return 'current'
+        return self.export_tree_choice.currentData() or 'current'
+
+    def export_snapshot(self, role=None):
+        role = role or self.export_role()
+        return self._baseline_snapshot if role == 'baseline' else self._current_snapshot
+
     def export_graph_action(self, index, combo):
         combo.setCurrentIndex(0)
         if index == 0:
             return
-        if index == 1:
+        role = self.export_role()
+        if index in {10, 11, 12, 13}:
+            return self.export_baseline_comparison(index)
+        if role == 'baseline' and not self._baseline_drawn:
+            self.notify('Show the baseline tree first: there is nothing drawn to export.')
+            return
+        if index == 1 and role == 'current':
             return self.save_tree()
-        if index == 5:
+        if index == 5 and role == 'current':
             return self.export_distances()
-        formats = {2: ("svg", "save_svg"), 3: ("graphml", "save_graphml"), 4: ("nwk", "save_newick"), 6: ("tsv", None),
+        formats = {1: ('png', 'save_image'), 2: ("svg", "save_svg"), 3: ("graphml", "save_graphml"),
+                   4: ("nwk", "save_newick"), 5: ('json', 'distances'), 6: ("tsv", None),
                    7: ('jpg', 'save_image'), 8: ('tsv', 'profiles'), 9: ('tsv', 'groups')}
         extension, method = formats[index]
         path, _ = QFileDialog.getSaveFileName(self, "Export comparison", f"comparison.{extension}", f"{extension.upper()} (*.{extension})")
@@ -1367,34 +1921,143 @@ class ComparisonWorkspaceMixin:
             return
         try:
             self.check_output(path)
+            snapshot = self.export_snapshot(role)
             if method in {'profiles', 'groups'}:
-                self.write_comparison_table(path, method)
+                self.write_comparison_table(path, method, snapshot=snapshot if role == 'baseline' else None)
+            elif method == 'distances':
+                from wmlstudio.export import write_distances
+                write_distances(snapshot.get('pairs', []), path, snapshot.get('min_overlap', 0.95))
             elif method:
-                getattr(self.tree, method)(path)
+                view = self._graph_view(role)
+                title = ('Baseline allele-distance minimum spanning forest'
+                         if role == 'baseline' else None)
+                if method in {'save_graphml', 'save_newick'}:
+                    getattr(view, method)(path)
+                else:
+                    getattr(view, method)(path, title=title, subtitle=self._export_subtitle(role))
             else:
-                self.write_distance_matrix(path)
-            self.notify("Comparison exported with its current cohort and evidence.")
+                self.write_distance_matrix(path, snapshot=snapshot if role == 'baseline' else None)
+            self.notify(('Baseline snapshot exported exactly as it was stored.' if role == 'baseline'
+                         else 'Comparison exported with its current cohort and evidence.'))
         except Exception as exc:
             self.error(exc)
 
-    def write_comparison_table(self, path, table):
+    def _export_subtitle(self, role):
+        if role != 'baseline' or not self._baseline_snapshot:
+            return None
+        snapshot = self._baseline_snapshot
+        return (f"Baseline snapshot frozen {snapshot.get('created_at') or 'at an unrecorded time'} · "
+                f"link ≤ {snapshot.get('threshold')} · not a phylogeny or transmission tree")
+
+    def export_baseline_comparison(self, index):
+        """The two trees together, and the change summary that explains them."""
+        baseline, current = self._baseline_snapshot, self._current_snapshot
+        if not baseline or not current or self._baseline_diff is None:
+            missing = 'baseline tree' if not baseline else 'current comparison'
+            self.notify(f'This export needs both trees; there is no {missing} yet.')
+            return
+        if index in {10, 11} and not self._baseline_drawn:
+            self.notify('Show the baseline tree first: there is nothing drawn to export.')
+            return
+        extension = {10: 'png', 11: 'jpg', 12: 'tsv', 13: 'json'}[index]
+        path, _ = QFileDialog.getSaveFileName(self, 'Export baseline comparison',
+                                              f'baseline-comparison.{extension}',
+                                              f'{extension.upper()} (*.{extension})')
+        if not path:
+            return
+        try:
+            self.check_output(path)
+            if index in {10, 11}:
+                image = self.render_dual_graph()
+                if not image.save(str(path), 'JPEG' if index == 11 else 'PNG'):
+                    raise OSError(f'Could not save image: {path}')
+            elif index == 12:
+                self.write_change_summary(path)
+            else:
+                self.write_change_summary_json(path)
+            self.notify('Exported both trees with the policy that produced each of them.')
+        except Exception as exc:
+            self.error(exc)
+
+    def render_dual_graph(self, width=1800, height=1200):
+        """One image holding both trees, headlined with whether they are comparable."""
+        policy = self._baseline_diff['policy']
+        headline = policy['reason']
+        if policy['identical']:
+            headline = ('Same reference, same link threshold, same minimum shared loci — the two '
+                        'trees can be read against each other.')
+        baseline, current = self._baseline_snapshot, self._current_snapshot
+        return render_side_by_side(
+            self.baseline_tree, self.tree,
+            left_title=f"Baseline · {str(baseline.get('created_at') or '')[:16].replace('T', ' ')} · "
+                       f"{len(baseline.get('profiles', []))} isolates · link ≤ {baseline.get('threshold')}",
+            right_title=f"Current · {len(current.get('profiles', []))} isolates · "
+                        f"link ≤ {current.get('threshold')}",
+            left_subtitle=self._export_subtitle('baseline'),
+            right_subtitle=None, headline=headline, width=width, height=height)
+
+    def write_change_summary(self, path):
         import csv
 
         from wmlstudio.export import _atomic_text, _csv_cell
-        rows = self.profile_model.rows if table == 'profiles' else (self._current_snapshot or {}).get('groups', [])
-        headers = self.profile_model.headers if table == 'profiles' else ['id', 'name', 'status', 'members', 'change', 'parents', 'max_direct_distance', 'chained', 'unassessed_within_pairs']
+        rows = snapshot_diff_rows(self._baseline_diff)
+        with _atomic_text(path) as handle:
+            writer = csv.writer(handle, delimiter='\t')
+            writer.writerow(DIFF_ROW_FIELDS)
+            for row in rows:
+                writer.writerow([_csv_cell(row[key]) for key in DIFF_ROW_FIELDS])
+            writer.writerow([])
+            for caveat in self._baseline_diff['caveats']:
+                writer.writerow([_csv_cell('how_to_read'), _csv_cell(caveat)])
+
+    def write_change_summary_json(self, path):
+        from copy import deepcopy
+        from datetime import datetime, timezone
+
+        from wmlstudio import __version__
+        from wmlstudio.export import _atomic_text
+        document = {'application': f'WMLSTudio {__version__}',
+                    'exported_at': datetime.now(timezone.utc).isoformat(),
+                    **deepcopy(self._baseline_diff)}
+        with _atomic_text(path) as handle:
+            json.dump(document, handle, indent=2, ensure_ascii=False, allow_nan=False)
+
+    def write_comparison_table(self, path, table, snapshot=None):
+        import csv
+
+        from wmlstudio.export import _atomic_text, _csv_cell
+        if snapshot is not None and table == 'profiles':
+            # known_alleles omits every uncallable locus, so a blank cell here is
+            # "not called", never a matching allele.
+            profiles = snapshot.get('profiles', [])
+            loci = sorted({locus for p in profiles for locus in (p.get('known_alleles') or {})})
+            headers = ['Sample', 'ST', 'Scheme', *loci]
+            rows = [{'Sample': p.get('sample_name'), 'ST': p.get('st'), 'Scheme': snapshot.get('scheme'),
+                     **(p.get('known_alleles') or {})} for p in profiles]
+        elif snapshot is not None:
+            rows, headers = snapshot.get('groups', []), None
+        else:
+            rows = self.profile_model.rows if table == 'profiles' else (self._current_snapshot or {}).get('groups', [])
+            headers = self.profile_model.headers if table == 'profiles' else None
+        if headers is None:
+            headers = ['id', 'name', 'status', 'members', 'change', 'parents', 'max_direct_distance', 'chained', 'unassessed_within_pairs']
         with _atomic_text(path) as handle:
             writer = csv.writer(handle, delimiter='\t')
             writer.writerow(headers)
             for row in rows:
                 writer.writerow([_csv_cell(row.get(key)) for key in headers])
 
-    def write_distance_matrix(self, path):
+    def write_distance_matrix(self, path, snapshot=None):
         import csv
 
         from wmlstudio.export import _atomic_text, _csv_cell
-        results = self._last_comparison
-        distances = {frozenset((p["source"], p["target"])): p["distance"] if p["comparable"] else "NA" for p in self.distance_rows}
+        if snapshot is not None:
+            results = [{'sample_id': str(p['sample_id']), 'sample_name': p.get('sample_name', p['sample_id'])}
+                       for p in snapshot.get('profiles', [])]
+            pairs = snapshot.get('pairs', [])
+        else:
+            results, pairs = self._last_comparison, self.distance_rows
+        distances = {frozenset((p["source"], p["target"])): p["distance"] if p["comparable"] else "NA" for p in pairs}
         with _atomic_text(path) as handle:
             writer = csv.writer(handle, delimiter="\t")
             writer.writerow(["sample", *[_csv_cell(r["sample_name"]) for r in results]])

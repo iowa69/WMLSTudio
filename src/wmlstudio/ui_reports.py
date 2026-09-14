@@ -5,7 +5,7 @@ import os
 import tempfile
 from pathlib import Path
 
-from PySide6.QtCore import QBuffer, QByteArray, QIODevice, Qt
+from PySide6.QtCore import QBuffer, QByteArray, QIODevice, Qt, QTimer
 from PySide6.QtGui import QColor, QImage, QPageSize, QPainter, QPdfWriter, QTextDocument
 from PySide6.QtWidgets import (
     QCheckBox,
@@ -17,6 +17,7 @@ from PySide6.QtWidgets import (
     QInputDialog,
     QLineEdit,
     QMenu,
+    QMessageBox,
     QTableView,
     QTabWidget,
     QTextBrowser,
@@ -32,6 +33,7 @@ from wmlstudio.sample_workflow import (
     set_cluster,
     suggest_hydra_links,
 )
+from wmlstudio.theme import BACKGROUND
 from wmlstudio.ui_common import (
     FlowLayout,
     cell,
@@ -42,11 +44,29 @@ from wmlstudio.ui_common import (
 from wmlstudio.ui_compare import EvidenceMatrixModel
 from wmlstudio.widgets import button, card, label
 
+# How long the one-click summary waits for a background comparison before it
+# writes the document anyway, saying plainly that no comparison was available.
+_COMPARISON_WAIT_STEP_MS = 250
+_COMPARISON_WAIT_LIMIT_MS = 120_000
+
 
 class ReportWorkspaceMixin:
     def build_reports(self):
         _, layout = self.page()
         self.heading(layout, "Prepare a review report", "Choose a report template and its own isolates. Clear evidence summaries come first; technical provenance is optional.")
+        # The one-click route, above the template controls, because a reader who
+        # is not a bioinformatician should not have to choose a template first.
+        simple, simple_layout = card()
+        simple_layout.addWidget(label('Just give me a summary', 'cardTitle'))
+        simple_layout.addWidget(label(
+            'One short document in plain words: a picture of how close the isolates are, the resistance '
+            'genes that were found, and each isolate’s closest match. It prints which isolates it covered '
+            'and where that choice came from, and it never calls a gene a susceptibility result.',
+            'small', True))
+        simple_row = FlowLayout()
+        simple_row.addWidget(button('Make a simple summary (PDF)…', lambda: self.simple_report(), True))
+        simple_layout.addLayout(simple_row)
+        layout.addWidget(simple)
         controls = FlowLayout()
         self.report_scope = QComboBox(self)
         self.report_scope.hide()  # Kept as the explicit scope model, not a global selector.
@@ -56,7 +76,8 @@ class ReportWorkspaceMixin:
         self.report_preset = QComboBox()
         for key, value in REPORT_PRESETS.items():
             self.report_preset.addItem(value['title'], key)
-        self.report_preset.setCurrentIndex(1)
+        # By key, not by position: appending a preset must never repoint the default.
+        self.report_preset.setCurrentIndex(self.report_preset.findData('cohort'))
         self.report_preset.currentIndexChanged.connect(self.report_preset_changed)
         controls.addWidget(self.report_preset, 1)
         controls.addWidget(button('Choose report isolates…', self.choose_report_cohort, True))
@@ -66,11 +87,14 @@ class ReportWorkspaceMixin:
         self.report_count = label("Report scope: all project samples", "cardTitle")
         layout.addWidget(self.report_count)
         self.report_table = make_table(["Include", "Highlight", "Sample", "Organism", "ST", "AMR genes", "Group"])
-        self.report_table.setParent(self)
-        self.report_table.hide()
         self.report_table.setColumnWidth(0, 65)
         self.report_table.setColumnWidth(1, 75)
+        # Visible and compact: the reader can see exactly which isolates the
+        # report covers, tick one in or out, and right-click to act on them.
+        self.report_table.setMaximumHeight(214)
         self.report_table.itemChanged.connect(self.report_item_changed)
+        layout.addWidget(self.report_table)
+        self.install_view_menu('reports', self.report_table)
         self.report_preview = QTextBrowser()
         self.report_preview.setOpenExternalLinks(False)
         layout.addWidget(self.report_preview, 1)
@@ -120,7 +144,9 @@ class ReportWorkspaceMixin:
         for key, text in [('investigation', 'Groups and nearest-neighbour comparisons'), ('qc', 'Input quality evidence'),
                           ('amr', 'AMR determinants'), ('virulence', 'Virulence assay'),
                           ('plasmid_hypotheses', 'Plasmid-marker hypotheses'), ('drug_associations', 'Reference-reported drug classes'),
-                          ('graph', 'Graph with focal isolates highlighted'), ('provenance', 'Full technical provenance appendix')]:
+                          ('graph', 'Graph with focal isolates highlighted'),
+                          ('graph_jpeg', 'Embed the picture as JPEG (smaller file, slightly softer text)'),
+                          ('provenance', 'Full technical provenance appendix')]:
             check = QCheckBox(text)
             check.setChecked(options[key])
             checks[key] = check
@@ -139,15 +165,32 @@ class ReportWorkspaceMixin:
         self.notify('Saved this report template in the project. Its isolate selection remains separate for each report.')
 
     def report_context(self):
+        options = self.report_options()
+        if not options['investigation']:
+            return None
         context = getattr(self, '_report_investigation_snapshot', None)
+        current = getattr(self, '_current_snapshot', None)
         if self.report_scope.currentIndex() == 1:
-            context = getattr(self, '_current_snapshot', None)
-        return context if self.report_options()['investigation'] else None
+            context = current
+        if options.get('layout') == 'one_page' and (
+                context is None or current is None
+                or context.get('snapshot_id') != current.get('snapshot_id')):
+            # The simple summary always describes the comparison that is on
+            # screen, so its picture, its threshold and its distances cannot
+            # disagree. Every other preset keeps the strict stored context.
+            context = current
+        return context
 
-    def report_graph_png(self, ids=None):
+    def report_graph_available(self):
+        """Whether a picture would describe the same snapshot as the numbers."""
         context = self.report_context()
         current = getattr(self, '_current_snapshot', None)
-        if not self.report_options()['graph'] or not context or not current or context['snapshot_id'] != current['snapshot_id']:
+        return bool(self.report_options()['graph'] and context and current
+                    and context['snapshot_id'] == current['snapshot_id'])
+
+    def report_graph_image(self, ids=None, *, fmt='PNG'):
+        """Focal isolates highlighted on the graph that is actually on screen."""
+        if not self.report_graph_available():
             return None
         tree = self.tree
         selected = tree.selected_ids()
@@ -155,39 +198,84 @@ class ReportWorkspaceMixin:
         try:
             focus = set(ids if ids is not None else self.report_sample_ids()) & tree._results.keys()
             tree.select_ids(focus)
-            picture = QImage(1800, 1200, QImage.Format.Format_ARGB32)
+            # JPEG carries no alpha channel, so the canvas is opaque from the
+            # start; _render fills the same background over it.
+            picture = QImage(1800, 1200, QImage.Format.Format_RGB32)
+            picture.fill(QColor(BACKGROUND))
             painter = QPainter(picture)
             tree._render(painter, 1800, 1200)
             painter.end()
             data = QByteArray()
             buffer = QBuffer(data)
             buffer.open(QIODevice.OpenModeFlag.WriteOnly)
-            if not picture.save(buffer, 'PNG'):
+            if not picture.save(buffer, fmt, 92 if fmt == 'JPEG' else -1):
                 raise OSError('Could not render the report graph.')
             return bytes(data)
         finally:
             tree.select_ids(selected)
             tree.blockSignals(False)
 
+    def report_graph_png(self, ids=None):
+        return self.report_graph_image(ids, fmt='PNG')
+
     def export_report_graph(self):
-        data = self.report_graph_png()
-        if not data:
+        if not self.report_graph_available():
             self.notify('Choose a comparison-aware report with a matching current graph first.')
             return
-        path, _ = QFileDialog.getSaveFileName(self, 'Export focal-isolate graph', 'investigation.png', 'PNG (*.png);;JPEG (*.jpg)')
+        path, _ = QFileDialog.getSaveFileName(self, 'Export focal-isolate graph', 'investigation.png',
+                                              'PNG (*.png);;JPEG (*.jpg *.jpeg)')
         if not path:
             return
+        fmt = 'JPEG' if Path(path).suffix.casefold() in {'.jpg', '.jpeg'} else 'PNG'
         try:
             self.check_output(path)
-            image = QImage.fromData(data, 'PNG')
+            data = self.report_graph_image(fmt=fmt)
+            if not data:
+                raise OSError('The image could not be written.')
             with tempfile.TemporaryDirectory(prefix='.wmlstudio-image-', dir=Path(path).resolve().parent) as directory:
                 temporary = Path(directory) / Path(path).name
-                if not image.save(str(temporary)):
-                    raise OSError('The image could not be written.')
+                temporary.write_bytes(data)
                 os.replace(temporary, path)
-            self.notify('Exported the graph with this report’s focal isolates highlighted.')
+            self.notify(f'Exported the graph as {fmt} with this report’s focal isolates highlighted.')
         except Exception as error:
             self.error(error)
+
+    def resolve_report_scope(self, selected_ids=None):
+        """Decide a report's scope once, and state that decision inside the report.
+
+        A fallback is announced in the document, never inherited silently from a
+        view filter. An explicit caller wins; then the isolates chosen for this
+        report; then whatever the workspace has focused, named by where it came
+        from; and only then every isolate in the project.
+        """
+        records = self.report_records()
+        known = {sample['id'] for sample in records}
+        eligible = {sample['id'] for sample in records
+                    if sample.get('metadata', {}).get('workflow', {}).get('source_kind') != 'read_mate'}
+        if selected_ids is not None:
+            ids = {str(value) for value in selected_ids} & known
+            if not ids:
+                raise ValueError('None of the isolates given for this report are in the project. '
+                                 'Choose this report’s isolates, or import sequence files first.')
+            return {'ids': ids, 'implicit': False,
+                    'note': f'This report covers {len(ids)} isolate(s) chosen by the caller.'}
+        ids = self.report_sample_ids() & eligible
+        if ids:
+            return {'ids': ids, 'implicit': False,
+                    'note': f'This report covers the {len(ids)} isolate(s) you chose for it.'}
+        focus = getattr(self, 'focus', None)
+        focused = {str(value) for value in getattr(focus, 'ids', ()) or ()} & eligible
+        if focused:
+            origin = getattr(focus, 'origin', '') or 'your current selection'
+            return {'ids': focused, 'implicit': True,
+                    'note': (f'No isolates were chosen for this report, so it covers the {len(focused)} '
+                             f'isolate(s) you had selected — from {origin}. '
+                             'Use “Choose report isolates…” to set the scope yourself.')}
+        if not eligible:
+            raise ValueError('This project has no isolates yet. Import sequence files before making a report.')
+        return {'ids': eligible, 'implicit': True,
+                'note': (f'No isolates were chosen for this report, so it covers all {len(eligible)} '
+                         'isolates in the project. Use “Choose report isolates…” to narrow it.')}
 
     def report_sample_ids(self):
         index = self.report_scope.currentIndex()
@@ -227,8 +315,12 @@ class ReportWorkspaceMixin:
             self.report_count.setText(f"{len(chosen)} included · {highlights} highlighted · {len(samples)} in project")
             if hasattr(self, 'report_preview'):
                 if chosen:
+                    options = self.report_options()
+                    jpeg = bool(options.get('graph_jpeg'))
                     self.report_preview.setHtml(review_report_html(self.report_records(), selected_ids=chosen,
-                        investigation=self.report_context(), options=self.report_options(), graph_png=self.report_graph_png(chosen)))
+                        investigation=self.report_context(), options=options,
+                        graph_png=self.report_graph_image(chosen, fmt='JPEG' if jpeg else 'PNG'),
+                        graph_mime='image/jpeg' if jpeg else 'image/png'))
                 else:
                     self.report_preview.setHtml('<h2>Start a focused report</h2><p>Choose a template above, then choose this report’s isolates. No sample is silently included from a library filter.</p>')
         finally:
@@ -251,6 +343,11 @@ class ReportWorkspaceMixin:
             group = sample.get("metadata", {}).get("cluster", {})
             set_cluster(self.project, [sid], group.get("label") or "Highlighted", group.get("color") or "#E9AD66", checked)
         self.refresh_report_table()
+
+    # The right-click handlers these three views need (open a record, route a
+    # selection to another tab, archive, export) all live on WorkbenchMixin,
+    # which sits earlier in the MainWindow MRO. Wiring the views is what is
+    # needed here; a second copy of those handlers would only shadow-compete.
 
     def report_selected(self):
         if not self.selection_ids:
@@ -304,42 +401,64 @@ class ReportWorkspaceMixin:
             self.error(error)
 
     def export_report(self, fmt):
-        ids = self.report_sample_ids()
-        if not ids:
-            self.notify("The report selection is empty. Select samples or choose All project samples.")
+        try:
+            scope = self.resolve_report_scope()
+        except ValueError as error:
+            self.notify(str(error))
             return
+        ids = scope['ids']
         path, _ = QFileDialog.getSaveFileName(self, f"Export {len(ids)} samples", f"wmlstudio-report.{fmt}", f"{fmt.upper()} (*.{fmt})")
         if not path:
             return
         try:
             self.check_output(path)
+            options = self.report_options()
+            jpeg = bool(options.get('graph_jpeg'))
             if fmt == "pdf":
-                self.write_pdf_report(path, selected_ids=ids)
+                self.write_pdf_report(path, selected_ids=ids, scope_note=scope['note'],
+                                      scope_implicit=scope['implicit'])
             elif fmt == 'html':
                 write_review_report(self.report_records(), path, selected_ids=ids, investigation=self.report_context(),
-                                    options=self.report_options(), graph_png=self.report_graph_png(ids))
+                                    options=options, graph_png=self.report_graph_image(ids, fmt='JPEG' if jpeg else 'PNG'),
+                                    graph_mime='image/jpeg' if jpeg else 'image/png',
+                                    scope_note=scope['note'], scope_implicit=scope['implicit'])
             else:
                 export_results(self.report_records(), path, fmt, selected_ids=ids, investigation=self.report_context())
-            scope = f"all {len(ids)} project samples" if self.report_scope.currentIndex() == 2 else f"{len(ids)} selected samples"
-            self.notify(f"Exported {scope} with their linked metadata and highlights.")
+            self.notify(f"Exported {len(ids)} samples with their linked metadata and highlights. " + scope['note'])
         except Exception as exc:
             self.error(exc)
 
-    def write_pdf_report(self, path, selected_ids=None, *, full_project=False):
+    def write_pdf_report(self, path, selected_ids=None, *, full_project=False, options=None, graph=None,
+                         scope_note=None, scope_implicit=False):
+        """Print the chosen report to PDF, stating in the document which isolates it covered.
+
+        ``options`` and ``graph`` (an ``(image bytes, mime)`` pair) let the
+        one-click summary pin its own preset and its own already-rendered
+        picture; both default to today's behaviour.
+        """
         self.check_output(path)
-        ids = self.report_sample_ids() if selected_ids is None else set(selected_ids)
+        scope = self.resolve_report_scope(selected_ids)
+        ids = scope['ids']
         samples = [s for s in self.report_records() if s["id"] in ids]
-        if not samples:
-            raise ValueError("No samples selected for the PDF report.")
+        settings = options if options is not None else (REPORT_PRESETS['cohort'] if full_project else self.report_options())
+        if graph is not None:
+            image, mime = graph
+        elif full_project:
+            image, mime = None, 'image/png'
+        else:
+            jpeg = bool(settings.get('graph_jpeg'))
+            image = self.report_graph_image(ids, fmt='JPEG' if jpeg else 'PNG')
+            mime = 'image/jpeg' if jpeg else 'image/png'
         document = QTextDocument()
         document.setHtml(review_report_html(samples, selected_ids=ids,
                                            investigation=None if full_project else self.report_context(),
-                                           options=REPORT_PRESETS['cohort'] if full_project else self.report_options(),
-                                           graph_png=None if full_project else self.report_graph_png(ids)))
+                                           options=settings, graph_png=image, graph_mime=mime,
+                                           scope_note=scope_note or scope['note'],
+                                           scope_implicit=scope_implicit or (scope['implicit'] and scope_note is None)))
         with tempfile.TemporaryDirectory(prefix='.wmlstudio-pdf-', dir=Path(path).resolve().parent) as directory:
             output = Path(directory) / 'report.pdf'
             writer = QPdfWriter(str(output))
-            writer.setTitle(self.report_options()['title'])
+            writer.setTitle(settings['title'])
             writer.setPageSize(QPageSize(QPageSize.PageSizeId.A4))
             writer.setResolution(144)
             document.print_(writer)
@@ -351,9 +470,108 @@ class ReportWorkspaceMixin:
     def report_records(self):
         return [dict(sample, analyses=self.available_profiles(sample)) for sample in self.project.samples()]
 
+    # ------------------------------------------------------------------
+    # The one-click plain-language summary
+    # ------------------------------------------------------------------
+    def simple_report(self, path=None, *, build_comparison=None):
+        """One click: the picture, the genes found, and each isolate's closest match.
+
+        ``build_comparison`` decides whether to build a comparison when none
+        exists; ``None`` asks the user, so a test never meets a modal dialog.
+        """
+        try:
+            scope = self.resolve_report_scope()
+        except ValueError as error:
+            self.notify(str(error))
+            return
+        if getattr(self, '_current_snapshot', None) is None:
+            if build_comparison is None:
+                build_comparison = self._ask_to_build_comparison(len(scope['ids']))
+            if build_comparison:
+                from wmlstudio import workspace_focus
+                # An explicit, announced cohort change: the picture then shows
+                # exactly the isolates this report is about, and the Compare tab
+                # records where its cohort came from.
+                workspace_focus.send_selection(self, 'compare', sorted(scope['ids']),
+                                               origin='Simple summary report', navigate=False)
+                if getattr(self, '_current_snapshot', None) is None:
+                    self._await_comparison_for_summary(path, getattr(self, '_comparison_generation', 0))
+                    return
+        self._write_simple_report(path, scope)
+
+    def _ask_to_build_comparison(self, count):
+        answer = QMessageBox.question(
+            self, 'Build a comparison first?',
+            f'No comparison has been built yet, so the summary would carry no picture and no '
+            f'closest-match table.\n\nBuild one now from these {count} isolate(s)? This replaces the '
+            f'current comparison cohort.\n\nChoosing No still writes the summary; it will say plainly '
+            f'that no comparison was available.',
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.Yes)
+        return answer == QMessageBox.StandardButton.Yes
+
+    def _await_comparison_for_summary(self, path, generation, waited=0):
+        """Finish the summary once a background comparison lands, or say it did not.
+
+        The comparison belongs to the Compare workspace; this watches the state
+        it publishes rather than reaching into its worker, abandons quietly when
+        the user starts a different comparison or closes the project, and never
+        leaves the click without a document.
+        """
+        if getattr(self, '_comparison_closing', False) or generation != getattr(self, '_comparison_generation', generation):
+            return
+        idle = (getattr(self, 'comparison_worker', None) is None
+                and getattr(self, '_comparison_pending', None) is None)
+        ready = getattr(self, '_current_snapshot', None) is not None
+        if not (ready or waited >= _COMPARISON_WAIT_LIMIT_MS or (idle and waited >= 3 * _COMPARISON_WAIT_STEP_MS)):
+            QTimer.singleShot(_COMPARISON_WAIT_STEP_MS, lambda: self._await_comparison_for_summary(
+                path, generation, waited + _COMPARISON_WAIT_STEP_MS))
+            return
+        if not ready:
+            self.notify('The comparison did not produce a snapshot for these isolates. '
+                        'The summary says so; it does not report them as unrelated.')
+        try:
+            scope = self.resolve_report_scope()
+        except ValueError as error:
+            self.notify(str(error))
+            return
+        self._write_simple_report(path, scope)
+
+    def _write_simple_report(self, path, scope):
+        if path is None:
+            path, _ = QFileDialog.getSaveFileName(self, 'Save simple summary', 'outbreak-summary.pdf',
+                                                  'PDF (*.pdf);;HTML (*.html)')
+            if not path:
+                return
+        options = {**REPORT_PRESETS['simple']}
+        # One click must produce the same document whatever preset the combo was
+        # left on, and report_context()/report_graph_image() both read
+        # report_options(). Evaluate the whole write against the simple preset.
+        previous = self._report_options_override
+        self._report_options_override = options
+        try:
+            self.check_output(path)
+            investigation = self.report_context()
+            image = self.report_graph_image(scope['ids'], fmt='JPEG')
+            if Path(path).suffix.casefold() == '.pdf':
+                self.write_pdf_report(path, selected_ids=scope['ids'], options=options,
+                                      graph=(image, 'image/jpeg'), scope_note=scope['note'],
+                                      scope_implicit=scope['implicit'])
+            else:
+                records = [s for s in self.report_records() if s['id'] in scope['ids']]
+                write_review_report(records, path, selected_ids=scope['ids'], investigation=investigation,
+                                    options=options, graph_png=image, graph_mime='image/jpeg',
+                                    scope_note=scope['note'], scope_implicit=scope['implicit'])
+        except Exception as error:
+            self.error(error)
+            return
+        finally:
+            self._report_options_override = previous
+        self.notify('Simple summary saved. ' + scope['note'])
+
     def build_hydra(self):
         super().build_hydra()
-        layout = self.pages.widget(4).widget().layout()
+        layout = self.pages.page_for('evidence').widget().layout()
         layout.itemAt(0).widget().setText('Review isolate evidence')
         layout.itemAt(1).widget().setText('Choose this workspace’s cohort. Identity, AMR and accessory evidence remain separate from core allele distances.')
         # Preserve source-import functionality, but move its independent scope
@@ -387,12 +605,14 @@ class ReportWorkspaceMixin:
         layout.addWidget(self.feature_scope_label)
         tabs = QTabWidget()
         self.evidence_tabs = tabs
+        self.pages.register_subtabs('evidence', self.evidence_tabs)
         self.feature_table = QTableView()
         self.feature_model = EvidenceMatrixModel(self.feature_table)
         self.feature_table.setModel(self.feature_model)
         self.feature_table.setSortingEnabled(True)
         self.feature_table.setAlternatingRowColors(True)
         self.feature_table.doubleClicked.connect(lambda index: self.open_isolate_record(self.feature_model.rows[index.row()]['_sample_id']))
+        self.install_view_menu('evidence.features', self.feature_table)
         tabs.addTab(self.feature_table, 'Isolate feature summary')
         matrix_page = QWidget()
         matrix_layout = QVBoxLayout(matrix_page)
@@ -406,6 +626,7 @@ class ReportWorkspaceMixin:
         self.amr_matrix.setAlternatingRowColors(True)
         self.amr_matrix.setSortingEnabled(True)
         self.amr_matrix.doubleClicked.connect(lambda index: self.open_isolate_record(self.amr_model.rows[index.row()]['_sample_id']))
+        self.install_view_menu('evidence.amr', self.amr_matrix)
         matrix_layout.addWidget(self.amr_matrix)
         matrix_layout.addWidget(label("Present = detected in the linked report; not detected is not a susceptibility claim. No report = unknown, never absence.", "small", True))
         tabs.addTab(matrix_page, "AMR gene matrix")

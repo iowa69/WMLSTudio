@@ -318,4 +318,8 @@ MODULE = register(OrganismModule(
     runner=type_sccmec, option_keys=('threads', 'blastn_path', 'makeblastdb_path'),
     manifest_sections=('sccmec.targets', 'sccmec.rules'),
     summary=summarize_sccmec, detail_html=sccmec_html, report_default=True,
+    purpose='Looks for the ccr and mec marker genes that define the SCCmec cassette types and reports which '
+            'published type definition those markers satisfy. It does not establish methicillin resistance, '
+            'an MRSA or MSSA designation, or any susceptibility result, and a cassette broken across contigs '
+            'is reported as partial or untypeable rather than as the nearest type.',
     limitations=tuple(LIMITATIONS)))

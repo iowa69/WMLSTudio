@@ -51,6 +51,12 @@ application cannot read the upgraded project.
 Use **Help → Practice project**. Seven explicitly synthetic assemblies let you
 test navigation, sample selection, comparisons, graph options and reports.
 
+For real data to practise on, two pinned cohorts of published complete genomes
+can be downloaded and checksum-verified: ten *K. pneumoniae* genomes, or twenty
+genomes across fifteen genera that deliberately include the hard calls. No
+sequence ships in the ZIP, and no expected answer ships with either cohort. See
+[practice cohorts](docs/TEST_DATASETS.md).
+
 ![Native WMLSTudio workbench with the synthetic practice cohort](docs/images/wmlstudio-workbench.png)
 
 *Native Windows application; synthetic demonstration data, not a clinical cohort.*
@@ -74,18 +80,29 @@ provenance remain linked to the resulting assembly.
 
 ## One connected workflow
 
-| Workspace | What you can do |
+Seven tabs run across the top of the window, one per question. Each carries a
+plain sentence saying what it answers, a button for the usual next step, and a
+**?** that opens the guide at the right place.
+
+| Tab | What you can do |
 | --- | --- |
 | Overview | Browse the library by organism/ST, open projects and research saved isolates |
-| Samples | Assign workflows, select cohorts, inspect QC/typing, edit annotations, create collections and inspect history |
+| Isolates | Assign workflows, select cohorts, inspect QC/typing, edit annotations, create collections and inspect history |
 | Compare | Choose a cohort and scheme snapshot, call additional cgMLST/wgMLST profiles, reuse saved profiles, style/export the minimum spanning forest |
-| Scheme library | Import local schemes, browse online catalogs, install versioned snapshots and create a local ad-hoc cohort scheme |
-| HYDRA insights | Run native assembly AMR searches, map external reports explicitly, inspect all features and primary-aware AMR matrices |
+| Schemes | Import local schemes, browse online catalogs, install versioned snapshots and create a local ad-hoc cohort scheme |
+| Evidence | Run native assembly AMR searches, map external reports explicitly, inspect all features and primary-aware AMR matrices |
 | Reports | Include/exclude isolates, highlight investigation groups, export PDF/HTML/CSV/TSV/JSON and portable profile bundles |
-| Settings and help | Reduced motion, local data location, workflow guidance and scientific limitations |
+| Settings | Text size and whole-interface scale, data location and references, and what this version cannot do |
+
+Selecting isolates anywhere sets a **focus** — the top strip says how many and
+where they came from. A tab reviews them only when you press **Use current focus**
+on that tab, and it then states which cohort it holds and where it came from.
+Focus never changes a cohort by itself.
 
 Menus provide the canonical actions; **Ctrl+K** opens command search.
-**Ctrl+R** analyses selected samples. **Alt+1…7** switches workspace pages.
+**Ctrl+R** analyses selected samples. **Alt+1…7** switches tabs. Right-click
+offers add, open, rename, assign organism, re-file, archive, remove, copy and
+export for the selection you actually have, with the count always shown.
 
 ## Typing and comparison
 
@@ -162,8 +179,23 @@ database-driven product/service use requires permission. PubMLST has separate
 [terms](https://pubmlst.org/terms-conditions). Confirm rights for your actual use
 and sharing. Software licensing does not grant database redistribution rights.
 
-The complete Kleborate/Kaptive, AMRFinderPlus, agr/SCCmec/spa, MOB-recon and
-abricate execution stack, direct-read AMR/pileup, fastp/SPAdes, independent species
+Organism-specific reference panels are pinned to one upstream commit each and
+ship with their own licence text: Kleborate (GPL-3.0-or-later), rpetit3/sccmec
+v1.2.0 (MIT) and Kaptive v2.0.9 (GPL-3.0-or-later, `wzi`/`wzc` markers only).
+WMLSTudio runs its own screens against that data. It does **not** execute those
+tools and is not equivalent to them: no Kleborate virulence or resistance score
+is computed, no K or O locus is assigned, mecC is not assayed, and no SCCmec
+result is an MRSA designation or a susceptibility result. See
+[organism modules](docs/ORGANISM_MODULES.md).
+
+Published cluster thresholds are catalogued with their citations and are never
+applied automatically. Eight organisms have a cutoff bound to a named scheme;
+twelve listed organisms have none at all, and no bundled scheme can bind a cgMLST
+cutoff. [Which organisms are actually covered](docs/THRESHOLDS.md) states each
+case, including the paediatric gaps.
+
+The complete Kleborate/Kaptive, AMRFinderPlus, agr/spa, MOB-recon and abricate
+execution stack, direct-read AMR/pileup, fastp/SPAdes, independent species
 confirmation and clinical validation remain unfinished. The
 [scientific workflow contract](docs/MICROBIOLOGY_WORKFLOWS.md) makes those gaps
 explicit.

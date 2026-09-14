@@ -76,6 +76,7 @@ class WorkspaceTabs(QTabWidget):
         self.setDocumentMode(False)
         self.setMovable(False)
         self.setUsesScrollButtons(True)
+        self.tabBar().setObjectName("workspaceTabBar")
         self.tabBar().setExpanding(False)
         self.tabBar().setElideMode(Qt.TextElideMode.ElideRight)
         self.tabBar().setAccessibleName("Workspace sections")

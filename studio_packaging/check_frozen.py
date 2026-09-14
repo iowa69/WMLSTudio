@@ -10,12 +10,22 @@ import os
 import platform
 import random
 import subprocess
+import sys
 import tempfile
 from pathlib import Path
 
 from wmlstudio import __version__
+from wmlstudio.organism_modules import registered_modules
 from wmlstudio.sequence import file_sha256, iter_sequences
 from wmlstudio.typing import load_scheme
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from stage_reference_panels import (  # noqa: E402 - resolved from this script's own directory
+    UNBUNDLED_NOTE,
+    panel_summary,
+    sccmec_region_reference,
+    unbundled_payload,
+)
 
 
 def check_hydra(bundle, root, suffix):
@@ -98,7 +108,73 @@ def check_species(cli, bundle, root):
     if not matching:
         raise ValueError("Executed pyskani native-module hash does not match the portable bundle")
     return {"status": "passed", "control": "Bundled K. pneumoniae reference self-comparison; not an independent biological validation",
-            "input_sha256": before, "species_evidence": result, "native_module": str(matching[0])}
+            "input_sha256": before, "species_evidence": result, "native_module": str(matching[0]),
+            "characterization_sections": sorted(report)}
+
+
+def check_reference_panels(bundle):
+    """Re-verify the staged reference panels the portable build actually carries.
+
+    The bundled characterization snapshot is re-hashed file by file inside the
+    frozen bundle, so a panel that was truncated by packaging fails here rather
+    than reading later as a negative assay result. The practice cohorts and the
+    broad species panel must be absent: they are the user's own downloads.
+    """
+    panel = panel_summary(bundle / "_internal/wmlstudio/resources/characterization/starter")
+    leaked = unbundled_payload([bundle])
+    if leaked:
+        raise ValueError(f"{UNBUNDLED_NOTE} This bundle carries {leaked}")
+    return {"status": "passed", "characterization": panel,
+            "unbundled_payload": [], "unbundled_note": UNBUNDLED_NOTE}
+
+
+def check_organism_modules(cli, root, panel, sections):
+    """Prove the organism-module registry survives freezing, then self-compare SCCmec.
+
+    The assay modules are reached through a computed ``__import__``, which the
+    module scan cannot follow, so a bundle that omitted them raises
+    ModuleNotFoundError on the first characterization run. ``sections`` is the
+    key set of the frozen ``characterize`` report: the registry keys being there
+    is the evidence that the import succeeded inside the frozen process. ``panel``
+    is the already-verified summary from check_reference_panels.
+    """
+    expected = sorted(registered_modules())
+    absent = [key for key in expected if key not in sections]
+    if absent:
+        raise ValueError(f"The frozen characterization report carries no evidence block for {absent}; "
+                         "the organism-module registry did not load inside the bundle.")
+    references = Path(panel["path"])
+    registry = {"status": "passed", "registered_modules": expected,
+                "control": "Bundled reference self-comparison; not an independent biological validation"}
+    if panel["organism_modules"] != "staged":
+        return {**registry, "sccmec": {"status": "not_run", "reason": panel["organism_modules_reason"]}}
+    usage = subprocess.run([str(cli), "characterize", "--help"], capture_output=True, text=True, timeout=60)
+    if "--module" not in usage.stdout:
+        return {**registry, "sccmec": {"status": "not_run", "reason":
+                "The frozen command line does not offer 'characterize --module', so no frozen SCCmec "
+                "control was run here. The assay is reachable from the desktop characterization plan."}}
+    source = sccmec_region_reference(references)
+    before = file_sha256(source)
+    destination = root / "sccmec.json"
+    process = subprocess.run([str(cli), "characterize", str(source), "--references", str(references),
+                              "--no-species", "--no-virulence", "--module", "sccmec",
+                              "--output", str(destination)], capture_output=True, text=True, timeout=300)
+    if process.returncode:
+        raise RuntimeError(f"Frozen SCCmec typing failed: {process.stdout[-2000:]}\n{process.stderr[-4000:]}")
+    evidence = json.loads(destination.read_text(encoding="utf-8"))["sccmec"]
+    complexes = {row["name"]: row["state"] for row in (*evidence["ccr_complexes"], *evidence["mec_classes"])}
+    if evidence["mecA"] != "detected" or complexes.get("ccr Type 2") != "present":
+        raise ValueError(f"Frozen SCCmec typing did not recover its own type IV cassette reference: {evidence}")
+    if "IV" not in evidence["candidate_types"]:
+        raise ValueError(f"Frozen SCCmec typing proposed {evidence['candidate_types']} for the IVa reference")
+    if evidence["official_type"] is not None or evidence["mecC"] != "not_assayed":
+        raise ValueError("Frozen SCCmec typing asserted an official type or a mecC result it cannot support")
+    if file_sha256(source) != before:
+        raise ValueError("Frozen SCCmec typing altered the bundled reference it read")
+    return {**registry, "sccmec": {"status": "passed", "reference": str(source), "input_sha256": before,
+                                   "complexes": complexes, "candidate_types": evidence["candidate_types"],
+                                   "type": evidence["type"], "mecA": evidence["mecA"], "mecC": evidence["mecC"],
+                                   "official_type": evidence["official_type"]}}
 
 
 def check_ska_cli(cli, root):
@@ -161,6 +237,9 @@ def main() -> int:
         hydra = check_hydra(bundle, root, suffix)
         fastqc = check_fastqc(cli, root)
         species = check_species(cli, bundle, root)
+        panels = check_reference_panels(bundle)
+        modules = check_organism_modules(cli, root, panels["characterization"],
+                                         species["characterization_sections"])
         ska = check_ska_cli(cli, root)
         skesa = None
         if suffix:
@@ -183,7 +262,7 @@ def main() -> int:
         "typing": "passed", "desktop_demo": "passed", "screenshot": str(screenshot),
         "hydra_frozen_worker": hydra, "native_skesa": skesa,
         "original_fastqc": fastqc, "native_pyskani": species,
-        "native_ska2": ska,
+        "native_ska2": ska, "reference_panels": panels, "organism_modules": modules,
     }
     revision = os.environ.get("GITHUB_SHA") or os.environ.get("WMLSTUDIO_SOURCE_REVISION")
     if revision:

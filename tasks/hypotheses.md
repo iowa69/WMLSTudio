@@ -1,5 +1,46 @@
 # Validation hypotheses
 
+## Acceptance revision: alternatives introduced by this batch
+
+| Explanation | Status | Discriminating check |
+| --- | --- | --- |
+| A frozen build silently omits an assay module the registry imports by computed name, so a portable install fails on every characterization run | **Addressed** | Disassembly shows `_load` emits no `IMPORT_NAME`; an AST scan finds no static reference; the spec derives hidden imports from `runner.__module__`; `check_frozen` asserts the registry's evidence blocks are present in a frozen report |
+| A missing or out-of-date reference panel section is read as a negative assay result | Addressed by construction | A format 1 snapshot yields `not_run` naming the missing section; `check_frozen` reports `staged`/`absent` with the reason rather than a silent pass |
+| An automatically created organism folder is taken for a laboratory identification | Unresolved | Folder text, quarantine README and cohort caveats all state the distinction; needs observation with a real non-specialist user |
+| Filing quarantines the wrong isolates because "nothing matched" is read as "not this organism" | Unresolved | Quarantine reason is derived from the engine's own numbers, not from its prose; `Not_in_reference_panel` is an explicit statement about the installed panel |
+| A published threshold is applied to a scheme it was never measured on | Addressed | `record_decision` refuses without an exact scheme key, the full target count, the reference fingerprint, the caller, the missing-data policy and a written justification; seventeen catalogue entries are refusable by that rule today |
+| A practice cohort is mistaken for a validation set, or its agreement with a published study is read as software validation | Addressed in text, unresolved in use | Five caveats ship inside each cohort manifest and are shown at download; no expected ST, cluster or threshold is distributed |
+| A re-rendered baseline snapshot reads as 100% locus completeness because only called alleles were stored | Addressed | `snapshot_graph` documents that `len(alleles)` is the callable count; completeness must come from the stored `callable_loci`/`total_loci` scalars |
+| An incomparable pair of snapshots is summarised as "no change" | Addressed | Every not-assessed section and count is `None`, never `[]` or `0`; consumers must branch on `None` |
+| A whole-interface scale leaves the window larger than the screen and unrecoverable | Addressed | Only scales the screen can display the whole window at are offered; `--display-scale` is a documented recovery path |
+| Sequence data reach the repository or the portable ZIP through a practice cohort or the species panel | Addressed | Gitignore covers the download directories; the build refuses to package either, and `check_frozen` re-checks the built bundle |
+| An SCCmec type call is read as an MRSA determination or a methicillin susceptibility result | Unresolved | `official_type` is unconditionally `None`, `mecC` is always `not_assayed`, and the limitation is repeated in every drill-down and report section; needs user observation |
+
+### Recorded deferral: whole K and O locus typing
+
+Not implemented, and recorded rather than promised. Kaptive v2.0.9 (commit
+`b3856eac6e76b3017aa993319da2a8ea967a1ba0`, GPL-3.0-or-later) ships
+`Klebsiella_k_locus_primary_reference.gbk` (8,325,855 B),
+`Klebsiella_o_locus_primary_reference.gbk` (325,387 B),
+`Klebsiella_k_locus_variant_reference.gbk` (1,303,472 B) and
+`Klebsiella_o_locus_primary_reference.logic` (591 B). Kaptive 3 master no longer
+carries the databases in-repo, so v2.0.9 is the pinnable artefact.
+
+Two blockers. **Format**: GenBank, with no runtime parser and no justification
+for adding one; it needs a build-time converter to whole-locus FASTA, per-CDS
+gene FASTA and a locus-to-gene JSON, with Biopython in the development group only
+and the manifest recording upstream `.gbk` SHA-256, derived SHA-256 and converter
+version. **Algorithm**: Kaptive's output is a locus assignment with a confidence
+grade derived from expected-gene coverage, missing and extra genes and locus
+contiguity, plus `.logic` O-locus special rules. Reimplementing that and calling
+the result a K or O locus type would be precisely the overstatement this project
+refuses.
+
+If pursued, the honest shape is `capsule_locus_candidate` by interval-union
+coverage with per-expected-gene presence and a contig count, status capped at
+`provisional_reference_match`, `official_locus` unconditionally `None`, and a
+limitation naming what is not implemented. Bundle cost about **+9.9 MB**.
+
 ## Investigation revision: active scientific and usability alternatives
 
 | Explanation | Status | Discriminating check |

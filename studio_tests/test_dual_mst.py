@@ -5,13 +5,18 @@ from copy import deepcopy
 
 import pytest
 
+from wmlstudio import ui_compare
 from wmlstudio.comparison import forest_from_distances, pairwise_distances
 from wmlstudio.investigation import (
     DIFF_CAVEATS,
+    DIFF_ROW_FIELDS,
     INTERPRETATION,
     InvestigationStore,
     build_snapshot,
     snapshot_diff,
+    snapshot_diff_caption,
+    snapshot_diff_html,
+    snapshot_diff_rows,
     snapshot_graph,
 )
 from wmlstudio.project import Project
@@ -355,3 +360,421 @@ def test_a_change_summary_needs_both_halves():
         snapshot_diff(stored, None)
     with pytest.raises(ValueError, match="baseline and a current"):
         snapshot_diff(None, stored)
+
+
+# ---------------------------------------------------------------------------
+# The change summary as a reader sees it
+# ---------------------------------------------------------------------------
+
+
+def test_the_rendered_change_summary_escapes_names_and_states_its_limits():
+    records = [profile("a", "1111"), profile("b", "2111")]
+    first = build_snapshot(records, pairwise_distances(records), 1, 0.95)
+    grown = records + [dict(profile("c", "2211"), sample_name="Ward <b>A</b>")]
+    second = build_snapshot(grown, pairwise_distances(grown), 1, 0.95, previous=first)
+    page = snapshot_diff_html(snapshot_diff(first, second))
+    assert "Ward &lt;b&gt;A&lt;/b&gt;" in page and "<b>A</b>" not in page
+    assert "not a phylogeny" in page and "transmission chain" in page
+    assert "not assessed" in page.casefold()
+
+
+def test_a_refused_comparison_renders_the_refusal_and_no_distance_table():
+    records = [profile("a", "1111"), profile("b", "2111")]
+    first = build_snapshot(records, pairwise_distances(records), 1, 0.95)
+    second = build_snapshot([dict(row, scheme_digest="other") for row in records],
+                            pairwise_distances([dict(row, scheme_digest="other") for row in records]), 1, 0.95)
+    diff = snapshot_diff(first, second)
+    page = snapshot_diff_html(diff)
+    assert "not measured on one scale" in page
+    assert "Baseline shared/total" not in page
+    assert page.count("Not assessed") >= 3          # distances, groups and drawn lines
+    assert snapshot_diff_caption(diff).endswith("distances, lines and groups not comparable")
+
+
+def test_the_change_summary_table_names_what_was_not_assessed():
+    records = [profile("a", "1111"), profile("b", "2111")]
+    first = build_snapshot(records, pairwise_distances(records), 1, 0.95)
+    grown = records + [profile("c", "2211")]
+    second = build_snapshot(grown, pairwise_distances(grown), 1, 0.95, previous=first)
+    rows = snapshot_diff_rows(snapshot_diff(first, second))
+    assert all(tuple(row) == DIFF_ROW_FIELDS for row in rows)
+    kinds = {row["change_type"]: row for row in rows}
+    assert kinds["isolate_added"]["sample_id"] == "c"
+    assert kinds["pairs_not_assessed"]["current_value"] == 2
+    assert "not assessed is not" in kinds["pairs_not_assessed"]["note"].casefold()
+    assert kinds["comparison_policy"]["note"].startswith("Same reference")
+
+
+def test_a_caption_names_only_what_moved_and_says_so_when_nothing_did():
+    records = [profile("a", "1111"), profile("b", "2111")]
+    first = build_snapshot(records, pairwise_distances(records), 1, 0.95)
+    second = build_snapshot(records, pairwise_distances(records), 1, 0.95, previous=first)
+    assert snapshot_diff_caption(snapshot_diff(first, second)) == "no change since the baseline"
+    changed = [profile("a", "1111"), profile("b", "2211")]
+    third = build_snapshot(changed, pairwise_distances(changed), 1, 0.95, previous=first)
+    caption = snapshot_diff_caption(snapshot_diff(first, third))
+    assert "1 re-typed" in caption and "1 distance changed" in caption
+
+
+# ---------------------------------------------------------------------------
+# The two trees on screen
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def window(qtbot, tmp_path, monkeypatch):
+    from wmlstudio.app import MainWindow
+    widget = MainWindow(storage_root=tmp_path / "application")
+    errors = []
+    monkeypatch.setattr(widget, "error", lambda message: errors.append(str(message)))
+    widget.test_errors = errors
+    qtbot.addWidget(widget)
+    # Laid out with resize, never shown: repainting a second TreeView after many
+    # torn-down offscreen widgets crashes inside the graph label painter.
+    widget.resize(1280, 860)
+    yield widget
+    widget.cancel_comparison_for_close()
+    qtbot.waitUntil(lambda: widget.comparison_worker is None, timeout=5000)
+    widget.close()
+
+
+def imported(window, name, vector="1111", ward="ICU"):
+    return window.project.add_profile(name, {
+        "sample_name": name, "scheme": "Study cgMLST", "scheme_digest": "study-reference",
+        "status": "profile_imported", "alleles": dict(zip("abcd", vector)), "calls": [],
+        "st": "20" if vector.startswith("1") else "44", "input_sha256": "a" * 64,
+    }, {"organism": {"genus": "Staphylococcus", "species": "aureus"}, "annotations": {"ward": ward}})
+
+
+def build(window, ids, threshold=1, investigation_id=None, name="Ward A"):
+    """Save (or re-save) the investigation and build it, which stores a snapshot."""
+    window.refresh_cohort_table()
+    plan = InvestigationStore(window.project).save(
+        name, list(ids), investigation_id=investigation_id, scheme="Study cgMLST",
+        scheme_digest="study-reference", threshold=threshold, min_overlap=0.95,
+        protocol="Synthetic test protocol; not a clinical cutoff")
+    window.cohort_ids = set(ids)
+    window.select_investigation(plan["id"])
+    assert window._current_snapshot, window.tree_status.text()
+    return plan["id"]
+
+
+def grown_investigation(window):
+    """A baseline of two isolates and a current comparison of three."""
+    a, b = imported(window, "A"), imported(window, "B", "2111")
+    investigation_id = build(window, [a, b])
+    c = imported(window, "C", "2211", ward="Ward 2")
+    build(window, [a, b, c], investigation_id=investigation_id)
+    window.dual_toggle.setChecked(True)
+    return investigation_id, a, b, c
+
+
+def test_the_baseline_pane_is_absent_until_it_is_asked_for(window):
+    a, b = imported(window, "A"), imported(window, "B", "2111")
+    build(window, [a, b])
+    assert window.baseline_pane.isVisibleTo(window.graph_split) is False
+    assert window.current_caption.isVisibleTo(window.current_pane) is False
+    assert window.export_tree_choice.isVisibleTo(window) is False
+    assert window.graph_tabs.widget(0) is window.graph_split
+    assert window.tree.parent() is window.current_pane
+    assert window.baseline_tree._results == {}
+
+
+def test_each_tree_holds_its_own_cohort_and_says_which_moment_it_is(window):
+    _, a, b, c = grown_investigation(window)
+    assert set(window.baseline_tree._results) == {a, b}
+    assert set(window.tree._results) == {a, b, c}
+    assert window.baseline_caption.text().startswith("Baseline · ")
+    assert "2 isolates" in window.baseline_caption.text()
+    assert "+1 isolate" in window.baseline_caption.text()
+    assert window.current_caption.text() == "Current · 3 isolates · link ≤ 1"
+    assert "frozen" in window.baseline_caption.toolTip()
+    assert "study-refer" in window.baseline_caption.toolTip()
+    assert "nothing here is recalculated" in window.baseline_caption.toolTip()
+    assert window.test_errors == []
+
+
+def test_selecting_in_one_tree_selects_the_same_isolates_in_the_other_once(window):
+    _, a, b, c = grown_investigation(window)
+    emissions = []
+    window.baseline_tree.selectionChanged.connect(lambda ids: emissions.append(tuple(ids)))
+    window.tree.selectionChanged.connect(lambda ids: emissions.append(tuple(ids)))
+    window.tree.select_ids([a, b])
+    assert window.baseline_tree.selected_ids() == sorted([a, b])
+    assert len(emissions) == 2                      # one per view, no ping-pong
+    window.baseline_tree.select_ids([b])
+    assert window.tree.selected_ids() == [b]
+    assert len(emissions) == 4
+
+
+def test_selecting_an_isolate_added_since_the_baseline_says_so_rather_than_nothing(window):
+    _, a, b, c = grown_investigation(window)
+    window.tree.select_ids([c])
+    assert window.baseline_tree.selected_ids() == []
+    assert "1 also in the baseline tree" not in window.graph_selection_label.text()
+    assert "0 also in the baseline tree · 1 added since the baseline" in window.graph_selection_label.text()
+    window.baseline_tree.select_ids([a])
+    assert "1 still in the current comparison · 0 no longer in it" in window.graph_selection_label.text()
+
+
+def test_linking_selection_can_be_switched_off_without_touching_either_tree(window):
+    _, a, b, c = grown_investigation(window)
+    window.tree.select_ids([a])
+    assert window.baseline_tree.selected_ids() == [a]
+    window.link_selection.setChecked(False)
+    window.tree.select_ids([b])
+    assert window.baseline_tree.selected_ids() == [a]
+
+
+def test_each_tree_keeps_its_own_saved_arrangement(window):
+    _, a, b, c = grown_investigation(window)
+    window._pending_graph_state = None
+    window._pending_baseline_graph_state = None
+    window.tree.nodes[a].setPos(11, 12)
+    window.tree.update_edges()
+    window.baseline_tree.nodes[a].setPos(90, 91)
+    window.baseline_tree.update_edges()
+    current = window.project.get_setting("graph_style", {})
+    baseline = window.project.get_setting("graph_style.baseline", {})
+    assert current["positions"][a] == [11, 12]
+    assert baseline["positions"][a] == [90, 91]
+    assert current["positions"][a] != baseline["positions"][a]
+    assert set(baseline["positions"]) == {a, b}
+
+
+def test_highlighting_marks_matches_in_both_trees_and_stores_nothing(window):
+    _, a, b, c = grown_investigation(window)
+    stored = window.project.samples()
+    window.graph_search.setText("Ward 2")
+    assert window.tree.nodes[c].highlighted is True
+    assert window.tree.nodes[a].highlighted is False
+    assert all(not node.highlighted for node in window.baseline_tree.nodes.values())
+    assert "1 matched here · 0 in the baseline tree" in window.graph_selection_label.text()
+    window.graph_search.setText("A")
+    assert window.baseline_tree.nodes[a].highlighted is True
+    assert window.project.samples() == stored
+
+
+def test_one_shared_colour_key_covers_both_trees_when_colouring_by_st(window):
+    _, a, b, c = grown_investigation(window)
+    window.color_by.setCurrentIndex(window.color_by.findData("st"))
+    assert window.tree.color_by == "st" and window.baseline_tree.color_by == "st"
+    shared = set(window.tree.color_categories()) & set(window.baseline_tree.color_categories())
+    assert shared
+    for category in shared:
+        assert window.tree.legend()[category] == window.baseline_tree.legend()[category]
+    assert all(category in window.graph_legend.toolTip()
+               for category in window.tree.color_categories())
+
+
+def test_colouring_by_cluster_pins_nothing_because_group_numbers_already_match(window):
+    grown_investigation(window)
+    window.color_by.setCurrentIndex(window.color_by.findData("cluster"))
+    assert window.tree._pinned_legend == {}
+    assert window.baseline_tree._pinned_legend == {}
+
+
+def test_without_a_saved_investigation_the_pane_offers_to_save_one(window):
+    imported(window, "A")
+    imported(window, "B", "2111")
+    window.refresh_comparison()
+    window.dual_toggle.setChecked(True)
+    assert window.baseline_tree.isVisibleTo(window.baseline_pane) is False
+    assert "No baseline tree yet" in window.baseline_notice.text()
+    assert window.baseline_action.text().startswith("Save this comparison as an investigation")
+    assert "No baseline tree is pinned" in window.changes_view.toPlainText()
+    assert window.baseline_caption.text() == "Baseline · none pinned"
+
+
+def test_a_baseline_larger_than_the_autodraw_limit_waits_to_be_asked(window, monkeypatch):
+    count = ui_compare.BASELINE_AUTODRAW_LIMIT + 10
+    stored = {"snapshot_id": "big", "created_at": "2026-01-01T00:00:00+00:00", "threshold": 1,
+              "min_overlap": 0.95, "scheme": "Study cgMLST", "scheme_digest": "study-reference",
+              "groups": [], "pairs": [],
+              "profiles": [{"sample_id": f"s{index}", "sample_name": f"Isolate {index}",
+                            "known_alleles": {"a": "1"}, "callable_loci": 1, "total_loci": 4}
+                           for index in range(count)]}
+    monkeypatch.setattr(InvestigationStore, "baseline_snapshot_id", lambda self, iid: "big")
+    monkeypatch.setattr(InvestigationStore, "snapshot", lambda self, iid, sid=None: stored)
+    window.active_investigation_id = "pretend"
+    window.dual_toggle.setChecked(True)
+    assert window._baseline_drawn is False
+    assert window.baseline_tree._results == {}
+    assert f"({count} isolates; this can take several seconds)" in window.baseline_action.text()
+    window.baseline_action.click()
+    assert window._baseline_drawn is True
+    assert len(window.baseline_tree._results) == count
+    assert window.baseline_notice.isVisibleTo(window.baseline_pane) is False
+
+
+def test_a_baseline_on_another_reference_refuses_the_comparison_on_screen(window, monkeypatch):
+    _, a, b, c = grown_investigation(window)
+    original = window._baseline_snapshot
+    monkeypatch.setattr(InvestigationStore, "snapshot",
+                        lambda self, iid, sid=None: dict(original, scheme_digest="another-reference"))
+    window._reset_baseline_state()
+    window.refresh_baseline_graph()
+    assert window._baseline_diff["policy"]["comparable"] is False
+    assert window._baseline_diff["pairs"] is None
+    page = window.changes_view.toPlainText()
+    assert "not measured on one scale" in page
+    assert "Baseline shared/total" not in page
+    assert "not comparable" in window.baseline_caption.text()
+    assert "not measured on one scale" in window.baseline_caption.toolTip()
+
+
+def test_reporting_from_the_baseline_tree_carries_the_baseline_snapshot(window):
+    _, a, b, c = grown_investigation(window)
+    window.report_graph_selection([a, b], role="baseline")
+    assert window.report_sample_ids() == {a, b}
+    assert window._report_investigation_snapshot is window._baseline_snapshot
+    window.report_graph_selection([a, b, c], role="current")
+    assert window._report_investigation_snapshot is window._current_snapshot
+
+
+def test_switching_projects_forgets_the_other_projects_baseline(window, tmp_path, qtbot):
+    investigation_id, a, b, c = grown_investigation(window)
+    assert window._baseline_snapshot is not None
+    window.switch_project(tmp_path / "second.wmlstudio")
+    qtbot.waitUntil(lambda: window.comparison_worker is None, timeout=5000)
+    assert window._baseline_snapshot is None
+    assert window._baseline_diff is None
+    assert window.baseline_tree._results == {}
+    assert window.active_investigation_id is None
+
+
+def test_pinning_a_later_snapshot_moves_the_left_tree_without_rebuilding(window, monkeypatch):
+    investigation_id, a, b, c = grown_investigation(window)
+    store = InvestigationStore(window.project)
+    catalog = store.snapshot_catalog(investigation_id)
+    assert [entry["is_baseline"] for entry in catalog] == [True, False]
+    monkeypatch.setattr(ui_compare.QInputDialog, "getItem",
+                        lambda *args, **kwargs: (args[3][1], True))
+    before = window.project.get_setting(f"investigation.{investigation_id}")["updated_at"]
+    window.choose_baseline_snapshot()
+    assert store.baseline_snapshot_id(investigation_id) == catalog[1]["snapshot_id"]
+    assert set(window.baseline_tree._results) == {a, b, c}
+    assert window.project.get_setting(f"investigation.{investigation_id}")["updated_at"] == before
+    assert window._baseline_diff["summary"]["isolates_added"] == 0
+
+
+def choose_path(monkeypatch, path):
+    monkeypatch.setattr(ui_compare.QFileDialog, "getSaveFileName",
+                        lambda *args, **kwargs: (str(path), ""))
+
+
+def test_both_trees_export_as_one_picture_carrying_the_interpretation_limit(window, monkeypatch, tmp_path):
+    from PySide6.QtGui import QImage
+    from PySide6.QtWidgets import QComboBox
+    grown_investigation(window)
+    combo = QComboBox()
+    for index, suffix in ((10, "png"), (11, "jpg")):
+        path = tmp_path / f"pair.{suffix}"
+        choose_path(monkeypatch, path)
+        window.export_graph_action(index, combo)
+        assert path.stat().st_size > 0
+        assert QImage(str(path)).width() == 3600
+    assert window.test_errors == []
+
+
+def test_the_change_summary_exports_as_a_spreadsheet_and_as_data(window, monkeypatch, tmp_path):
+    import csv
+
+    from PySide6.QtWidgets import QComboBox
+    _, a, b, c = grown_investigation(window)
+    combo = QComboBox()
+    table = tmp_path / "changes.tsv"
+    choose_path(monkeypatch, table)
+    window.export_graph_action(12, combo)
+    with table.open(encoding="utf-8-sig", newline="") as handle:
+        rows = [row for row in csv.DictReader(handle, delimiter="\t") if row.get("change_type")]
+    added = [row for row in rows if row["change_type"] == "isolate_added"]
+    assert [row["sample_id"] for row in added] == [c]
+    assert any(row["change_type"] == "pairs_not_assessed" for row in rows)
+    assert any(row["change_type"] == "how_to_read" and "not a phylogeny" in row["sample_id"]
+               for row in rows)
+    document = tmp_path / "changes.json"
+    choose_path(monkeypatch, document)
+    window.export_graph_action(13, combo)
+    payload = json.loads(document.read_text(encoding="utf-8"))
+    assert payload["format_version"] == 1 and payload["application"].startswith("WMLSTudio")
+    assert all(caveat in payload["caveats"] for caveat in DIFF_CAVEATS)
+    assert payload["summary"]["isolates_added"] == 1
+    assert window.test_errors == []
+
+
+def test_an_export_of_the_baseline_pane_writes_the_baseline_cohort_not_the_current_one(window, monkeypatch, tmp_path):
+    from PySide6.QtWidgets import QComboBox
+    _, a, b, c = grown_investigation(window)
+    combo = QComboBox()
+    window.export_tree_choice.setCurrentIndex(window.export_tree_choice.findData("baseline"))
+    profiles = tmp_path / "baseline-profiles.tsv"
+    choose_path(monkeypatch, profiles)
+    window.export_graph_action(8, combo)
+    text = profiles.read_text(encoding="utf-8-sig")
+    assert "A" in text and "B" in text and "\nC\t" not in text
+    picture = tmp_path / "baseline.png"
+    choose_path(monkeypatch, picture)
+    window.export_graph_action(1, combo)
+    assert picture.stat().st_size > 0
+    distances = tmp_path / "baseline-distances.json"
+    choose_path(monkeypatch, distances)
+    window.export_graph_action(5, combo)
+    payload = json.loads(distances.read_text(encoding="utf-8"))
+    assert {row["source"] for row in payload["pairs"]} | {row["target"] for row in payload["pairs"]} == {a, b}
+    assert window.test_errors == []
+
+
+def test_exports_that_need_both_halves_say_which_half_is_missing(window, monkeypatch):
+    from PySide6.QtWidgets import QComboBox
+    imported(window, "A")
+    imported(window, "B", "2111")
+    window.refresh_comparison()
+    window.dual_toggle.setChecked(True)
+    said = []
+    monkeypatch.setattr(window, "notify", lambda message: said.append(str(message)))
+    monkeypatch.setattr(ui_compare.QFileDialog, "getSaveFileName",
+                        lambda *args, **kwargs: pytest.fail("Nothing may be written without both trees."))
+    for index in (10, 11, 12, 13):
+        window.export_graph_action(index, QComboBox())
+    assert said and all("no baseline tree yet" in message for message in said)
+
+
+def test_the_comparison_views_offer_the_shared_right_click_actions(window):
+    from PySide6.QtWidgets import QMenu
+    _, a, b, c = grown_investigation(window)
+    assert set(window._context_adapters) >= {"compare.cohort", "compare.groups", "compare.profiles"}
+    window.tree.select_ids([a, b])
+    menu = QMenu()
+    dispatch = window.graph_context_entries(window.tree, menu, a)
+    titles = [action.text() for action in menu.actions() if action.text()]
+    assert "Add 2 isolates to comparison" in titles
+    assert "Remove 2 isolates from comparison" not in titles   # not an action of this view
+    assert any("Copy" in title for title in titles)
+    assert dispatch
+    menu.deleteLater()
+
+
+def test_removing_from_the_comparison_leaves_the_isolate_and_its_evidence_in_place(window, monkeypatch):
+    from wmlstudio.context_menus import Selection
+    _, a, b, c = grown_investigation(window)
+    said = []
+    monkeypatch.setattr(window, "notify", lambda message: said.append(str(message)))
+    window.context_remove_from_comparison(Selection("compare.cohort", (c,)))
+    assert c not in window.cohort_ids
+    assert window.project.get_setting("comparison_cohort") == sorted({a, b})
+    assert {sample["id"] for sample in window.project.samples()} == {a, b, c}
+    record = next(sample for sample in window.project.samples() if sample["id"] == c)
+    assert record["result"]["alleles"] == {"a": "2", "b": "2", "c": "1", "d": "1"}
+    assert "comparison cohort" in said[-1] and "removed" in said[-1]
+    window.context_add_to_comparison(Selection("compare.cohort", (c,)))
+    assert c in window.cohort_ids
+    assert "added to the comparison cohort" in said[-1]
+
+
+def test_a_right_click_on_a_group_row_acts_on_its_isolates_not_on_the_group_identifier(window):
+    _, a, b, c = grown_investigation(window)
+    group = next(g for g in window._current_snapshot["groups"] if len(g["members"]) > 1)
+    adapter = window._context_adapters["compare.groups"]
+    assert set(adapter.group_members({group["id"]})) == set(group["members"])
+    assert group["id"] not in adapter.group_members({group["id"]})

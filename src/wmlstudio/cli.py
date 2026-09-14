@@ -12,6 +12,27 @@ from wmlstudio.sequence import inspect_sequence, validate_read_pair
 from wmlstudio.typing import call_assembly, load_scheme
 
 
+def parse_organism(value):
+    """'Klebsiella pneumoniae' -> ('Klebsiella', 'pneumoniae'); a bare genus keeps an empty species."""
+    parts = (value or "").split(maxsplit=1)
+    if not parts:
+        return None
+    return parts[0], parts[1] if len(parts) > 1 else ""
+
+
+def describe_modules(modules):
+    """What each organism-specific module is, which taxa it covers, and what it does not establish."""
+    from wmlstudio.organism_modules import BOUNDARY
+    return {"boundary": BOUNDARY,
+            "modules": [{"key": key, "title": module.title, "column_title": module.column_title,
+                         "purpose": module.purpose, "genera": sorted(module.match.genera),
+                         "species": sorted(module.match.species),
+                         "excluded_species": sorted(module.match.exclude_species),
+                         "reference_sections": list(module.manifest_sections),
+                         "limitations": list(module.limitations)}
+                        for key, module in sorted(modules.items())]}
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(prog="wmlstudio-cli", description="Reproducible WMLSTudio sequence analysis")
     parser.add_argument("--version", action="version", version=__version__)
@@ -40,10 +61,16 @@ def main(argv=None):
     fastqc.add_argument("--threads", type=int, default=2)
     fastqc.add_argument("--memory-gb", type=int, default=1)
     characterization = commands.add_parser("characterize", help="Independent ANI, virulence and explicitly linked accessory evidence")
-    characterization.add_argument("input", type=Path)
+    characterization.add_argument("input", nargs="?", type=Path)
     characterization.add_argument("--references", type=Path)
     characterization.add_argument("--no-species", action="store_true")
     characterization.add_argument("--no-virulence", action="store_true")
+    characterization.add_argument("--module", action="append", metavar="KEY",
+        help="Run an organism-specific typing module; repeat for several. See --list-modules")
+    characterization.add_argument("--list-modules", action="store_true",
+        help="Print the registered organism-specific modules, their taxa and their stated limits")
+    characterization.add_argument("--organism", metavar="\"Genus species\"",
+        help="Record which taxa this isolate belongs to; modules are labelled applicable or off-panel, never skipped")
     characterization.add_argument("--hydra-report", type=Path)
     characterization.add_argument("--hydra-sample")
     characterization.add_argument("--threads", type=int, default=2)
@@ -84,13 +111,26 @@ def main(argv=None):
         if args.command == "characterize":
             from wmlstudio.characterization import characterize_assembly
             from wmlstudio.characterization_refs import bundled_reference_root
+            from wmlstudio.organism_modules import registered_modules
+            modules = registered_modules()
+            if args.list_modules:
+                print(json.dumps(describe_modules(modules), indent=2))
+                return 0
+            if args.input is None:
+                raise ValueError("Provide an assembly to characterize, or use --list-modules.")
             if args.threads < 1:
                 raise ValueError("Threads must be positive")
+            unknown = [key for key in (args.module or []) if key not in modules]
+            if unknown:
+                raise ValueError(f"Unknown organism module {', '.join(sorted(unknown))}. "
+                                 f"Available: {', '.join(sorted(modules))}.")
             if args.output:
                 ensure_separate_destination(args.output, [args.input, *([args.hydra_report] if args.hydra_report else [])])
             result = characterize_assembly(args.input, args.references or bundled_reference_root(),
                 args.hydra_report, threads=args.threads, hydra_sample_name=args.hydra_sample,
-                species=not args.no_species, virulence=not args.no_virulence)
+                species=not args.no_species, virulence=not args.no_virulence,
+                modules={key: True for key in (args.module or [])},
+                organism=parse_organism(args.organism))
             encoded = json.dumps(result, indent=2)
             if args.output:
                 args.output.parent.mkdir(parents=True, exist_ok=True)

@@ -48,8 +48,37 @@ parameters, which loci failed, and which evidence supports the interpretation?
 | Does proximity prove transmission? | No. A spanning tree visualizes distances; sampling, dates, epidemiology and organism-specific validation remain necessary |
 | Can this be reproduced? | Preserve hashes, software/tool versions, reference manifests, parameters, history and original inputs |
 | Can this be shared? | Confirm sample-data permissions and database/software rights; make the export cohort explicit |
+| Where is this isolate filed, and why? | A folder is a storage decision. Show the evidence and the confidence behind it, keep an explicit unresolved tree with the *reason* for each bucket, and never auto-confirm below genus |
+| Is an organism-specific assay applicable here? | Recommend on the organism, never gate on it; stamp every result with whether the isolate was inside the taxa its panel was curated on |
+| Did the picture change, or did the measurement change? | Report cohort changes, distance changes and denominator changes separately; an incomparable pair of snapshots is "not assessed", never "no change" |
+| Is this threshold ours to use? | Require the exact scheme, the full target set, the caller and the missing-data policy before any published number is adopted, and record the adoption as a local adaptation |
+| Can a non-specialist read the output? | Every section states what it shows *and* what it does not; the susceptibility caveat cannot be switched off |
 
-## Decisions implemented in this revision
+## Decisions implemented in the 0.3 investigation revision
+
+- The interface is divided by **question**, not by data type, and a tab states its
+  own question and the usual next step in plain language.
+- Selecting isolates sets a visible, attributed **focus**. A tab adopts that focus
+  only when the user asks, and then says where its cohort came from. No tab
+  silently inherits another tab's selection.
+- **Archive is the default for removal.** Nothing that destroys evidence happens
+  without the evidence first being written somewhere it can be recovered from, and
+  the user's own input files are never deleted.
+- Organism folders are created automatically, and an **unresolved isolate is filed
+  by the reason it is unresolved** rather than by a guess. A folder is never
+  presented as an identification.
+- Organism-specific assays are **recommended by organism and gated by nothing**.
+  Running one outside its curated taxa is allowed and is recorded in the result.
+- A published threshold is a **citation until it is bound**. The catalogue records
+  the papers it could not turn into a usable cutoff as explicitly as the ones it
+  could.
+- Practice data are **downloaded, checksum-verified and shipped with no answer
+  key**. Their purpose includes demonstrating the failure modes, not only the
+  successes.
+- The plain-language report exists so that a non-bioinformatician can hand
+  something over; its limitations section is fixed and cannot be switched off.
+
+## Decisions implemented in the 0.2 workbench revision
 
 - Primary MLST and additional cgMLST snapshots are separate.
 - Novel sequences use full hashes, not collision-prone short suffixes.

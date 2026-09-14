@@ -258,6 +258,7 @@ class FocusBar(QWidget):
         super().__init__(parent)
         self.focus = focus
         self.project_count = 0
+        self.project_text = "0 isolates in project"
         row = QHBoxLayout(self)
         row.setContentsMargins(0, 0, 0, 0)
         row.setSpacing(8)
@@ -276,36 +277,57 @@ class FocusBar(QWidget):
 
     def set_project_count(self, count) -> None:
         self.project_count = int(count)
+        self.project_text = f"{self.project_count} isolates in project"
+        self.refresh()
+
+    def setText(self, text) -> None:      # noqa: N802 - drop-in for the label it replaced
+        """Compatibility with the plain scope label this bar replaced in the top strip.
+
+        The window still writes the project count here; the bar shows it whenever
+        nothing is focused, and shows the focus line when something is.
+        """
+        self.project_text = str(text)
         self.refresh()
 
     def refresh(self) -> None:
         focused = bool(getattr(self.focus, "ids", set()))
-        self.text.setText(self.focus.describe() if focused
-                          else f"{self.project_count} isolates in project")
+        self.text.setText(self.focus.describe() if focused else self.project_text)
         for control in (self.show_button, self.clear_button):
             control.setVisible(focused)
 
 
 class CohortBar(QWidget):
-    """One row under a tab header: what it reviews, where that came from, how to change it."""
+    """One row under a tab header: what it reviews, where that came from, how to change it.
 
-    def __init__(self, window, key, focus=None, *, ledger=None, extra=None, parent=None):
+    `compact` is for hosts that already carry the tab's own chooser — the orientation
+    strip does — so the bar shows only the scope line and the one button that turns
+    focus into this tab's cohort. The full sentence stays in the tooltip; it is the
+    honest one, and it must be readable wherever the short form is shown.
+    """
+
+    def __init__(self, window, key, focus=None, *, ledger=None, extra=None, compact=False,
+                 parent=None):
         super().__init__(parent)
         self.window_ref = window
         self.key = str(key)
+        self.compact = bool(compact)
+        self.setObjectName("cohortBar")
         self.focus = getattr(window, "focus", None) if focus is None else focus
         self.ledger = getattr(window, "cohort_origins", None) if ledger is None else ledger
         row = QHBoxLayout(self)
         row.setContentsMargins(0, 0, 0, 0)
         row.setSpacing(8)
-        self.text = label(EMPTY_COHORT_TEXT, "small", True)
-        row.addWidget(self.text, 1)
+        self.text = label(EMPTY_COHORT_TEXT, "cohortScope" if self.compact else "small",
+                          not self.compact)
+        row.addWidget(self.text, 0 if self.compact else 1)
         if extra is not None:
             row.addWidget(extra)
         chooser = CHOOSE_METHODS.get(self.key)
-        if chooser and hasattr(window, chooser):
+        if chooser and not self.compact and hasattr(window, chooser):
             row.addWidget(button("Choose isolates…", getattr(window, chooser)))
         self.adopt_button = button("Use current focus", self.adopt)
+        if self.compact:
+            self.adopt_button.setObjectName("cohortAdopt")
         self.adopt_button.setToolTip("Copy the isolates you are focused on into this tab's "
                                      "own cohort. Nothing is copied until you click.")
         row.addWidget(self.adopt_button)
@@ -319,22 +341,36 @@ class CohortBar(QWidget):
         adopt_focus(self.window_ref, self.key, self.focus, ledger=self.ledger)
         self.refresh()
 
-    def refresh(self) -> None:
+    def describe(self) -> str:
         count = len(cohort_ids(self.window_ref, self.key))
         if isinstance(self.ledger, CohortLedger):
-            self.text.setText(self.ledger.describe(self.key, count))
-        elif count:
+            return self.ledger.describe(self.key, count)
+        if count:
             noun = COHORT_NOUNS.get(self.key, "in this tab")
-            self.text.setText(f"Reviewing {count} isolate{'s' if count != 1 else ''} {noun} · "
-                              "this cohort belongs to this tab only.")
-        else:
-            self.text.setText(EMPTY_COHORT_TEXT)
+            return (f"Reviewing {count} isolate{'s' if count != 1 else ''} {noun} · "
+                    "this cohort belongs to this tab only.")
+        return EMPTY_COHORT_TEXT
+
+    def short_text(self) -> str:
+        count = len(cohort_ids(self.window_ref, self.key))
+        if not count:
+            return "Nothing chosen here yet"
+        entry = self.ledger.entry(self.key) if isinstance(self.ledger, CohortLedger) else {}
+        # Name the origin only while it still describes the cohort on screen; a
+        # cohort edited since was not chosen that way.
+        origin = entry.get("origin", "") if entry.get("count") == count else ""
+        return f"Reviewing {count} · from {origin}" if origin else f"Reviewing {count}"
+
+    def refresh(self) -> None:
+        full = self.describe()
+        self.text.setText(self.short_text() if self.compact else full)
+        self.text.setToolTip(full)
         focused = len(getattr(self.focus, "ids", set()) or ())
         self.adopt_button.setText(f"Use current focus ({focused})" if focused
                                   else "Use current focus")
         self.adopt_button.setEnabled(bool(focused))
 
 
-def cohort_bar(window, key, focus=None, *, ledger=None, extra=None) -> CohortBar:
+def cohort_bar(window, key, focus=None, *, ledger=None, extra=None, compact=False) -> CohortBar:
     """Build the explicit focus-to-cohort bridge for one tab."""
-    return CohortBar(window, key, focus, ledger=ledger, extra=extra)
+    return CohortBar(window, key, focus, ledger=ledger, extra=extra, compact=compact)

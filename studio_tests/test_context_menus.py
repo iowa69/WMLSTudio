@@ -516,3 +516,126 @@ def test_installing_a_menu_routes_every_request_through_one_callback(sample_tabl
     assert selection.sample_ids == ("id-b",)
     assert not position.isNull()
     assert adapter.widget() is sample_table
+
+
+# ---------------------------------------------------------------------------
+# The window half: one menu builder, the generic handlers, and a soft report of
+# whatever the per-view handlers have not landed yet.
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def studio(qtbot, tmp_path):
+    from wmlstudio.app import MainWindow
+    widget = MainWindow(storage_root=tmp_path / "workspace")
+    qtbot.addWidget(widget)
+    yield widget
+    widget.close()
+
+
+def imported(studio, tmp_path, names=("alpha", "bravo")):
+    for name in names:
+        path = tmp_path / f"{name}.fasta"
+        path.write_text(">c\nACGTACGTACGT\n", encoding="utf-8")
+        studio.import_paths([path])
+    return [sample["id"] for sample in studio.project.samples()]
+
+
+def test_the_window_reports_the_handlers_it_still_lacks_instead_of_failing_to_build(studio):
+    """A partially wired window must construct; the gap is reportable, never fatal."""
+    report = studio.context_menu_report()
+    assert isinstance(report, tuple)
+    assert set(report) <= set(handler_names())
+    for name in ("context_copy_id", "context_open_folder", "context_export_selection",
+                 "context_copy_path"):
+        assert name not in report
+        assert callable(getattr(studio, name))
+
+
+def test_a_menu_only_offers_entries_this_window_can_actually_run(studio, tmp_path):
+    ids = imported(studio, tmp_path)
+    selection = Selection("library", tuple(ids))
+    plan = studio.context_menu_plan(selection)
+    keys = [entry.key for entry in plan if entry is not SEPARATOR]
+    assert "copy_id" in keys and "export_selection" in keys
+    for entry in plan:
+        if entry is not SEPARATOR:
+            assert callable(getattr(studio, entry.handler)), entry.key
+    assert plan and plan[0] is not SEPARATOR and plan[-1] is not SEPARATOR
+
+
+def test_the_scheme_and_imported_source_views_are_wired_to_the_one_callback(studio):
+    from PySide6.QtCore import Qt as QtCore_Qt
+    for view_id, widget in (("schemes", studio.scheme_table),
+                            ("evidence.hydra", studio.hydra_table)):
+        assert studio._context_adapters[view_id].widget() is widget
+        assert widget.contextMenuPolicy() == QtCore_Qt.ContextMenuPolicy.CustomContextMenu
+
+
+def test_copying_identifiers_copies_exactly_the_selected_rows(studio, tmp_path):
+    from PySide6.QtWidgets import QApplication
+    ids = imported(studio, tmp_path)
+    studio.context_copy_id(Selection("library", tuple(ids)))
+    assert QApplication.clipboard().text() == "\n".join(ids)
+    studio.context_copy_id(Selection("library", ()))
+    assert QApplication.clipboard().text() == "\n".join(ids)
+
+
+def test_opening_the_containing_folder_opens_the_users_own_input_directory(studio, tmp_path,
+                                                                          monkeypatch):
+    opened = []
+    monkeypatch.setattr("wmlstudio.context_menus.QDesktopServices.openUrl", opened.append)
+    ids = imported(studio, tmp_path, names=("alpha",))
+    studio.context_open_folder(Selection("library", (ids[0],), clicked_id=ids[0]))
+    assert [url.toLocalFile() for url in opened] == [str(tmp_path)]
+
+
+def test_opening_a_folder_for_an_isolate_without_a_file_says_so_rather_than_guessing(studio):
+    messages = []
+    studio.notify = messages.append
+    studio.current_samples = [{"id": "x", "input_path": None}]
+    studio.context_open_folder(Selection("library", ("x",)))
+    assert messages and "no attached sequence file" in messages[-1]
+
+
+def test_copying_a_path_reads_the_scheme_row_and_the_isolate_row(studio, tmp_path):
+    from PySide6.QtWidgets import QApplication
+    ids = imported(studio, tmp_path, names=("alpha",))
+    studio.context_copy_path(Selection("library", (ids[0],)))
+    assert QApplication.clipboard().text() == str(tmp_path / "alpha.fasta")
+    studio.context_copy_path(Selection("schemes", paths=(Path("/schemes/practice_7"),)))
+    assert QApplication.clipboard().text() == str(Path("/schemes/practice_7"))
+
+
+def test_exporting_a_selection_writes_only_the_isolates_that_were_selected(studio, tmp_path,
+                                                                           monkeypatch):
+    import csv
+    ids = imported(studio, tmp_path, names=("alpha", "bravo", "charlie"))
+    destination = tmp_path / "selection.csv"
+    monkeypatch.setattr("wmlstudio.context_menus.QFileDialog.getSaveFileName",
+                        lambda *args, **kwargs: (str(destination), ""))
+    messages = []
+    studio.notify = messages.append
+    studio.context_export_selection(Selection("library", (ids[0], ids[2])), "csv")
+    with destination.open(encoding="utf-8-sig", newline="") as handle:
+        rows = list(csv.DictReader(handle))
+    exported = {row["sample_name"] for row in rows}
+    assert exported == {"alpha", "charlie"}
+    assert "2 explicitly selected isolates" in messages[-1]
+
+
+def test_exporting_nothing_refuses_instead_of_exporting_the_whole_project(studio, monkeypatch):
+    asked = []
+    monkeypatch.setattr("wmlstudio.context_menus.QFileDialog.getSaveFileName",
+                        lambda *args, **kwargs: asked.append(True) or ("", ""))
+    messages = []
+    studio.notify = messages.append
+    studio.context_export_selection(Selection("library", ()), "csv")
+    assert asked == []
+    assert "Nothing is included automatically" in messages[-1]
+
+
+def test_running_an_action_the_window_does_not_implement_does_nothing(studio):
+    assert studio.run_context_action(None, Selection("library", ("a",))) is None
+    assert studio.run_context_action(("context_not_a_real_handler", None),
+                                     Selection("library", ("a",))) is None

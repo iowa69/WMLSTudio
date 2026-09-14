@@ -25,6 +25,24 @@ def test_entrypoint_preserves_screen_aware_size_without_explicit_override(monkey
     assert sizes == expected
 
 
+def test_entrypoint_never_rescales_an_interface_that_is_already_running(monkeypatch):
+    """Display scale is read before Qt starts; changing it afterwards would be a lie."""
+    import os
+
+    import wmlstudio.app as desktop
+
+    application = SimpleNamespace(
+        setApplicationName=lambda value: None, setOrganizationName=lambda value: None,
+        setStyle=lambda value: None, setStyleSheet=lambda value: None, exec=lambda: 0,
+    )
+    window = SimpleNamespace(resize=lambda width, height: None, show=lambda: None)
+    monkeypatch.setattr(desktop, "QApplication", SimpleNamespace(instance=lambda: application))
+    monkeypatch.setattr(desktop, "MainWindow", lambda *args: window)
+    before = os.environ.get("QT_SCALE_FACTOR")
+    assert desktop.main(["--display-scale", "150"]) == 0
+    assert os.environ.get("QT_SCALE_FACTOR") == before
+
+
 @pytest.mark.parametrize("writer", [write_csv, write_html, write_json, write_tsv])
 def test_export_cannot_overwrite_input(writer, tmp_path):
     sequence = tmp_path / "isolate.fasta"

@@ -5,10 +5,11 @@ from pathlib import Path
 
 import pytest
 from PySide6.QtCore import QPoint, QTimer, qVersion
-from PySide6.QtWidgets import QApplication, QSplitter, QWidget
+from PySide6.QtWidgets import QApplication, QSizePolicy, QSplitter, QWidget
 
 from wmlstudio import ui_compare
 from wmlstudio.app import MainWindow
+from wmlstudio.investigation import InvestigationStore
 from wmlstudio.project import Project
 from wmlstudio.sequence import check_cancelled
 
@@ -253,10 +254,63 @@ def test_comparison_fits_larger_font_metrics_without_outer_scroll(window, qtbot)
     profile(window, 1)
     page = window.pages.widget(2)
     # Stress font metrics independently of whichever Windows/Linux font is installed.
-    page.setStyleSheet('QPushButton, QToolButton, QComboBox, QLineEdit, QSpinBox, QDoubleSpinBox, QTabBar '
-                      '{ font-size: 15px; } QLabel#small { font-size: 13px; } '
-                      'QLabel#cardTitle { font-size: 17px; }')
+    page.setStyleSheet(STRESS_FONTS)
     window.resize(1080, 720)
     window.navigate(2)
     window.refresh_comparison()
     assert_comparison_geometry(window, qtbot, '1080x720-larger-font')
+
+
+STRESS_FONTS = ('QPushButton, QToolButton, QComboBox, QLineEdit, QSpinBox, QDoubleSpinBox, QTabBar '
+                '{ font-size: 15px; } QLabel#small { font-size: 13px; } '
+                'QLabel#cardTitle { font-size: 17px; }')
+
+
+def pinned_baseline(window):
+    """A saved investigation whose first build becomes the pinned baseline tree."""
+    plan = InvestigationStore(window.project).save(
+        'Geometry check', sorted(window.cohort_ids or ()), scheme='Example cgMLST',
+        scheme_digest='same-reference', threshold=1, min_overlap=0.95,
+        protocol='Synthetic test protocol; not a clinical cutoff')
+    window.select_investigation(plan['id'])
+    assert window._current_snapshot, window.tree_status.text()
+    return plan['id']
+
+
+@pytest.mark.parametrize('size,stress', [((1380, 940), False), ((1080, 720), False), ((1080, 720), True)])
+def test_both_trees_keep_a_usable_height_at_normal_desktop_sizes(window, qtbot, size, stress):
+    profile(window, 0)
+    profile(window, 1)
+    page = window.pages.widget(2)
+    if stress:
+        page.setStyleSheet(STRESS_FONTS)
+    pinned_baseline(window)
+    window.resize(*size)
+    window.navigate(2)
+    window.dual_toggle.setChecked(True)
+    window.refresh_comparison()
+    case = f'{size[0]}x{size[1]}-dual' + ('-larger-font' if stress else '')
+    assert_comparison_geometry(window, qtbot, case)
+    assert window.baseline_pane.isVisible() and window.baseline_tree.isVisible()
+    assert window.baseline_tree.height() >= 200, window.baseline_tree.height()
+    assert window.baseline_caption.isVisible() and window.current_caption.isVisible()
+    assert window.baseline_caption.text().startswith('Baseline · ')
+    # A caption must never be what pushes the page into a horizontal scroll: the
+    # size policy ignores its preferred width, so a long title clips instead.
+    assert window.baseline_caption.sizePolicy().horizontalPolicy() == QSizePolicy.Policy.Ignored
+
+
+def test_turning_the_baseline_off_restores_the_single_tree_layout(window, qtbot):
+    profile(window, 0)
+    profile(window, 1)
+    pinned_baseline(window)
+    window.resize(1080, 720)
+    window.navigate(2)
+    window.dual_toggle.setChecked(True)
+    qtbot.wait(60)
+    window.dual_toggle.setChecked(False)
+    assert not window.baseline_pane.isVisible()
+    assert not window.current_caption.isVisible()
+    assert not window.export_tree_choice.isVisible()
+    assert window.baseline_tree._results == {}
+    assert_comparison_geometry(window, qtbot, '1080x720-dual-off')

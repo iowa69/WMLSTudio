@@ -394,3 +394,20 @@ def test_a_mixed_drop_is_identified_on_the_originals_then_filed_once(project, tm
     moved = Path(project.get_sample(stranger["id"])["input_path"]).relative_to(root)
     assert moved.parts[:3] == ("Serratia", "marcescens", "ST_unassigned")
     assert not (root / QUARANTINE_ROOT / "Not_in_reference_panel").exists()
+
+
+def test_a_linked_original_is_relabelled_but_never_adopted_into_managed_storage(project, tmp_path):
+    original = sequence(tmp_path / "inbox" / "linked.fasta")
+    root = tmp_path / "managed"
+    sid = import_samples(project, [{"path": original, "typing_mode": "manual",
+                                    "genus": "Klebsiella"}], root, managed=False)[0]
+    plan = plan_filing(project, sid)
+    assert plan["eligible"] is False and "linked where you keep it" in plan["reason"]
+
+    reassign_organism(project, [sid], "Enterobacter", "cloacae")
+    sample = project.get_sample(sid)
+    assert sample["metadata"]["organism"] == {"genus": "Enterobacter", "species": "cloacae"}
+    assert sample["input_path"] == str(original) and original.is_file()
+    assert not root.exists(), "a file the user keeps in place is never copied into managed storage"
+    report = refile_samples(project, [sid])
+    assert report["moved"] == [] and report["skipped"] == [(sid, plan["reason"])]

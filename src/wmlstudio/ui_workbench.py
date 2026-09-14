@@ -23,8 +23,10 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from wmlstudio.archive import active_samples, archived_samples, is_archived
 from wmlstudio.background import FunctionWorker
 from wmlstudio.jobs import AnalysisWorker
+from wmlstudio.storage import QUARANTINE_BUCKETS
 from wmlstudio.ui_common import (
     FlowLayout,
     cell,
@@ -34,6 +36,34 @@ from wmlstudio.ui_common import (
     organism_for,
 )
 from wmlstudio.widgets import DropZone, Helix, Metric, button, card, label
+
+
+def quarantine_bucket(sample):
+    """The needs-review folder this isolate sits in, or None when it is filed.
+
+    Quarantine means WMLSTudio declined to decide what the organism is. It is not
+    a claim that the organism is unusual, and it is not the user's own "unknown".
+    """
+    evidence = (sample.get("metadata") or {}).get("organism_evidence")
+    if not isinstance(evidence, dict) or evidence.get("status") != "quarantined":
+        return None
+    token = str(evidence.get("quarantine_reason") or "awaiting_identification")
+    return QUARANTINE_BUCKETS.get(token, QUARANTINE_BUCKETS["awaiting_identification"])
+
+
+def organism_evidence_note(sample):
+    """Where this genus and species came from, in the words the engine used."""
+    evidence = (sample.get("metadata") or {}).get("organism_evidence")
+    if not isinstance(evidence, dict):
+        return ""
+    from wmlstudio.organism_id import confidence_label, evidence_sentences
+    from wmlstudio.workflow_dialogs import BASIS_LABELS
+    word, explanation = confidence_label(evidence)
+    basis = BASIS_LABELS.get(evidence.get("basis"), str(evidence.get("basis") or "Not identified"))
+    lines = [f"{basis} · {word}", explanation,
+             "A folder name is where the copy is stored; it is not a laboratory identification."]
+    lines.extend(evidence_sentences(evidence))
+    return "\n".join(line for line in lines if line)
 
 
 class WorkbenchMixin:
@@ -56,6 +86,9 @@ class WorkbenchMixin:
         self._task_succeeded = False
         self._typing_override = None
         self._progress_dialog = None
+        self._pending_import = None
+        self._import_notes = []
+        self._practice_cohort = None
         self.ui_scale = 100
         super().__init__(*args, **kwargs)
         from wmlstudio import theme
@@ -133,12 +166,14 @@ class WorkbenchMixin:
         self.library_tree.setMinimumWidth(250)
         self.library_tree.itemActivated.connect(self.open_library_group)
         self.library_tree.itemClicked.connect(self.open_library_group)
+        self.install_view_menu("library.tree", self.library_tree)
         content.addWidget(self.library_tree)
         splitter.addWidget(explorer)
         recent, content = card()
         content.addWidget(label("Recent samples · double-click to inspect", "cardTitle"))
         self.recent_table = make_table(["Sample", "Input", "Status", "ST", "Loci"])
         self.recent_table.cellDoubleClicked.connect(self.open_recent_sample)
+        self.install_view_menu("overview.recent", self.recent_table)
         content.addWidget(self.recent_table)
         self.drop_zone = DropZone()
         self.drop_zone.filesDropped.connect(lambda paths: self.import_paths(paths, configure=True))
@@ -197,8 +232,7 @@ class WorkbenchMixin:
         self.sample_table.cellDoubleClicked.connect(lambda row, column: self.open_isolate_record(self.sample_table.item(row, 0).data(Qt.ItemDataRole.UserRole)))
         for column in (7, 8, 10, 11):
             self.sample_table.setColumnHidden(column, True)
-        self.sample_table.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
-        self.sample_table.customContextMenuRequested.connect(self.sample_context_menu)
+        self.install_view_menu("library", self.sample_table)
         splitter.addWidget(self.sample_table)
         self.detail = QTextBrowser()
         self.detail.setOpenExternalLinks(False)
@@ -217,15 +251,25 @@ class WorkbenchMixin:
         self._refreshing = True
         try:
             super().refresh()
-            isolates = [sample for sample in self.current_samples if sample.get("metadata", {}).get("workflow", {}).get("source_kind") != "read_mate"]
-            mates = len(self.current_samples) - len(isolates)
+            # Archived isolates keep every record they carry; they simply leave
+            # the working views until the user restores them.
+            working = active_samples(self.current_samples)
+            archived = len(self.current_samples) - len(working)
+            isolates = [sample for sample in working if sample.get("metadata", {}).get("workflow", {}).get("source_kind") != "read_mate"]
+            mates = len(working) - len(isolates)
             self.metrics[0].value.setText(str(len(isolates)))
-            self.metrics[0].hint.setText(f"{len(isolates)} isolates · {mates} linked mates" if mates else "in the active library")
+            hint = "in the active library"
+            if mates:
+                hint = f"{len(isolates)} isolates · {mates} linked mates"
+            if archived:
+                hint += f" · {archived} archived"
+            self.metrics[0].hint.setText(hint)
             if self.library is not None and not (self.worker and self.worker.isRunning()):
                 self.library.index_project(self.project)
-            valid = {s["id"] for s in self.current_samples}
+            valid = {s["id"] for s in working}
             self.selection_ids.intersection_update(valid)
             self.report_ids.intersection_update(valid)
+            self.focus.prune(valid)
             self.refresh_library()
             if hasattr(self, "cohort_table"):
                 self.refresh_cohort_table()
@@ -241,7 +285,7 @@ class WorkbenchMixin:
         if not hasattr(self, "investigation_map"):
             return
         from wmlstudio.journey import journey_summary
-        summary = journey_summary(self.current_samples, selected_ids=self.selection_ids,
+        summary = journey_summary(active_samples(self.current_samples), selected_ids=self.selection_ids,
                                   comparison_ids=self.cohort_ids)
         investigation = self.investigation_summary() if hasattr(self, "investigation_summary") else {}
         description = None
@@ -263,7 +307,7 @@ class WorkbenchMixin:
             self.navigate(1)
         elif action == "review":
             from wmlstudio.journey import journey_summary
-            identifiers = journey_summary(self.current_samples)["review_ids"]
+            identifiers = journey_summary(active_samples(self.current_samples))["review_ids"]
             self.clear_filters()
             self.selection_ids = set(identifiers)
             self.library_filter = ("ids", set(identifiers))
@@ -285,13 +329,20 @@ class WorkbenchMixin:
         tree = self.library_tree
         tree.blockSignals(True)
         tree.clear()
-        all_item = QTreeWidgetItem([f"All samples  ({len(self.current_samples)})"])
+        working = active_samples(self.current_samples)
+        all_item = QTreeWidgetItem([f"All samples  ({len(working)})"])
         all_item.setData(0, Qt.ItemDataRole.UserRole, None)
         tree.addTopLevelItem(all_item)
         groups = {}
         collections = {}
-        for sample in self.current_samples:
+        review = {}
+        for sample in working:
             if sample.get("metadata", {}).get("workflow", {}).get("source_kind") == "read_mate":
+                continue
+            bucket = quarantine_bucket(sample)
+            if bucket:
+                # Needs review is not an organism, so it never joins the genus tree.
+                review.setdefault(bucket, []).append(sample)
                 continue
             genus, species, _ = organism_for(sample)
             genus, species = genus or "Unknown", species or "Unspecified"
@@ -316,6 +367,25 @@ class WorkbenchMixin:
                         child = QTreeWidgetItem([sample["name"]])
                         child.setData(0, Qt.ItemDataRole.UserRole, ("ids", [sample["id"]]))
                         node.addChild(child)
+        if review:
+            total = sum(len(samples) for samples in review.values())
+            branch = QTreeWidgetItem([f"Needs review  ({total})"])
+            branch.setData(0, Qt.ItemDataRole.UserRole,
+                           ("ids", [s["id"] for samples in review.values() for s in samples]))
+            branch.setToolTip(0, "WMLSTudio declined to decide what these organisms are, so nothing "
+                                 "was filed into a genus folder on a guess. Right-click to assign an "
+                                 "organism; the managed copy moves with the label.")
+            tree.addTopLevelItem(branch)
+            for bucket, samples in sorted(review.items()):
+                node = QTreeWidgetItem([f"{bucket.replace('_', ' ')}  ({len(samples)})"])
+                node.setData(0, Qt.ItemDataRole.UserRole, ("ids", [s["id"] for s in samples]))
+                branch.addChild(node)
+                for sample in samples:
+                    child = QTreeWidgetItem([sample["name"]])
+                    child.setData(0, Qt.ItemDataRole.UserRole, ("ids", [sample["id"]]))
+                    child.setToolTip(0, organism_evidence_note(sample))
+                    node.addChild(child)
+            branch.setExpanded(True)
         if collections:
             branch = QTreeWidgetItem(["Collections"])
             tree.addTopLevelItem(branch)
@@ -339,7 +409,18 @@ class WorkbenchMixin:
                     projects.addChild(node)
                 projects.setExpanded(True)
         all_item.setExpanded(True)
-        mates = [sample for sample in self.current_samples if sample.get("metadata", {}).get("workflow", {}).get("source_kind") == "read_mate"]
+        stored = archived_samples(self.current_samples)
+        if stored:
+            branch = QTreeWidgetItem([f"Archived  ({len(stored)})"])
+            branch.setData(0, Qt.ItemDataRole.UserRole, ("ids", [s["id"] for s in stored]))
+            branch.setToolTip(0, "Archived isolates keep every result, allele call, file and history "
+                                 "entry. They are hidden from the working views until you restore them.")
+            tree.addTopLevelItem(branch)
+            for sample in stored:
+                child = QTreeWidgetItem([sample["name"]])
+                child.setData(0, Qt.ItemDataRole.UserRole, ("ids", [sample["id"]]))
+                branch.addChild(child)
+        mates = [sample for sample in active_samples(self.current_samples) if sample.get("metadata", {}).get("workflow", {}).get("source_kind") == "read_mate"]
         if mates:
             mate_branch = QTreeWidgetItem([f"Linked read mates  ({len(mates)})"])
             mate_branch.setData(0, Qt.ItemDataRole.UserRole, ("ids", [sample["id"] for sample in mates]))
@@ -375,14 +456,20 @@ class WorkbenchMixin:
     def refresh_tables(self):
         if not hasattr(self, "sample_table"):
             return
-        taxa = [organism_for(s) for s in self.current_samples]
+        working = active_samples(self.current_samples)
+        if self.library_filter and self.library_filter[0] == "ids":
+            # An explicitly named group — the Archived branch, for instance — shows
+            # the isolates it names, so a hidden isolate is never simply missing.
+            named = set(self.library_filter[1])
+            working = working + [s for s in archived_samples(self.current_samples) if s["id"] in named]
+        taxa = [organism_for(s) for s in working]
         self.fill_filter(self.genus_filter, [t[0] for t in taxa], "All genera")
         self.fill_filter(self.species_filter, [t[1] for t in taxa], "All species")
-        self.fill_filter(self.collection_filter, [c for s in self.current_samples for c in
+        self.fill_filter(self.collection_filter, [c for s in working for c in
                          (s.get("metadata") or {}).get("collections", [])], "All collections")
         query = self.search.text().strip().casefold()
         visible = []
-        for sample in self.current_samples:
+        for sample in working:
             genus, species, evidence = organism_for(sample)
             metadata = sample.get("metadata") or {}
             result = sample.get("result") or {}
@@ -406,9 +493,20 @@ class WorkbenchMixin:
                     continue
             visible.append(sample)
         self.fill_sample_table(self.sample_table, visible)
-        self.fill_sample_table(self.recent_table, self.current_samples[-12:])
-        self.selection_label.setText(f"{len(self.selection_ids)} selected · {len(visible)} visible · {len(self.current_samples)} in project")
+        self.fill_sample_table(self.recent_table, active_samples(self.current_samples)[-12:])
+        self.selection_label.setText(self.selection_summary(len(visible)))
         self.show_sample_detail()
+
+    def selection_summary(self, visible):
+        working = active_samples(self.current_samples)
+        archived = len(self.current_samples) - len(working)
+        review = sum(1 for sample in working if quarantine_bucket(sample))
+        text = f"{len(self.selection_ids)} selected · {visible} visible · {len(working)} in project"
+        if review:
+            text += f" · {review} in Needs review"
+        if archived:
+            text += f" · {archived} archived"
+        return text
 
     def fill_sample_table(self, widget, samples):
         self._filling = True
@@ -426,9 +524,16 @@ class WorkbenchMixin:
             if metadata.get("workflow", {}).get("source_kind") == "read_mate":
                 kind, status = "read_mate", "linked_mate"
             genus, species, evidence = organism_for(sample)
+            bucket = quarantine_bucket(sample)
+            note = organism_evidence_note(sample)
             storage = "Managed copy" if metadata.get("workflow", {}).get("managed") else "Linked original"
             if sample.get("missing_input") and kind != "profile":
                 storage = "Input unavailable"
+            if bucket:
+                genus, species = genus or "Needs review", species or "—"
+                evidence = f"Needs review · {bucket.replace('_', ' ')}"
+            if is_archived(sample):
+                evidence = f"Archived · {evidence}"
             values = [sample["name"], {"fastq": "Reads", "profile": "Profile only", "read_mate": "Linked reverse mate"}.get(kind, "Assembly"),
                       status.replace("_", " ").title(), f"ST {result['st']}" if result.get("st") else "—",
                       f"{sum(v is not None for v in alleles.values())} / {len(alleles)}" if alleles else "—",
@@ -442,6 +547,8 @@ class WorkbenchMixin:
                                                else "#A6B7D0"))
                 if metadata.get("cluster", {}).get("highlight"):
                     item.setBackground(QColor("#343348"))
+                if note and column in (5, 6, 7):
+                    item.setToolTip(note)
                 widget.setItem(row, column, item)
                 if widget is self.sample_table and sample["id"] in self.selection_ids:
                     item.setSelected(True)
@@ -457,7 +564,8 @@ class WorkbenchMixin:
         selected = {item.data(Qt.ItemDataRole.UserRole) for item in self.sample_table.selectedItems()}
         self.selection_ids.difference_update(visible)
         self.selection_ids.update(selected)
-        self.selection_label.setText(f"{len(self.selection_ids)} selected · {len(visible)} visible · {len(self.current_samples)} in project")
+        self.focus.set_focus(self.selection_ids, "Isolate table selection")
+        self.selection_label.setText(self.selection_summary(len(visible)))
         self.show_sample_detail()
 
         self.refresh_journey()
@@ -575,7 +683,9 @@ class WorkbenchMixin:
         files, seen = [], set()
         for source in paths:
             path = Path(source)
-            candidates = path.rglob("*") if path.is_dir() else [path]
+            # Sorted, so a dropped folder is reviewed in the order the user sees it
+            # in their own file manager rather than in filesystem order.
+            candidates = sorted(path.rglob("*")) if path.is_dir() else [path]
             for candidate in candidates:
                 name = candidate.name.lower().removesuffix(".gz").removesuffix(".bz2")
                 if candidate.is_file() and name.endswith((".fa", ".fasta", ".fna", ".fq", ".fastq")):
@@ -591,23 +701,182 @@ class WorkbenchMixin:
         dialog.storage_root.setText(str(self.project_path.with_suffix(".files")))
         if dialog.exec() != QDialog.DialogCode.Accepted:
             return
+        if any(assignment.get("typing_mode") == "auto" for assignment in dialog.assignments):
+            self.identify_before_import(dialog.assignments, dialog.options)
+            return
         self.import_assignments(dialog.assignments, dialog.options)
 
-    def import_assignments(self, assignments, options):
+    def installed_species_panel(self):
+        """The broad ANI panel the user installed, or None when only the starter is present."""
+        from wmlstudio import organism_panel, paths
+        try:
+            return organism_panel.installed_species_panel(paths.data_root())
+        except OSError:
+            return None
+
+    def organism_suggestions(self):
+        """Organism names worth offering: installed references first, then this project."""
+        pairs = {}
+        try:
+            from wmlstudio.organism_panel import installed_species_panel
+            from wmlstudio.paths import data_root
+            from wmlstudio.reference_index import panel_entries
+            from wmlstudio.reference_index import scheme_entries as installed_scheme_entries
+            panel = installed_species_panel(data_root())
+            entries = list(installed_scheme_entries(self.scheme_paths))
+            entries += list(panel_entries(panel)) if panel else []
+            for entry in entries:
+                if entry.get("genus"):
+                    pairs.setdefault((str(entry["genus"]), str(entry.get("species") or "")), None)
+        except (OSError, ValueError):
+            pass  # Suggestions are a convenience; a missing reference never blocks import.
+        for sample in self.current_samples:
+            genus, species, _ = organism_for(sample)
+            if genus:
+                pairs.setdefault((genus, species or ""), None)
+        return sorted(pairs)
+
+    def identify_before_import(self, assignments, options):
+        """Identify the user's own files first, so nothing is copied to a folder it must leave.
+
+        Identification runs on the originals, before a single byte is copied, so a
+        cancelled or rejected review leaves the project exactly as it was.
+        """
+        from wmlstudio.characterization_refs import bundled_reference_root
+        from wmlstudio.scheduler import resources_for_run
+        originals = [assignment["path"] for assignment in assignments
+                     if assignment.get("typing_mode") == "auto"]
+        panel = self.installed_species_panel()
+        scheme_paths = list(self.scheme_paths)
+        starter = bundled_reference_root()
+
+        def operation(cancelled, progress):
+            from wmlstudio.organism_id import identify_batch
+            return identify_batch(originals, allocation=resources_for_run({"threads": 2, "memory_gb": 2}),
+                                  species_panel_root=panel, kpsc_panel_root=starter,
+                                  scheme_paths=scheme_paths, cancelled=cancelled, progress=progress)
+
+        self._pending_import = {"assignments": list(assignments), "options": dict(options),
+                                "verdicts": []}
+        if not self.launch_task(operation, "identify", self.identification_completed):
+            self._pending_import = None
+
+    def identification_completed(self, verdicts):
+        if self._pending_import is not None:
+            self._pending_import["verdicts"] = list(verdicts)
+
+    def review_identification(self):
+        """Show what was proposed, and copy only what the user accepts."""
+        pending, self._pending_import = self._pending_import, None
+        if not pending:
+            return
+        if not self._task_succeeded:
+            self.notify("Identification stopped. Nothing was imported and your files are unchanged.")
+            return
+        from wmlstudio.workflow_dialogs import IdentificationReviewDialog
+        options = pending["options"]
+        root = options.get("storage_root") or str(self.project_path.with_suffix(".files"))
+        names = {str(Path(a["path"]).expanduser().resolve()): a.get("name")
+                 for a in pending["assignments"] if a.get("name")}
+        dialog = IdentificationReviewDialog(pending["verdicts"], root, self,
+                                            organisms=self.organism_suggestions(), names=names,
+                                            policy=self.project)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            self.notify("Nothing was imported. Your files are where you left them and no folders "
+                        "were created.")
+            return
+        reviewed = {str(Path(entry["path"]).expanduser().resolve()): entry
+                    for entry in dialog.assignments}
+        assignments = []
+        for assignment in pending["assignments"]:
+            if assignment.get("typing_mode") != "auto":
+                assignments.append(assignment)
+                continue
+            chosen = reviewed.get(str(Path(assignment["path"]).expanduser().resolve()))
+            if chosen is not None:
+                # The review decides the organism, which is what files the copy. How
+                # the typing scheme is chosen is a separate question the user already
+                # answered in the import dialog, so their answer is kept.
+                assignments.append({**assignment, **chosen,
+                                    "typing_mode": assignment.get("typing_mode", "auto")})
+        if not assignments:
+            self.notify("No files were selected for import. Nothing was copied.")
+            return
+        self.import_assignments(assignments, options, duplicates="skip")
+
+    def import_assignments(self, assignments, options, *, duplicates="allow"):
         from wmlstudio.storage import import_samples
         root = options.get("storage_root") or str(self.project_path.with_suffix(".files"))
+        notes = []
+        self._import_notes = notes
         def operation(cancelled, progress):
             return import_samples(
                 self.project, assignments, storage_root=root, managed=options.get("managed", True),
-                append_st=options.get("append_st", False), cancelled=cancelled, progress=progress)
+                append_st=options.get("append_st", False), cancelled=cancelled, progress=progress,
+                duplicates=duplicates, notes=notes)
         self.launch_task(operation, "import", lambda ids: self.import_completed(ids))
 
     def import_completed(self, ids):
+        skipped = list(getattr(self, "_import_notes", ()) or ())
+        self._import_notes = []
         self.selection_ids = set(ids)
         self.clear_filters()
         self.refresh()
         self.navigate(1)
-        self.notify(f"Imported {len(ids)} samples. Review their assignments, then analyse when ready.")
+        chosen = set(ids)
+        review = [sample for sample in self.current_samples
+                  if sample["id"] in chosen and quarantine_bucket(sample)]
+        message = f"Imported {len(ids)} samples."
+        if skipped:
+            message += (f" {len(skipped)} file(s) already in this project were not copied again.")
+        if review:
+            message += (f" {len(review)} are in Needs review: no installed reference supported an "
+                        "organism, so nothing was filed into a genus folder on a guess.")
+        else:
+            message += " Review their assignments, then analyse when ready."
+        self.notify(message)
+
+    def refile_completed(self, report):
+        """Say what moved, what did not, and why — never a bare success."""
+        self.refresh()
+        moved, skipped = len(report.get("moved", ())), report.get("skipped", ())
+        message = (f"{moved} managed copies were filed to match their organism. "
+                   "Your original files were not moved.")
+        if skipped:
+            message += f" {len(skipped)} were left where they are: {skipped[0][1]}"
+        self.notify(message)
+
+    def apply_organism_assignments(self, assignments, *, notice=""):
+        """Record corrected organisms, then move the managed copies to match them.
+
+        A corrected label that did not move the file would leave the file sitting
+        in a folder that contradicts it, so the two always travel together.
+        """
+        from wmlstudio.storage import confirm_organism, refile_samples
+        assignments = [dict(assignment) for assignment in assignments if assignment.get("sample_id")]
+        if not assignments:
+            return False
+
+        def operation(cancelled, progress):
+            report = {"moved": [], "unchanged": [], "skipped": []}
+            for index, assignment in enumerate(assignments):
+                progress(index, len(assignments), f"Filing {index + 1} of {len(assignments)}…")
+                sample_id = assignment["sample_id"]
+                confirm_organism(self.project, [sample_id], assignment.get("genus", ""),
+                                 assignment.get("species", ""),
+                                 scheme_path=assignment.get("scheme_path"),
+                                 typing_mode=assignment.get("typing_mode", "manual"))
+                # Each sample keeps its own storage location; correcting a label
+                # never moves a managed copy into a different root.
+                outcome = refile_samples(self.project, [sample_id], cancelled=cancelled)
+                for key in report:
+                    report[key].extend(outcome[key])
+            return report
+
+        started = self.launch_task(operation, "refile", self.refile_completed)
+        if started and notice:
+            self.notify(notice)
+        return started
 
     def assign_selected(self):
         if self.busy():
@@ -616,16 +885,108 @@ class WorkbenchMixin:
         if not samples:
             self.notify("Select one or more sample rows first.")
             return
-        from wmlstudio.storage import assign_organism
         from wmlstudio.workflow_dialogs import BatchAssignmentDialog
         dialog = BatchAssignmentDialog(samples, self.scheme_entries(), self)
         if dialog.exec() != QDialog.DialogCode.Accepted:
             return
-        for assignment in dialog.assignments:
-            assign_organism(self.project, [assignment["sample_id"]], assignment["genus"], assignment["species"],
-                            scheme_path=assignment.get("scheme_path"), typing_mode=assignment["typing_mode"])
-        self.refresh()
-        self.notify("Assignments saved. Previous analysis evidence remains in the sample history.")
+        self.apply_organism_assignments(dialog.assignments)
+
+    def refile_selected(self):
+        return self.context_refile(self.library_selection())
+
+    def context_refile(self, selection):
+        """Show where each managed copy would go, then move only what the user confirms."""
+        if self.busy():
+            return
+        from PySide6.QtWidgets import QMessageBox
+
+        from wmlstudio.storage import plan_filing, refile_samples
+        identifiers = list(selection.sample_ids)
+        if not identifiers:
+            self.notify("Select the isolates whose managed copies should be re-filed.")
+            return
+        plans = [plan_filing(self.project, sample_id) for sample_id in identifiers]
+        moving = [plan for plan in plans if plan["eligible"] and plan["changed"]]
+        if not moving:
+            reasons = {plan["reason"] for plan in plans if plan["reason"]}
+            self.notify("Every selected managed copy is already in the folder its organism says. "
+                        + (" ".join(sorted(reasons)) if reasons else ""))
+            return
+        lines = [f"{plan['name']}  →  {plan['relative']}" for plan in moving[:10]]
+        if len(moving) > 10:
+            lines.append(f"…and {len(moving) - 10} more.")
+        if QMessageBox.question(self, "Re-file managed copies?",
+                f"{len(moving)} managed copies will move to match the organism recorded for them. "
+                "Your original files are not moved, and a folder name is a filing decision rather "
+                "than a laboratory identification.\n\n" + "\n".join(lines)) != QMessageBox.StandardButton.Yes:
+            return
+        ids = [plan["sample_id"] for plan in moving]
+
+        def operation(cancelled, progress):
+            return refile_samples(self.project, ids, cancelled=cancelled, progress=progress)
+
+        self.launch_task(operation, "refile", self.refile_completed)
+
+    def download_practice_cohort(self):
+        """Fetch a pinned teaching cohort after its caveats have been read."""
+        if self.busy():
+            return
+        from wmlstudio import paths, practice_cohorts
+        from wmlstudio.workflow_dialogs import PracticeCohortDialog
+        cohorts = practice_cohorts.describe_cohorts()
+        destinations = {entry["name"]: practice_cohorts.default_destination(paths.data_root(), entry["name"])
+                        for entry in cohorts}
+        dialog = PracticeCohortDialog(cohorts, destinations, self)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        name = dialog.chosen
+        destination = destinations[name]
+
+        def operation(cancelled, progress):
+            return practice_cohorts.download_cohort(name, destination, cancelled=cancelled,
+                                                    progress=progress)
+
+        self._practice_cohort = None
+        self.launch_task(operation, "practice_cohort",
+                         lambda result: setattr(self, "_practice_cohort", result))
+
+    def practice_cohort_ready(self):
+        """Point the user at the downloaded files and start the ordinary import."""
+        result, self._practice_cohort = self._practice_cohort, None
+        if not result or not self._task_succeeded:
+            return
+        path = Path(result["path"])
+        self.notify(f"{result['genomes']} practice genomes are ready in {path}. Every file was "
+                    "checked against the checksum NCBI publishes for it.")
+        self.import_paths([str(path)], configure=True)
+
+    def install_species_panel(self):
+        """Download the broader reference panel identification needs, on request only."""
+        if self.busy():
+            return
+        from PySide6.QtWidgets import QMessageBox
+
+        from wmlstudio import organism_panel, paths
+        data_root = paths.data_root()
+        installed = organism_panel.installed_species_panel(data_root)
+        megabytes = sum(entry[5] for entry in organism_panel.SPECIES_PANEL) / (1024 * 1024)
+        question = (f"Download {len(organism_panel.SPECIES_PANEL)} reference genomes "
+                    f"({megabytes:.1f} MB) from NCBI RefSeq to {data_root}?\n\n"
+                    "One reference per organism is a triage panel, not a representation of "
+                    "within-species diversity. Nothing is uploaded and no genome leaves this "
+                    "computer.")
+        if installed:
+            question = f"A panel is already installed at {installed}.\n\n" + question
+        if QMessageBox.question(self, "Install broader species panel", question) != QMessageBox.StandardButton.Yes:
+            return
+        root = data_root / organism_panel.PANEL_DIRECTORY
+
+        def operation(cancelled, progress):
+            return organism_panel.provision_species_panel(root, cancelled=cancelled, progress=progress)
+
+        self.launch_task(operation, "species_panel", lambda result: self.notify(
+            f"Species panel installed: {result['species_count']} references at {result['path']}. "
+            "New imports will be compared against it."))
 
     def busy(self):
         if self.worker and self.worker.isRunning():
@@ -831,6 +1192,12 @@ class WorkbenchMixin:
         if role == "fastqc_pipeline":
             self.continue_after_fastqc()
             return
+        if role == "identify":
+            self.review_identification()
+            return
+        if role == "practice_cohort":
+            self.practice_cohort_ready()
+            return
         if role == "assembly":
             if self._task_succeeded and not self._run_cancelled:
                 samples = [sample for sample in self.project.samples() if sample["id"] in self._run_ids
@@ -843,15 +1210,14 @@ class WorkbenchMixin:
             managed = [s for s in self.project.samples() if s["id"] in self._run_ids and s["status"] == "completed"
                        and s.get("metadata", {}).get("workflow", {}).get("managed")]
             if managed:
-                from wmlstudio.storage import organize_sample
+                from wmlstudio.storage import refile_samples
+                identifiers = [sample["id"] for sample in managed]
 
                 def organize(cancelled, progress):
-                    for i, sample in enumerate(managed):
-                        organize_sample(self.project, sample["id"], cancelled=cancelled)
-                        progress(i + 1, len(managed), "Organising managed input copies by organism and ST…")
-                    return len(managed)
+                    return refile_samples(self.project, identifiers, cancelled=cancelled,
+                                          progress=progress)
 
-                self.launch_task(organize, "organize", lambda count: self.notify(f"{count} managed sample copies organised. Originals unchanged."))
+                self.launch_task(organize, "organize", self.refile_completed)
                 return
         if role in {"analysis", "organize"}:
             if self._run_plan.get("hydra") and not self._run_cancelled and (role != "organize" or self._task_succeeded):
@@ -1063,16 +1429,366 @@ class WorkbenchMixin:
         self.launch_task(lambda cancelled, progress: relink_input(self.project, sample["id"], path, cancelled=cancelled),
             "relink", lambda result: self.notify("Input relinked after SHA-256 verification. Saved profiles and original files are unchanged."))
 
-    def sample_context_menu(self, point):
-        from PySide6.QtWidgets import QMenu
-        menu = QMenu(self)
-        for title, callback in [("Assign organism / workflow…", self.assign_selected), ("Edit annotations…", self.edit_metadata),
-                                ("Add to collection…", self.add_collection), ("Compare selected", self.compare_selected),
-                                ("Report selected", self.report_selected), ("Highlight cluster…", self.highlight_selected),
-                                ("Relink input (same bytes)…", self.relink_selected_input),
-                                ("Open input folder", self.open_sample_folder), ("Remove from project…", self.remove_sample)]:
-            menu.addAction(title, callback)
-        menu.exec(self.sample_table.viewport().mapToGlobal(point))
+    # --- right-click handlers -----------------------------------------------
+    # One method per entry in context_menus.ACTIONS that acts on isolates. A view
+    # is wired with a single install_view_menu call; an action whose handler is
+    # absent is left out of the menu rather than offered and then failing.
+
+    def context_records(self, selection):
+        wanted = set(selection.sample_ids)
+        return [sample for sample in self.project.samples() if sample["id"] in wanted]
+
+    def context_open_record(self, selection):
+        if selection.single:
+            self.open_isolate_record(selection.single)
+
+    def context_select_in_library(self, selection):
+        ids = set(selection.sample_ids)
+        if not ids:
+            return
+        self.clear_filters()
+        self.selection_ids = set(ids)
+        self.library_filter = ("ids", ids)
+        self.focus.set_focus(ids, "Right-click selection")
+        self.refresh_tables()
+        self.navigate(1)
+        self.notify(f"{len(ids)} isolates shown. Clear filters to return to the whole library.")
+
+    def update_comparison_cohort(self, ids, add=True):
+        """Change the comparison cohort explicitly, and say where the change came from."""
+        ids = {value for value in ids if value}
+        if not ids:
+            return
+        self.cohort_ids = (set(self.cohort_ids) | ids) if add else (set(self.cohort_ids) - ids)
+        self.project.set_setting("comparison_cohort", sorted(self.cohort_ids))
+        ledger = getattr(self, "cohort_origins", None)
+        if ledger is not None:
+            ledger.record("compare", self.cohort_ids, "Right-click in the isolate library")
+        if hasattr(self, "cohort_table"):
+            self.refresh_cohort_table()
+        self.refresh_journey()
+        verb = "added to" if add else "removed from"
+        self.notify(f"{len(ids)} isolates {verb} the comparison cohort · {len(self.cohort_ids)} in it now. "
+                    "Nothing else was included automatically.")
+
+    def context_add_to_comparison(self, selection):
+        self.update_comparison_cohort(selection.sample_ids, add=True)
+
+    def context_remove_from_comparison(self, selection):
+        self.update_comparison_cohort(selection.sample_ids, add=False)
+
+    def context_add_to_characterization(self, selection):
+        ids = set(selection.sample_ids)
+        if not ids:
+            return
+        self.feature_ids = set(self.feature_ids) | ids
+        ledger = getattr(self, "cohort_origins", None)
+        if ledger is not None:
+            ledger.record("evidence", self.feature_ids, "Right-click in the isolate library")
+        if hasattr(self, "feature_table"):
+            self.refresh_features()
+        self.notify(f"{len(ids)} isolates added to the evidence cohort · {len(self.feature_ids)} in it now.")
+
+    def context_add_to_report(self, selection):
+        ids = set(selection.sample_ids)
+        if not ids:
+            return
+        self.report_ids = set(self.report_ids) | ids
+        ledger = getattr(self, "cohort_origins", None)
+        if ledger is not None:
+            ledger.record("reports", self.report_ids, "Right-click in the isolate library")
+        if hasattr(self, "report_table"):
+            self.refresh_report_table()
+        self.notify(f"{len(ids)} isolates added to the report · {len(self.report_ids)} in it now.")
+
+    def context_remove_from_report(self, selection):
+        ids = set(selection.sample_ids)
+        self.report_ids = set(self.report_ids) - ids
+        if hasattr(self, "report_table"):
+            self.refresh_report_table()
+        self.notify(f"{len(ids)} isolates removed from the report · {len(self.report_ids)} in it now.")
+
+    @staticmethod
+    def label_assignment(sample, genus, species):
+        """An organism correction that keeps the sample's own typing workflow."""
+        workflow = (sample.get("metadata") or {}).get("workflow", {})
+        mode = workflow.get("typing_mode") or "manual"
+        if mode == "unknown" and genus:
+            mode = "manual"
+        return {"sample_id": sample["id"], "genus": genus, "species": species,
+                "typing_mode": mode, "scheme_path": workflow.get("scheme_path")}
+
+    def context_assign_organism(self, selection):
+        if self.busy():
+            return
+        samples = self.context_records(selection)
+        if not samples:
+            return
+        from wmlstudio.workflow_dialogs import BatchAssignmentDialog
+        dialog = BatchAssignmentDialog(samples, self.scheme_entries(), self)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        self.apply_organism_assignments(dialog.assignments)
+
+    def context_assign_organism_quick(self, selection, organism):
+        if self.busy():
+            return
+        genus, species = organism
+        samples = self.context_records(selection)
+        self.apply_organism_assignments([self.label_assignment(sample, genus, species)
+                                         for sample in samples])
+
+    def context_assign_scheme(self, selection):
+        if self.busy():
+            return
+        entries = self.scheme_entries()
+        samples = self.context_records(selection)
+        if not entries or not samples:
+            self.notify("No typing schemes are installed. Use Data ▸ Online scheme catalog first.")
+            return
+        names = [name for name, _ in entries]
+        title, accepted = QInputDialog.getItem(self, "Assign typing scheme",
+            f"Type these {len(samples)} isolates with:", names, 0, False)
+        if not accepted:
+            return
+        path = entries[names.index(title)][1]
+        assignments = []
+        for sample in samples:
+            genus, species, _ = organism_for(sample)
+            if not genus:
+                self.notify(f"{sample['name']} has no organism yet. Assign a genus first, or use "
+                            "Unknown organism in the assignment dialog.")
+                return
+            assignments.append({"sample_id": sample["id"], "genus": genus, "species": species,
+                                "typing_mode": "manual", "scheme_path": path})
+        self.apply_organism_assignments(assignments)
+
+    def context_rename_sample(self, selection):
+        sample_id = selection.single
+        if not sample_id or self.busy():
+            return
+        sample = self.project.get_sample(sample_id)
+        name, accepted = QInputDialog.getText(self, "Rename isolate",
+            "Display name. The sample identifier, its input file and every stored result stay "
+            "exactly as they are:", text=sample["name"])
+        if not accepted:
+            return
+        try:
+            self.project.rename_sample(sample_id, name)
+        except (KeyError, ValueError) as error:
+            self.error(error)
+            return
+        self.refresh()
+        self.notify("Renamed. No result, allele call or file was changed.")
+
+    def context_rename_folder(self, selection):
+        """Re-label every isolate in an organism folder, and move their copies with it."""
+        if self.busy() or not selection.folder:
+            return
+        genus, species = selection.folder
+        samples = self.context_records(selection)
+        if not samples:
+            self.notify("That folder holds no isolates to re-label.")
+            return
+        new_genus, accepted = QInputDialog.getText(self, "Rename this organism folder",
+            f"Genus recorded for these {len(samples)} isolates. A folder name is a filing decision, "
+            "not a laboratory identification:", text="" if genus == "Unknown" else genus)
+        if not accepted:
+            return
+        new_species, accepted = QInputDialog.getText(self, "Rename this organism folder",
+            "Species (leave empty if you only know the genus):",
+            text="" if species in {"Unspecified", ""} else species)
+        if not accepted:
+            return
+        self.apply_organism_assignments([self.label_assignment(sample, new_genus.strip(), new_species.strip())
+                                         for sample in samples])
+
+    def context_edit_annotations(self, selection):
+        self.with_selection(selection, self.edit_metadata)
+
+    def context_add_collection(self, selection):
+        self.with_selection(selection, self.add_collection)
+
+    def context_highlight(self, selection):
+        self.with_selection(selection, self.highlight_selected)
+
+    def with_selection(self, selection, action):
+        """Run an existing selection-driven action on exactly what was right-clicked."""
+        previous = self.selection_ids
+        self.selection_ids = set(selection.sample_ids)
+        try:
+            action()
+        finally:
+            self.selection_ids = previous
+        self.refresh_tables()
+
+    def context_unhighlight(self, selection):
+        from wmlstudio.sample_workflow import set_cluster
+        identifiers = list(selection.sample_ids)
+        if not identifiers:
+            return
+        for sample in self.context_records(selection):
+            group = (sample.get("metadata") or {}).get("cluster", {})
+            set_cluster(self.project, [sample["id"]], group.get("label") or "Highlighted",
+                        group.get("color") or "#2F8A78", False)
+        self.refresh()
+        self.notify(f"Highlight removed from {len(identifiers)} isolates. The grouping you recorded "
+                    "stays in each isolate's history.")
+
+    def context_add_files(self, selection):
+        self.browse_files()
+
+    def context_add_folder(self, selection):
+        self.browse_folder()
+
+    def context_import_scheme(self, selection):
+        self.import_scheme()
+
+    def context_open_scheme_folder(self, selection):
+        folder = next((Path(path) for path in selection.paths), None)
+        if folder is None or not folder.is_dir():
+            self.notify("That scheme folder is not available on this computer.")
+            return
+        QDesktopServices.openUrl(QUrl.fromLocalFile(str(folder)))
+
+    def context_remove_scheme(self, selection):
+        import shutil
+
+        from PySide6.QtWidgets import QMessageBox
+        if self.busy():
+            return
+        root = Path(self.root).resolve()
+        paths = [Path(path).resolve() for path in selection.paths]
+        removable = [path for path in paths if root in path.parents and path.is_dir()]
+        if not removable or len(removable) != len(paths):
+            self.notify("Bundled reference snapshots are read-only; nothing was removed.")
+            return
+        names = ", ".join(path.name for path in removable)
+        if QMessageBox.question(self, "Remove imported scheme?",
+                f"Delete {names} from this computer? Results already produced with it keep their "
+                "scheme fingerprint in the project, but you cannot rerun them until it is installed "
+                "again.") != QMessageBox.StandardButton.Yes:
+            return
+        for path in removable:
+            try:
+                shutil.rmtree(path)
+            except OSError as error:
+                self.error(error)
+                break
+        self.populate_schemes()
+        self.notify(f"Removed {len(removable)} imported scheme folders. Saved results are unchanged.")
+
+    def context_archive(self, selection):
+        from wmlstudio import archive
+        identifiers = list(selection.sample_ids)
+        if not identifiers or self.busy():
+            return
+        reason, accepted = QInputDialog.getText(self, f"Archive {len(identifiers)} isolates",
+            "Archiving hides these isolates from the working views and destroys nothing: every "
+            "result, allele call, file and history entry is kept, and you can restore them at any "
+            "time.\n\nWhy are you archiving them? (optional)")
+        if not accepted:
+            return
+        try:
+            changed = archive.archive_samples(self.project, identifiers, reason.strip())
+        except (KeyError, ValueError) as error:
+            self.error(error)
+            return
+        self.refresh()
+        already = len(identifiers) - len(changed)
+        self.notify(f"{len(changed)} isolates archived and hidden from the working views."
+                    + (f" {already} were already archived." if already else "")
+                    + " Nothing was deleted; find them under Archived in the library navigator.")
+
+    def context_restore(self, selection):
+        from wmlstudio import archive
+        identifiers = list(selection.sample_ids)
+        if not identifiers or self.busy():
+            return
+        try:
+            changed = archive.restore_samples(self.project, identifiers)
+        except (KeyError, ValueError) as error:
+            self.error(error)
+            return
+        self.refresh()
+        self.notify(f"{len(changed)} isolates restored to the working views with every record they "
+                    "carried.")
+
+    def context_remove(self, selection):
+        from PySide6.QtWidgets import QCheckBox, QMessageBox
+
+        from wmlstudio.storage import remove_samples
+        identifiers = list(selection.sample_ids)
+        if not identifiers or self.busy():
+            return
+        box = QMessageBox(self)
+        box.setWindowTitle("Remove from this project?")
+        box.setText(f"Remove {len(identifiers)} isolates and their saved analyses from this project?")
+        box.setInformativeText(
+            "Your original sequence files are never deleted. If you only want them out of the way, "
+            "cancel and choose Archive instead — archiving keeps every result and can be undone.")
+        box.setStandardButtons(QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel)
+        box.setDefaultButton(QMessageBox.StandardButton.Cancel)
+        check = QCheckBox("Also delete the managed copies WMLSTudio made in its own folders")
+        box.setCheckBox(check)
+        if box.exec() != QMessageBox.StandardButton.Yes:
+            return
+        try:
+            report = remove_samples(self.project, identifiers,
+                                    delete_managed_copy=check.isChecked())
+        except (KeyError, ValueError) as error:
+            self.error(error)
+            return
+        self.refresh()
+        message = (f"{len(report['removed'])} isolates removed. Their evidence is recorded in the "
+                   "project history and can be restored from Samples ▸ Recently removed.")
+        if report["deleted"]:
+            message += f" {len(report['deleted'])} managed copies were deleted; your originals were not."
+        if report["retained"]:
+            message += f" {len(report['retained'])} copies were kept: {report['retained'][0][1]}"
+        self.notify(message)
+
+    def remove_sample(self):
+        """Menu twin of the right-click removal, so both routes explain themselves."""
+        from wmlstudio.context_menus import Selection
+        identifiers = sorted(self.selection_ids)
+        if not identifiers:
+            sample = self.selected_sample()
+            identifiers = [sample["id"]] if sample else []
+        if not identifiers:
+            self.notify("Select the isolates to remove first.")
+            return
+        self.context_remove(Selection("library", tuple(identifiers)))
+
+    def fill_recently_removed(self, menu):
+        """Offer the last removals back, saying plainly which ones cannot be restored."""
+        menu.clear()
+        entries = [entry for entry in self.project.history()
+                   if entry["action"] == "sample_removed"][-20:]
+        if not entries:
+            menu.addAction("Nothing has been removed from this project").setEnabled(False)
+            return
+        for entry in reversed(entries):
+            details = entry.get("details") or {}
+            sample = details.get("sample") or {}
+            action = menu.addAction(f"{sample.get('name') or 'Unnamed isolate'} · removed {entry['created_at']}")
+            if details.get("format_version") != 2:
+                action.setEnabled(False)
+                action.setToolTip("This removal predates restorable records.")
+                continue
+            action.triggered.connect(lambda checked=False, i=entry["id"]: self.restore_removed(i))
+
+    def restore_removed(self, history_id):
+        try:
+            sample_id = self.project.restore_removed_sample(history_id)
+        except (KeyError, ValueError) as error:
+            self.error(error)
+            return
+        self.refresh()
+        self.selection_ids = {sample_id}
+        self.refresh_tables()
+        self.notify("Isolate restored with every saved analysis it had. Its original file was never "
+                    "deleted.")
 
     def build_menus(self):
         self.command_actions = []
@@ -1113,8 +1829,16 @@ class WorkbenchMixin:
         action(samples, "Select visible", self.select_visible_samples)
         action(samples, "Clear selection", self.clear_sample_selection)
         action(samples, "Relink input (same bytes)…", self.relink_selected_input)
+        action(samples, "Re-file managed copies now…", self.refile_selected)
         action(samples, "Attach original reads to assemblies…", self.attach_reads_selected)
+        samples.addSeparator()
+        action(samples, "Archive selected isolates…",
+               lambda: self.context_archive(self.library_selection()))
+        action(samples, "Restore selected isolates from the archive",
+               lambda: self.context_restore(self.library_selection()))
         action(samples, "Remove sample…", self.remove_sample)
+        recently_removed = samples.addMenu("Recently removed")
+        recently_removed.aboutToShow.connect(lambda menu=recently_removed: self.fill_recently_removed(menu))
         analysis = bar.addMenu("&Analysis")
         action(analysis, "Choose isolates and analyse…", self.choose_and_analyse, "Ctrl+R")
         action(analysis, "Review pending isolates…", lambda: self.choose_and_analyse(pending_only=True))
@@ -1132,6 +1856,8 @@ class WorkbenchMixin:
         action(data, "Research saved library…", self.open_library_research)
         action(data, "AMR databases / updates…", self.open_amr_databases)
         action(data, "Characterization references / updates…", self.install_characterization_references)
+        action(data, "Install broader species panel…", self.install_species_panel)
+        action(data, "Download practice data…", self.download_practice_cohort)
         action(data, "Import local scheme…", self.import_scheme)
         action(data, "Epidemiology grid / bulk import…", self.open_metadata_grid)
         action(data, "Published cluster threshold guidance…", self.open_threshold_guidance)
@@ -1181,6 +1907,17 @@ class WorkbenchMixin:
         QApplication.instance().setStyleSheet(scaled_style(percent))
         interface_preferences(self.root).setValue("scale", percent)
         self.updateGeometry()
+
+    def set_graph_text_scale(self, percent):
+        """Resize the lettering on both comparison trees; the trees themselves do not move."""
+        from wmlstudio.widgets import set_graph_text_scale
+        percent = set_graph_text_scale(percent)
+        from wmlstudio.interface_settings import interface_preferences
+        interface_preferences(self.root).setValue("graph_scale", percent)
+        for name in ("tree", "baseline_tree"):
+            view = getattr(self, name, None)
+            if view is not None and hasattr(view, "_redraw"):
+                view._redraw()
 
     def open_interface_settings(self):
         from wmlstudio.interface_settings import InterfaceSettingsDialog
@@ -1234,11 +1971,10 @@ class WorkbenchMixin:
         self.refresh_features()
         self.navigate(4)
 
-    def navigate(self, index):
-        if index == 6:
-            self.open_interface_settings()
-            return
-        super().navigate(index)
+    def library_selection(self):
+        """The isolate-library selection as a right-click Selection, for menu twins."""
+        from wmlstudio.context_menus import Selection
+        return Selection("library", tuple(sorted(self.selection_ids)))
 
     def choose_and_analyse(self, checked=False, assemble=False, pending_only=False):
         if self.busy():

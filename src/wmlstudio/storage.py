@@ -504,6 +504,12 @@ def plan_filing(project: Project, sample_id: str, *, storage_root=None, append_s
     if sample.get("profile_only") or not sample.get("input_path"):
         plan["reason"] = "A profile-only sample has no sequence file to file."
         return plan
+    if not sample["metadata"].get("workflow", {}).get("managed"):
+        # Organising means moving WMLSTudio's own copy. A file the user chose to
+        # keep where it is stays there; correcting its label never adopts it.
+        plan["reason"] = ("This file is linked where you keep it, so only its label changed. "
+                          "WMLSTudio organises its own managed copies.")
+        return plan
     filing = _filing(project, sample, storage_root, append_st, quarantine)
     plan.update(eligible=True, current=filing["source"], destination=filing["destination"],
                 relative=filing["destination"].relative_to(filing["root"]).as_posix(),

@@ -240,3 +240,130 @@ def test_cohort_ids_reads_each_tabs_own_attribute(window):
     assert cohort_ids(window, "evidence") == {"x"}
     assert cohort_ids(window, "compare") == set()
     assert cohort_ids(window, "schemes") == set()
+
+
+# ---------------------------------------------------------------------------
+# The real window: focus is installed, shared and visible, and still writes
+# nothing into the cohorts this revision keeps separate.
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def studio(qtbot, tmp_path):
+    from wmlstudio.app import MainWindow
+    widget = MainWindow(storage_root=tmp_path / "workspace")
+    qtbot.addWidget(widget)
+    yield widget
+    widget.close()
+
+
+def two_isolates(studio, tmp_path):
+    ids = []
+    for name in ("alpha", "bravo"):
+        path = tmp_path / f"{name}.fasta"
+        path.write_text(">c\nACGTACGTACGT\n", encoding="utf-8")
+        ids.append(path)
+    studio.import_paths(ids)
+    return [sample["id"] for sample in studio.project.samples()]
+
+
+def test_the_window_carries_one_focus_bus_and_one_cohort_ledger(studio):
+    assert isinstance(studio.focus, FocusBus)
+    assert isinstance(studio.cohort_origins, CohortLedger)
+    assert studio.focus.ids == set()
+
+
+def test_the_top_strip_shows_the_project_count_and_then_what_is_focused(studio, tmp_path):
+    ids = two_isolates(studio, tmp_path)
+    assert isinstance(studio.focus_bar, FocusBar)
+    # refresh_journey still writes the project count through the old attribute name.
+    assert studio.scope_label is studio.focus_bar
+    assert studio.focus_bar.text.text() == "2 isolates in project"
+    studio.focus.set_focus(ids, "Isolate table selection")
+    assert "2 isolates" in studio.focus_bar.text.text()
+    assert "Isolate table selection" in studio.focus_bar.text.text()
+    studio.focus.clear()
+    assert studio.focus_bar.text.text() == "2 isolates in project"
+
+
+def test_focusing_isolates_on_the_real_window_writes_no_cohort(studio, tmp_path):
+    ids = two_isolates(studio, tmp_path)
+    studio.focus.set_focus(ids, "Graph selection")
+    assert studio.focus.ids == set(ids)
+    assert studio.cohort_ids == set()
+    assert studio.feature_ids == set()
+    assert studio.report_ids == set()
+    assert studio.project.get_setting("comparison_cohort", None) in (None, [])
+
+
+def test_adopting_focus_into_the_report_cohort_records_where_it_came_from(studio, tmp_path):
+    ids = two_isolates(studio, tmp_path)
+    studio.focus.set_focus(ids, "Graph selection")
+    adopted = adopt_focus(studio, "reports")
+    assert adopted == set(ids)
+    assert studio.report_ids == set(ids)
+    assert studio.cohort_ids == set()
+    assert studio.feature_ids == set()
+    entry = studio.cohort_origins.entry("reports")
+    assert entry["origin"] == "Graph selection"
+    assert "Graph selection" in studio.cohort_origins.describe("reports", len(ids))
+    assert "belongs to this tab only" in studio.cohort_origins.describe("reports", len(ids))
+
+
+def test_sending_a_selection_to_compare_goes_there_and_persists_only_that_cohort(
+        studio, tmp_path):
+    ids = two_isolates(studio, tmp_path)
+    send_selection(studio, "compare", ids, origin="Isolate table selection")
+    assert studio.cohort_ids == set(ids)
+    assert studio.pages.currentIndex() == studio.page_index["compare"]
+    assert sorted(studio.project.get_setting("comparison_cohort", [])) == sorted(ids)
+    assert studio.report_ids == set()
+    assert studio.feature_ids == set()
+
+
+def test_showing_the_focus_takes_you_to_the_isolates_tab_without_changing_anything(
+        studio, tmp_path):
+    ids = two_isolates(studio, tmp_path)
+    studio.focus.set_focus(ids, "Graph selection")
+    studio.navigate(studio.page_index["compare"])
+    studio.show_focus_in_library()
+    assert studio.pages.currentIndex() == studio.page_index["isolates"]
+    assert studio.cohort_ids == set()
+    assert studio.feature_ids == set()
+    assert studio.report_ids == set()
+
+
+def test_removing_an_isolate_drops_it_from_the_shared_focus(studio, tmp_path):
+    ids = two_isolates(studio, tmp_path)
+    studio.focus.set_focus(ids, "Isolate table selection")
+    studio.project.remove_sample(ids[0])
+    studio.refresh()
+    studio.focus.prune({sample["id"] for sample in studio.current_samples})
+    assert studio.focus.ids == {ids[1]}
+
+
+def test_each_cohort_tab_says_what_it_is_reviewing_and_offers_only_a_click(studio, tmp_path):
+    from wmlstudio.workspace_focus import COHORT_ATTRIBUTES
+    for key in COHORT_ATTRIBUTES:
+        bar = studio.page_headers[key].cohort_bar
+        assert bar.text.text() == "Nothing chosen here yet"
+        assert EMPTY_COHORT_TEXT in bar.text.toolTip()
+        assert bar.adopt_button.isEnabled() is False
+
+
+def test_the_adopt_button_is_the_only_thing_that_turns_focus_into_a_cohort(studio, tmp_path,
+                                                                          qtbot):
+    ids = two_isolates(studio, tmp_path)
+    bar = studio.page_headers["reports"].cohort_bar
+    studio.focus.set_focus(ids, "Isolate table selection")
+    assert bar.adopt_button.text() == "Use current focus (2)"
+    assert bar.adopt_button.isEnabled() is True
+    # Focusing alone changed nothing.
+    assert studio.report_ids == set()
+    bar.adopt_button.click()
+    assert studio.report_ids == set(ids)
+    assert "Isolate table selection" in bar.text.text()
+    assert "belongs to this tab only" in bar.text.toolTip()
+    # And only that tab's cohort moved.
+    assert studio.cohort_ids == set()
+    assert studio.feature_ids == set()
