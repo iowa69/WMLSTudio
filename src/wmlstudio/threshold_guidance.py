@@ -43,6 +43,24 @@ SOURCES = {
     "citrobacter2025": {"citation": "Kieninger et al. (2025). Development and validation of a core genome multilocus sequence typing scheme for Citrobacter freundii: application in outbreak investigations and comparative analysis across the Citrobacter genus.",
         "doi": "10.1128/jcm.00860-25", "url": "https://journals.asm.org/doi/10.1128/jcm.00860-25", "published": "2025-09-19",
         "locator": "Results: species-specific scheme and outbreak evaluation; Figure 4", "type": "peer_reviewed_scheme_evaluation"},
+    "moura2016": {"citation": "Moura, Criscuolo, Pouseele, Maury, Leclercq, Tarr, Björkman, Dallman, Reimer, Enouf, Larsonneur, Carleton, Bracq-Dieye, Katz, Jones, Touchon, Tourdjman, Walker, Stroika, Cantinelli, Chenal-Francisque, Kucerova, Rocha, Nadon, Grant, Nielsen, Pot, Gerner-Smidt, Lecuit and Brisse (2016). Whole genome-based population biology and epidemiological surveillance of Listeria monocytogenes.",
+        "doi": "10.1038/nmicrobiol.2016.185", "url": "https://www.nature.com/articles/nmicrobiol2016185", "published": "2016-10-10",
+        "locator": "Results: nomenclature of Lm cgMLST profiles; Figure 1a; Supplementary Sections 2.1 and 2.7", "type": "peer_reviewed_scheme_definition"},
+    "vanwalle2018": {"citation": "Van Walle, Björkman, Cormican, Dallman, Mossong, Moura, Pietzka, Ruppitsch, Takkinen and the European Listeria WGS typing group (2018). Retrospective validation of whole genome sequencing-enhanced surveillance of listeriosis in Europe, 2010 to 2015.",
+        "doi": "10.2807/1560-7917.ES.2018.23.33.1700798", "url": "https://www.eurosurveillance.org/content/10.2807/1560-7917.ES.2018.23.33.1700798", "published": "2018-08-16",
+        "locator": "Results: epidemiological validation; Figure 2b; Table 3", "type": "peer_reviewed_multi_country_evaluation"},
+    "bletz2018": {"citation": "Bletz, Janezic, Harmsen, Rupnik and Mellmann (2018). Defining and Evaluating a Core Genome Multilocus Sequence Typing Scheme for Genome-Wide Typing of Clostridium difficile.",
+        "doi": "10.1128/JCM.01987-17", "url": "https://journals.asm.org/doi/10.1128/JCM.01987-17", "published": "2018-04-04",
+        "locator": "Results: outbreak evaluation preceding Figure 2; Figure 2 legend; Discussion", "type": "peer_reviewed_scheme_evaluation"},
+    "kohl2018": {"citation": "Kohl, Harmsen, Rothgänger, Walker, Diel and Niemann (2018). Harmonized Genome Wide Typing of Tubercle Bacilli Using a Web-Based Gene-By-Gene Nomenclature System.",
+        "doi": "10.1016/j.ebiom.2018.07.030", "url": "https://www.sciencedirect.com/science/article/pii/S2352396418302779", "published": "2018-08-11",
+        "locator": "Research in Context; Methods 2.5; Results and Figure 2a; Table 3", "type": "peer_reviewed_scheme_evaluation"},
+    "leeper2023": {"citation": "Leeper, Tolar, Griswold, Vidyaprakash, Hise, Williams, Im, Chen, Pouseele and Carleton (2023). Evaluation of whole and core genome multilocus sequence typing allele schemes for Salmonella enterica outbreak detection in a national surveillance network, PulseNet USA.",
+        "doi": "10.3389/fmicb.2023.1254777", "url": "https://www.frontiersin.org/journals/microbiology/articles/10.3389/fmicb.2023.1254777/full", "published": "2023-10-19",
+        "locator": "Introduction: PulseNet cluster definition and scheme locus counts; Table 1; Discussion limitations", "type": "peer_reviewed_surveillance_evaluation"},
+    "morangilad2015": {"citation": "Moran-Gilad, Prior, Yakunin, Harrison, Underwood, Lazarovitch, Valinsky, Lück, Krux, Agmon, Grotto and Harmsen (2015). Design and application of a core genome multilocus sequence typing scheme for investigation of Legionnaires' disease incidents.",
+        "doi": "10.2807/1560-7917.ES2015.20.28.21186", "url": "https://www.eurosurveillance.org/content/10.2807/1560-7917.ES2015.20.28.21186", "published": "2015-07-16",
+        "locator": "Results: humidifier-associated incident and cluster-type calibration; Discussion, opening paragraph", "type": "peer_reviewed_scheme_definition"},
 }
 
 # This is a surveillance work-list, not a ranking of danger or prevalence.
@@ -55,6 +73,7 @@ ORGANISMS = (
     "Staphylococcus epidermidis", "Staphylococcus lugdunensis", "Staphylococcus capitis",
     "Streptococcus pneumoniae", "Streptococcus pyogenes", "Streptococcus agalactiae",
     "Clostridioides difficile", "Legionella pneumophila", "Cutibacterium acnes", "Salmonella enterica",
+    "Listeria monocytogenes", "Mycobacterium tuberculosis complex",
 )
 
 # Fields are facts extracted from the cited study, not default application values.
@@ -114,6 +133,27 @@ def catalog_entries():
     entries.append(_entry("Citrobacter freundii", 10, "citrobacter2025", loci=3250,
         scheme_key="kieninger2025:cfreundii-3250", scope="Species-specific 3,250-target scheme; maximum intracluster distance in evaluated outbreaks.",
         note="Not the paper's separate combined-species scheme or its 8-allele criterion. Single-linkage endpoints may exceed the published within-cluster bound; review cluster diameters."))
+    entries.append(_entry("Listeria monocytogenes", 7, "moura2016", loci=1748,
+        scheme_key="pasteur:lmonocytogenes-1748", scope="Institut Pasteur BIGSdb-Lm 1,748-locus scheme; cgMLST type (CT) definition by single linkage.",
+        missing_policy="Mismatches counted among loci called in both profiles.",
+        note="A CT is a surveillance grouping, not a transmission finding. The authors state CTs diversify slowly (about 0.2 alleles per year), so short-term transmission may need finer methods. The separate 150-mismatch sublineage cutoff is not an outbreak cutoff."))
+    entries.append(_entry("Listeria monocytogenes", 7, "vanwalle2018", suffix="-ruppitsch", loci=1701,
+        scheme_key="cgmlst.org:lmonocytogenes-1701", scope="ECDC-led retrospective evaluation across 27 EU/EEA countries and 19 confirmed outbreaks; Ruppitsch 1,701-locus scheme in SeqSphere+.",
+        note="Confirmed useful for cluster detection at 7 allele differences, with positive predictive value near 58-68%: most detected clusters were not confirmed outbreaks. The authors offer 4 allele differences as a stricter option for more compelling microbiological evidence. Case definitions must state the scheme, its full locus count and the cutoff."))
+    entries.append(_entry("Clostridioides difficile", 6, "bletz2018", loci=2270,
+        scheme_key="cgmlst.org:cdifficile-2270", scope="Bletz 2,270-target scheme seeded on strain 630 (NC_009089.1); cluster type grouping on a minimum spanning tree.",
+        missing_policy="Pairwise ignore missing targets.",
+        note="The authors observed at most 3 allele differences among linked isolates and doubled it to 6 as a precaution, so this is precautionary rather than statistically calibrated. SCHEME VERSION MATTERS: the provider now lists this 2,270-target scheme as deprecated v1, with a current v2 of 2,147 targets. Bind the version you actually ran. A separate local 6-allele criterion exists under siddall2025 with no bound scheme; the two must not be read as independent confirmation."))
+    entries.append(_entry("Mycobacterium tuberculosis complex", 5, "kohl2018", loci=2891,
+        scheme_key="cgmlst.org:mtbc-2891", scope="MTBC 2,891-target scheme seeded on H37Rv (NC_000962.3), PE/PPE and repetitive genes excluded; recent transmission judged likely at or below this distance.",
+        note="Banded, not binary: above 12 allele differences recent transmission is judged unlikely, and 6 to 12 is explicitly INDETERMINATE and must never render as unrelated. Derived by transferring the SNP thresholds of Walker et al. 2013 onto the same 390-genome UK cohort, so it is a method transfer, not an independent derivation. A reduced, extended or re-derived target set voids the cutoff. No paediatric derivation or validation exists."))
+    entries.append(_entry("Salmonella enterica", 10, "leeper2023", loci=3002,
+        scheme_key="enterobase:senterica-cgmlst-3002", scope="PulseNet USA national surveillance cluster-detection criterion on the EnteroBase-derived 3,002-locus core scheme, evaluated but not derived by this study.",
+        note="An operational surveillance criterion, not a validated outbreak or transmission cutoff. It is only half the rule: PulseNet also requires at least seven clinical cases, or three for rarer serotypes, within 60 days. The evaluation clustered by UPGMA, so do not assume single linkage. EnteroBase HC5 is a hierarchical clustering level, not this criterion and not a validated threshold. ECDC and EFSA set their Salmonella cutoff per outbreak, so no single European number is curated here."))
+    entries.append(_entry("Legionella pneumophila", 4, "morangilad2015", loci=1521,
+        scheme_key="cgmlst.org:lpneumophila-1521", scope="ESGLI-associated 1,521-target scheme seeded on Philadelphia-1 (NC_002942.5); preliminary cluster-type distance.",
+        missing_policy="Calibration compared the 1,446 of 1,521 targets shared by all analysed genomes; missing targets excluded rather than counted as differences.",
+        note="PRELIMINARY by the authors' own wording, from only 17 genomes, and never independently revalidated; they state it should be further evaluated and fine-tuned. Linked isolates actually differed by 0, 1 and 3 alleles, so 4 is a rounded bound, not a measured maximum. David et al. 2016 (10.1128/JCM.00432-16) question this scheme's resolution for outbreak use. It is a linkage distance, so report cluster diameter. A separate local 4-allele criterion exists under siddall2025 with no bound scheme; the numeric coincidence is not independent confirmation."))
     return deepcopy(entries)
 
 

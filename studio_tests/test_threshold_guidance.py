@@ -27,7 +27,9 @@ def kp():
 
 
 def test_catalog_has_explicit_coverage_gaps_and_sources():
-    assert 20 <= len(ORGANISMS) <= 30
+    # A sanity bound on the surveillance work-list, not a scientific claim: it
+    # must stay populated and hand-curated rather than becoming a species dump.
+    assert 20 <= len(ORGANISMS) <= 40
     entries = catalog_entries()
     assert len({e['id'] for e in entries}) == len(entries)
     assert all(e['source_id'] in SOURCES and not e['auto_apply'] for e in entries)
