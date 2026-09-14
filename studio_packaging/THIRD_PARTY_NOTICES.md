@@ -209,11 +209,13 @@ redistributed by this project.
 > submitters, not WMLSTudio, when reusing these sequences.
 
 The broad species panel is pinned as revision
-`ncbi-refseq-species-panel-2026-09-14`: 17 RefSeq assemblies, one per taxon,
-about 15.7 MiB, each row pinning the accession, assembly directory, compressed
-byte count, compressed SHA-256 and decompressed-FASTA SHA-256. It is a triage
-panel, not a representation of within-species diversity, and it does not
-distinguish *Escherichia coli* from *Shigella*.
+`ncbi-refseq-species-panel-2026-09-14.2`: 18 RefSeq assemblies, about 16.5 MiB,
+each row pinning the accession, assembly directory, compressed byte count,
+compressed SHA-256 and decompressed-FASTA SHA-256. It is a triage panel, not a
+representation of within-species diversity, and it does not distinguish
+*Escherichia coli* from *Shigella*. Most taxa carry one assembly;
+*Listeria monocytogenes* carries two, because its lineages straddle the 95% ANI
+species line and a single reference left common genomes unresolved.
 
 The practice cohorts are pinned as content digests over their accession tables:
 `kpneumoniae-10` (10 assemblies, 16,746,561 bytes, digest
