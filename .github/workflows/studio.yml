@@ -29,7 +29,10 @@ jobs:
       matrix:
         os: [ubuntu-latest, windows-latest]
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 45
+    # Staging the reference data, then 1,100+ tests, then freezing the desktop
+    # does not fit in 45 minutes on a hosted runner: the run was being killed
+    # mid-suite, which reads as a red build rather than as a timeout.
+    timeout-minutes: 120
     env:
       QT_QPA_PLATFORM: offscreen
       PYTHONUTF8: "1"

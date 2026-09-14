@@ -772,6 +772,13 @@ class BaseWindow(QMainWindow):
 
     def populate_schemes(self):
         selected = self.project.get_setting("scheme_path", "")
+        # The cgMLST library exists before anything is downloaded, so a user never
+        # has to make a folder and can see which schemes this build can ship.
+        try:
+            from wmlstudio import cgmlst_schemes
+            cgmlst_schemes.prepare_library(self.root)
+        except (OSError, ValueError):
+            pass  # A read-only or full data folder must not stop the workspace opening.
         self.scheme_paths = scheme_locations(self.root)
         self.scheme_combo.clear()
         self.scheme_combo.addItem("Quality checks only", None)
@@ -1141,6 +1148,7 @@ class BaseWindow(QMainWindow):
             self.motion.blockSignals(False)
             self.set_motion(enabled)
             self.populate_schemes()
+            self.recover_moved_storage()
             self.refresh()
             self.navigate(0)
             return True
@@ -1149,6 +1157,32 @@ class BaseWindow(QMainWindow):
                 new_lock.unlock()
             self.error(exc)
             return False
+
+    def recover_moved_storage(self):
+        """Re-point managed copies after a project folder moves drive or machine.
+
+        Every stored path is absolute, so a project carried on a USB stick shows
+        every sample as missing although its copies sit right beside it. A
+        candidate is adopted only when its SHA-256 matches the recorded copy: a
+        file that merely has the right name is reported, never accepted.
+        """
+        from wmlstudio import storage
+        try:
+            missing = storage.missing_managed_copies(self.project)
+            if not missing:
+                return
+            result = storage.relocate_managed_storage(self.project)
+        except (OSError, ValueError) as exc:
+            self.notify(f"Some sequence copies could not be found: {exc}")
+            return
+        recovered, unresolved = len(result.get("relocated", ())), len(result.get("unresolved", ()))
+        if recovered:
+            self.notify(f"Found {recovered} sequence {'copy' if recovered == 1 else 'copies'} "
+                        "beside the project after it moved. Nothing was copied or changed."
+                        + (f" {unresolved} could not be matched and still need attention." if unresolved else ""))
+        elif unresolved:
+            self.notify(f"{unresolved} sequence {'copy is' if unresolved == 1 else 'copies are'} "
+                        "missing from this project's folder. Re-link them from the isolate record.")
 
     @staticmethod
     def lock_project(path):

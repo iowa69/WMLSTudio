@@ -229,6 +229,12 @@ SAMPLE_ACTIONS = _OPEN + _ROUTING + _ASSIGN + _GROUPING + _ADDING + _TAKING + _A
 
 VIEW_ACTIONS: dict[str, tuple[str, ...]] = {
     "library": SAMPLE_ACTIONS + ("remove",),
+    # The Samples sub-tabs are the same isolates seen from one angle, so they are
+    # declared rather than left to the catch-all, which offered actions belonging
+    # to the comparison and report views.
+    "library.st": SAMPLE_ACTIONS + ("remove",),
+    "library.cgmlst": SAMPLE_ACTIONS + ("remove",),
+    "library.hydra": SAMPLE_ACTIONS + ("remove",),
     "overview.recent": SAMPLE_ACTIONS + ("remove",),
     "library.tree": (_OPEN + _ROUTING + ("assign_organism_quick", "assign_organism",
                      "rename_folder", "add_collection") + _GROUPING + _ADDING
