@@ -101,16 +101,21 @@ jobs:
       - name: Independently probe bundled Windows CDS modules without installed-wheel fallback
         if: runner.os == 'Windows'
         run: uv run python studio_packaging/check_bundled_cds.py dist/WMLSTudio --output artifacts/bundled-cds.json
+      - name: Read the application version
+        id: appversion
+        shell: bash
+        run: echo "value=$(uv run python -c 'import wmlstudio; print(wmlstudio.__version__)')" >> "$GITHUB_OUTPUT"
       - name: Archive portable Linux build
         if: runner.os == 'Linux'
         run: |
-          tar -czf dist/WMLSTudio-Linux-x64.tar.gz -C dist WMLSTudio
+          tar -czf dist/WMLSTudio-${{ steps.appversion.outputs.value }}-Linux-x64.tar.gz -C dist WMLSTudio
       - name: Archive portable Windows build
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
-          Compress-Archive -Path dist/WMLSTudio -DestinationPath dist/WMLSTudio-Windows-x64.zip
-          Get-FileHash -Algorithm SHA256 dist/WMLSTudio-Windows-x64.zip | Format-List | Out-File dist/windows-sha256.txt
+          $archive = "dist/WMLSTudio-${{ steps.appversion.outputs.value }}-Windows-x64.zip"
+          Compress-Archive -Path dist/WMLSTudio -DestinationPath $archive
+          Get-FileHash -Algorithm SHA256 $archive | Format-List | Out-File dist/windows-sha256.txt
       - name: Attach validation results
         if: always()
         uses: actions/upload-artifact@v4
@@ -121,7 +126,7 @@ jobs:
       - name: Attach portable development build
         uses: actions/upload-artifact@v4
         with:
-          name: WMLSTudio-${{ runner.os }}-x64
+          name: WMLSTudio-${{ steps.appversion.outputs.value }}-${{ runner.os }}-x64
           path: |
             dist/*.zip
             dist/*.tar.gz

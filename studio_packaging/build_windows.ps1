@@ -47,8 +47,13 @@ try {
     $env:QT_QPA_PLATFORM = "offscreen"
     & uv run python studio_packaging/check_frozen.py dist/WMLSTudio --output dist/frozen-check.json
     if ($LASTEXITCODE -ne 0) { throw "Frozen reference typing and desktop checks failed" }
-    Compress-Archive -Path dist/WMLSTudio -DestinationPath dist/WMLSTudio-Windows-x64.zip -Force
-    Get-FileHash -Algorithm SHA256 dist/WMLSTudio-Windows-x64.zip
+    # The download carries its version, so a saved ZIP can still be identified
+    # months later and two builds cannot be confused for one another.
+    $version = & uv run python -c "import wmlstudio; print(wmlstudio.__version__)"
+    if ($LASTEXITCODE -ne 0) { throw "Could not read the application version" }
+    $archive = "dist/WMLSTudio-$version-Windows-x64.zip"
+    Compress-Archive -Path dist/WMLSTudio -DestinationPath $archive -Force
+    Get-FileHash -Algorithm SHA256 $archive
 } finally {
     Pop-Location
 }
