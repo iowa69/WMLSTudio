@@ -8,8 +8,15 @@ from pathlib import Path
 from PySide6.QtCore import Qt, Signal
 from PySide6.QtGui import QDesktopServices
 from PySide6.QtWidgets import (
-    QDialog, QDialogButtonBox, QHBoxLayout, QLineEdit, QListWidget,
-    QListWidgetItem, QSplitter, QTextBrowser, QVBoxLayout,
+    QDialog,
+    QDialogButtonBox,
+    QHBoxLayout,
+    QLineEdit,
+    QListWidget,
+    QListWidgetItem,
+    QSplitter,
+    QTextBrowser,
+    QVBoxLayout,
 )
 
 GUIDE_ACTIONS = frozenset({"import", "samples", "review", "analyse", "characterize",

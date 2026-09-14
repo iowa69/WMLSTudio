@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import math
 import threading
+from collections import OrderedDict
 from pathlib import Path
 
 import pyskani
@@ -16,7 +17,10 @@ import pyskani
 from .characterization_refs import validate_characterization_references
 from .sequence import SequenceReader, check_cancelled, file_sha256, file_signature, sample_name
 
-_CACHE = {}
+# Two bounded installed panels: a broad triage panel and a focused complex panel
+# are queried alternately for one isolate, and neither should evict the other.
+_CACHE_LIMIT = 2
+_CACHE: OrderedDict = OrderedDict()
 _LOCK = threading.Lock()
 
 
@@ -50,6 +54,7 @@ def _database(root, cancelled=None, progress=None):
     with _LOCK:
         cached = _CACHE.get(str(root))
         if cached and all(file_signature(root / relative) == signature for relative, signature in cached[2]):
+            _CACHE.move_to_end(str(root))
             return cached[0], cached[1]
     manifest = validate_characterization_references(root, cancelled=cancelled)
     if not manifest['species'] or not any(item.get('outgroup') for item in manifest['species']):
@@ -66,8 +71,10 @@ def _database(root, cancelled=None, progress=None):
     if any(file_signature(root / relative) != signature for relative, signature in signatures):
         raise ValueError('Species reference files changed while creating the sketch database.')
     with _LOCK:
-        _CACHE.clear()  # One bounded installed panel, shared across a batch.
         _CACHE[str(root)] = (database, manifest, signatures)
+        _CACHE.move_to_end(str(root))
+        while len(_CACHE) > _CACHE_LIMIT:
+            _CACHE.popitem(last=False)
     return database, manifest
 
 

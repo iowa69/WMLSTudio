@@ -104,3 +104,9 @@ studio_packaging/generated_notices/
 *.wmlstudio.lock
 artifacts/
 src/wmlstudio/resources/characterization/
+
+# Pinned practice cohorts download to the user's Data root on explicit request
+# (studio_scripts/fetch_practice_cohort.py, docs/TEST_DATASETS.md). Only the
+# accession/checksum tables are committed; the sequences never are.
+practice-cohorts/
+src/wmlstudio/resources/testdata/

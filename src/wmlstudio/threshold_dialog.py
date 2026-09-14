@@ -2,16 +2,35 @@
 
 import html
 import json
-from pathlib import Path
 from urllib.parse import urlencode
 
 from PySide6.QtCore import Qt, QUrl
 from PySide6.QtGui import QDesktopServices
-from PySide6.QtWidgets import (QCheckBox, QComboBox, QDialog, QDialogButtonBox,
-    QFormLayout, QHBoxLayout, QLineEdit, QListWidget, QListWidgetItem,
-    QPlainTextEdit, QSpinBox, QSplitter, QTextBrowser, QVBoxLayout, QWidget)
+from PySide6.QtWidgets import (
+    QCheckBox,
+    QComboBox,
+    QDialog,
+    QDialogButtonBox,
+    QFormLayout,
+    QHBoxLayout,
+    QLineEdit,
+    QListWidget,
+    QListWidgetItem,
+    QPlainTextEdit,
+    QSpinBox,
+    QSplitter,
+    QTextBrowser,
+    QVBoxLayout,
+    QWidget,
+)
 
-from .threshold_guidance import CATALOG_VERSION, ORGANISMS, REVIEWED_ON, guidance_for, record_decision
+from .threshold_guidance import (
+    CATALOG_VERSION,
+    ORGANISMS,
+    REVIEWED_ON,
+    guidance_for,
+    record_decision,
+)
 from .ui_common import organism_for
 from .widgets import button, label
 
@@ -121,7 +140,9 @@ class ThresholdGuideDialog(QDialog):
         if item is None:
             return
         entry = item.data(Qt.ItemDataRole.UserRole)
-        e = lambda value: html.escape(str(value))
+        def e(value):
+            return html.escape(str(value))
+
         source = entry['source']
         value = entry['published_threshold']
         body = f"<h2>{e(entry['organism'])}</h2><h3>{e(entry['method'])}: {e('No numeric rule curated' if value is None else '≤ ' + str(value) + ' ' + entry['unit'])}</h3>"

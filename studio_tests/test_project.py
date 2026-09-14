@@ -90,6 +90,94 @@ def test_deleting_record_keeps_input(tmp_path, sequence):
             project.remove_sample(sample_id)
 
 
+def test_renaming_a_sample_keeps_its_input_result_and_identifier(tmp_path, sequence):
+    with Project(tmp_path / "study.wmlstudio") as project:
+        sample_id = project.add_sample(sequence, "Isolate α")
+        project.set_result(sample_id, {"scheme": "MLST", "scheme_digest": "mlst-v1", "st": "258"})
+        before = project.get_sample(sample_id)
+        project.rename_sample(sample_id, "  Ward B isolate 7  ")
+        sample = project.get_sample(sample_id)
+        assert sample["name"] == "Ward B isolate 7"
+        assert sample["id"] == sample_id
+        assert sample["input_path"] == before["input_path"]
+        assert sample["result"] == before["result"]
+        assert sequence.is_file()
+        renames = [event for event in project.history(sample_id) if event["action"] == "sample_renamed"]
+        assert renames[0]["details"] == {"from": "Isolate α", "to": "Ward B isolate 7"}
+        project.rename_sample(sample_id, "Ward B isolate 7")
+        assert len([e for e in project.history(sample_id) if e["action"] == "sample_renamed"]) == 1
+
+
+def test_renaming_refuses_a_blank_name_or_an_unknown_sample(tmp_path, sequence):
+    with Project(tmp_path / "study.wmlstudio") as project:
+        sample_id = project.add_sample(sequence, "Isolate α")
+        with pytest.raises(ValueError, match="cannot be empty"):
+            project.rename_sample(sample_id, "   ")
+        assert project.get_sample(sample_id)["name"] == "Isolate α"
+        with pytest.raises(KeyError):
+            project.rename_sample("does-not-exist", "Anything")
+
+
+def test_removal_records_the_analyses_it_deletes_so_they_can_be_restored(tmp_path, sequence):
+    with Project(tmp_path / "study.wmlstudio") as project:
+        sample_id = project.add_sample(sequence, "Isolate α")
+        project.set_metadata(sample_id, {"organism": {"genus": "Klebsiella", "species": "pneumoniae"}})
+        project.set_result(sample_id, {"scheme": "MLST", "scheme_digest": "mlst-v1", "st": "258",
+                                       "alleles": {"gapA": "3"}})
+        project.set_analysis(sample_id, {"scheme": "cgMLST", "scheme_digest": "cgmlst-v1",
+                                         "alleles": {"locus0001": "7"}})
+        before = project.get_sample(sample_id)
+        analyses = project.analysis_results(sample_id)
+        project.remove_sample(sample_id)
+
+        removal = [event for event in project.history(sample_id) if event["action"] == "sample_removed"][0]
+        assert removal["details"]["format_version"] == 2
+        assert removal["details"]["sample"] == before
+        assert removal["details"]["analyses"] == analyses
+        assert sequence.is_file()
+
+        assert project.restore_removed_sample(removal["id"]) == sample_id
+        restored = project.get_sample(sample_id)
+        assert restored["name"] == before["name"]
+        assert restored["input_path"] == before["input_path"]
+        assert restored["status"] == before["status"] and restored["error"] == before["error"]
+        assert restored["metadata"] == before["metadata"]
+        assert restored["result"] == before["result"]
+        assert restored["created_at"] == before["created_at"]
+        assert project.analysis_results(sample_id) == analyses
+        assert any(event["action"] == "sample_restored_from_history"
+                   for event in project.history(sample_id))
+
+
+def test_restoring_refuses_a_live_identifier_or_an_unrelated_history_entry(tmp_path, sequence):
+    with Project(tmp_path / "study.wmlstudio") as project:
+        sample_id = project.add_sample(sequence, "Isolate α")
+        project.remove_sample(sample_id)
+        removal = [event for event in project.history(sample_id) if event["action"] == "sample_removed"][0]
+        project.restore_removed_sample(removal["id"])
+
+        with pytest.raises(ValueError, match="already in this project"):
+            project.restore_removed_sample(removal["id"])
+        imported = [event for event in project.history(sample_id) if event["action"] == "sample_imported"][0]
+        with pytest.raises(ValueError, match="not hold a restorable"):
+            project.restore_removed_sample(imported["id"])
+        with pytest.raises(KeyError):
+            project.restore_removed_sample(99999)
+        assert len(project.samples()) == 1
+
+
+def test_restoring_a_sample_removed_mid_analysis_never_claims_it_is_still_running(tmp_path, sequence):
+    with Project(tmp_path / "study.wmlstudio") as project:
+        sample_id = project.add_sample(sequence)
+        project.set_status(sample_id, "running")
+        project.remove_sample(sample_id)
+        removal = [event for event in project.history(sample_id) if event["action"] == "sample_removed"][0]
+        project.restore_removed_sample(removal["id"])
+        restored = project.get_sample(sample_id)
+        assert restored["status"] == "interrupted"
+        assert "Rerun" in restored["error"]
+
+
 def test_rejects_foreign_database_without_modifying_it(tmp_path):
     path = tmp_path / "foreign.sqlite"
     with sqlite3.connect(path) as connection:

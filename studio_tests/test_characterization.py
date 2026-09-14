@@ -25,11 +25,15 @@ from wmlstudio.virulence_evidence import (
 )
 
 
-def reference_panel(tmp_path, genomes=None, genes=None):
+def reference_panel(tmp_path, genomes=None, genes=None, format_version=1):
     root = tmp_path / 'references'
     root.mkdir()
-    manifest = {'format_version': 1, 'source_revision': 'synthetic-truth',
+    manifest = {'format_version': format_version, 'source_revision': 'synthetic-truth',
                 'source_repository': 'synthetic-test-fixture', 'species': [], 'virulence': {}, 'files': []}
+    if format_version >= 2:
+        manifest.update(sources={'synthetic': {'repository': 'synthetic-test-fixture', 'revision': 'synthetic-truth',
+                                               'license': 'synthetic', 'license_file': 'source-LICENSE-synthetic'}},
+                        locus_profiles={}, sccmec={}, capsule={})
     for index, (taxon, sequence) in enumerate(genomes or []):
         relative = f'ref{index}.fasta'
         (root / relative).write_text(f'>ref{index}\n{sequence}\n')
@@ -272,11 +276,54 @@ def test_per_record_hydra_bridge_keeps_source_and_never_hashes_user_mapping(tmp_
         assert hydra_report_for_record(record) is None
 
 
-def test_reference_manifest_does_not_trust_modified_sequence_bytes(tmp_path):
-    root = reference_panel(tmp_path, genes={'a': 'ATGAAATAA'})
-    validate_characterization_references(root)
+@pytest.mark.parametrize('format_version', [1, 2])
+def test_reference_manifest_does_not_trust_modified_sequence_bytes(tmp_path, format_version):
+    root = reference_panel(tmp_path, genes={'a': 'ATGAAATAA'}, format_version=format_version)
+    assert validate_characterization_references(root)['format_version'] == format_version
     (root / 'a.fasta').write_text('>a_1\nATGCCCTAA\n')
     with pytest.raises(ValueError, match='changed or is missing'):
+        validate_characterization_references(root)
+
+
+def test_format_version_one_snapshot_still_validates_and_new_modules_report_not_run(tmp_path):
+    root = reference_panel(tmp_path, genes={'a': 'ATGAAATAA'})
+    manifest = validate_characterization_references(root)
+    assert manifest['format_version'] == 1 and 'sccmec' not in manifest
+    assembly = tmp_path / 'a.fasta'
+    assembly.write_text('>c\nACGT\n')
+    result = characterize_assembly(assembly, reference_root=root, species=False, virulence=False,
+                                   modules={'sccmec': True, 'klebsiella_locus_st': True})
+    for key in ('sccmec', 'klebsiella_locus_st'):
+        assert result[key]['status'] == 'not_run'
+        assert 'format 1' in result[key]['reason'] and key.split('_')[0] in result[key]['reason'].lower()
+
+
+def test_v2_manifest_missing_a_declared_section_is_rejected(tmp_path):
+    root = reference_panel(tmp_path, genes={'a': 'ATGAAATAA'}, format_version=2)
+    manifest = json.loads((root / 'manifest.json').read_text())
+    del manifest['capsule']
+    (root / 'manifest.json').write_text(json.dumps(manifest))
+    with pytest.raises(ValueError, match='omits a declared organism-module section'):
+        validate_characterization_references(root)
+
+
+def test_reference_manifest_rejects_a_stripped_organism_module_section(tmp_path):
+    root = reference_panel(tmp_path, genes={'a': 'ATGAAATAA'}, format_version=2)
+    manifest = json.loads((root / 'manifest.json').read_text())
+    manifest['sccmec'] = {'targets': [{'gene': 'mecA', 'path': 'a.fasta'}]}
+    (root / 'manifest.json').write_text(json.dumps(manifest))
+    with pytest.raises(ValueError, match='fingerprint is invalid'):
+        validate_characterization_references(root)
+
+
+def test_v2_manifest_requires_a_source_hash_for_every_organism_module_reference(tmp_path):
+    from wmlstudio.characterization_refs import reference_digest as digest
+    root = reference_panel(tmp_path, genes={'a': 'ATGAAATAA'}, format_version=2)
+    manifest = json.loads((root / 'manifest.json').read_text())
+    manifest['capsule'] = {'loci': [{'gene': 'wzi', 'path': 'capsule/wzi.fasta'}]}
+    manifest['reference_digest'] = digest(manifest)
+    (root / 'manifest.json').write_text(json.dumps(manifest))
+    with pytest.raises(ValueError, match='no source hash'):
         validate_characterization_references(root)
 
 
@@ -284,8 +331,8 @@ def test_reference_provision_failure_or_cancel_never_publishes_partial_snapshot(
     from wmlstudio import characterization_refs
     root = tmp_path / 'installed'
     calls = []
-    def broken_fetch(source, target, cancelled=None, **options):
-        calls.append(source)
+    def broken_fetch(source_key, relative, target, cancelled=None, **options):
+        calls.append((source_key, relative))
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_bytes(b'partial network response')
         raise OSError('connection lost')

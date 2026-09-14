@@ -7,9 +7,20 @@ from pathlib import Path
 
 from PySide6.QtCore import Qt, Signal
 from PySide6.QtWidgets import (
-    QCheckBox, QComboBox, QDialog, QDialogButtonBox, QFileDialog, QFormLayout,
-    QHBoxLayout, QLineEdit, QMessageBox, QScrollArea, QSplitter, QTextBrowser,
-    QVBoxLayout, QWidget,
+    QCheckBox,
+    QComboBox,
+    QDialog,
+    QDialogButtonBox,
+    QFileDialog,
+    QFormLayout,
+    QHBoxLayout,
+    QLineEdit,
+    QMessageBox,
+    QScrollArea,
+    QSplitter,
+    QTextBrowser,
+    QVBoxLayout,
+    QWidget,
 )
 
 from wmlstudio.journey import characterization_state, isolate_records
@@ -21,7 +32,9 @@ from wmlstudio.widgets import button, label
 
 def characterization_html(sample):
     """Escaped, compact drill-down; no unverified imported values become HTML."""
-    escape = lambda value: html.escape(str(value))
+    def escape(value):
+        return html.escape(str(value))
+
     state, evidence = characterization_state(sample)
     body = f"<h2>{escape(sample['name'])}</h2><p><b>Characterization:</b> {escape(state)}</p>"
     if not evidence:
@@ -297,7 +310,11 @@ class CharacterizationWorkspaceMixin:
         project = self.project
         database_root = self.active_amr_database()
         def operation(cancelled, progress):
-            from wmlstudio.characterization import characterize_assembly, hydra_report_for_record, persist_characterization
+            from wmlstudio.characterization import (
+                characterize_assembly,
+                hydra_report_for_record,
+                persist_characterization,
+            )
             from wmlstudio.hydra_runtime import run_assemblies
             from wmlstudio.sample_workflow import link_hydra
             completed, failures = [], []

@@ -5,8 +5,14 @@ from datetime import date
 
 import pytest
 
-from wmlstudio.threshold_guidance import (ORGANISMS, SOURCES, catalog_entries,
-    guidance_for, record_decision, review_age_days)
+from wmlstudio.threshold_guidance import (
+    ORGANISMS,
+    SOURCES,
+    catalog_entries,
+    guidance_for,
+    record_decision,
+    review_age_days,
+)
 
 
 def context():

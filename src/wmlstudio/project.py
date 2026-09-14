@@ -403,6 +403,22 @@ class Project:
                                       'locus_count': len(result['alleles']) if isinstance(result.get('alleles'), dict) else 0})
                 return summaries
 
+    def rename_sample(self, sample_id: str, name: str) -> None:
+        """Change the display name only; the input file and every stored result are untouched.
+
+        Allele calls, analyses and history stay attached to the sample identifier,
+        which never changes.
+        """
+        text = str(name).strip()
+        if not text:
+            raise ValueError("Sample name cannot be empty.")
+        with self.transaction():
+            previous = self.get_sample(sample_id)["name"]
+            if previous == text:
+                return
+            self._update(sample_id, "name = ?", (text,))
+            self.record_history(sample_id, "sample_renamed", {"from": previous, "to": text})
+
     def set_status(self, sample_id: str, status: str, error: str = "") -> None:
         if status not in STATUSES:
             raise ValueError(f"Unknown job status {status!r}.")
@@ -467,14 +483,67 @@ class Project:
             return [{**dict(row), "details": json.loads(row["details"])} for row in rows]
 
     def remove_sample(self, sample_id: str) -> None:
-        """Remove the stored record and result; never delete the input file."""
+        """Remove the stored record and result; never delete the input file.
+
+        The row and every stored scheme analysis are captured in history before
+        the delete, so restore_removed_sample can rebuild the discarded evidence.
+        """
         with self.transaction():
             sample = self.get_sample(sample_id)
+            analyses = self.analysis_results(sample_id)
             cursor = self._connection.execute("DELETE FROM samples WHERE id = ?", (sample_id,))
             if cursor.rowcount != 1:
                 raise KeyError(f"Unknown sample: {sample_id}")
-            self.record_history(sample_id, "sample_removed", {"sample": sample})
+            self.record_history(sample_id, "sample_removed",
+                                {"sample": sample, "analyses": analyses, "format_version": 2})
             self._connection.execute("DELETE FROM analyses WHERE sample_id = ?", (sample_id,))
+
+    def restore_removed_sample(self, history_id: int) -> str:
+        """Rebuild a removed sample from its own removal record; nothing is invented.
+
+        Only a format_version 2 ``sample_removed`` entry carries the analyses it
+        deleted. An older entry is refused rather than restored without them, so a
+        restored isolate never looks like it had fewer scheme results than it had.
+        """
+        with self.transaction():
+            row = self._connection.execute(
+                "SELECT * FROM history WHERE id = ?", (history_id,)
+            ).fetchone()
+            if row is None:
+                raise KeyError(f"Unknown history entry: {history_id}")
+            details = json.loads(row["details"])
+            sample = details.get("sample")
+            if (row["action"] != "sample_removed" or details.get("format_version") != 2
+                    or not isinstance(sample, dict)):
+                raise ValueError("This history entry does not hold a restorable removed sample.")
+            sample_id = str(sample.get("id") or "")
+            if not sample_id:
+                raise ValueError("The stored removal record carries no sample identifier.")
+            if self._connection.execute(
+                "SELECT 1 FROM samples WHERE id = ?", (sample_id,)
+            ).fetchone() is not None:
+                raise ValueError(f"Sample {sample_id} is already in this project; nothing was restored.")
+            status, error = sample.get("status"), str(sample.get("error") or "")
+            if status not in STATUSES:
+                raise ValueError(f"The stored removal record has an unknown job status {status!r}.")
+            if status == "running":
+                status = "interrupted"
+                error = "Analysis was interrupted before completion. Rerun this sample."
+            result, timestamp = sample.get("result"), _now()
+            self._connection.execute(
+                "INSERT INTO samples (id, name, input_path, status, error, metadata, result, "
+                "created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (sample_id, str(sample.get("name") or sample_id), str(sample.get("input_path") or ""),
+                 status, error, _json(sample.get("metadata") or {}),
+                 None if result is None else _json(result),
+                 str(sample.get("created_at") or timestamp), timestamp),
+            )
+            analyses = details.get("analyses") or []
+            for analysis in analyses:
+                self.set_analysis(sample_id, analysis)
+            self.record_history(sample_id, "sample_restored_from_history",
+                                {"history_id": row["id"], "analyses": len(analyses)})
+        return sample_id
 
     def get_setting(self, key: str, default: Any = None) -> Any:
         with self._lock:

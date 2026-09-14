@@ -5,7 +5,13 @@ import pytest
 
 from wmlstudio.project import Project
 from wmlstudio.sequence import AnalysisCancelled
-from wmlstudio.storage import assign_organism, import_samples, organize_sample, safe_component
+from wmlstudio.storage import (
+    assign_organism,
+    import_samples,
+    organize_sample,
+    plan_filing,
+    safe_component,
+)
 
 
 def sequence(path, text="ACGTACGT"):
@@ -65,6 +71,35 @@ def test_typing_organises_managed_copy_and_appends_st_only_to_copy(project, tmp_
     assert project.get_sample(sid)["result"]["st"] == "131"
     assert organize_sample(project, sid) == destination
     assert any(event["action"] == "input_relocated" for event in project.history(sid))
+
+
+def test_organising_by_st_prunes_the_directory_it_vacated(project, tmp_path):
+    original = sequence(tmp_path / "original" / "isolate.fasta")
+    root = tmp_path / "managed"
+    sid = import_samples(project, [{"path": original, "typing_mode": "manual", "genus": "Escherichia",
+                                    "species": "coli"}], root)[0]
+    vacated = Path(project.get_sample(sid)["input_path"]).parent
+    project.set_result(sid, {"status": "complete", "st": "131", "alleles": {},
+                             "input_sha256": hashlib.sha256(original.read_bytes()).hexdigest()})
+    destination = organize_sample(project, sid)
+    assert "Escherichia/coli/ST_131" in destination.as_posix()
+    assert not vacated.exists() and not vacated.parent.exists()
+    assert (root / "Escherichia" / "coli").is_dir()
+
+
+def test_recorded_organism_evidence_travels_with_the_import_without_changing_filing(project, tmp_path):
+    original = sequence(tmp_path / "isolate.fasta")
+    evidence = {"status": "confirmed", "basis": "genomic_ani", "confidence": "genomic_reference_supported",
+                "proposed": {"genus": "Klebsiella", "species": "pneumoniae"},
+                "accepted": {"genus": "Klebsiella", "species": "pneumoniae"}}
+    sid = import_samples(project, [{"path": original, "typing_mode": "manual", "genus": "Klebsiella",
+                                    "species": "pneumoniae", "organism_evidence": evidence}],
+                         tmp_path / "managed")[0]
+    stored = project.get_sample(sid)["metadata"]["organism_evidence"]
+    assert stored["basis"] == "genomic_ani" and stored["format_version"] == 1
+    assert "Klebsiella/pneumoniae/ST_unassigned" in Path(project.get_sample(sid)["input_path"]).as_posix()
+    assert plan_filing(project, sid)["changed"] is False
+    assert any(event["action"] == "organism_identified" for event in project.history(sid))
 
 
 def test_auto_identification_controls_folders_without_rewriting_manual_assignment(project, tmp_path):

@@ -4,8 +4,15 @@ import re
 
 from PySide6.QtCore import QSettings, Qt
 from PySide6.QtWidgets import (
-    QCheckBox, QComboBox, QDialog, QDialogButtonBox, QFormLayout, QGroupBox,
-    QScrollArea, QVBoxLayout, QWidget,
+    QCheckBox,
+    QComboBox,
+    QDialog,
+    QDialogButtonBox,
+    QFormLayout,
+    QGroupBox,
+    QScrollArea,
+    QVBoxLayout,
+    QWidget,
 )
 
 from wmlstudio import __version__

@@ -21,7 +21,8 @@ from .sequence import SequenceError, SequenceReader, check_cancelled, file_signa
 from .typing import ALLELE_SUFFIXES, call_assembly, load_scheme, reverse_complement
 
 # Public database labels verified against https://rest.pubmlst.org/db on
-# 2026-09-12. These describe schema scope, not a validated species classifier.
+# 2026-09-12, extended for eleven bundled databases on 2026-09-14.
+# These describe schema scope, not a validated species classifier.
 _SOURCE_LABELS = {
     "aactinomycetemcomitans": "Aggregatibacter actinomycetemcomitans",
     "abaumannii": "Acinetobacter baumannii", "achromobacter": "Achromobacter spp.",
@@ -32,6 +33,9 @@ _SOURCE_LABELS = {
     "bcereus": "Bacillus cereus", "bfragilis": "Bacteroides fragilis",
     "bhenselae": "Bartonella henselae", "blastocystis": "Blastocystis spp.",
     "blicheniformis": "Bacillus licheniformis", "bmallei": "Burkholderia mallei",
+    # A whole-genus database describes schema scope only; organism_parts keeps
+    # every "spp." label genus-only rather than inventing a species name.
+    "bordetella": "Bordetella spp.",
     "borrelia": "Borrelia spp.", "bpseudomallei": "Burkholderia pseudomallei",
     "brachyspira": "Brachyspira spp.", "brucella": "Brucella spp.",
     "bsubtilis": "Bacillus subtilis", "bwashoensis": "Bartonella washoensis",
@@ -44,20 +48,27 @@ _SOURCE_LABELS = {
     "cmaltaromaticum": "Carnobacterium maltaromaticum", "cperfringens": "Clostridium perfringens",
     "cronobacter": "Cronobacter spp.", "csepticum": "Clostridium septicum",
     "csinensis": "Clonorchis sinensis", "ctropicalis": "Candida tropicalis",
+    "diphtheria": "Corynebacterium diphtheriae",
     "dnodosus": "Dichelobacter nodosus", "ecloacae": "Enterobacter spp.",
+    "ecoli": "Escherichia coli", "ecoli_achtman": "Escherichia coli",
     "edwardsiella": "Edwardsiella spp.", "efaecalis": "Enterococcus faecalis",
     "efaecium": "Enterococcus faecium", "escherichia": "Escherichia spp.",
     "fpsychrophilum": "Flavobacterium psychrophilum", "gallibacterium": "Gallibacterium anatis",
     "geotrichum": "Geotrichum spp.", "hcinaedi": "Helicobacter cinaedi",
     "helicobacter": "Helicobacter pylori", "hinfluenzae": "Haemophilus influenzae",
     "hparasuis": "Glaesserella parasuis", "hsuis": "Helicobacter suis",
-    "kaerogenes": "Klebsiella aerogenes", "koxytoca": "Klebsiella oxytoca",
+    "kaerogenes": "Klebsiella aerogenes", "kingella": "Kingella kingae",
+    # The public klebsiella database spans the K. pneumoniae species complex;
+    # naming one species here would overstate what an ST establishes.
+    "klebsiella": "Klebsiella spp.", "koxytoca": "Klebsiella oxytoca",
     "kseptempunctata": "Kudoa septempunctata", "leptospira": "Leptospira spp.",
     "lgarvieae": "Lactococcus garvieae", "liberibacter": "Candidatus Liberibacter solanacearum",
+    "listeria": "Listeria monocytogenes",
     "lsalivarius": "Lactobacillus salivarius", "mabscessus": "Mycobacteroides abscessus complex",
     "magalactiae": "Mycoplasma agalactiae", "manserisalpingitidis": "Mycoplasma anserisalpingitidis",
     "mbovis": "Mycoplasma bovis", "mcanis": "Macrococcus canis",
-    "mcaseolyticus": "Macrococcus caseolyticus", "mflocculare": "Mycoplasma flocculare",
+    "mcaseolyticus": "Macrococcus caseolyticus", "mcatarrhalis_achtman": "Moraxella catarrhalis",
+    "mflocculare": "Mycoplasma flocculare",
     "mgallisepticum": "Mycoplasma gallisepticum", "mgenitalium": "Mycoplasma genitalium",
     "mhaemolytica": "Mannheimia haemolytica", "mhominis": "Mycoplasma hominis",
     "mhyopneumoniae": "Mycoplasma hyopneumoniae", "mhyorhinis": "Mycoplasma hyorhinis",
@@ -77,7 +88,8 @@ _SOURCE_LABELS = {
     "salmonella": "Salmonella spp.", "saureus": "Staphylococcus aureus",
     "sbsec": "Streptococcus bovis/equinus complex (SBSEC)", "scanis": "Streptococcus canis",
     "scapitis": "Staphylococcus capitis", "schromogenes": "Staphylococcus chromogenes",
-    "sdysgalactiae": "Streptococcus dysgalactiae", "sepidermidis": "Staphylococcus epidermidis",
+    "sdysgalactiae": "Streptococcus dysgalactiae", "senterica_achtman": "Salmonella enterica",
+    "sepidermidis": "Staphylococcus epidermidis",
     "serratia": "Serratia spp.", "sgallolyticus": "Streptococcus gallolyticus",
     "shaemolyticus": "Staphylococcus haemolyticus", "shewanella": "Shewanella spp.",
     "shominis": "Staphylococcus hominis", "siniae": "Streptococcus iniae",
@@ -85,6 +97,7 @@ _SOURCE_LABELS = {
     "smitis": "Streptococcus mitis", "sparasitica": "Saprolegnia parasitica",
     "spneumoniae": "Streptococcus pneumoniae", "spseudintermedius": "Staphylococcus pseudintermedius",
     "spyogenes": "Streptococcus pyogenes", "ssuis": "Streptococcus suis",
+    "staphlugdunensis": "Staphylococcus lugdunensis",
     "sthermophilus": "Streptococcus thermophilus", "streptomyces": "Streptomyces spp",
     "suberis": "Streptococcus uberis", "szooepidemicus": "Streptococcus zooepidemicus",
     "taylorella": "Taylorella spp.", "tenacibaculum": "Tenacibaculum spp.",
@@ -93,8 +106,11 @@ _SOURCE_LABELS = {
     "vparahaemolyticus": "Vibrio parahaemolyticus", "vtapetis": "Vibrio tapetis",
     "vvulnificus": "Vibrio vulnificus", "wolbachia": "Wolbachia spp.",
     "xcitri": "Xanthomonas citri", "xfastidiosa": "Xylella fastidiosa",
+    "yersinia": "Yersinia spp.",
     "ypseudotuberculosis_achtman": "Yersinia pseudotuberculosis", "yruckeri": "Yersinia ruckeri",
 }
+# halobacteria, llactis_phage, mamphoriforme, streptothermophilus and tvaginalis
+# stay unlabelled on purpose: a guessed clinical label is worse than a blank.
 _INDEX_CACHE: OrderedDict = OrderedDict()
 _SCHEME_CACHE: OrderedDict = OrderedDict()
 _CACHE_LOCK = threading.Lock()

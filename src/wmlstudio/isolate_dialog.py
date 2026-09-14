@@ -4,7 +4,12 @@ import html
 import json
 
 from PySide6.QtWidgets import (
-    QDialog, QDialogButtonBox, QFileDialog, QTabWidget, QTextBrowser, QVBoxLayout,
+    QDialog,
+    QDialogButtonBox,
+    QFileDialog,
+    QTabWidget,
+    QTextBrowser,
+    QVBoxLayout,
 )
 
 from wmlstudio.ui_characterization import characterization_html
@@ -44,7 +49,9 @@ class IsolateRecordDialog(QDialog):
     def refresh_record(self):
         sample = self.window.project.get_sample(self.sample_id)
         self.heading.setText(sample["name"])
-        escape = lambda value: html.escape(str(value))
+        def escape(value):
+            return html.escape(str(value))
+
         self.window.show_sample_detail_for_id(self.sample_id)
         self.views["Overview / typing"].setHtml(self.window.detail.toHtml())
         self.views["History"].setHtml(self.window.history_view.toHtml())
