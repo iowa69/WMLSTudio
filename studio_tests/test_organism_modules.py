@@ -534,3 +534,32 @@ def test_the_run_gives_each_isolate_only_the_tools_its_organism_supports(window,
     assert 'capsule.loci' in stored['Klebsiella']['klebsiella_capsule']['reason']
     # A module the user never chose is still distinguishable from one that was skipped.
     assert stored['Klebsiella']['klebsiella_locus_st']['reason'] == 'Assay not selected.'
+
+
+def test_module_order_does_not_depend_on_which_assay_was_imported_first():
+    """Import timing must not decide the columns a user reads or exports.
+
+    The registry is populated by import side effects, so whichever assay module
+    another code path happened to touch first would otherwise set the column
+    order. A table and a table export that reorder between runs are not
+    reproducible evidence.
+    """
+    import importlib
+    import subprocess
+    import sys
+
+    from wmlstudio.organism_modules import registered_modules
+
+    expected = [module.title for module in registered_modules().values()]
+    assert expected, "the registry must load at least one assay module"
+    script = (
+        "import sys; sys.path.insert(0, 'src')\n"
+        "__import__('wmlstudio.klebsiella_evidence')\n"
+        "__import__('wmlstudio.sccmec_evidence')\n"
+        "from wmlstudio.organism_modules import registered_modules\n"
+        "print('\\n'.join(m.title for m in registered_modules().values()))\n"
+    )
+    finished = subprocess.run([sys.executable, "-c", script], capture_output=True, text=True,
+                              cwd=str(Path(importlib.util.find_spec("wmlstudio").origin).parents[2]))
+    assert finished.returncode == 0, finished.stderr
+    assert finished.stdout.splitlines() == expected

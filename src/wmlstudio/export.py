@@ -33,6 +33,7 @@ _FIELDS = (
     "investigation_cluster", "investigation_cluster_id", "investigation_cluster_status",
     "nearest_allele_distance", "nearest_isolates", "within_threshold_isolates",
     "comparison_scheme_digest", "comparison_threshold", "comparison_min_overlap",
+    "organism_typing",
 )
 
 
