@@ -2,8 +2,16 @@ name: Native WMLSTudio
 
 on:
   push:
+    paths-ignore: ['**/*.md', 'docs/**', 'tasks/**', 'LICENSE', '.gitignore']
   pull_request:
+    paths-ignore: ['**/*.md', 'docs/**', 'tasks/**', 'LICENSE', '.gitignore']
   workflow_dispatch:
+
+# Pushing several commits in a row otherwise leaves stale Windows builds running
+# behind the newest one, which delays the result that is actually wanted.
+concurrency:
+  group: native-${{ github.ref }}
+  cancel-in-progress: true
 
 permissions:
   contents: read
