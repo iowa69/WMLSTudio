@@ -15,12 +15,19 @@ installation for the portable package.
 
 **v0.2.0-workbench.1 · Windows x64 · 147.6 MB ZIP · Non-commercial research**
 
+> **0.3.0 is in development and is not the download above.** The link serves the
+> last released build, 0.2. It has none of the 0.3 work: the tabbed workspace,
+> the Samples hub, separate MLST and cgMLST trees, automatic organism filing,
+> adjustable display scaling or the cgMLST scheme library. Builds of the current
+> source, named `WMLSTudio-0.3.0-Windows-x64.zip`, are attached to each run under
+> [Actions](https://github.com/iowa69/WMLSTudio/actions/workflows/studio.yml);
+> 0.3.0 has no release of its own yet.
+
 [Release notes](https://github.com/iowa69/WMLSTudio/releases/tag/v0.2.0-workbench.1)
 · [SHA-256 checksum](https://github.com/iowa69/WMLSTudio/releases/download/v0.2.0-workbench.1/WMLSTudio-Windows-x64.zip.sha256)
 · [Build/test results](https://github.com/iowa69/WMLSTudio/actions/workflows/studio.yml)
 · [Previous 0.1 release](https://github.com/iowa69/WMLSTudio/releases/tag/v0.1.0-preview.1)
 
-This repository is private: sign in with an account that has access to download.
 The release notes distinguish observed Linux, native Windows CI and Wine checks
 from the still-required clean Windows 11 desktop acceptance test.
 The published binary was built from `e5d5f72`: **466 tests passed on each hosted
