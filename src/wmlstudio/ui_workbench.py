@@ -43,12 +43,219 @@ def quarantine_bucket(sample):
 
     Quarantine means WMLSTudio declined to decide what the organism is. It is not
     a claim that the organism is unusual, and it is not the user's own "unknown".
+
+    storage.review_bucket is the one place that answers this, so the count shown
+    here and the folder the file actually sits in cannot drift apart: a proposal
+    nobody accepted also waits under _Unresolved, and it is not "filed".
     """
-    evidence = (sample.get("metadata") or {}).get("organism_evidence")
-    if not isinstance(evidence, dict) or evidence.get("status") != "quarantined":
+    from wmlstudio.storage import review_bucket
+    token = review_bucket((sample.get("metadata") or {}))
+    return QUARANTINE_BUCKETS.get(token) if token else None
+
+
+# Two kinds of trouble, two colours — and the words are always in the cell too.
+# Colour alone is unreadable to a colour-blind reader and to a printed screenshot,
+# so every amber row also says "Needs organism review" in text.
+REVIEW_STYLES = {"conflict": ("#E08A2E", "#20160A"), "undecided": ("#F2C94C", "#241D07")}
+REVIEW_PREFIX = "Needs organism review"
+STEP_KEYS = ("assembly", "st", "cgmlst", "hydra")
+# The heading each step is known by. "ST" is the classical seven-locus scheme and
+# cgMLST is a different quantity against a different scheme; they never share a
+# column, a tab or a threshold.
+STEP_TITLES = {"assembly": "Assembly", "st": "ST", "cgmlst": "cgMLST", "hydra": "HYDRA"}
+STEP_PURPOSE = {
+    "assembly": "Turn read pairs into assemblies. Read quality is not typing, and an "
+                "assembly is not a finished genome.",
+    "st": "Classical seven-locus MLST: one ST per isolate, from a curated allele panel.",
+    "cgmlst": "Core-genome MLST: hundreds to thousands of targets. A cgMLST distance and a "
+              "seven-locus distance are different quantities and never share a scale.",
+    "hydra": "Screen assemblies for resistance, virulence and plasmid markers. A genotype is "
+             "not measured susceptibility.",
+}
+STEP_ACTIONS = {"assembly": "Assemble selected read pairs…", "st": "Type selected · 7-locus MLST…",
+                "cgmlst": "Call cgMLST on selected…", "hydra": "Run HYDRA on selected…"}
+
+
+def input_kind(sample):
+    """What this isolate actually is on disk: reads, an assembly, or a profile only."""
+    metadata = sample.get("metadata") or {}
+    workflow = metadata.get("workflow") or {}
+    if workflow.get("source_kind") == "profile" or sample.get("profile_only") or not sample.get("input_path"):
+        return "profile"
+    if workflow.get("source_kind") == "read_mate":
+        return "read_mate"
+    if metadata.get("assembly"):
+        return "assembly"  # Assembled here from its own reads.
+    name = Path(sample["input_path"]).name.casefold().removesuffix(".gz").removesuffix(".bz2")
+    return "reads" if name.endswith((".fq", ".fastq")) else "assembly"
+
+
+def accepted_organism(sample):
+    """The organism somebody or something actually decided on, or None.
+
+    A proposal nobody accepted is not a decision, so the pipeline may not act on
+    it. This is the fact the ST, cgMLST and HYDRA gates ask for.
+    """
+    if quarantine_bucket(sample):
         return None
-    token = str(evidence.get("quarantine_reason") or "awaiting_identification")
-    return QUARANTINE_BUCKETS.get(token, QUARANTINE_BUCKETS["awaiting_identification"])
+    genus, species, _ = organism_for(sample)
+    return (genus, species) if genus else None
+
+
+def organism_text(organism):
+    return " ".join(part for part in (organism or ()) if part) or "No organism set"
+
+
+def proposed_organism(sample):
+    """The organism the evidence put forward but nobody has accepted, or None.
+
+    Worth showing — it is often the classical panel's suggestion, which is what a
+    user is asking for when they drop files in — but never worth acting on: it is
+    always shown beside the words "not accepted".
+    """
+    evidence = (sample.get("metadata") or {}).get("organism_evidence") or {}
+    proposed = evidence.get("proposed") or {}
+    if not proposed.get("genus"):
+        return None
+    return (str(proposed["genus"]), str(proposed.get("species") or ""))
+
+
+def organism_cell_text(sample):
+    """What to write in an Organism column: the decision, or the unaccepted proposal."""
+    accepted = accepted_organism(sample)
+    if accepted:
+        return organism_text(accepted)
+    suggestion = proposed_organism(sample)
+    return f"Proposed: {organism_text(suggestion)} · not accepted" if suggestion else "No organism set"
+
+
+def scheme_organism_index(entries):
+    """{scheme name or folder id → its entry} for the installed references."""
+    index = {}
+    for entry in entries or ():
+        for key in (entry.get("name"), entry.get("id")):
+            if key:
+                index.setdefault(str(key).casefold(), entry)
+    return index
+
+
+def mlst_corroboration(sample, schemes=None, mlst=None):
+    """The organism label carried by the classical scheme this isolate matched.
+
+    The user asked for MLST to count as identification evidence, and it does —
+    as corroboration. A seven-locus profile is compatibility with a curated panel,
+    so the genus belongs to the reference that panel was built from, not to this
+    genome. It is reported beside the genomic evidence and never in place of it.
+    """
+    if mlst is None:
+        from wmlstudio.sample_workflow import typing_profiles
+        mlst = typing_profiles(sample)["mlst"] or {}
+    name = str(mlst.get("scheme") or "")
+    entry = (schemes or {}).get(name.casefold()) if name else None
+    if entry and entry.get("genus"):
+        return {"genus": str(entry["genus"]), "species": str(entry.get("species") or ""),
+                "scheme": str(entry.get("name") or name), "st": mlst.get("st"),
+                "source": "the seven-locus scheme this isolate typed against"}
+    evidence = (sample.get("metadata") or {}).get("organism_evidence") or {}
+    for candidate in (evidence.get("detail") or {}).get("mlst_top") or ():
+        parts = str(candidate.get("organism_label") or "").split()
+        if parts:
+            return {"genus": parts[0], "species": parts[1] if len(parts) > 1 else "",
+                    "scheme": str(candidate.get("scheme") or ""), "st": candidate.get("st"),
+                    "source": "the typing panel that matched during identification"}
+    return None
+
+
+def identification_support(sample, schemes=None, mlst=None):
+    """What this isolate's organism rests on, and whether the two sources agree.
+
+    There are only two sources here and they are not the same kind of thing: the
+    claim on the record — a genome comparison, or a person's own assignment — and
+    the classical typing panel, which can corroborate a claim but never make one.
+    They are compared at genus level only: a curated panel routinely covers a whole
+    species complex, so a species difference inside one genus is not a conflict.
+    """
+    from wmlstudio.workflow_dialogs import BASIS_LABELS
+    evidence = (sample.get("metadata") or {}).get("organism_evidence") or {}
+    basis = str(evidence.get("basis") or "")
+    label = evidence.get("accepted") or {}
+    if not label.get("genus"):
+        label = evidence.get("proposed") or {}
+    claim = None
+    if label.get("genus") and basis not in {"", "none", "mlst_panel"}:
+        claim = {"genus": str(label["genus"]), "species": str(label.get("species") or ""),
+                 "source": BASIS_LABELS.get(basis, basis),
+                 "genomic": basis.startswith("genomic_")}
+    panel = mlst_corroboration(sample, schemes, mlst)
+    if claim and panel:
+        agreement = "agree" if claim["genus"].casefold() == panel["genus"].casefold() else "conflict"
+    else:
+        agreement = "claim_only" if claim else "panel_only" if panel else "none"
+    sentences = {
+        "agree": lambda: (f"{claim['source']} and {panel['source']} both point to "
+                          f"{panel['genus']}. The panel corroborates the call; a panel match is "
+                          "not an independent identification."),
+        "conflict": lambda: (f"{claim['source']}: {claim['genus']} {claim['species']}".rstrip()
+                             + f". {panel['source']}: labelled {panel['genus']} "
+                               f"{panel['species']}".rstrip()
+                             + ". These disagree, so nothing is assumed: review the organism "
+                               "before analysing this isolate."),
+        "claim_only": lambda: (f"{claim['source']} supported this organism. "
+                               + ("No classical typing panel has corroborated it yet."
+                                  if claim["genomic"] else
+                                  "No installed reference has corroborated it.")),
+        "panel_only": lambda: (f"Only {panel['source']} supports this organism. Panel "
+                               "compatibility is not a species identification."),
+        "none": lambda: "Nothing installed has supported an organism for this isolate.",
+    }
+    return {"claim": claim, "genomic": claim if claim and claim["genomic"] else None,
+            "panel": panel, "agreement": agreement, "sentence": sentences[agreement]()}
+
+
+def organism_review(sample, schemes=None, mlst=None):
+    """Whether this isolate needs a person to look at its organism, and why.
+
+    Returned as words first: `label` is written into the row and `level` only
+    chooses which amber the row is painted.
+    """
+    evidence = (sample.get("metadata") or {}).get("organism_evidence") or {}
+    support = identification_support(sample, schemes, mlst)
+    bucket = quarantine_bucket(sample)
+    confidence = str(evidence.get("confidence") or "")
+    settled = {"needs_review": False, "level": "", "label": "", "detail": support["sentence"],
+               "support": support}
+    if support["agreement"] == "conflict":
+        return {**settled, "needs_review": True, "level": "conflict",
+                "label": f"{REVIEW_PREFIX} · genome comparison and typing panel disagree"}
+    suggestion = proposed_organism(sample)
+    # The proposal is shown because it is often what the user wants to accept, and
+    # it always carries "not accepted" with it: it decided nothing.
+    offer = f" · proposed {organism_text(suggestion)}, not accepted" if suggestion else ""
+    if bucket:
+        words = bucket.replace("_", " ").casefold()
+        level = "conflict" if "conflicting" in words else "undecided"
+        return {**settled, "needs_review": True, "level": level,
+                "label": f"{REVIEW_PREFIX} · {words}{offer}",
+                "detail": organism_evidence_note(sample) or support["sentence"]}
+    if confidence == "complex_only":
+        return {**settled, "needs_review": True, "level": "conflict",
+                "label": f"{REVIEW_PREFIX} · species complex, not separated",
+                "detail": organism_evidence_note(sample) or support["sentence"]}
+    if accepted_organism(sample) is None:
+        return {**settled, "needs_review": True, "level": "undecided",
+                "label": f"{REVIEW_PREFIX} · no organism set{offer}"}
+    return settled
+
+
+def paint_review(item, review):
+    """Repeat a review state as colour on a cell whose text already says it."""
+    if not review.get("needs_review"):
+        return item
+    background, foreground = REVIEW_STYLES.get(review["level"], REVIEW_STYLES["undecided"])
+    item.setBackground(QColor(background))
+    item.setForeground(QColor(foreground))
+    item.setToolTip(f"{review['label']}\n\n{review['detail']}")
+    return item
 
 
 def organism_evidence_note(sample):
@@ -89,6 +296,17 @@ class WorkbenchMixin:
         self._pending_import = None
         self._import_notes = []
         self._practice_cohort = None
+        self._intake_report = None
+        self._scheme_rows = []
+        self._scheme_rows_key = None
+        self._amr_state = None
+        self._amr_state_key = None
+        self._visible_samples = []
+        self._typing_overview = {}
+        self._called_cache = {}
+        self.step_tables = {}
+        self.step_buttons = {}
+        self.step_notes = {}
         self.ui_scale = 100
         super().__init__(*args, **kwargs)
         from wmlstudio import theme
@@ -176,7 +394,7 @@ class WorkbenchMixin:
         self.install_view_menu("overview.recent", self.recent_table)
         content.addWidget(self.recent_table)
         self.drop_zone = DropZone()
-        self.drop_zone.filesDropped.connect(lambda paths: self.import_paths(paths, configure=True))
+        self.drop_zone.filesDropped.connect(self.intake_paths)
         self.drop_zone.browseRequested.connect(self.browse_files)
         content.addWidget(self.drop_zone)
         splitter.addWidget(recent)
@@ -187,18 +405,63 @@ class WorkbenchMixin:
         layout.addWidget(self.practice_notice)
 
     def build_samples(self):
+        """Samples is the hub: loaded once here, then seen from four angles.
+
+        Assembly, ST, cgMLST and HYDRA are the same isolates, each tab showing the
+        facts that step needs and running only that step. ST is the classical
+        seven-locus scheme; cgMLST has its own scheme, its own target count and its
+        own called/missing loci, and the two are never merged into one column.
+        """
         _, layout = self.page()
-        self.heading(layout, "Isolate library", "Browse your stored isolates. Double-click a record for complete evidence; each analysis chooses its own cohort.")
+        self.heading(layout, "Samples",
+                     "Load your sequences once. Each tab below is the same isolates seen from one "
+                     "angle and runs that one step for the isolates you select.")
         row = QHBoxLayout()
         self.search = QLineEdit()
         self.search.setPlaceholderText("Search names, organisms, STs, AMR genes, collections or metadata…")
         self.search.setClearButtonEnabled(True)
         self.search.textChanged.connect(self.refresh_tables)
         row.addWidget(self.search, 1)
-        row.addWidget(button("Import…", self.browse_files, True))
+        row.addWidget(button("Add samples…", self.browse_files, True))
         row.addWidget(button("Assign organism…", self.assign_selected))
-        row.addWidget(button("Epidemiology grid…", self.open_metadata_grid))
+        self.samples_advanced_button = button("Advanced ▾", None)
+        self.samples_advanced_button.setCheckable(True)
+        self.samples_advanced_button.setToolTip(
+            "Filters, storage options and the older import dialog. Nothing here is needed for an "
+            "ordinary investigation.")
+        row.addWidget(self.samples_advanced_button)
         layout.addLayout(row)
+        self.selection_label = label("No samples selected · each sample keeps its own organism and typing workflow", "small", True)
+        layout.addWidget(self.selection_label)
+        layout.addWidget(self.build_samples_advanced())
+        self.sample_tabs = QTabWidget()
+        self.sample_tabs.setAccessibleName("Sample steps")
+        for key in STEP_KEYS:
+            self.sample_tabs.addTab(self.build_step_page(key), STEP_TITLES[key])
+            self.sample_tabs.setTabToolTip(self.sample_tabs.count() - 1, STEP_PURPOSE[key])
+        self.sample_tabs.currentChanged.connect(lambda _index: self.update_step_gates())
+        if hasattr(self.pages, "register_subtabs"):
+            self.pages.register_subtabs("isolates", self.sample_tabs)
+        layout.addWidget(self.sample_tabs, 1)
+        self.apply_column_visibility()
+        self.detail = QTextBrowser()
+        self.detail.setOpenExternalLinks(False)
+        self.detail.setMinimumHeight(120)
+        inspector = QTabWidget()
+        inspector.addTab(self.detail, "Sample evidence")
+        self.history_view = QTextBrowser()
+        inspector.addTab(self.history_view, "History / provenance")
+        inspector.setParent(self)
+        inspector.hide()  # Complete evidence is available in the isolate popup.
+
+    def build_samples_advanced(self):
+        """Rarely-used controls, hidden until asked for.
+
+        The default view shows what somebody importing their first isolates needs.
+        Filters, the managed-storage options and the older per-file import dialog
+        live here, because reaching for them is the exception.
+        """
+        panel, content = card()
         filters = FlowLayout()
         self.genus_filter = QComboBox()
         self.species_filter = QComboBox()
@@ -209,41 +472,101 @@ class WorkbenchMixin:
             combo.currentIndexChanged.connect(self.refresh_tables)
             filters.addWidget(combo, 1)
         filters.addWidget(button("Clear filters", self.clear_filters))
-        layout.addLayout(filters)
-        run, content = card()
+        content.addLayout(filters)
         strip = FlowLayout()
         self.scheme_combo = QComboBox()
         self.scheme_combo.setMinimumWidth(180)
         self.scheme_combo.setAccessibleName("Typing scheme override")
         self.scheme_combo.hide()  # Per-isolate schemes are reviewed in the analysis dialog.
         self.run_button = button("Analyse…", self.choose_and_analyse, True)
+        self.run_button.setToolTip("Choose any isolates and any analysis, in one review dialog.")
         self.rerun_button = button("Review pending…", lambda: self.choose_and_analyse(pending_only=True))
-        strip.addWidget(self.run_button)
-        strip.addWidget(self.rerun_button)
-        strip.addWidget(button("Attach reads…", self.attach_reads_selected))
+        for widget in (self.run_button, self.rerun_button,
+                       button("Import with options…", self.browse_files_with_options),
+                       button("Attach reads…", self.attach_reads_selected),
+                       button("Re-file managed copies…", self.refile_selected),
+                       button("Epidemiology grid…", self.open_metadata_grid)):
+            strip.addWidget(widget)
         content.addLayout(strip)
-        self.selection_label = label("No samples selected · each sample keeps its own organism and typing workflow", "small", True)
-        content.addWidget(self.selection_label)
-        layout.addWidget(run)
-        splitter = QSplitter(Qt.Orientation.Vertical)
-        self.sample_table = make_table(["Sample", "Input", "Status", "ST", "Called loci", "Genus", "Species",
-                                        "Evidence", "Scheme", "AMR genes", "Collection", "Storage"])
-        self.sample_table.itemSelectionChanged.connect(self.sample_selection_changed)
-        self.sample_table.cellDoubleClicked.connect(lambda row, column: self.open_isolate_record(self.sample_table.item(row, 0).data(Qt.ItemDataRole.UserRole)))
-        for column in (7, 8, 10, 11):
-            self.sample_table.setColumnHidden(column, True)
-        self.install_view_menu("library", self.sample_table)
-        splitter.addWidget(self.sample_table)
-        self.detail = QTextBrowser()
-        self.detail.setOpenExternalLinks(False)
-        self.detail.setMinimumHeight(120)
-        inspector = QTabWidget()
-        inspector.addTab(self.detail, "Sample evidence")
-        self.history_view = QTextBrowser()
-        inspector.addTab(self.history_view, "History / provenance")
-        inspector.setParent(self)
-        inspector.hide()  # Complete evidence is available in the isolate popup.
-        layout.addWidget(splitter, 1)
+        self.sample_columns_button = button("Show every column", None)
+        self.sample_columns_button.setCheckable(True)
+        self.sample_columns_button.toggled.connect(self.apply_column_visibility)
+        content.addWidget(self.sample_columns_button)
+        content.addWidget(label("Import with options… opens the per-file dialog: it asks for an "
+                                "organism and a scheme before anything is copied. Dropping files "
+                                "on the window does the same identification without the dialog.",
+                                "small", True))
+        panel.setVisible(False)
+        self.samples_advanced = panel
+        self.samples_advanced_button.toggled.connect(panel.setVisible)
+        return panel
+
+    def build_step_page(self, key):
+        """One sub-tab: the isolates from this step's angle, and only this step's action."""
+        page = QWidget()
+        layout = QVBoxLayout(page)
+        layout.setContentsMargins(0, 10, 0, 0)
+        layout.setSpacing(8)
+        layout.addWidget(label(STEP_PURPOSE[key], "small", True))
+        strip = FlowLayout()
+        action = button(STEP_ACTIONS[key], lambda checked=False, k=key: self.run_step(k), True)
+        self.step_buttons[key] = action
+        strip.addWidget(action)
+        if key == "hydra":
+            strip.addWidget(button("AMR databases / updates…", self.open_amr_databases))
+        if key in {"st", "cgmlst"}:
+            strip.addWidget(button("Install schemes…", self.open_reference_manager))
+        if key == "assembly":
+            strip.addWidget(button("Identify waiting samples again", self.reidentify_waiting))
+        layout.addLayout(strip)
+        note = label("", "small", True)
+        note.setObjectName("stepGate")
+        self.step_notes[key] = note
+        layout.addWidget(note)
+        if key == "hydra":
+            layout.addWidget(self.build_hydra_organism_control())
+        table = self.build_step_table(key)
+        self.step_tables[key] = table
+        layout.addWidget(table, 1)
+        return page
+
+    # Column layouts. ST and cgMLST deliberately have different column names and
+    # different denominators: seven loci and several thousand targets are not the
+    # same measurement and must never be read off the same column.
+    STEP_COLUMNS = {
+        "assembly": ["Sample", "Input", "Status", "ST (7-locus)", "MLST loci", "Genus", "Species",
+                     "Organism evidence", "Scheme", "AMR genes", "Collection", "Storage"],
+        "st": ["Sample", "Organism", "Organism review", "7-locus scheme", "ST", "Loci called",
+               "Status"],
+        "cgmlst": ["Sample", "Organism", "Organism review", "cgMLST scheme", "Targets in scheme",
+                   "Loci called", "Missing", "Status"],
+        "hydra": ["Sample", "Organism", "Organism review", "HYDRA organism", "AMR genes",
+                  "Evidence state"],
+    }
+    # What a first-time user needs on the roster. The rest is a click away.
+    ASSEMBLY_HIDDEN = (3, 4, 8, 9, 10)
+
+    def build_step_table(self, key):
+        if key == "assembly":
+            # The roster keeps its long-standing name: every other view, export and
+            # test addresses the isolate library through it.
+            table = self.sample_table = make_table(self.STEP_COLUMNS["assembly"])
+            self.install_view_menu("library", table)
+        else:
+            table = make_table(self.STEP_COLUMNS[key])
+            self.install_view_menu(f"library.{key}", table)
+        table.itemSelectionChanged.connect(lambda k=key: self.step_selection_changed(k))
+        table.cellDoubleClicked.connect(
+            lambda row, column, t=table: self.open_isolate_record(t.item(row, 0).data(Qt.ItemDataRole.UserRole)))
+        return table
+
+    def apply_column_visibility(self, show_all=None):
+        """Hide the roster columns that belong to another tab, unless asked for them."""
+        if not hasattr(self, "sample_table"):
+            return
+        show_all = self.sample_columns_button.isChecked() if show_all is None else bool(show_all)
+        for column in range(self.sample_table.columnCount()):
+            self.sample_table.setColumnHidden(column, not show_all and column in self.ASSEMBLY_HIDDEN)
 
     def refresh(self):
         if self._refreshing:
@@ -492,9 +815,18 @@ class WorkbenchMixin:
                 if kind == "organism" and ((genus or "Unknown"), (species or "Unspecified")) != tuple(values):
                     continue
             visible.append(sample)
+        self._visible_samples = visible
+        recent = active_samples(self.current_samples)[-12:]
+        self._typing_overview = self.typing_overview(
+            list({sample["id"]: sample for sample in visible + recent}.values()))
         self.fill_sample_table(self.sample_table, visible)
-        self.fill_sample_table(self.recent_table, active_samples(self.current_samples)[-12:])
+        self.fill_sample_table(self.recent_table, recent)
+        for key in STEP_KEYS:
+            if key != "assembly" and key in self.step_tables:
+                self.fill_step_table(key, visible)
         self.selection_label.setText(self.selection_summary(len(visible)))
+        self.populate_hydra_organisms()
+        self.update_step_gates()
         self.show_sample_detail()
 
     def selection_summary(self, visible):
@@ -508,7 +840,78 @@ class WorkbenchMixin:
             text += f" · {archived} archived"
         return text
 
+    def scheme_organisms(self):
+        """Installed references keyed by the name a stored result records for them."""
+        return scheme_organism_index(self.installed_scheme_rows())
+
+    def called_loci(self, sample, kind, row):
+        """How many loci of one stored profile were actually called.
+
+        The scheme, the ST and the number of targets come straight out of SQLite
+        without decoding anything. Only this number needs the profile itself, so it
+        is taken from the copy the sample already carries when that is the profile
+        in question, and cached on the scheme fingerprint otherwise: a stored
+        profile never changes under a fingerprint.
+        """
+        digest = row.get("scheme_digest")
+        key = (sample["id"], kind, digest)
+        if key in self._called_cache:
+            return self._called_cache[key]
+        headline = sample.get("result") or {}
+        alleles = None
+        if digest and headline.get("scheme_digest") == digest:
+            alleles = headline.get("alleles")
+        if not isinstance(alleles, dict):
+            try:
+                profile = self.project.latest_analysis(sample["id"], kind) or {}
+            except (KeyError, ValueError):
+                profile = {}
+            alleles = profile.get("alleles") if isinstance(profile.get("alleles"), dict) else {}
+        called = sum(1 for value in alleles.values() if value)
+        if len(self._called_cache) > 8192:
+            self._called_cache.clear()
+        self._called_cache[key] = called
+        return called
+
+    def typing_overview(self, samples):
+        """Each isolate's MLST and cgMLST profile summaries, kept strictly apart.
+
+        The headline result is whichever analysis ran last, so reading a seven-locus
+        ST off it would let a core-genome run erase it. These come from the stored
+        analyses, addressed by typing kind, and a kind with no profile is absent —
+        never filled in from the other one.
+        """
+        overview = {}
+        for sample in samples:
+            try:
+                rows = self.project.analysis_summaries(sample["id"])
+            except KeyError:
+                rows = []  # Removed between the refresh and this read.
+            latest = {}
+            for row in rows:
+                if row.get("typing_kind") in {"mlst", "cgmlst"}:
+                    latest[row["typing_kind"]] = row  # Ordered oldest first; the last wins.
+            entries = {}
+            for kind, row in latest.items():
+                loci = int(row.get("locus_count") or 0)
+                called = self.called_loci(sample, kind, row)
+                entries[kind] = {"scheme": row.get("scheme") or "", "st": row.get("st"),
+                                 "status": row.get("status") or "", "loci": loci, "called": called,
+                                 "scheme_digest": row.get("scheme_digest")}
+            overview[sample["id"]] = entries
+        return overview
+
+    def typing_entry(self, sample, kind):
+        return (self._typing_overview.get(sample["id"]) or {}).get(kind) or {}
+
     def fill_sample_table(self, widget, samples):
+        """The roster: what each isolate is, what its organism is, and where it lives.
+
+        The ST and loci columns are read from the isolate's classical MLST profile
+        only. A cgMLST run is a different measurement against a different scheme, so
+        it never writes an ST or a seven-locus denominator into these cells.
+        """
+        schemes = self.scheme_organisms()
         self._filling = True
         widget.blockSignals(True)
         widget.setSortingEnabled(False)
@@ -517,27 +920,27 @@ class WorkbenchMixin:
             result = sample.get("result") or {}
             metadata = sample.get("metadata") or {}
             status = result.get("status", sample["status"]) if sample["status"] == "completed" else sample["status"]
-            alleles = result.get("alleles", {})
+            mlst = self.typing_entry(sample, "mlst")
             kind = result.get("kind") or ("fastq" if ".fq" in sample["input_path"] or ".fastq" in sample["input_path"] else "fasta")
             if metadata.get("workflow", {}).get("source_kind") == "profile":
                 kind = "profile"
             if metadata.get("workflow", {}).get("source_kind") == "read_mate":
                 kind, status = "read_mate", "linked_mate"
             genus, species, evidence = organism_for(sample)
-            bucket = quarantine_bucket(sample)
-            note = organism_evidence_note(sample)
+            review = organism_review(sample, schemes, mlst)
+            note = review["detail"] or organism_evidence_note(sample)
             storage = "Managed copy" if metadata.get("workflow", {}).get("managed") else "Linked original"
             if sample.get("missing_input") and kind != "profile":
                 storage = "Input unavailable"
-            if bucket:
+            if review["needs_review"]:
                 genus, species = genus or "Needs review", species or "—"
-                evidence = f"Needs review · {bucket.replace('_', ' ')}"
+                evidence = review["label"]
             if is_archived(sample):
                 evidence = f"Archived · {evidence}"
             values = [sample["name"], {"fastq": "Reads", "profile": "Profile only", "read_mate": "Linked reverse mate"}.get(kind, "Assembly"),
-                      status.replace("_", " ").title(), f"ST {result['st']}" if result.get("st") else "—",
-                      f"{sum(v is not None for v in alleles.values())} / {len(alleles)}" if alleles else "—",
-                      genus or "Unknown", species or "—", evidence, result.get("scheme") or "—",
+                      status.replace("_", " ").title(), f"ST {mlst['st']}" if mlst.get("st") else "—",
+                      f"{mlst['called']} / {mlst['loci']}" if mlst.get("loci") else "—",
+                      genus or "Unknown", species or "—", evidence, mlst.get("scheme") or "—",
                       "; ".join(gene_names(sample)) or "—", "; ".join(metadata.get("collections", [])) or "—", storage]
             for column, value in enumerate(values[:widget.columnCount()]):
                 item = cell(value, sample["id"])
@@ -549,6 +952,8 @@ class WorkbenchMixin:
                     item.setBackground(QColor("#343348"))
                 if note and column in (5, 6, 7):
                     item.setToolTip(note)
+                if column in (5, 6, 7):
+                    paint_review(item, review)
                 widget.setItem(row, column, item)
                 if widget is self.sample_table and sample["id"] in self.selection_ids:
                     item.setSelected(True)
@@ -556,19 +961,87 @@ class WorkbenchMixin:
         widget.blockSignals(False)
         self._filling = False
 
-    def sample_selection_changed(self):
+    def step_row_values(self, sample, key, review):
+        """One row of a step view, in that step's own units."""
+        from wmlstudio.sample_workflow import hydra_evidence_status
+        organism = organism_cell_text(sample)
+        marker = review["label"] if review["needs_review"] else "Ready"
+        if key == "st":
+            mlst = self.typing_entry(sample, "mlst")
+            return [sample["name"], organism, marker, mlst.get("scheme") or "—",
+                    f"ST {mlst['st']}" if mlst.get("st") else "—",
+                    f"{mlst['called']} / {mlst['loci']}" if mlst.get("loci") else "—",
+                    (mlst.get("status") or "Not typed").replace("_", " ").title()]
+        if key == "cgmlst":
+            cgmlst = self.typing_entry(sample, "cgmlst")
+            loci, called = cgmlst.get("loci") or 0, cgmlst.get("called") or 0
+            return [sample["name"], organism, marker, cgmlst.get("scheme") or "—",
+                    str(loci) if loci else "—", str(called) if loci else "—",
+                    str(loci - called) if loci else "—",
+                    (cgmlst.get("status") or "Not called").replace("_", " ").title()]
+        state = hydra_evidence_status(sample)
+        return [sample["name"], organism, marker, self.hydra_organism_for(sample) or "No organism flags",
+                "; ".join(gene_names(sample)) or "—", state["status"].replace("_", " ").title()]
+
+    def fill_step_table(self, key, samples):
+        schemes = self.scheme_organisms()
+        widget = self.step_tables[key]
+        self._filling = True
+        widget.blockSignals(True)
+        widget.setSortingEnabled(False)
+        widget.setRowCount(len(samples))
+        for row, sample in enumerate(samples):
+            review = organism_review(sample, schemes, self.typing_entry(sample, "mlst"))
+            for column, value in enumerate(self.step_row_values(sample, key, review)):
+                item = cell(value, sample["id"])
+                if column in (1, 2):
+                    paint_review(item, review)
+                if column == 2 and not review["needs_review"]:
+                    item.setToolTip(review["detail"])
+                widget.setItem(row, column, item)
+                if sample["id"] in self.selection_ids:
+                    item.setSelected(True)
+        widget.setSortingEnabled(True)
+        widget.blockSignals(False)
+        self._filling = False
+
+    def step_selection_changed(self, key):
+        """One selection, whichever view the user clicked in."""
         if self._filling:
             return
-        visible = {self.sample_table.item(r, 0).data(Qt.ItemDataRole.UserRole)
-                   for r in range(self.sample_table.rowCount())}
-        selected = {item.data(Qt.ItemDataRole.UserRole) for item in self.sample_table.selectedItems()}
+        widget = self.step_tables.get(key)
+        if widget is None:
+            return
+        visible = {widget.item(r, 0).data(Qt.ItemDataRole.UserRole) for r in range(widget.rowCount())}
+        selected = {item.data(Qt.ItemDataRole.UserRole) for item in widget.selectedItems()}
         self.selection_ids.difference_update(visible)
         self.selection_ids.update(selected)
         self.focus.set_focus(self.selection_ids, "Isolate table selection")
         self.selection_label.setText(self.selection_summary(len(visible)))
+        self.mirror_selection(key)
+        self.update_step_gates()
         self.show_sample_detail()
-
         self.refresh_journey()
+
+    def mirror_selection(self, source):
+        """Show the same isolates as selected in the other step views."""
+        self._filling = True
+        try:
+            for key, widget in self.step_tables.items():
+                if key == source:
+                    continue
+                widget.blockSignals(True)
+                widget.clearSelection()
+                for row in range(widget.rowCount()):
+                    item = widget.item(row, 0)
+                    if item is not None and item.data(Qt.ItemDataRole.UserRole) in self.selection_ids:
+                        widget.selectRow(row)
+                widget.blockSignals(False)
+        finally:
+            self._filling = False
+
+    def sample_selection_changed(self):
+        self.step_selection_changed("assembly")
 
     def select_visible_samples(self):
         self.sample_table.selectAll()
@@ -589,6 +1062,180 @@ class WorkbenchMixin:
     def selected_samples(self):
         return [s for s in self.project.samples() if s["id"] in self.selection_ids]
 
+    # --- what a step needs before it may run --------------------------------
+    # The user's own words: "only when basic information for the pipeline to
+    # continue are set then the fasta can be processed". So each step states the
+    # facts it needs, the action stays disabled until they are set, and the note
+    # under the button names the missing fact and where to set it — instead of
+    # letting a run start and fail with something only a bioinformatician reads.
+
+    def installed_scheme_rows(self):
+        """Installed references with the organism each one records for itself.
+
+        Cached on the list of scheme folders: reference_index already caches on
+        each folder's file signature, so a refresh costs nothing until something
+        is installed or removed.
+        """
+        key = tuple(str(path) for path in self.scheme_paths)
+        if self._scheme_rows_key != key:
+            from wmlstudio.reference_index import scheme_entries
+            try:
+                self._scheme_rows = scheme_entries(self.scheme_paths)
+            except (OSError, ValueError):
+                self._scheme_rows = []  # A reference that cannot be read blocks nothing.
+            self._scheme_rows_key = key
+        return self._scheme_rows
+
+    def step_schemes(self, key, organism):
+        """Installed schemes of this step's kind that name this organism.
+
+        Exact species matches come first; a scheme labelled with the genus alone
+        follows, because many curated panels cover a whole species complex.
+        """
+        if organism is None or key not in {"st", "cgmlst"}:
+            return []
+        genus, species = organism
+        wanted = "mlst" if key == "st" else "cgmlst"
+        matches = [entry for entry in self.installed_scheme_rows()
+                   if entry.get("kind") == wanted
+                   and str(entry.get("genus") or "").casefold() == str(genus).casefold()]
+        exact = [e for e in matches if species and str(e.get("species") or "").casefold() == str(species).casefold()]
+        return exact + [e for e in matches if e not in exact]
+
+    def preferred_schemes(self, key, organism):
+        """The best-matching tier only: exact species matches when there are any.
+
+        One reference named for this exact species is not a choice worth
+        interrupting for; two are, and the run says which one it used either way.
+        """
+        matches = self.step_schemes(key, organism)
+        species = (organism or ("", ""))[1]
+        exact = [entry for entry in matches
+                 if species and str(entry.get("species") or "").casefold() == str(species).casefold()]
+        return exact or matches
+
+    def amr_database_state(self):
+        """Whether HYDRA has a database to search, asked of the installed store itself."""
+        key = self.active_amr_database()
+        if self._amr_state_key != key:
+            from wmlstudio import paths, provisioning
+            try:
+                requirement = provisioning.hydra_database_requirement(paths.data_root(), key)
+                detail = requirement.detail or {}
+                self._amr_state = {
+                    # A partial store still runs and says what it could not search;
+                    # only an empty or unusable one blocks the step.
+                    "ready": requirement.state in {"ready", "partial"},
+                    "reason": requirement.reason,
+                    "organisms": list(detail.get("organisms") or []),
+                    "route": requirement.action.ui_route if requirement.action else "",
+                }
+            except (OSError, ValueError) as error:
+                self._amr_state = {"ready": False, "reason": str(error), "organisms": [],
+                                   "route": "Data ▸ AMR databases / updates…"}
+            self._amr_state_key = key
+        return self._amr_state
+
+    def step_gate(self, sample, key):
+        """What this isolate still needs before this step may run, in plain words."""
+        metadata = sample.get("metadata") or {}
+        workflow = metadata.get("workflow") or {}
+        kind = input_kind(sample)
+        missing = []
+        if kind == "profile":
+            missing.append(("no sequence file", "This isolate was imported as a saved allele "
+                            "profile. Profiles can be compared, but not assembled, typed or "
+                            "screened."))
+        elif kind == "read_mate":
+            missing.append(("nothing of its own to run", "This record is the reverse mate of "
+                            "another isolate; run the step on its forward partner."))
+        elif sample.get("missing_input"):
+            missing.append(("its sequence file", "The file recorded for it is not on this "
+                            "computer. Use Samples ▸ Relink input (same bytes)…"))
+        elif key == "assembly" and kind != "reads":
+            missing.append(("nothing to assemble", "This isolate is already an assembly. Type it "
+                            "on the ST or cgMLST tab."))
+        elif key != "assembly" and kind == "reads":
+            missing.append(("an assembly", "These are raw reads. Assemble them on the Assembly "
+                            "tab first; reads are never typed directly."))
+        notes = []
+        if key in {"st", "cgmlst", "hydra"} and accepted_organism(sample) is None:
+            if key == "hydra":
+                # HYDRA itself runs without one; only the organism-specific tools
+                # need it, so this is stated rather than used to block the run.
+                notes.append(f"{sample['name']} has no accepted organism, so AMRFinderPlus "
+                             "organism rules, Kleborate and SCCmec typing stay unavailable for "
+                             "it. Choose one in the organism box above to enable them.")
+            else:
+                missing.append(("an accepted organism", "Use Assign organism…, or accept the "
+                                "proposal in the Needs review branch of the library tree."))
+        if key in {"st", "cgmlst"}:
+            organism = accepted_organism(sample)
+            pinned = workflow.get("scheme_path")
+            entry = self.scheme_organisms().get(str(Path(pinned).name).casefold()) if pinned else None
+            wanted = "mlst" if key == "st" else "cgmlst"
+            if entry is not None and entry.get("kind") == wanted:
+                pass  # An explicitly pinned scheme of the right kind settles it.
+            elif organism is not None and not self.step_schemes(key, organism):
+                title = "seven-locus MLST" if key == "st" else "cgMLST"
+                missing.append((f"an installed {title} scheme for {organism_text(organism)}",
+                                "Install one from Schemes ▸ Browse online / install updates…"))
+        if key == "hydra" and not self.amr_database_state()["ready"]:
+            state = self.amr_database_state()
+            missing.append(("an installed AMR database",
+                            state["reason"] or "Use Data ▸ AMR databases / updates…"))
+        return {"ready": not missing, "missing": missing, "notes": notes}
+
+    def step_partition(self, key, samples=None):
+        """Split a selection into what this step can run and what it cannot, with reasons."""
+        if samples is None:
+            samples = self.selected_samples()
+        ready, blocked = [], []
+        for sample in samples:
+            gate = self.step_gate(sample, key)
+            (ready if gate["ready"] else blocked).append((sample, gate))
+        return [sample for sample, _ in ready], blocked
+
+    def step_gate_sentence(self, key):
+        """The line under a step's button: what it would run, or exactly what is missing."""
+        selected = self.selected_samples()
+        if not selected:
+            return (False, f"Select isolates in any tab, then {STEP_ACTIONS[key][:-1].casefold()}. "
+                           "Nothing runs on isolates you have not chosen.")
+        ready, blocked = self.step_partition(key, selected)
+        caveats = " ".join(dict.fromkeys(
+            note for sample in ready for note in self.step_gate(sample, key)["notes"]))
+        if ready and not blocked:
+            return (True, f"{len(ready)} of {len(selected)} selected isolates are ready for "
+                          f"{STEP_TITLES[key]}. {caveats}".strip())
+        reasons = []
+        for sample, gate in blocked[:3]:
+            fact, fix = gate["missing"][0]
+            reasons.append(f"{sample['name']} needs {fact} — {fix}")
+        more = f" …and {len(blocked) - 3} more." if len(blocked) > 3 else ""
+        if ready:
+            return (True, f"{len(ready)} of {len(selected)} are ready. "
+                          f"{len(blocked)} cannot run yet: " + " ".join(reasons) + more
+                          + (f" {caveats}" if caveats else ""))
+        return (False, f"None of the {len(selected)} selected isolates can run {STEP_TITLES[key]} "
+                       "yet: " + " ".join(reasons) + more)
+
+    def update_step_gates(self):
+        """Enable each step's action only when it would actually work."""
+        if not self.step_buttons:
+            return
+        # The window's own idea of "a task is in progress": the thread object can
+        # still report itself running inside its own finished handler, and a step
+        # that is ready must not stay greyed until the user clicks something.
+        busy = bool(self.worker_role and self.worker and self.worker.isRunning())
+        for key, action in self.step_buttons.items():
+            enabled, sentence = self.step_gate_sentence(key)
+            action.setEnabled(enabled and not busy)
+            action.setToolTip(sentence)
+            note = self.step_notes.get(key)
+            if note is not None:
+                note.setText(sentence)
+
     def show_sample_detail(self, sample_id=None):
         sample = self.project.get_sample(sample_id) if sample_id else self.selected_sample()
         if not sample:
@@ -601,7 +1248,36 @@ class WorkbenchMixin:
         result = sample.get("result") or {}
         metadata = sample.get("metadata") or {}
         genus, species, evidence = organism_for(sample)
-        body = f"<h2>{e(sample['name'])}</h2><p><b>{e(' '.join([genus, species]).strip() or 'Unknown organism')}</b> · {e(evidence)} · ST {e(result.get('st') or 'unassigned')}</p>"
+        # Addressed by typing kind: the headline result is only whichever analysis
+        # ran last, and a core-genome run must not hide the seven-locus ST.
+        mlst = self.project.latest_analysis(sample["id"], "mlst") or {}
+        cgmlst = self.project.latest_analysis(sample["id"], "cgmlst") or {}
+        review = organism_review(sample, self.scheme_organisms(), mlst)
+        body = f"<h2>{e(sample['name'])}</h2><p><b>{e(' '.join([genus, species]).strip() or 'Unknown organism')}</b> · {e(evidence)} · ST {e(mlst.get('st') or 'unassigned')}</p>"
+        if review["needs_review"]:
+            body += f"<p><b>{e(review['label'])}</b><br>{e(review['detail'])}</p>"
+        else:
+            body += f"<p>{e(review['detail'])}</p>"
+        # The two typings are reported separately and labelled with their own
+        # denominators: seven loci and several thousand targets are not comparable,
+        # and one must never stand in for the other.
+        body += "<h3>Typing</h3><p>"
+        if mlst:
+            alleles = mlst.get("alleles") or {}
+            called = sum(1 for value in alleles.values() if value)
+            body += (f"<b>Classical MLST (7-locus):</b> {e(mlst.get('scheme') or 'scheme not recorded')} · "
+                     f"ST {e(mlst.get('st') or 'unassigned')} · {called} of {len(alleles)} loci called<br>")
+        else:
+            body += "<b>Classical MLST (7-locus):</b> no profile. An ST is not implied by any other result.<br>"
+        if cgmlst:
+            targets = cgmlst.get("alleles") or {}
+            called = sum(1 for value in targets.values() if value)
+            body += (f"<b>cgMLST:</b> {e(cgmlst.get('scheme') or 'scheme not recorded')} · "
+                     f"{called} of {len(targets)} targets called · {len(targets) - called} missing")
+        else:
+            body += "<b>cgMLST:</b> no profile."
+        body += ("</p><p>A seven-locus distance and a core-genome distance are different "
+                 "quantities against different schemes; they share no scale and no threshold.</p>")
         body += f"<p><b>Input:</b> {e(sample['input_path'] or 'Imported profile; no sequence attached')}<br><b>Sample ID:</b> {e(sample['id'])}</p>"
         if sample.get("error"):
             body += f"<p><b>Needs attention:</b> {e(sample['error'])}</p>"
@@ -631,7 +1307,11 @@ class WorkbenchMixin:
             body += "<h3>Annotations</h3><p>" + "<br>".join(f"<b>{e(k)}:</b> {e(v)}" for k, v in annotations.items()) + "</p>"
         calls = result.get("calls") or []
         if calls:
-            body += "<h3>Allele calls</h3><table width='100%' cellpadding='6'><tr bgcolor='#253650'><th>Locus</th><th>Allele</th><th>Evidence</th></tr>"
+            # Named, because these calls belong to one scheme — the most recent run —
+            # and not to whichever typing the reader has in mind.
+            body += (f"<h3>Allele calls · {e(result.get('scheme') or 'most recent analysis')}</h3>"
+                     "<table width='100%' cellpadding='6'><tr bgcolor='#253650'><th>Locus</th>"
+                     "<th>Allele</th><th>Evidence</th></tr>")
             for call in calls[:100]:
                 body += f"<tr><td>{e(call['locus'])}</td><td>{e(call.get('allele') or '—')}</td><td>{e(call.get('status'))}</td></tr>"
             body += "</table>"
@@ -659,27 +1339,34 @@ class WorkbenchMixin:
     def populate_schemes(self):
         super().populate_schemes()
         self.scheme_combo.setItemText(0, "Use each sample's workflow")
+        # Installing or removing a reference changes which steps can run at all.
+        self._scheme_rows_key = None
+        if self.step_buttons:
+            self.update_step_gates()
 
     def browse_files(self):
+        paths, _ = QFileDialog.getOpenFileNames(self, "Add samples", "", "FASTA / FASTQ (*.fa *.fasta *.fna *.fq *.fastq *.gz *.bz2);;All files (*)")
+        if paths:
+            self.intake_paths(paths)
+
+    def browse_files_with_options(self):
+        """The per-file import dialog, for the cases the automatic route cannot answer."""
         paths, _ = QFileDialog.getOpenFileNames(self, "Import sequences", "", "FASTA / FASTQ (*.fa *.fasta *.fna *.fq *.fastq *.gz *.bz2);;All files (*)")
         if paths:
             self.import_paths(paths, configure=True)
 
     def browse_folder(self):
-        path = QFileDialog.getExistingDirectory(self, "Import sequence folder")
+        path = QFileDialog.getExistingDirectory(self, "Add a folder of samples")
         if path:
-            self.import_paths([path], configure=True)
+            self.intake_paths([path])
 
     def dropEvent(self, event):
-        self.import_paths([u.toLocalFile() for u in event.mimeData().urls() if u.isLocalFile()], configure=True)
+        self.intake_paths([u.toLocalFile() for u in event.mimeData().urls() if u.isLocalFile()])
         event.acceptProposedAction()
 
-    def import_paths(self, paths, configure=False):
-        if not configure:
-            # Direct, non-interactive API retained for scripted integration tests.
-            return super().import_paths(paths)
-        if self.busy():
-            return
+    @staticmethod
+    def sequence_files(paths):
+        """Every readable sequence file in a selection or a dropped folder, in reading order."""
         files, seen = [], set()
         for source in paths:
             path = Path(source)
@@ -693,6 +1380,120 @@ class WorkbenchMixin:
                     if resolved not in seen:
                         seen.add(resolved)
                         files.append(resolved)
+        return files
+
+    def intake_paths(self, paths):
+        """Drag and drop: identify each original, then store it under its organism.
+
+        One action, one pass over the user's own files. Identification runs on the
+        originals before a byte is copied; a strong genome-comparison call files
+        itself into its genus and species folder, and everything weaker is still
+        imported and waits under a named reason instead of being guessed at.
+        """
+        if self.busy():
+            return
+        files = self.sequence_files(paths)
+        if not files:
+            self.error("No supported FASTA or FASTQ files were found.")
+            return
+        from wmlstudio.characterization_refs import bundled_reference_root
+        from wmlstudio.storage import intake_samples
+        project = self.project
+        root = str(self.project_path.with_suffix(".files"))
+        panel = self.installed_species_panel()
+        starter = bundled_reference_root()
+        scheme_paths = list(self.scheme_paths)
+
+        def operation(cancelled, progress):
+            return intake_samples(project, files, storage_root=root, species_panel_root=panel,
+                                  kpsc_panel_root=starter, scheme_paths=scheme_paths,
+                                  cancelled=cancelled, progress=progress)
+
+        self._intake_report = None
+        self.launch_task(operation, "intake",
+                         lambda report: setattr(self, "_intake_report", report))
+
+    def intake_completed(self):
+        """Say what was loaded, what was already here, and what still needs a person."""
+        report, self._intake_report = self._intake_report, None
+        if not report or not self._task_succeeded:
+            self.notify("Loading stopped. Nothing was imported and your files are unchanged.")
+            return
+        imported = list(report.get("imported") or ())
+        self.selection_ids = set(imported)
+        self.clear_filters()
+        self.refresh()
+        self.navigate(1)
+        waiting = list(report.get("needs_review") or ())
+        parts = [f"{len(imported)} isolates loaded."]
+        # Everything imported is "filed" somewhere; only what left the review tree
+        # was filed under an organism, and that is what this sentence may claim.
+        by_organism = len(imported) - len(waiting)
+        if by_organism:
+            parts.append(f"{by_organism} were filed under the organism the genome comparison "
+                         "supported.")
+        skipped = list(report.get("skipped") or ())
+        if skipped:
+            parts.append(f"{len(skipped)} files were already in this project and were not copied "
+                         "again.")
+        if waiting:
+            parts.append(f"{len(waiting)} are marked '{REVIEW_PREFIX}' and shown in amber: no "
+                         "organism was decided for them, so nothing was filed on a guess.")
+        notice = ((report.get("identification") or {}).get("notice") or "").strip()
+        if notice:
+            parts.append(notice)
+        self.notify(" ".join(parts))
+
+    def reidentify_waiting(self):
+        """Run identification again on the isolates still waiting for an organism.
+
+        Installing a reference panel does not change anything on its own: this is
+        the second half of that sentence, and it re-identifies only what is waiting.
+        A decision a person already made is never overwritten.
+        """
+        if self.busy():
+            return
+        waiting = [sample for sample in active_samples(self.current_samples)
+                   if quarantine_bucket(sample)]
+        if not waiting:
+            self.notify("No isolates are waiting for an organism.")
+            return
+        from wmlstudio.characterization_refs import bundled_reference_root
+        from wmlstudio.storage import reidentify_samples
+        project = self.project
+        root = str(self.project_path.with_suffix(".files"))
+        panel = self.installed_species_panel()
+        starter = bundled_reference_root()
+        scheme_paths = list(self.scheme_paths)
+
+        def operation(cancelled, progress):
+            return reidentify_samples(project, species_panel_root=panel, kpsc_panel_root=starter,
+                                      scheme_paths=scheme_paths, storage_root=root,
+                                      cancelled=cancelled, progress=progress)
+
+        self.launch_task(operation, "reidentify", self.reidentification_completed)
+
+    def reidentification_completed(self, report):
+        self.refresh()
+        accepted = report.get("accepted") or ()
+        waiting = report.get("waiting") or ()
+        message = (f"{len(accepted)} isolates were identified and filed under their organism; "
+                   f"{len(waiting)} are still waiting.")
+        if waiting:
+            buckets = sorted({bucket.replace('_', ' ') for _, bucket in waiting})
+            message += " Reasons: " + ", ".join(buckets) + "."
+        notice = ((report.get("identification") or {}).get("notice") or "").strip()
+        if notice:
+            message += " " + notice
+        self.notify(message)
+
+    def import_paths(self, paths, configure=False):
+        if not configure:
+            # Direct, non-interactive API retained for scripted integration tests.
+            return super().import_paths(paths)
+        if self.busy():
+            return
+        files = self.sequence_files(paths)
         if not files:
             self.error("No supported FASTA or FASTQ files were found.")
             return
@@ -804,7 +1605,9 @@ class WorkbenchMixin:
             return
         self.import_assignments(assignments, options, duplicates="skip")
 
-    def import_assignments(self, assignments, options, *, duplicates="allow"):
+    def import_assignments(self, assignments, options, *, duplicates="skip"):
+        # Offering the same file twice is a mistake, not an instruction: the same
+        # bytes stay one isolate whichever route imported them.
         from wmlstudio.storage import import_samples
         root = options.get("storage_root") or str(self.project_path.with_suffix(".files"))
         notes = []
@@ -986,7 +1789,182 @@ class WorkbenchMixin:
 
         self.launch_task(operation, "species_panel", lambda result: self.notify(
             f"Species panel installed: {result['species_count']} references at {result['path']}. "
-            "New imports will be compared against it."))
+            "New imports will be compared against it. Use 'Identify waiting samples again' on the "
+            "Assembly tab to re-run identification on the isolates already waiting."))
+
+    # --- one step at a time -------------------------------------------------
+
+    def run_step(self, key):
+        """Run exactly this step, on the isolates in the selection that are ready for it."""
+        if self.busy():
+            return
+        selected = self.selected_samples()
+        if not selected:
+            self.notify(f"Select the isolates to run {STEP_TITLES[key]} on first.")
+            return
+        ready, blocked = self.step_partition(key, selected)
+        if not ready:
+            _, sentence = self.step_gate_sentence(key)
+            self.notify(sentence)
+            return
+        if blocked:
+            self.notify(f"{len(blocked)} selected isolates are not ready for {STEP_TITLES[key]} "
+                        f"and were left out. {blocked[0][0]['name']} needs "
+                        f"{blocked[0][1]['missing'][0][0]}.")
+        if key == "assembly":
+            self.start_analysis(confirm=True, assemble=True,
+                                sample_ids=[sample["id"] for sample in ready])
+        elif key == "hydra":
+            self.run_hydra_step(ready)
+        else:
+            self.run_typing_step(key, ready)
+
+    def choose_step_scheme(self, key, organism):
+        """Settle which reference this run uses, asking only when it is a real choice."""
+        candidates = self.preferred_schemes(key, organism)
+        if not candidates:
+            return None
+        if len(candidates) == 1:
+            return candidates[0]["path"]
+        names = [f"{entry['name']} · {entry['locus_count']} loci" for entry in candidates]
+        title = "seven-locus MLST" if key == "st" else "cgMLST"
+        chosen, accepted = QInputDialog.getItem(
+            self, f"Which {title} scheme?",
+            f"{len(candidates)} installed schemes are labelled {organism_text(organism)}. "
+            "The choice is recorded with every result it produces:", names, 0, False)
+        return candidates[names.index(chosen)]["path"] if accepted and chosen in names else None
+
+    def run_typing_step(self, key, samples):
+        """Type the ready isolates against a scheme of this step's kind, and only that kind.
+
+        A seven-locus ST and a core-genome profile are different measurements; the
+        scheme is chosen for the step the user asked for, never inherited from the
+        other tab's run.
+        """
+        wanted = "mlst" if key == "st" else "cgmlst"
+        prepared, chosen = [], {}
+        for sample in samples:
+            workflow = (sample.get("metadata") or {}).get("workflow") or {}
+            pinned = workflow.get("scheme_path")
+            entry = self.scheme_organisms().get(str(Path(pinned).name).casefold()) if pinned else None
+            if entry is not None and entry.get("kind") == wanted:
+                path = pinned
+            else:
+                path = self.choose_step_scheme(key, accepted_organism(sample))
+                if path is None:
+                    self.notify("No scheme was chosen; nothing was run.")
+                    return
+            chosen[Path(path).name] = chosen.get(Path(path).name, 0) + 1
+            prepared.append(dict(sample, metadata={**(sample.get("metadata") or {}), "workflow": {
+                **workflow, "typing_mode": "manual", "scheme_path": str(path)}}))
+        plan = self.review_run_plan(prepared)
+        if plan is None:
+            return
+        # Which reference produced a result is part of the result: say it before the
+        # run as well, so nobody has to open a record to find out what was used.
+        self.notify(f"{STEP_TITLES[key]} on {len(prepared)} isolates using "
+                    + ", ".join(f"{name} ({count})" for name, count in sorted(chosen.items())) + ".")
+        self._run_plan = plan
+        self._run_ids = {sample["id"] for sample in prepared}
+        self._run_cancelled = False
+        self._typing_override = None
+        self.begin_typing(prepared, None, remember=False)
+
+    # --- HYDRA organism -----------------------------------------------------
+
+    def build_hydra_organism_control(self):
+        """Choose the organism HYDRA is told about, and say what that unlocks.
+
+        The organism-specific tools — AMRFinderPlus organism flags, Kleborate and
+        SCCmec typing — only run when an organism is set, and the only values that
+        mean anything are the ones the installed point-mutation catalogues cover.
+        Choosing one here is your statement about the isolate, not new evidence.
+        """
+        panel, content = card()
+        content.addWidget(label("Organism for the organism-specific tools", "cardTitle"))
+        row = FlowLayout()
+        self.hydra_organism = QComboBox()
+        self.hydra_organism.setAccessibleName("HYDRA organism")
+        self.hydra_organism.setMinimumWidth(220)
+        row.addWidget(self.hydra_organism)
+        row.addWidget(button("Apply to selected samples",
+                             lambda: self.apply_hydra_organism("selected")))
+        row.addWidget(button("Apply to every sample in this project",
+                             lambda: self.apply_hydra_organism("project")))
+        content.addLayout(row)
+        self.hydra_organism_note = label("", "small", True)
+        content.addWidget(self.hydra_organism_note)
+        return panel
+
+    def populate_hydra_organisms(self):
+        """Offer only organisms the installed database actually has catalogues for."""
+        if not hasattr(self, "hydra_organism"):
+            return
+        state = self.amr_database_state()
+        names = list(state["organisms"])
+        for sample in active_samples(self.current_samples):
+            organism = accepted_organism(sample)
+            if organism and organism_text(organism) not in names:
+                names.append(organism_text(organism))
+        current = self.hydra_organism.currentData()
+        self.hydra_organism.blockSignals(True)
+        self.hydra_organism.clear()
+        self.hydra_organism.addItem("Unresolved · no organism flags", "")
+        for name in sorted(dict.fromkeys(names)):
+            self.hydra_organism.addItem(name, name)
+        index = self.hydra_organism.findData(current)
+        self.hydra_organism.setCurrentIndex(max(0, index))
+        self.hydra_organism.blockSignals(False)
+        if state["organisms"]:
+            self.hydra_organism_note.setText(
+                f"{len(state['organisms'])} organisms have point-mutation catalogues in the "
+                "installed database. An organism is what enables the AMRFinderPlus organism "
+                "rules, Kleborate and SCCmec typing; setting one here records it as your own "
+                "assignment — it is not genomic evidence, and it never changes an organism the "
+                "genome comparison supported. A detected gene is not measured susceptibility.")
+        else:
+            self.hydra_organism_note.setText(
+                "The installed AMR database reports no organism catalogues, so the AMRFinderPlus "
+                "organism rules are unavailable and no point mutation can be called. "
+                + (state["reason"] or ""))
+
+    def hydra_organism_for(self, sample):
+        """The organism HYDRA would be told about for this isolate, or an empty string."""
+        override = str(((sample.get("metadata") or {}).get("workflow") or {}).get("hydra_organism") or "")
+        if override:
+            return override
+        organism = accepted_organism(sample)
+        # HYDRA's organism flags need a species; a genus alone cannot select a catalogue.
+        return organism_text(organism) if organism and organism[1] else ""
+
+    def apply_hydra_organism(self, scope):
+        """Record the chosen organism for HYDRA, on the selection or the whole project."""
+        if self.busy():
+            return
+        name = self.hydra_organism.currentData() or ""
+        samples = (self.selected_samples() if scope == "selected"
+                   else active_samples(self.current_samples))
+        if not samples:
+            self.notify("Select the isolates this organism applies to first.")
+            return
+        for sample in samples:
+            self.project.update_metadata(sample["id"], {"workflow": {"hydra_organism": name}})
+        self.refresh()
+        if name:
+            self.notify(f"{len(samples)} isolates will be screened as {name}. This is your "
+                        "assignment for the organism-specific tools; the organism recorded from "
+                        "genomic evidence is unchanged.")
+        else:
+            self.notify(f"{len(samples)} isolates will be screened with no organism flags. "
+                        "AMRFinderPlus organism rules, Kleborate and SCCmec typing stay "
+                        "unavailable for them.")
+
+    def run_hydra_step(self, samples):
+        plan = self.review_run_plan(samples, hydra=True)
+        if not plan or not plan.get("hydra"):
+            return
+        self._run_cancelled = False
+        self.run_hydra_plan({sample["id"] for sample in samples}, plan, require_completed=False)
 
     def busy(self):
         if self.worker and self.worker.isRunning():
@@ -1017,6 +1995,12 @@ class WorkbenchMixin:
     def set_running(self, running):
         for widget in (self.run_button, self.rerun_button, self.scheme_combo, self.demo_button):
             widget.setEnabled(not running)
+        for action in self.step_buttons.values():
+            # Re-enabled by the gate, not by the end of the task: a step whose facts
+            # are still missing must not become clickable just because nothing is busy.
+            action.setEnabled(False)
+        if not running:
+            self.update_step_gates()
         self.cancel_button.setVisible(running)
         self.progress_bar.setVisible(running)
         if running:
@@ -1127,7 +2111,12 @@ class WorkbenchMixin:
         scheme = pending["scheme"]
         self.begin_typing(samples, scheme)
 
-    def begin_typing(self, samples, scheme):
+    def begin_typing(self, samples, scheme, *, remember=True):
+        """Type these samples. `remember` records the global scheme the user picked.
+
+        A step run chooses a scheme per isolate for that step alone, so it passes
+        remember=False: it must not overwrite the workspace-wide default.
+        """
         from wmlstudio.scheduler import resources_for_run
         try:
             allocation = resources_for_run(self._run_plan)
@@ -1138,7 +2127,8 @@ class WorkbenchMixin:
             samples = [dict(sample, metadata={**sample.get("metadata", {}), "workflow": {
                 **sample.get("metadata", {}).get("workflow", {}), "typing_mode": "manual", "scheme_path": scheme}})
                 for sample in samples]
-        self.project.set_setting("scheme_path", scheme or "")
+        if remember:
+            self.project.set_setting("scheme_path", scheme or "")
         self.worker_role = "analysis"
         self.worker = AnalysisWorker(samples, scheme, parent=self, installed_scheme_paths=self.scheme_paths,
                                      resource_plan=allocation)
@@ -1194,6 +2184,9 @@ class WorkbenchMixin:
             return
         if role == "identify":
             self.review_identification()
+            return
+        if role == "intake":
+            self.intake_completed()
             return
         if role == "practice_cohort":
             self.practice_cohort_ready()
@@ -1294,10 +2287,10 @@ class WorkbenchMixin:
 
             reports = []
             def analyse(sample, resources, stopped, report_progress):
-                genus, species, _ = organism_for(sample)
-                assigned = sample.get("metadata", {}).get("organism", {})
-                # A provisional MLST lineage alone is not a verified mutation-catalog assignment.
-                organism = " ".join([genus, species]) if assigned.get("genus") and assigned.get("species") else None
+                # A provisional MLST lineage alone is not a verified mutation-catalog
+                # assignment: only an accepted organism, or one the user chose on the
+                # HYDRA tab, selects an organism catalogue.
+                organism = self.hydra_organism_for(sample) or None
                 return run_assemblies([sample["input_path"]], plan["db_root"], plan.get("databases"),
                     sample_names=[sample["id"]], organism=organism, threads=resources.threads_per_sample,
                     protein=plan.get("protein", True), cancelled=stopped,
@@ -1822,6 +2815,12 @@ class WorkbenchMixin:
         file.addSeparator()
         action(file, "Exit", self.close, "Alt+F4")
         samples = bar.addMenu("&Samples")
+        action(samples, "Add samples…", self.browse_files)
+        action(samples, "Add a folder of samples…", self.browse_folder)
+        action(samples, "Identify waiting samples again", self.reidentify_waiting)
+        for key in STEP_KEYS:
+            action(samples, STEP_ACTIONS[key], lambda checked=False, k=key: self.run_step(k))
+        samples.addSeparator()
         action(samples, "Assign organism / workflow…", self.assign_selected)
         action(samples, "Edit annotations…", self.edit_metadata)
         action(samples, "Add to collection…", self.add_collection)

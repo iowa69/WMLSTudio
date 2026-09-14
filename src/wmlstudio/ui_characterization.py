@@ -158,11 +158,14 @@ def characterization_html(sample):
 class CharacterizationPlanDialog(QDialog):
     installRequested = Signal()
 
-    def __init__(self, samples, reference_path=None, parent=None, *, project=None, scheme_entries=()):
+    def __init__(self, samples, reference_path=None, parent=None, *, project=None, scheme_entries=(),
+                 database_root=None):
         super().__init__(parent)
         self.plan = None
         self.samples = list(samples)
         self.project = project
+        self.database_root = str(database_root or "")
+        self.hydra_check = None
         self.scheme_entries = list(scheme_entries)
         self.module_boxes = {}
         self.module_notes = {}
@@ -194,6 +197,11 @@ class CharacterizationPlanDialog(QDialog):
         self.hydra.setChecked(True)
         for control in (self.species, self.virulence, self.hydra):
             layout.addWidget(control)
+        # What HYDRA is about to search, and what it cannot search for, stated
+        # before the run rather than discovered in an empty result afterwards.
+        self.hydra_state = label("", "small", True)
+        layout.addWidget(self.hydra_state)
+        self.refresh_hydra_state()
         layout.addWidget(self.build_module_group())
         layout.addWidget(label("Species/virulence reference panel: focused Klebsiella representatives and E. coli outgroup; not a comprehensive taxonomy database. Existing HYDRA plasmid assays may support co-location hypotheses; the AMR starter alone does not assay plasmids.", "small", True))
         form = QFormLayout()
@@ -219,6 +227,54 @@ class CharacterizationPlanDialog(QDialog):
         controls.accepted.connect(self.accept)
         controls.rejected.connect(self.reject)
         outer.addWidget(controls)
+
+    def refresh_hydra_state(self):
+        """Probe the AMR engine, tools and reference release once, when the plan opens.
+
+        A run that cannot finish must not be offered as if it could, so an
+        unavailable HYDRA is switched off and disabled with the reason beside it,
+        rather than accepted here and failed per isolate after every other assay
+        has already been done. The ready case still says which release will be
+        searched and which isolates it holds no point-mutation catalogue for.
+        """
+        from wmlstudio import provisioning
+
+        try:
+            self.hydra_check = provisioning.hydra_prerequisites(
+                selected=self.database_root or None)
+        except (OSError, ValueError) as error:
+            self.hydra_check = None
+            self.hydra.setChecked(False)
+            self.hydra.setEnabled(False)
+            self.hydra_state.setText(f"The AMR reference store could not be read: {error}")
+            return
+        check = self.hydra_check
+        self.hydra.setEnabled(check["ready"])
+        if not check["ready"]:
+            self.hydra.setChecked(False)
+            self.hydra.setToolTip(check["message"])
+            self.hydra_state.setText(check["message"])
+            return
+        notes = [check["database"]["label"]]
+        covered = set(check["database"]["organisms"])
+        uncovered = sorted({organism_line(sample).split(" (")[0] for sample in self.samples
+                            if organism_line(sample) != "Unknown organism"
+                            and not self.organism_covered(sample, covered)})
+        if uncovered:
+            notes.append("No point-mutation catalogue is installed for " + "; ".join(uncovered)
+                         + ". Those isolates are screened for genes only, which is not evidence "
+                         "that they carry no resistance mutation.")
+        notes.extend(check["warnings"])
+        self.hydra_state.setText(" ".join(notes))
+
+    @staticmethod
+    def organism_covered(sample, accepted):
+        """True when the installed release has a catalogue this isolate can be run against."""
+        from wmlstudio.hydra_runtime import match_organism
+
+        genus, species, _ = organism_for(sample)
+        name = f"{genus} {species}".strip()
+        return bool(name) and match_organism(name, accepted=accepted) is not None
 
     def refresh_plan_table(self):
         """Fill the cohort rows, keeping whatever the user has already excluded."""
@@ -354,6 +410,8 @@ class CharacterizationPlanDialog(QDialog):
         self.samples = [records.get(sample["id"], sample) for sample in self.samples]
         self.refresh_plan_table()
         self.refresh_module_badges()
+        # Which isolates have a point-mutation catalogue follows the assignment too.
+        self.refresh_hydra_state()
         self.feedback.setText("Assignment saved. The organism-specific tools offered now follow it.")
 
     def update_resources(self):
@@ -382,6 +440,12 @@ class CharacterizationPlanDialog(QDialog):
         reference = self.reference.text().strip()
         if (self.species.isChecked() or self.virulence.isChecked()) and not (Path(reference) / "manifest.json").is_file():
             self.feedback.setText("Install or select a characterization snapshot. No reference download occurs during analysis.")
+            return
+        # Refuse here rather than halfway through the cohort: without the engine,
+        # the tools or a populated reference store every isolate would fail after
+        # its species and virulence work had already been done.
+        if self.hydra.isChecked() and self.hydra_check is not None and not self.hydra_check["ready"]:
+            self.feedback.setText(self.hydra_check["message"])
             return
         try:
             allocation = plan_resources(threads_per_sample=4, memory_gb=3, policy=self.policy.currentData())
@@ -543,7 +607,8 @@ class CharacterizationWorkspaceMixin:
             self.navigate(1)
             return
         dialog = CharacterizationPlanDialog(assemblies, self.active_characterization_reference(), self,
-                                            project=self.project, scheme_entries=self.scheme_entries())
+                                            project=self.project, scheme_entries=self.scheme_entries(),
+                                            database_root=self.active_amr_database())
         dialog.installRequested.connect(self.install_characterization_references)
         if dialog.exec() != QDialog.DialogCode.Accepted:
             return
@@ -571,6 +636,10 @@ class CharacterizationWorkspaceMixin:
                 assigned = (sample.get("metadata") or {}).get("organism") or {}
                 # A provisional detection is not a verified mutation-catalog assignment,
                 # so only an assigned genus AND species chooses a point-mutation catalog.
+                # The engine's taxgroups are underscore-joined and genus-level for some
+                # organisms, so run_assemblies resolves this name against the installed
+                # catalogue: an unknown one stops the whole run upstream, and a name it
+                # cannot resolve is reported rather than replaced by a near neighbour.
                 organism = f"{genus} {species}" if assigned.get("genus") and assigned.get("species") else None
                 if plan["hydra"] and hydra is None:
                     generated = run_assemblies([sample["input_path"]], database_root,

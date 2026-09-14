@@ -36,6 +36,30 @@ HYDRA_COMMIT = "6d36c109491c16544e8919fe6962b4b62e97d3d7"
 HYDRA_VERSION = "1.4.0"
 TOOLS = ("blastn", "blastx", "blastp", "tblastn", "makeblastdb")
 NCBI_REFERENCE_ROOT = "https://ftp.ncbi.nlm.nih.gov/pathogen/Antimicrobial_resistance/AMRFinderPlus/database/latest"
+# The stores a run uses when the caller names none, in the order a report reads.
+DEFAULT_DATABASES = ("ncbi", "protein")
+# What each store is for, said in the words a microbiologist reads. A run without
+# one of these does not fail: it returns nothing for that whole class of evidence,
+# which reads exactly like a negative result. Every refusal below names the store
+# and this sentence, so "nothing was found" is never confused with "nothing ran".
+DATABASE_PURPOSE = {
+    "ncbi": ("acquired resistance, stress and virulence genes, searched with blastn against the "
+             "NCBI AMRFinderPlus nucleotide catalogue"),
+    "protein": ("the translated protein search and every organism point-mutation catalogue, "
+                "searched with blastx against AMRProt"),
+}
+# What each executable is for, so a missing one is a sentence and not a filename.
+TOOL_PURPOSE = {
+    "blastn": "the nucleotide gene search",
+    "blastx": "the translated protein search, which is where point mutations are read",
+    "blastp": "protein-to-protein confirmation of a translated hit",
+    "tblastn": "recovering a gene that the translated search split across a contig break",
+    "makeblastdb": "building the search index a reference store needs before it can be read",
+}
+# A snapshot older than this still runs and is still reported as the exact release
+# it is; the age is surfaced so a user can decide whether to update before
+# reporting. Determinants named after this date are simply not in it.
+REFERENCE_AGE_DAYS = 180
 
 
 class HydraRuntimeError(ValueError):
@@ -90,7 +114,12 @@ def installed_databases(db_root):
         for name, entry in records.items():
             if not isinstance(entry, dict) or not isinstance(entry.get("path"), str):
                 raise ValueError(f"invalid entry for {name}")
-            target = (root / entry["path"]).resolve()
+            # A store staged on Windows records "nucl\ncbi"; on POSIX that is one
+            # filename, not a folder, and the whole store would read as empty.
+            # Normalising here makes one staged snapshot portable, and tightens
+            # the containment check rather than loosening it: "..\\outside" is
+            # now recognised as an escape instead of a legal filename.
+            target = (root / entry["path"].replace("\\", "/")).resolve()
             if not target.is_relative_to(root):
                 raise ValueError(f"database path leaves the selected store: {name}")
             if target.exists():
@@ -98,6 +127,143 @@ def installed_databases(db_root):
         return result
     except (OSError, ValueError, TypeError, AttributeError) as exc:
         raise HydraRuntimeError(f"Cannot read HYDRA database manifest: {exc}") from exc
+
+
+def _entry_directory(root, entry):
+    """The folder one manifest entry names, with the same separator normalisation."""
+    return (Path(root) / str(entry.get("path", "")).replace("\\", "/")).resolve()
+
+
+def _release_date(version):
+    """The NCBI release date inside a version like '2026-08-07.1', or None."""
+    match = re.match(r"([0-9]{4}-[0-9]{2}-[0-9]{2})", str(version or ""))
+    if not match:
+        return None
+    try:
+        return datetime.strptime(match.group(1), "%Y-%m-%d").replace(tzinfo=UTC)
+    except ValueError:
+        return None
+
+
+def organism_catalogue(db_root):
+    """The organism names the installed store will actually accept, and why.
+
+    Upstream resolves --organism against its own taxgroup table and its DNA
+    mutation catalogues, so this reads the same two places rather than inventing a
+    list. "accepted" is every name the engine will take; "point_mutations" is the
+    smaller set that has a curated catalogue behind it. An organism outside the
+    first list stops the run upstream; one inside the first but outside the second
+    is accepted and simply has no mutations to report, which is not the same thing
+    as having none.
+    """
+    root = Path(db_root).resolve() if db_root is not None else None
+    accepted, catalogued = set(), set()
+    if root is None or not root.is_dir():
+        return {"accepted": [], "point_mutations": [], "root": str(root or "")}
+    try:
+        entries = installed_databases(root)
+    except HydraRuntimeError:
+        entries = {}
+    for name in (entries.get("protein", {}).get("organisms") or []):
+        if isinstance(name, str) and name.strip():
+            accepted.add(name.strip())
+            catalogued.add(name.strip())
+    mutation = root / "mutation" / "dna"
+    if mutation.is_dir():
+        for path in sorted(mutation.glob("*.fna")):
+            accepted.add(path.stem)
+            catalogued.add(path.stem)
+    protein = entries.get("protein")
+    taxgroup = (_entry_directory(root, protein) / "taxgroup.tsv") if protein else None
+    if taxgroup is not None and taxgroup.is_file():
+        try:
+            with taxgroup.open(encoding="utf-8") as handle:
+                handle.readline()
+                for line in handle:
+                    value = line.split("\t")[0].strip()
+                    if value and not value.startswith("#"):
+                        accepted.add(value)
+        except OSError as exc:
+            raise HydraRuntimeError(f"Cannot read the organism table: {exc}") from exc
+    return {"accepted": sorted(accepted), "point_mutations": sorted(catalogued),
+            "root": str(root)}
+
+
+def match_organism(name, db_root=None, *, accepted=None):
+    """Map an assigned organism onto a name the installed catalogues really use.
+
+    Upstream's taxgroups mix species ("Klebsiella_pneumoniae") with genus-level
+    groups ("Escherichia", "Salmonella"), and they are underscore-joined, so an
+    assignment of "Escherichia coli" belongs to "Escherichia" and one of
+    "Klebsiella pneumoniae" to "Klebsiella_pneumoniae". Nothing is resolved by
+    similarity: a name with no catalogue returns None so the caller can say that
+    plainly instead of substituting a neighbouring organism's mutation list.
+    """
+    text = " ".join(str(name or "").replace("_", " ").split())
+    if not text:
+        return None
+    choices = list(accepted) if accepted is not None else organism_catalogue(db_root)["accepted"]
+    index = {choice.replace("_", " ").casefold(): choice for choice in choices}
+    return index.get(text.casefold()) or index.get(text.split(" ")[0].casefold())
+
+
+def database_status(db_root=None, databases=None):
+    """What a store holds, which release it is, how old that release is, what is absent.
+
+    Plain data only: nothing is downloaded, created or repaired by asking. The
+    release and its age are reported separately from the day the copy was staged,
+    because it is the reference release — not the download — that decides which
+    determinants the run could possibly name.
+    """
+    root = Path(db_root).resolve() if db_root is not None else None
+    wanted = [str(name) for name in (databases if databases is not None else DEFAULT_DATABASES)]
+    status = {"root": str(root or ""), "bundled": False, "installed": {}, "requested": wanted,
+              "missing": [], "error": "", "release": "", "released_utc": "", "staged": "",
+              "age_days": None, "stale": False, "label": "No AMR reference database is installed.",
+              "organisms": [], "point_mutation_organisms": []}
+    bundled = bundled_database_root()
+    status["bundled"] = bool(root is not None and bundled is not None
+                             and root == Path(bundled).resolve())
+    if root is None:
+        return status
+    try:
+        entries = installed_databases(root)
+    except HydraRuntimeError as exc:
+        status["error"] = str(exc)
+        status["label"] = str(exc)
+        return status
+    for name, entry in sorted(entries.items()):
+        status["installed"][name] = {
+            "path": str(entry.get("path", "")), "kind": str(entry.get("kind", "")),
+            "version": str(entry.get("version", "") or ""),
+            "installed": str(entry.get("installed", "") or ""),
+            "sequences": entry.get("sequences"),
+            "title": str(entry.get("title", "") or ""),
+            "purpose": DATABASE_PURPOSE.get(name, "an additional reference set this engine reads")}
+    status["missing"] = [{"name": name, "purpose": DATABASE_PURPOSE.get(
+        name, "an additional reference set this engine reads")} for name in wanted
+        if name not in entries]
+    if not entries:
+        return status
+    catalogue = organism_catalogue(root)
+    status["organisms"] = catalogue["accepted"]
+    status["point_mutation_organisms"] = catalogue["point_mutations"]
+    versions = sorted({item["version"] for item in status["installed"].values() if item["version"]})
+    status["release"] = versions[0] if len(versions) == 1 else ("; ".join(versions) or "unrecorded")
+    staged = sorted({item["installed"] for item in status["installed"].values()
+                     if item["installed"]})
+    status["staged"] = staged[0] if staged else ""
+    released = _release_date(versions[0]) if len(versions) == 1 else None
+    if released is not None:
+        status["released_utc"] = released.isoformat()
+        status["age_days"] = max(0, (datetime.now(UTC) - released).days)
+        status["stale"] = status["age_days"] > REFERENCE_AGE_DAYS
+    where = "bundled with this release" if status["bundled"] else "installed"
+    age = (f", {status['age_days']} days old" if status["age_days"] is not None else "")
+    status["label"] = (f"NCBI AMRFinderPlus reference release {status['release']} "
+                       f"({', '.join(sorted(entries))}), {where}"
+                       + (f" on {status['staged'][:10]}" if status["staged"] else "") + age + ".")
+    return status
 
 
 def runtime_capabilities(db_root=None):
@@ -112,8 +278,16 @@ def runtime_capabilities(db_root=None):
     databases = installed_databases(db_root) if db_root is not None else {}
     available = version == HYDRA_VERSION and all(tools.values())
     missing = [name for name, path in tools.items() if not path]
-    message = ("Native HYDRA assembly runtime is ready." if available else
-               f"HYDRA {version or 'not installed'}; missing tools: {', '.join(missing) or 'none'}.")
+    if not available:
+        message = f"HYDRA {version or 'not installed'}; missing tools: {', '.join(missing) or 'none'}."
+    elif db_root is None or not databases:
+        # The engine being ready is not the same as the screen being runnable, and
+        # reporting only the first was how "HYDRA does not work" stayed unexplained.
+        message = ("The HYDRA engine and BLAST+ tools are ready, but no AMR reference database is "
+                   "installed, so a run would have nothing to search.")
+    else:
+        message = ("Native HYDRA assembly runtime is ready with "
+                   + ", ".join(sorted(databases)) + ".")
     return {"hydra_version": version, "expected_hydra_version": HYDRA_VERSION,
             "source_commit": HYDRA_COMMIT, "distribution_origin": origin,
             "tools": tools, "databases": databases,
@@ -122,6 +296,109 @@ def runtime_capabilities(db_root=None):
             "reads_available": False,
             "limitations": ["Assembly-only HYDRA execution; its direct-read and minority-allele pipelines are not enabled. Paired-read assembly is handled separately by native SKESA.",
                             "Gene and mutation evidence is not a validated susceptibility phenotype."]}
+
+
+def preflight(db_root=None, *, databases=None, organism=None, point_mutations=True,
+              capabilities=None):
+    """Everything a run needs, checked before a single sequence file is opened.
+
+    The failure this exists to stop is the quiet one: HYDRA is installed, BLAST is
+    installed, no reference store is, and the run either refuses with a sentence
+    about selecting a database or — worse — completes and reports nothing, which a
+    reader cannot tell from a clean isolate. So every piece is checked first, each
+    missing one is named together with what it is for and what the run loses
+    without it, and `ready` is False before any work starts.
+
+    Nothing here downloads, creates or repairs anything, and `warnings` is kept
+    separate from `missing`: a warning narrows what the run can report and is
+    recorded with the result, a missing item stops it.
+    """
+    capabilities = capabilities if capabilities is not None else runtime_capabilities(db_root)
+    tools = capabilities.get("tools") or {}
+    version = capabilities.get("hydra_version")
+    missing, warnings = [], []
+    if version != HYDRA_VERSION:
+        missing.append({"kind": "engine", "name": f"HYDRA {HYDRA_VERSION}",
+                        "purpose": "the analysis engine itself",
+                        "reason": (f"{version or 'No HYDRA engine'} is installed and this "
+                                   f"application is pinned to {HYDRA_VERSION}; it will not report "
+                                   "results from an engine it was not validated against.")})
+    for name in TOOLS:
+        if not tools.get(name):
+            missing.append({"kind": "tool", "name": name, "purpose": TOOL_PURPOSE[name],
+                            "reason": (f"{name} was not found beside the application or on PATH, "
+                                       "so this search cannot be run at all.")})
+    status = database_status(db_root, databases)
+    if db_root is None:
+        missing.append({"kind": "database", "name": "AMR reference database",
+                        "purpose": "every gene and mutation this screen can name",
+                        "reason": "No database store has been chosen for this project."})
+    elif status["error"]:
+        missing.append({"kind": "database", "name": "AMR reference database",
+                        "purpose": "every gene and mutation this screen can name",
+                        "reason": status["error"]})
+    chosen = [name for name in status["requested"] if name in status["installed"]]
+    if db_root is not None and not status["error"]:
+        if not status["installed"]:
+            missing.append({"kind": "database", "name": "AMR reference database",
+                            "purpose": "every gene and mutation this screen can name",
+                            "reason": (f"{status['root']} holds no reference database, so the "
+                                       "screen has nothing to search and would report no "
+                                       "determinants for every isolate.")})
+        elif databases is not None:
+            # A database the caller asked for by name is not optional: running
+            # without it would answer a different question than the one asked.
+            for entry in status["missing"]:
+                missing.append({"kind": "database", **entry,
+                                "reason": (f"The database '{entry['name']}' is not installed in "
+                                           f"{status['root']}.")})
+        else:
+            for entry in status["missing"]:
+                warnings.append(
+                    f"The '{entry['name']}' reference set is not installed, so {entry['purpose']} "
+                    "did not run. Nothing was reported for it; that is not a negative result.")
+    resolved, organism_reason = None, ""
+    if organism:
+        accepted = status["organisms"]
+        resolved = match_organism(organism, accepted=accepted) if accepted else str(organism)
+        if accepted and resolved is None:
+            organism_reason = (
+                f"The installed reference release has no catalogue for '{organism}', so point "
+                "mutations were not assessed for this isolate. Genes were still searched for. "
+                "An absent catalogue is not an absence of mutations.")
+            warnings.append(organism_reason)
+        elif resolved and accepted and resolved not in status["point_mutation_organisms"]:
+            organism_reason = (
+                f"'{resolved}' is accepted by the installed release but has no DNA point-mutation "
+                "catalogue in it, so only protein-level mutations could be reported.")
+            warnings.append(organism_reason)
+    elif point_mutations:
+        organism_reason = ("No organism was given, so no point-mutation catalogue was selected. "
+                           "Assign a genus and species to this isolate to have them assessed.")
+        warnings.append(organism_reason)
+    if point_mutations and "protein" not in chosen and status["installed"]:
+        warnings.append("Point mutations were requested but the protein reference set is not "
+                        "among the databases being searched, so none can be reported.")
+    if status["stale"]:
+        warnings.append(f"This reference release is {status['age_days']} days old "
+                        f"({status['release']}). Determinants named after it are not in it; use "
+                        "the update action to fetch the current NCBI release.")
+    message = ""
+    if missing:
+        lines = [f"  • {item['name']} — needed for {item['purpose']}. {item['reason']}"
+                 for item in missing]
+        fix = ("Install the BLAST+ tools that ship beside the application"
+               if any(item["kind"] == "tool" for item in missing) else
+               "Download the reference databases from HYDRA > AMR databases / updates")
+        message = ("HYDRA cannot start, so nothing was run and no isolate was marked screened.\n"
+                   + "\n".join(lines) + f"\n{fix}. Nothing is ever downloaded during a run.")
+    return {"ready": not missing, "message": message, "missing": missing, "warnings": warnings,
+            "databases": chosen, "database_status": status,
+            "organism": {"requested": str(organism or ""), "resolved": resolved or "",
+                         "reason": organism_reason,
+                         "point_mutations": bool(point_mutations)},
+            "engine": {"installed": version or "", "expected": HYDRA_VERSION},
+            "tools": dict(tools), "limitations": list(capabilities.get("limitations") or ())}
 
 
 def _worker_command(arguments):
@@ -222,7 +499,7 @@ def _database_provenance(db_root, names, cancelled=None):
         if name not in manifest:
             raise HydraRuntimeError(f"HYDRA database '{name}' is not installed. Download or choose a populated database store first.")
         entry = manifest[name]
-        directory = (root / entry["path"]).resolve()
+        directory = _entry_directory(root, entry)
         files = {}
         references = list(directory.rglob("*"))
         if name == "protein" and (root / "mutation").is_dir():
@@ -246,14 +523,24 @@ def run_assemblies(inputs, db_root, databases=None, *, sample_names=None, organi
                    protein_min_identity=90, protein_min_coverage=90):
     """Run the original HYDRA assembly pipeline and return its validated JSON report.
 
+    Every run goes through `preflight` first, so a run that could not finish never
+    starts and the caller gets a refusal naming each missing tool or reference set.
+    What the run could not look for — an absent reference set, an organism with no
+    catalogue, the age of the release — is recorded in the report's provenance and
+    repeated in its import warnings, because an empty result and an unperformed
+    search read identically otherwise.
+
     Input paths and reference files are never rewritten by this wrapper. The
     database store should be a managed writable cache because upstream may build
     missing indexes there. The caller must not concurrently update that store.
     """
     capabilities = runtime_capabilities(db_root)
-    if not capabilities["assembly_available"]:
-        missing = [name for name, path in capabilities["tools"].items() if not path]
-        raise HydraRuntimeError(f"Native HYDRA {HYDRA_VERSION} assembly runtime is incomplete. Missing tools: {', '.join(missing) or 'none'}; installed HYDRA: {capabilities['hydra_version'] or 'not installed'}.")
+    # One gate for every caller: a run that cannot finish never starts, and the
+    # refusal names each missing tool or reference set and what it was for.
+    checked = preflight(db_root, databases=databases, organism=organism,
+                        point_mutations=point_mutations, capabilities=capabilities)
+    if not checked["ready"]:
+        raise HydraRuntimeError(checked["message"])
     if not isinstance(threads, int) or isinstance(threads, bool) or not 1 <= threads <= 256:
         raise HydraRuntimeError("Threads must be an integer between 1 and 256.")
     thresholds = {"min-identity": min_identity, "min-coverage": min_coverage,
@@ -282,8 +569,7 @@ def run_assemblies(inputs, db_root, databases=None, *, sample_names=None, organi
         signatures[path] = file_signature(path)
         input_provenance.append({"path": str(path), "sha256": file_sha256(path, cancelled),
                                  "sample_name": names[index] if names is not None else sample_name(path)})
-    available = capabilities["databases"]
-    names_db = list(databases) if databases is not None else [name for name in ("ncbi", "protein") if name in available]
+    names_db = list(databases) if databases is not None else list(checked["databases"])
     if not names_db or any(not isinstance(name, str) or not name or name.startswith("-") for name in names_db):
         raise HydraRuntimeError("Select at least one installed HYDRA database.")
     if progress:
@@ -302,8 +588,14 @@ def run_assemblies(inputs, db_root, databases=None, *, sample_names=None, organi
     if names is not None:
         for name in names:
             arguments.extend(["--name", name])
-    if organism:
-        arguments.extend(["--organism", str(organism)])
+    # The engine takes underscore-joined taxgroup names and stops the whole run on
+    # one it does not know, so the assigned organism is resolved against the
+    # installed catalogue first. A name with no catalogue is not passed and not
+    # silently replaced by a neighbouring one: the run proceeds without mutation
+    # catalogs and says so in the report.
+    selected_organism = checked["organism"]["resolved"]
+    if selected_organism:
+        arguments.extend(["--organism", selected_organism])
     else:
         # Without native species sketches and an explicit organism, mutation
         # catalogs must not be chosen by an unvalidated inference.
@@ -333,9 +625,16 @@ def run_assemblies(inputs, db_root, databases=None, *, sample_names=None, organi
         "reference_snapshot": reference, "tools": capabilities["tools"],
         "completed_utc": datetime.now(UTC).isoformat(), "runtime_seconds": round(time.monotonic() - started, 3),
         "log": log, "scientific_limits": capabilities["limitations"],
+        # What the run could and could not look for travels with the result, so a
+        # report is never read as a complete screen when part of it never ran.
+        "organism": dict(checked["organism"]),
+        "reference_release": {key: checked["database_status"][key]
+                              for key in ("release", "released_utc", "staged", "age_days",
+                                          "stale", "bundled", "label")},
+        "coverage_warnings": list(checked["warnings"]),
     }
-    if not organism and point_mutations:
-        report.setdefault("import_warnings", []).append("No organism was specified: organism-specific point mutation catalogs were not selected.")
+    if checked["warnings"]:
+        report.setdefault("import_warnings", []).extend(checked["warnings"])
     return report
 
 
@@ -347,6 +646,19 @@ def _ncbi_version():
     if not re.fullmatch(r"[0-9]{4}-[0-9]{2}-[0-9]{2}\.[0-9]+", value):
         raise HydraRuntimeError("NCBI returned an unrecognized reference version; snapshot was not published.")
     return value
+
+
+def latest_release(*, cancelled=None):
+    """Ask NCBI which reference release is current today, without downloading it.
+
+    An explicit, user-initiated network call: nothing in startup, project open or
+    analysis reaches here, and no sample data is sent — only a request for one
+    version string. It exists so an update menu can say whether there is anything
+    to fetch before asking a person to wait for 25 MB.
+    """
+    if cancelled and cancelled():
+        raise AnalysisCancelled("Cancelled before the version check.")
+    return _ncbi_version()
 
 
 def update_databases(db_root, names, *, cancelled=None, progress=None, work_root=None):

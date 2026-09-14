@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 from copy import deepcopy
 from datetime import date, datetime, timezone
 
@@ -19,6 +20,23 @@ INTERPRETATION = (
     "direction of transmission, or clinical causation. Single linkage can join distant endpoints through "
     "intermediate isolates. Missing calls are unknown, not identical. A published cutoff is not validated "
     "for WMLSTudio merely because the organism or locus count matches."
+)
+# The rule every report and export inherits from this catalog. A seven-locus ST
+# distance and a core-genome distance are different quantities, so they never
+# share a scale, a column or a threshold. Every cutoff curated below was measured
+# on a core-genome target set (or, for the SKA entry, on SNPs); none of them was
+# measured on a classical scheme, so none of them can be carried onto one.
+SCALE_SEPARATION = (
+    "A classical MLST distance (seven housekeeping loci) and a cgMLST distance (hundreds to thousands of "
+    "targets) are different quantities: they share no scale, no column and no threshold. No cutoff in this "
+    "catalog was measured on a seven-locus scheme, so none of them applies to one."
+)
+# What a suggestion is, in the one sentence a report prints beside it. The
+# catalog never applies a number; only record_decision records an adopted one.
+SUGGESTION_NOTICE = (
+    "This is a suggestion to read, not a setting that is in use. WMLSTudio has not applied it, and it "
+    "becomes a local threshold only after the exact scheme, its full target count, the reference "
+    "fingerprint, the caller and the missing-data policy are bound and justified in writing."
 )
 
 SOURCES = {
@@ -96,6 +114,30 @@ _MAYO = (
 )
 
 
+def _first_sentence(text):
+    """The entry's own opening sentence, cut at a full stop and never reworded.
+
+    A report has room for one line of caveat beside a number, and the curated
+    ``limitations`` text already opens with the sharpest one. Slicing it keeps
+    the short form and the long form the same words; nothing is paraphrased.
+    """
+    text = " ".join(str(text or "").split())
+    head = text.split(". ")[0].strip()
+    return head + "." if head and not head.endswith(".") else head
+
+
+def short_citation(source):
+    """'Glasgow et al. (2025)' — the head of the curated citation, never a new one."""
+    citation = str(source.get("citation") or "")
+    lead = re.split(r"[,(]", citation, maxsplit=1)[0].strip()
+    if not lead:
+        return citation
+    if not lead.rstrip(".").endswith("et al"):
+        lead = lead.rstrip(".") + " et al."
+    year = str(source.get("published") or "")[:4]
+    return lead + (" (" + year + ")" if year else "")
+
+
 def _entry(organism, value, source, *, suffix="", scheme_key=None, loci=None,
            method="cgmlst", scope="", missing_policy="Protocol-specific; review original methods.", note=""):
     return {"id": organism.lower().replace(" ", "-") + "-" + source + suffix,
@@ -103,6 +145,12 @@ def _entry(organism, value, source, *, suffix="", scheme_key=None, loci=None,
             "operator": "<=", "unit": "allele differences" if method == "cgmlst" else "SNPs",
             "scheme_key": scheme_key, "locus_count": loci, "source_id": source,
             "scope": scope, "missing_policy": missing_policy, "limitations": note,
+            # The quotable half of the same curated text, for a report line that
+            # must carry the authors' own warning beside their number.
+            "caveat": _first_sentence(note),
+            # A number can only be adopted when the catalog can bind the exact
+            # scheme it was measured on; a citation-only entry never can.
+            "bindable": bool(scheme_key) and value is not None,
             "auto_apply": False, "reviewed_on": REVIEWED_ON}
 
 
@@ -157,6 +205,48 @@ def catalog_entries():
     return deepcopy(entries)
 
 
+def typing_scale(locus_count):
+    """Which typing scale a target count belongs to, on the application's own floor.
+
+    The floor is ``project.CGMLST_LOCUS_FLOOR``, the same number the analysis
+    planner uses to choose a caller, so a comparison is described here exactly as
+    it was produced. An unknown count stays unknown; it is never read as either
+    scale. Imported inside the call because this module is also used by report
+    code that must stay free of the project/database import at module load.
+    """
+    from wmlstudio.project import CGMLST_LOCUS_FLOOR
+    try:
+        count = int(locus_count)
+    except (TypeError, ValueError):
+        count = 0
+    if count <= 0:
+        return {"kind": "unknown", "loci": 0, "label": "typing scale not recorded",
+                "note": "No target count is recorded for this reference, so its typing scale cannot be stated. "
+                        + SCALE_SEPARATION}
+    if count > CGMLST_LOCUS_FLOOR:
+        return {"kind": "cgmlst", "loci": count, "label": f"core-genome typing over {count} targets",
+                "note": SCALE_SEPARATION}
+    return {"kind": "mlst", "loci": count, "label": f"classical MLST over {count} loci",
+            "note": SCALE_SEPARATION}
+
+
+def _annotate_recency(entries):
+    """Newest first, and 'most recent' decided inside one method, never across two.
+
+    A SNP cutoff published later than a cgMLST one does not become the newer
+    answer to a cgMLST question: they are different quantities, so each method
+    carries its own most-recent entry.
+    """
+    for entry in entries:
+        entry["published"] = SOURCES[entry["source_id"]]["published"]
+    entries.sort(key=lambda entry: (entry["published"], entry["id"]), reverse=True)
+    for method in {entry["method"] for entry in entries}:
+        group = [entry for entry in entries if entry["method"] == method]
+        for entry in group:
+            entry["most_recent"] = entry["published"] == group[0]["published"]
+    return entries
+
+
 def guidance_for(organism, method=None):
     """Exact taxon matching only: no genus fallback, taxonomic or method inference."""
     text = " ".join(str(organism).split()).casefold()
@@ -164,11 +254,103 @@ def guidance_for(organism, method=None):
                and (method is None or entry["method"] == method)]
     for entry in entries:
         entry["source"] = deepcopy(SOURCES[entry["source_id"]])
+    _annotate_recency(entries)
     return {"organism": str(organism), "catalog_version": CATALOG_VERSION, "reviewed_on": REVIEWED_ON,
             "status": "published_contexts_require_review" if entries else "no_curated_transferable_cutoff",
             "message": "No reviewed transferable cutoff in this catalog. This is an evidence gap, not proof that no publications exist." if not entries else INTERPRETATION,
             "entries": entries, "interpretation": INTERPRETATION,
             "review_scope": "Targeted primary-source review, including 2025 literature; not a systematic or continuously updated review."}
+
+
+def suggested_threshold(organism, method="cgmlst", *, locus_count=None, scheme_key=None):
+    """The catalog's suggestion for one organism, always labelled as a suggestion.
+
+    Nothing is applied here. ``applied`` and ``auto_apply`` are false in every
+    payload this can return, and only ``record_decision`` turns a number into a
+    recorded local threshold. Published numbers are reproduced exactly: no
+    scaling for a smaller target set, no rounding, and no transfer between the
+    two typing scales. The most recent reviewed source wins the suggestion, but
+    the others stay in ``alternatives`` and their disagreement is stated, because
+    picking whichever number is most convenient is the mistake this catalog
+    exists to prevent.
+    """
+    guidance = guidance_for(organism, method)
+    entries = guidance["entries"]
+    scale = typing_scale(locus_count) if locus_count is not None else None
+    payload = {"organism": str(organism), "method": method, "applied": False, "auto_apply": False,
+               "catalog_version": CATALOG_VERSION, "reviewed_on": REVIEWED_ON, "scale": scale,
+               "status": "no_curated_transferable_cutoff", "suggestion": None, "newest": None,
+               "alternatives": [], "disagreement": "", "headline": "", "notice": SUGGESTION_NOTICE,
+               "scheme_match": {"checked": False, "matches": None, "reason": ""},
+               "interpretation": INTERPRETATION, "message": guidance["message"]}
+    if scale is not None and scale["kind"] == "mlst" and method == "cgmlst":
+        # Refused before the catalog is even consulted: offering a core-genome
+        # number beside a seven-locus distance is the error this guards.
+        payload["status"] = "scale_mismatch"
+        payload["headline"] = ("This comparison is " + scale["label"] + ", so this catalog suggests no cutoff "
+                               "for it. " + SCALE_SEPARATION)
+        return payload
+    if not entries:
+        payload["headline"] = ("No reviewed transferable cutoff for " + payload["organism"]
+                               + " in this catalog. This is an evidence gap, not proof that no publications exist.")
+        return payload
+    payload["newest"] = entries[0]
+    bindable = [entry for entry in entries if entry["bindable"]]
+    suggestion = bindable[0] if bindable else None
+    payload["suggestion"] = suggestion
+    payload["alternatives"] = [entry for entry in entries if entry is not suggestion]
+    if suggestion is None:
+        payload["status"] = "no_bindable_cutoff"
+        payload["headline"] = ("This catalog holds published context for " + payload["organism"]
+                               + " but no number bound to a named scheme, so it suggests no cutoff. Most recent: "
+                               + short_citation(entries[0]["source"]) + ".")
+        return payload
+    payload["status"] = "suggestion_requires_review"
+    headline = ("Suggested, not applied: " + short_citation(suggestion["source"]) + " publishes at most "
+                + str(suggestion["published_threshold"]) + " " + suggestion["unit"] + " for "
+                + payload["organism"] + ", measured on " + suggestion["scheme_key"]
+                + (" over " + str(suggestion["locus_count"]) + " targets" if suggestion["locus_count"] else "") + ".")
+    if suggestion is not payload["newest"]:
+        headline += (" The most recent reviewed source for this organism, "
+                     + short_citation(payload["newest"]["source"])
+                     + ", is not bound to a scheme this catalog can bind, so it cannot supply a number.")
+    payload["headline"] = headline
+    if locus_count is not None or scheme_key:
+        mismatches = []
+        if locus_count is not None and suggestion["locus_count"] is not None and scale["loci"] != suggestion["locus_count"]:
+            mismatches.append("the published number was measured over " + str(suggestion["locus_count"])
+                              + " targets and this comparison used " + str(scale["loci"]))
+        if scheme_key and str(scheme_key) != suggestion["scheme_key"]:
+            mismatches.append("this comparison is bound to " + str(scheme_key)
+                              + ", not to " + suggestion["scheme_key"])
+        payload["scheme_match"] = {"checked": True, "matches": not mismatches,
+            "reason": ("The local reference matches the scheme binding recorded with this number; review of the "
+                       "caller, missing-data policy and epidemiology is still required."
+                       if not mismatches else
+                       "Not transferable as published: " + "; ".join(mismatches)
+                       + ". No scaling for a different target set exists.")}
+    differing = []
+    for entry in payload["alternatives"]:
+        value = entry["published_threshold"]
+        if value is None or value == suggestion["published_threshold"]:
+            continue
+        differing.append("at most " + str(value) + " " + entry["unit"] + " ("
+                         + short_citation(entry["source"]) + ")")
+    if differing:
+        payload["disagreement"] = ("Reviewed sources for " + payload["organism"] + " do not agree on one number: "
+                                   + "; ".join(differing) + ". They answer different questions and are not "
+                                   "interchangeable.")
+    same_number = [entry for entry in payload["alternatives"]
+                   if entry["published_threshold"] == suggestion["published_threshold"]
+                   and entry["scheme_key"] and entry["scheme_key"] != suggestion["scheme_key"]]
+    if same_number:
+        payload["disagreement"] = (payload["disagreement"] + " " if payload["disagreement"] else "") + (
+            "The same number is published on a different target set: "
+            + "; ".join(short_citation(entry["source"]) + " on " + entry["scheme_key"]
+                        + (" (" + str(entry["locus_count"]) + " targets)" if entry["locus_count"] else "")
+                        for entry in same_number)
+            + ". The same integer on a different scheme is not the same cutoff.")
+    return payload
 
 
 def review_age_days(today=None):
@@ -208,6 +390,12 @@ def record_decision(entry_id, context, *, selected_threshold=None, justification
     payload = {"format_version": 1, "catalog_version": CATALOG_VERSION, "reviewed_on": REVIEWED_ON,
                "created_at": datetime.now(timezone.utc).isoformat(), "entry_id": entry_id,
                "citation": source["citation"], "doi": source["doi"], "url": source["url"], "source": source,
+               # Frozen beside the citation so a report can print the authors'
+               # own warning, the scale their number belongs to and its full
+               # target set without re-reading a catalog that may have moved on.
+               "short_citation": short_citation(source), "caveat": entry["caveat"],
+               "published_organism": entry["organism"], "published_method": entry["method"],
+               "published_unit": entry["unit"], "published_locus_count": entry["locus_count"],
                "published_threshold": entry["published_threshold"], "approved_threshold": approved,
                "scheme_scope": entry["scheme_key"] or "Study-specific scheme not curated",
                "protocol_scope": entry["scope"], "context": context,

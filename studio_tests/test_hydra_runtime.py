@@ -21,6 +21,37 @@ def database(root):
     return root
 
 
+def complete_database(root, *, release="2026-08-07.1", separator="/",
+                      organisms=("Escherichia", "Klebsiella_pneumoniae", "Staphylococcus_aureus")):
+    """A store in the shape a real staged snapshot has: both sets, plus the catalogues.
+
+    ``separator`` reproduces a snapshot staged on Windows, whose manifest records
+    ``nucl\\ncbi`` and which must still read correctly wherever it is opened.
+    """
+    for relative in ("nucl/ncbi", "prot/protein"):
+        (root / relative).mkdir(parents=True)
+        (root / relative / "sequences.fna").write_text(">ref\nACGTACGT\n")
+    (root / "prot/protein/taxgroup.tsv").write_text(
+        "#taxgroup\tgpipe_taxgroup\tnumber_of_nucl_ref_genes\n"
+        + "".join(f"{name}\t{name}\t1\n" for name in (*organisms, "Pseudomonas_aeruginosa")))
+    (root / "mutation/dna").mkdir(parents=True)
+    for name in organisms:
+        (root / "mutation/dna" / f"{name}.fna").write_text(">locus\nACGT\n")
+    (root / "manifest.json").write_text(json.dumps({"hydra_db_version": 1, "databases": {
+        "ncbi": {"path": separator.join(("nucl", "ncbi")), "version": release, "kind": "nucl",
+                 "installed": "2026-09-12 18:41:37"},
+        "protein": {"path": separator.join(("prot", "protein")), "version": release, "kind": "prot",
+                    "installed": "2026-09-12 18:41:33", "organisms": list(organisms)}}}))
+    return root
+
+
+def capabilities(tools=None, version=None):
+    return {"assembly_available": True, "hydra_version": version or runtime.HYDRA_VERSION,
+            "tools": tools if tools is not None else {name: f"/tools/{name}"
+                                                      for name in runtime.TOOLS},
+            "databases": {}, "limitations": ["Assembly evidence only."]}
+
+
 @pytest.fixture
 def ready(monkeypatch, tmp_path):
     root = database(tmp_path / "reference")
@@ -174,3 +205,210 @@ def test_child_cancellation_terminates_owned_process(tmp_path, monkeypatch):
     with pytest.raises(AnalysisCancelled):
         runtime._run_child([], tmp_path, cancelled=lambda: time.monotonic() - started > 0.2)
     assert time.monotonic() - started < 15
+
+
+def test_a_run_with_no_reference_data_is_refused_before_anything_is_opened(tmp_path, monkeypatch):
+    """The silence the user reported as "HYDRA does not work" must become a sentence."""
+    assembly = tmp_path / "isolate.fasta"
+    assembly.write_text(">contig\nACGTACGT\n")
+    empty = tmp_path / "store"
+    empty.mkdir()
+    monkeypatch.setattr(runtime, "runtime_capabilities", lambda db_root=None: capabilities())
+    monkeypatch.setattr(runtime, "_run_child", lambda *args, **options: pytest.fail("must not launch"))
+    with pytest.raises(runtime.HydraRuntimeError) as failure:
+        runtime.run_assemblies([assembly], empty)
+    message = str(failure.value)
+    assert "HYDRA cannot start" in message and "nothing was run" in message
+    assert "every gene and mutation this screen can name" in message
+    assert str(empty) in message and "no reference database" in message
+    assert "Nothing is ever downloaded during a run." in message
+
+
+def test_a_missing_blast_tool_names_the_tool_and_the_search_it_performs(tmp_path, monkeypatch):
+    assembly = tmp_path / "isolate.fasta"
+    assembly.write_text(">contig\nACGTACGT\n")
+    store = complete_database(tmp_path / "store")
+    tools = {name: (None if name == "blastx" else f"/tools/{name}") for name in runtime.TOOLS}
+    monkeypatch.setattr(runtime, "runtime_capabilities",
+                        lambda db_root=None: capabilities(tools=tools))
+    monkeypatch.setattr(runtime, "_run_child", lambda *args, **options: pytest.fail("must not launch"))
+    with pytest.raises(runtime.HydraRuntimeError) as failure:
+        runtime.run_assemblies([assembly], store)
+    message = str(failure.value)
+    assert "blastx" in message and "point mutations are read" in message
+    assert "beside the application or on PATH" in message
+    # The tools that are present are not listed as problems.
+    assert "blastn —" not in message
+
+
+def test_an_unpinned_engine_is_refused_by_name_rather_than_run_anyway(tmp_path, monkeypatch):
+    store = complete_database(tmp_path / "store")
+    monkeypatch.setattr(runtime, "runtime_capabilities",
+                        lambda db_root=None: capabilities(version="0.9.0"))
+    checked = runtime.preflight(store)
+    assert checked["ready"] is False
+    assert f"HYDRA {runtime.HYDRA_VERSION}" in checked["message"]
+    assert "0.9.0 is installed" in checked["message"]
+
+
+def test_an_absent_reference_set_is_a_recorded_warning_not_a_silent_gap(tmp_path, monkeypatch):
+    """A store with no protein set still runs; what it could not look for is stated."""
+    monkeypatch.setattr(runtime, "runtime_capabilities", lambda db_root=None: capabilities())
+    checked = runtime.preflight(database(tmp_path / "partial"))
+    assert checked["ready"] is True and checked["databases"] == ["ncbi"]
+    warning = next(text for text in checked["warnings"] if "'protein'" in text)
+    assert "point-mutation catalogue" in warning
+    assert "that is not a negative result" in warning
+
+
+def test_a_store_staged_on_one_platform_is_readable_on_the_other(tmp_path):
+    """A Windows-staged manifest records nucl\\ncbi; the same snapshot must still read."""
+    store = complete_database(tmp_path / "windows", separator="\\")
+    assert sorted(runtime.installed_databases(store)) == ["ncbi", "protein"]
+    assert runtime.database_status(store)["release"] == "2026-08-07.1"
+    # Normalising separators must not weaken the containment check.
+    (store / "manifest.json").write_text(json.dumps(
+        {"databases": {"ncbi": {"path": "..\\outside"}}}))
+    with pytest.raises(runtime.HydraRuntimeError, match="leaves the selected store"):
+        runtime.installed_databases(store)
+
+
+def test_the_installed_release_is_labelled_with_its_version_date_and_age(tmp_path):
+    fresh = runtime.database_status(complete_database(tmp_path / "fresh"))
+    assert fresh["release"] == "2026-08-07.1" and fresh["staged"].startswith("2026-09-12")
+    assert fresh["age_days"] is not None and fresh["stale"] is False
+    assert "NCBI AMRFinderPlus reference release 2026-08-07.1" in fresh["label"]
+    assert "ncbi, protein" in fresh["label"] and "days old" in fresh["label"]
+
+    old = runtime.database_status(complete_database(tmp_path / "old", release="2019-01-01.1"))
+    assert old["stale"] is True and old["age_days"] > runtime.REFERENCE_AGE_DAYS
+
+    absent = runtime.database_status(tmp_path / "nothing-here")
+    assert absent["installed"] == {} and absent["age_days"] is None
+    assert absent["label"] == "No AMR reference database is installed."
+
+
+def test_the_organism_catalogue_separates_accepted_names_from_curated_ones(tmp_path):
+    catalogue = runtime.organism_catalogue(complete_database(tmp_path / "store"))
+    # Pseudomonas is an accepted taxgroup with no DNA catalogue staged for it.
+    assert "Pseudomonas_aeruginosa" in catalogue["accepted"]
+    assert "Pseudomonas_aeruginosa" not in catalogue["point_mutations"]
+    assert "Staphylococcus_aureus" in catalogue["point_mutations"]
+
+
+@pytest.mark.parametrize("assigned,expected", [
+    ("Staphylococcus aureus", "Staphylococcus_aureus"),
+    ("Klebsiella pneumoniae", "Klebsiella_pneumoniae"),
+    # Upstream groups every Escherichia at genus level; the species resolves to it.
+    ("Escherichia coli", "Escherichia"),
+    ("Listeria monocytogenes", None),
+    ("", None),
+])
+def test_an_assigned_organism_is_resolved_against_the_installed_catalogue(tmp_path, assigned,
+                                                                          expected):
+    store = complete_database(tmp_path / "store")
+    assert runtime.match_organism(assigned, store) == expected
+
+
+def test_a_spaced_organism_reaches_the_engine_in_the_form_it_accepts(tmp_path, monkeypatch):
+    """The assignment reads "Staphylococcus aureus"; the engine only takes the taxgroup."""
+    store = complete_database(tmp_path / "store")
+    assembly = tmp_path / "isolate.fasta"
+    assembly.write_text(">contig\nACGTACGT\n")
+    monkeypatch.setattr(runtime, "runtime_capabilities", lambda db_root=None: capabilities())
+    captured = []
+
+    def child(arguments, directory, cancelled=None, progress=None):
+        captured.extend(arguments)
+        output = Path(arguments[arguments.index("--outdir") + 1])
+        output.mkdir()
+        (output / "hydra.json").write_text(json.dumps({
+            "hydra_version": "1.4.0", "command": "hydra run", "databases": ["ncbi", "protein"],
+            "parameters": {}, "samples": [{"sample": "iso", "hits": []}]}))
+        return ["worker", *arguments], "done"
+
+    monkeypatch.setattr(runtime, "_run_child", child)
+    report = runtime.run_assemblies([assembly], store, sample_names=["iso"],
+                                    organism="Staphylococcus aureus")
+    assert captured[captured.index("--organism") + 1] == "Staphylococcus_aureus"
+    organism = report["execution_provenance"]["organism"]
+    assert organism["requested"] == "Staphylococcus aureus"
+    assert organism["resolved"] == "Staphylococcus_aureus"
+    assert report["execution_provenance"]["reference_release"]["release"] == "2026-08-07.1"
+
+
+def test_an_organism_with_no_catalogue_is_reported_not_replaced(tmp_path, monkeypatch):
+    store = complete_database(tmp_path / "store")
+    assembly = tmp_path / "isolate.fasta"
+    assembly.write_text(">contig\nACGTACGT\n")
+    monkeypatch.setattr(runtime, "runtime_capabilities", lambda db_root=None: capabilities())
+    captured = []
+
+    def child(arguments, directory, cancelled=None, progress=None):
+        captured.extend(arguments)
+        output = Path(arguments[arguments.index("--outdir") + 1])
+        output.mkdir()
+        (output / "hydra.json").write_text(json.dumps({
+            "hydra_version": "1.4.0", "command": "hydra run", "databases": ["ncbi"],
+            "parameters": {}, "samples": [{"sample": "iso", "hits": []}]}))
+        return ["worker", *arguments], "done"
+
+    monkeypatch.setattr(runtime, "_run_child", child)
+    report = runtime.run_assemblies([assembly], store, sample_names=["iso"],
+                                    organism="Listeria monocytogenes")
+    # Not passed at all, and no neighbouring organism's catalogue substituted.
+    assert "--organism" not in captured and "--no-auto-organism" in captured
+    warning = next(text for text in report["import_warnings"] if "Listeria" in text)
+    assert "not an absence of mutations" in warning
+    assert report["execution_provenance"]["organism"]["resolved"] == ""
+
+
+def test_a_store_that_publishes_no_catalogue_does_not_second_guess_the_caller(tmp_path):
+    """With nothing to check a name against, the caller's organism is passed through."""
+    store = database(tmp_path / "reference")
+    assert runtime.organism_catalogue(store)["accepted"] == []
+    checked = runtime.preflight(store, organism="Staphylococcus_aureus",
+                                capabilities=capabilities())
+    assert checked["organism"]["resolved"] == "Staphylococcus_aureus"
+
+
+def test_a_reference_release_older_than_the_threshold_says_so_before_the_run(tmp_path,
+                                                                             monkeypatch):
+    monkeypatch.setattr(runtime, "runtime_capabilities", lambda db_root=None: capabilities())
+    store = complete_database(tmp_path / "old", release="2019-01-01.1")
+    checked = runtime.preflight(store, organism="Staphylococcus aureus")
+    assert checked["ready"] is True
+    stale = next(text for text in checked["warnings"] if "days old" in text)
+    assert "Determinants named after it are not in it" in stale
+
+
+def test_the_database_surface_says_what_an_empty_store_would_report(tmp_path):
+    """A table with no rows reads as "nothing found"; the gap must be said in words."""
+    from wmlstudio.amr_databases import AMRDatabaseDialog
+
+    nothing = AMRDatabaseDialog.gap_sentence(runtime.database_status(tmp_path / "absent"))
+    assert "would have nothing to search" in nothing
+    assert "That is not a negative result." in nothing
+
+    partial = AMRDatabaseDialog.gap_sentence(runtime.database_status(database(tmp_path / "part")))
+    assert "Missing: protein" in partial and "point-mutation catalogue" in partial
+
+    complete = AMRDatabaseDialog.gap_sentence(
+        runtime.database_status(complete_database(tmp_path / "full")))
+    assert "Missing:" not in complete and "screened for genes only" in complete
+
+    old = AMRDatabaseDialog.gap_sentence(
+        runtime.database_status(complete_database(tmp_path / "old", release="2019-01-01.1")))
+    assert "days old" in old and "Determinants named after it are not in it" in old
+
+
+def test_a_named_database_that_is_absent_stops_the_run_rather_than_quietly_narrowing_it(
+        tmp_path, monkeypatch):
+    """Asking for ncbi and protein and getting only ncbi answers a different question."""
+    monkeypatch.setattr(runtime, "runtime_capabilities", lambda db_root=None: capabilities())
+    partial = database(tmp_path / "partial")
+    asked = runtime.preflight(partial, databases=["ncbi", "protein"])
+    assert asked["ready"] is False and "protein" in asked["message"]
+    # The same store, with nothing named, runs on what it has and says what it lost.
+    defaulted = runtime.preflight(partial)
+    assert defaulted["ready"] is True and defaulted["databases"] == ["ncbi"]

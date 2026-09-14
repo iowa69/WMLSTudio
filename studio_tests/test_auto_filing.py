@@ -14,7 +14,9 @@ from wmlstudio.storage import (
     assign_organism,
     confirm_organism,
     delete_managed_copy,
+    filing_policy,
     import_samples,
+    intake_samples,
     managed_copy_for,
     organize_sample,
     plan_filing,
@@ -23,7 +25,10 @@ from wmlstudio.storage import (
     reassign_organism,
     refile_samples,
     remove_samples,
+    review_bucket,
     safe_component,
+    sample_for_digest,
+    set_filing_policy,
 )
 
 
@@ -411,3 +416,172 @@ def test_a_linked_original_is_relabelled_but_never_adopted_into_managed_storage(
     assert not root.exists(), "a file the user keeps in place is never copied into managed storage"
     report = refile_samples(project, [sid])
     assert report["moved"] == [] and report["skipped"] == [(sid, plan["reason"])]
+
+
+@pytest.fixture
+def practice_panel(tmp_path):
+    """Two references and an inbox of real bytes: one match each, one stranger, one read set."""
+    genomes = {seed: "".join(random.Random(seed).choices("ACGT", k=200_000)) for seed in (1, 2, 3)}
+    panel = ani_panel(tmp_path / "panel", [("kp", "Klebsiella", "pneumoniae", genomes[1]),
+                                           ("pa", "Pseudomonas", "aeruginosa", genomes[2])])
+    inbox = tmp_path / "inbox"
+    files = {"first": sequence(inbox / "first.fasta", genomes[1]),
+             "second": sequence(inbox / "second.fasta", genomes[2]),
+             "stranger": sequence(inbox / "stranger.fasta", genomes[3])}
+    reads = inbox / "sample_R1.fastq"
+    reads.parent.mkdir(parents=True, exist_ok=True)
+    reads.write_text("@read1\nACGTACGT\n+\nIIIIIIII\n")
+    files["reads"] = reads
+    return {"panel": panel, "files": files}
+
+
+def test_loading_a_file_once_identifies_files_and_stores_them_under_their_organism(project, tmp_path, practice_panel):
+    root = tmp_path / "managed"
+    files = practice_panel["files"]
+    report = intake_samples(project, [files["first"], files["second"]], storage_root=root,
+                            species_panel_root=practice_panel["panel"])
+
+    assert len(report["imported"]) == 2 and report["needs_review"] == []
+    filed = {Path(sample["input_path"]).relative_to(root).parts[:2] for sample in project.samples()}
+    assert filed == {("Klebsiella", "pneumoniae"), ("Pseudomonas", "aeruginosa")}
+    for sample in project.samples():
+        evidence = sample["metadata"]["organism_evidence"]
+        assert evidence["status"] == "confirmed" and evidence["basis"] == "genomic_ani"
+        assert evidence["confidence"] == "genomic_reference_supported"
+        # Filed by the copy that was made, not copied once and moved afterwards.
+        assert not [event for event in project.history(sample["id"])
+                    if event["action"] == "input_relocated"]
+        assert plan_filing(project, sample["id"])["changed"] is False
+    assert len([path for path in root.rglob("*.fasta") if path.is_file()]) == 2
+    assert all(path.exists() for path in files.values())
+
+
+def test_an_unidentifiable_file_still_imports_and_waits_under_a_named_reason(project, tmp_path, practice_panel):
+    root = tmp_path / "managed"
+    files = practice_panel["files"]
+    report = intake_samples(project, [files["stranger"], files["reads"]], storage_root=root,
+                            species_panel_root=practice_panel["panel"])
+
+    assert len(report["imported"]) == 2 and len(report["needs_review"]) == 2
+    buckets = {Path(sample["input_path"]).relative_to(root).parts[:2]
+               for sample in project.samples()}
+    assert buckets == {(QUARANTINE_ROOT, "Not_in_reference_panel"),
+                       (QUARANTINE_ROOT, "Reads_not_assembled")}
+    for sample in project.samples():
+        assert sample["metadata"]["organism"] == {"genus": "", "species": ""}
+        assert sample["status"] == "queued"  # Still a first-class sample, still analysable.
+    assert "Needs review" in report["identification"]["notice"]
+
+
+def test_without_a_reference_panel_every_file_imports_and_the_report_says_why(project, tmp_path, practice_panel):
+    root = tmp_path / "managed"
+    files = practice_panel["files"]
+    report = intake_samples(project, [files["first"], files["second"]], storage_root=root)
+
+    assert len(report["imported"]) == 2 and len(report["needs_review"]) == 2
+    assert report["identification"]["available"] is False
+    assert "No species reference panel is installed" in report["identification"]["notice"]
+    assert "Install the species reference panel" in report["identification"]["notice"]
+    for sample in project.samples():
+        assert Path(sample["input_path"]).relative_to(root).parts[0] == QUARANTINE_ROOT
+        assert sample["metadata"]["organism_evidence"]["status"] == "quarantined"
+
+
+def test_offering_the_same_file_again_never_produces_a_second_isolate(project, tmp_path, practice_panel):
+    root = tmp_path / "managed"
+    original = practice_panel["files"]["first"]
+    first = intake_samples(project, [original], storage_root=root,
+                           species_panel_root=practice_panel["panel"])
+    again = intake_samples(project, [original], storage_root=root,
+                           species_panel_root=practice_panel["panel"])
+    assert again["imported"] == []
+    assert again["skipped"][0]["duplicate_of"] == first["imported"][0]
+    assert len(project.samples()) == 1
+    assert len([path for path in root.rglob("*.fasta") if path.is_file()]) == 1
+
+    # The same bytes under another name, and two copies inside one drop, are the same isolate.
+    elsewhere = sequence(tmp_path / "second_run" / "renamed.fasta", original.read_text().split("\n")[1])
+    twin = sequence(tmp_path / "third_run" / "twin.fasta", original.read_text().split("\n")[1])
+    mixed = intake_samples(project, [elsewhere, twin], storage_root=root,
+                           species_panel_root=practice_panel["panel"])
+    assert mixed["imported"] == []
+    assert {entry["duplicate_of"] for entry in mixed["skipped"]} == {first["imported"][0]}
+    assert len(project.samples()) == 1
+    assert sample_for_digest(project, file_sha256(original)) == first["imported"][0]
+
+
+def test_a_project_policy_that_reviews_everything_is_obeyed_by_intake(project, tmp_path, practice_panel):
+    root = tmp_path / "managed"
+    assert filing_policy(project)["auto_confirm"] is True
+    effective = set_filing_policy(project, auto_confirm=False)
+    assert effective["auto_confirm"] is False
+
+    report = intake_samples(project, [practice_panel["files"]["first"]], storage_root=root,
+                            species_panel_root=practice_panel["panel"])
+    sample = project.get_sample(report["imported"][0])
+    assert Path(sample["input_path"]).relative_to(root).parts[:2] == (QUARANTINE_ROOT,
+                                                                     "Awaiting_identification")
+    evidence = sample["metadata"]["organism_evidence"]
+    # A proposal nobody accepted is not a decision, so it stays a proposal and the
+    # file keeps waiting for review instead of drifting into a genus folder.
+    assert evidence["status"] == "proposed"
+    assert review_bucket(sample["metadata"]) == "awaiting_identification"
+    assert refile_samples(project, [report["imported"][0]])["unchanged"] == report["imported"]
+    # The proposal is kept verbatim so a reviewer sees what the comparison found.
+    assert evidence["proposed"] == {"genus": "Klebsiella", "species": "pneumoniae"}
+    assert evidence["confidence"] == "genomic_reference_supported"
+
+    confirm_organism(project, [report["imported"][0]], "Klebsiella", "pneumoniae")
+    refile_samples(project, [report["imported"][0]])
+    filed = Path(project.get_sample(report["imported"][0])["input_path"]).relative_to(root)
+    assert filed.parts[:2] == ("Klebsiella", "pneumoniae")
+
+
+def test_an_unknown_filing_floor_is_refused_before_anything_is_stored(project):
+    with pytest.raises(ValueError, match="confidence floor"):
+        set_filing_policy(project, min_confidence="pretty_sure")
+    assert filing_policy(project)["min_confidence"] == "genomic_reference_supported"
+
+
+def test_installing_the_panel_later_identifies_the_waiting_samples_and_files_them(project, tmp_path, practice_panel):
+    from wmlstudio.storage import reidentify_samples
+    root = tmp_path / "managed"
+    files = practice_panel["files"]
+    first = intake_samples(project, [files["first"], files["stranger"]], storage_root=root)
+    assert len(first["needs_review"]) == 2
+    assert first["identification"]["available"] is False
+
+    report = reidentify_samples(project, species_panel_root=practice_panel["panel"],
+                                storage_root=root)
+    assert [genus for _, genus, _ in report["accepted"]] == ["Klebsiella"]
+    # One was filed by organism; the other moved to the bucket that names why it was not.
+    assert [bucket for _, bucket in report["waiting"]] == ["not_in_reference_panel"]
+    assert len(report["moved"]) == 2
+    filed = {sample["name"]: Path(sample["input_path"]).relative_to(root).parts[:2]
+             for sample in project.samples()}
+    assert filed["first"] == ("Klebsiella", "pneumoniae")
+    assert filed["stranger"] == (QUARANTINE_ROOT, "Not_in_reference_panel")
+    # Nothing was imported again: one isolate per file, one managed copy per isolate.
+    assert len(project.samples()) == 2
+    assert len([path for path in root.rglob("*.fasta") if path.is_file()]) == 2
+    evidence = next(sample for sample in project.samples()
+                    if sample["name"] == "first")["metadata"]["organism_evidence"]
+    assert evidence["status"] == "confirmed" and evidence["basis"] == "genomic_ani"
+    assert evidence["confirmed_by"] == "auto_policy"
+
+
+def test_a_decision_a_person_made_is_never_overwritten_by_a_fresh_comparison(project, tmp_path, practice_panel):
+    from wmlstudio.storage import reidentify_samples
+    root = tmp_path / "managed"
+    report = intake_samples(project, [practice_panel["files"]["first"]], storage_root=root)
+    sid = report["imported"][0]
+    confirm_organism(project, [sid], "Enterobacter", "cloacae")
+    refile_samples(project, [sid], storage_root=root)
+
+    again = reidentify_samples(project, [sid], species_panel_root=practice_panel["panel"],
+                               storage_root=root)
+    assert again["accepted"] == [] and again["verdicts"] == []
+    assert "already accepted" in again["skipped"][0][1]
+    sample = project.get_sample(sid)
+    assert sample["metadata"]["organism"] == {"genus": "Enterobacter", "species": "cloacae"}
+    assert Path(sample["input_path"]).relative_to(root).parts[:2] == ("Enterobacter", "cloacae")

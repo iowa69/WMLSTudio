@@ -21,6 +21,23 @@ from .comparison import _known_calls, _sample_key, forest_from_distances, pairwi
 from .sequence import check_cancelled
 
 METRIC_VERSION = "shared-unambiguous-alleles-v1"
+# A classical MLST comparison and a core-genome comparison are two different
+# measurements of two different locus sets. Everything in this module that names
+# a distance also names which of the two produced it, because the numbers look
+# alike on screen and mean entirely different things.
+SCALE_SEPARATION = (
+    "A classical 7-locus MLST distance and a core-genome MLST distance are different quantities "
+    "measured over different loci. They never share a scale, an axis, a column or a threshold, and "
+    "a cutoff published for one of them is not a cutoff for the other."
+)
+TYPING_SCALES = {
+    "mlst": {"title": "Classical MLST", "target_word": "loci",
+             "question": "Which sequence type is this isolate?"},
+    "cgmlst": {"title": "cgMLST", "target_word": "targets",
+               "question": "How close are these isolates across the core genome?"},
+    "unclassified": {"title": "Unclassified typing", "target_word": "loci",
+                     "question": "Which loci were compared is not recorded."},
+}
 INTERPRETATION = (
     "Single-linkage clusters describe allele similarity, not proven transmission. "
     "A chain can join isolates whose direct distance exceeds the threshold. "
@@ -59,6 +76,49 @@ def profile_signature(result):
                     "input_sha256": result.get("input_sha256"),
                     "loci": sorted(map(str, result.get("alleles", {}))),
                     "called": _known_calls(result)})
+
+
+def _profile_loci(profile):
+    """Every locus key a profile carries, called or not — the denominator, not the numerator."""
+    keys = profile.get("profile_loci")
+    if keys is None:
+        alleles = profile.get("alleles")
+        keys = alleles if isinstance(alleles, dict) else (profile.get("known_alleles") or {})
+    return {str(key) for key in (keys or ())}
+
+
+def typing_scale(profiles, kind="", *, scheme=None, scheme_digest=None):
+    """Name the quantity one comparison measures: typing kind, reference, target count.
+
+    ``targets`` is the union of every locus key the profiles carry, never the
+    number of loci that happened to be called: the denominator belongs beside the
+    distance, and a locus that produced no call has not stopped being a target.
+    ``kind`` is stated by the caller from the stored typing kind rather than
+    guessed here, and an unstated kind stays "unclassified" instead of being
+    inferred from how many loci the panel happens to have.
+    """
+    rows = [row for row in (profiles or []) if isinstance(row, dict)]
+    loci = set()
+    for row in rows:
+        loci.update(_profile_loci(row))
+    kind = str(kind or "").strip().casefold() or "unclassified"
+    words = TYPING_SCALES.get(kind, TYPING_SCALES["unclassified"])
+    if scheme is None:
+        names = {str(row.get("scheme") or "") for row in rows} - {""}
+        scheme = next(iter(names)) if len(names) == 1 else ""
+    if scheme_digest is None:
+        digests = {str(row.get("scheme_digest") or "") for row in rows} - {""}
+        scheme_digest = next(iter(digests)) if len(digests) == 1 else ""
+    targets = len(loci)
+    return {"kind": kind, "title": words["title"], "target_word": words["target_word"],
+            "question": words["question"], "scheme": scheme, "scheme_digest": scheme_digest,
+            "targets": targets, "profiles": len(rows),
+            "unit": f"allele differences over {targets} {words['target_word']}" if targets
+                    else "allele differences (no target set recorded)",
+            "caption": " · ".join(filter(None, [
+                words["title"], scheme or "reference not recorded",
+                f"{targets} {words['target_word']}" if targets else "target count not recorded"])),
+            "separation": SCALE_SEPARATION}
 
 
 def incremental_distances(results, min_overlap=0.95, previous=None, *, cancelled=None):
@@ -191,7 +251,8 @@ def threshold_clusters(results, rows, threshold, *, previous=None, cancelled=Non
     return {"groups": groups, "next_cluster_number": next_number}
 
 
-def build_snapshot(results, rows, threshold, min_overlap, *, previous=None, reuse=None, cancelled=None):
+def build_snapshot(results, rows, threshold, min_overlap, *, previous=None, reuse=None, kind="",
+                   cancelled=None):
     results = list(results)
     schemes = {(r.get("scheme"), r.get("scheme_digest")) for r in results}
     if len(schemes) > 1 or any(not name or not digest for name, digest in schemes):
@@ -213,9 +274,16 @@ def build_snapshot(results, rows, threshold, min_overlap, *, previous=None, reus
                             profile_loci=sorted(map(str, result.get("alleles", {}))),
                             signature=profile_signature(result), callable_loci=len(known),
                             total_loci=len(result.get("alleles", {})))
+    scale = typing_scale(profiles, kind, scheme=results[0].get("scheme") if results else "",
+                         scheme_digest=results[0].get("scheme_digest") if results else "")
     return {"format_version": 1, "snapshot_id": uuid.uuid4().hex, "created_at": _now(),
             "scheme": results[0].get("scheme") if results else "",
             "scheme_digest": results[0].get("scheme_digest") if results else "",
+            # The typing kind and the size of the target set travel inside the
+            # snapshot, so a stored comparison can never be read back beside a
+            # comparison of the other kind without the difference being visible.
+            "typing_kind": scale["kind"], "target_loci": scale["targets"],
+            "scale_caption": scale["caption"], "scale_separation": SCALE_SEPARATION,
             "threshold": threshold, "min_overlap": min_overlap, "metric_version": METRIC_VERSION,
             "missing_policy": "Shared callable loci / union of profile loci; excluded pairs have no distance.",
             "interpretation": INTERPRETATION, "profiles": profiles, "pairs": deepcopy(rows),
@@ -277,6 +345,7 @@ def _snapshot_facts(snapshot):
             "investigation_id": snapshot.get("investigation_id"),
             "investigation_name": snapshot.get("investigation_name", ""),
             "scheme": snapshot.get("scheme", ""), "scheme_digest": snapshot.get("scheme_digest", ""),
+            "typing_kind": snapshot.get("typing_kind", ""), "target_loci": snapshot.get("target_loci"),
             "threshold": snapshot.get("threshold"), "min_overlap": snapshot.get("min_overlap"),
             "metric_version": snapshot.get("metric_version", ""),
             "cohort_size": len(snapshot.get("profiles", []))}
@@ -284,12 +353,25 @@ def _snapshot_facts(snapshot):
 
 def _diff_policy(baseline, current):
     """Decide whether two snapshots are on one measurement scale at all."""
+    # A recorded typing kind is compared only against another recorded one: an
+    # older snapshot that predates the field is unknown, not "the same kind".
+    kinds_known = bool(baseline["typing_kind"]) and bool(current["typing_kind"])
+    fields = ["scheme", "scheme_digest", "metric_version", "threshold", "min_overlap"]
+    if kinds_known:
+        fields.insert(0, "typing_kind")
     differences = [{"field": field, "baseline": baseline[field], "current": current[field]}
-                   for field in ("scheme", "scheme_digest", "metric_version", "threshold", "min_overlap")
-                   if baseline[field] != current[field]]
+                   for field in fields if baseline[field] != current[field]]
     blocking = sorted({field for field in ("scheme_digest", "metric_version")
-                       if baseline[field] != current[field] or not baseline[field] or not current[field]})
-    if blocking:
+                       if baseline[field] != current[field] or not baseline[field] or not current[field]}
+                      | ({"typing_kind"} if kinds_known
+                         and baseline["typing_kind"] != current["typing_kind"] else set()))
+    if "typing_kind" in blocking:
+        names = [TYPING_SCALES.get(facts["typing_kind"], TYPING_SCALES["unclassified"])["title"]
+                 for facts in (baseline, current)]
+        reason = (f"The baseline is a {names[0]} comparison and the current one is a {names[1]} "
+                  "comparison. " + SCALE_SEPARATION + " Only which isolates were added or removed "
+                  "is reported here.")
+    elif blocking:
         reason = ("These snapshots were not measured on one scale (" + ", ".join(blocking) + " differs or is "
                   "unrecorded). Allele distances from different references or metrics are not comparable, so "
                   "no distance, edge or cluster comparison is offered here; only which isolates were added "
@@ -649,6 +731,8 @@ def snapshot_diff_html(diff):
         item = diff[role]
         facts.append([title, item.get("investigation_name") or "Unsaved investigation",
                       item.get("created_at") or "not recorded", item.get("cohort_size"),
+                      TYPING_SCALES.get(item.get("typing_kind") or "", {}).get("title") or "not recorded",
+                      item.get("target_loci") if item.get("target_loci") is not None else "not recorded",
                       item.get("threshold"), item.get("min_overlap"),
                       item.get("scheme") or "not recorded",
                       str(item.get("scheme_digest") or "not recorded")[:12]])
@@ -656,8 +740,9 @@ def snapshot_diff_html(diff):
     banner = "notice" if not policy["identical"] else "plain"
     parts = ["<h2>What changed since the baseline</h2>",
              f"<p class='{banner}'>{escape(policy['reason'])}</p>",
-             _diff_table(["Panel", "Investigation", "Built", "Isolates", "Link ≤", "Shared ≥",
-                          "Reference", "Fingerprint"], facts),
+             _diff_table(["Panel", "Investigation", "Built", "Isolates", "Typing", "Targets",
+                          "Link ≤", "Shared ≥", "Reference", "Fingerprint"], facts),
+             f"<p class='notice'>{escape(SCALE_SEPARATION)}</p>",
              "<h3>Isolates</h3>",
              "<p>Cohort membership first: an isolate that is present in only one snapshot never reads "
              "as an unchanged distance.</p>"]
@@ -745,6 +830,166 @@ def snapshot_diff_html(diff):
     parts.append("<h3>How to read this</h3><ul class='notice'>"
                  + "".join(f"<li>{escape(str(caveat))}</li>" for caveat in diff["caveats"]) + "</ul>")
     return "".join(parts)
+
+
+# The curated catalogue is keyed on a published scheme identity such as
+# "cgmlst.org:kpneumoniae-2358", never on an organism name. An installed
+# reference states its own key in its metadata under one of these fields; a
+# reference that states none is simply not bound, and no cutoff is offered.
+GUIDANCE_KEY_FIELDS = ("threshold_scheme_key", "guidance_scheme_key", "scheme_key")
+
+
+def scheme_key_from(*sources):
+    """The curated publication key a reference declares for itself, or ''.
+
+    Only an explicit declaration counts. Matching a catalogue entry by organism
+    name, by genus or by locus count would attach a published cutoff to a panel
+    the publication never evaluated, so nothing of the sort is attempted: an
+    unbound reference returns '' and the caller reports the gap.
+    """
+    for source in sources:
+        if not isinstance(source, dict):
+            continue
+        containers = [source, source.get("scheme_metadata"), source.get("metadata"),
+                      (source.get("context") if isinstance(source.get("context"), dict) else None)]
+        for container in containers:
+            if not isinstance(container, dict):
+                continue
+            for field in GUIDANCE_KEY_FIELDS:
+                value = container.get(field)
+                if isinstance(value, str) and value.strip():
+                    return value.strip()
+    return ""
+
+
+def _citation_label(entry):
+    source = entry.get("source") or {}
+    citation = str(source.get("citation") or "")
+    return citation.split(".")[0].strip() or entry.get("source_id", "")
+
+
+def _installed_scheme_suggestion(base, catalog_key, targets):
+    """Ask the installed-scheme catalogue, which is keyed on the pinned scheme itself.
+
+    ``cgmlst_schemes.threshold_for`` binds a cutoff only when the installed scheme
+    is the pinned one and its target count is the full published set, and it
+    refuses outright for a classical MLST distance. Its verdict is used as given;
+    nothing here re-derives, relaxes or scales it.
+    """
+    from . import cgmlst_schemes
+    bound = cgmlst_schemes.threshold_for(catalog_key, locus_count=targets)
+    # The same filter the catalogue applied when it decided a number was offerable:
+    # a row curated for a different target set stays a citation, never a cutoff.
+    entries = [row for row in bound["entries"] if row.get("published_threshold") is not None
+               and row.get("locus_count") in (None, bound["catalogue_locus_count"])]
+    result = {**base, "scheme_key": bound.get("scheme_key") or base["scheme_key"],
+              "catalog_key": catalog_key, "interpretation": bound["interpretation"],
+              "reason": bound["reason"], "entries": [], "mismatched": bound["entries"]}
+    if bound["status"] != "threshold_offerable":
+        result["status"] = ("target_count_mismatch" if bound["status"] == "target_count_mismatch"
+                            else "no_curated_entry")
+        result["headline"] = ("A published cutoff exists for this reference but does not apply as "
+                              "measured." if bound["status"] == "target_count_mismatch"
+                              else f"No reviewed cutoff is offered for {bound['organism']}.")
+        return result
+    result.update(status="available", entries=entries, mismatched=[])
+    if len(entries) == 1:
+        entry = entries[0]
+        result["headline"] = (f"Published cutoff for this reference: ≤ {entry['published_threshold']} "
+                              f"{entry['unit']} over {bound['catalogue_locus_count']} targets — "
+                              f"{_citation_label(entry)} (doi:{entry['source']['doi']}).")
+    else:
+        result["headline"] = (f"{len(entries)} published cutoffs are bound to this reference: "
+                              + "; ".join(f"≤ {row['published_threshold']} ({_citation_label(row)})"
+                                          for row in entries) + ".")
+    result["reason"] = "Not applied. " + bound["reason"]
+    return result
+
+
+def scheme_threshold_suggestion(scheme_key, *, method="cgmlst", targets=None, scheme="",
+                                catalog_key=""):
+    """Published cutoffs bound to exactly this reference — offered, never applied.
+
+    The catalogue is keyed on the published scheme identity and on the full
+    published target set, so a suggestion appears only when the installed
+    reference declares that identity and the comparison measures that many
+    targets. Every returned entry keeps ``auto_apply`` false: nothing here moves
+    the threshold in use, and adopting a number still goes through
+    :func:`wmlstudio.threshold_guidance.record_decision`, which refuses without an
+    exact scheme binding, a matching target count and a recorded local
+    justification. An absent suggestion is an evidence gap, never an endorsement
+    of whatever number is currently set.
+    """
+    from . import threshold_guidance
+    CATALOG_VERSION, REVIEWED_ON = threshold_guidance.CATALOG_VERSION, threshold_guidance.REVIEWED_ON
+    SOURCES, catalog_entries = threshold_guidance.SOURCES, threshold_guidance.catalog_entries
+    GUIDANCE_INTERPRETATION = threshold_guidance.INTERPRETATION
+    key = str(scheme_key or "").strip()
+    method = str(method or "").strip().casefold()
+    base = {"scheme_key": key, "method": method, "targets": targets, "scheme": str(scheme or ""),
+            "catalog_key": str(catalog_key or ""),
+            "catalog_version": CATALOG_VERSION, "reviewed_on": REVIEWED_ON, "auto_apply": False,
+            "entries": [], "mismatched": [], "interpretation": GUIDANCE_INTERPRETATION,
+            "separation": SCALE_SEPARATION,
+            "detail": "No cutoff is applied automatically. Review the target set, the caller, the "
+                      "missing-data policy and the epidemiological question before adopting any number."}
+    if catalog_key and method == "cgmlst":
+        try:
+            return _installed_scheme_suggestion(base, catalog_key, targets)
+        except (ImportError, ValueError):
+            # An unknown pin (SchemeCatalogError is a ValueError) binds nothing.
+            # The declared-key path below still applies, and if that finds nothing
+            # the caller reports the gap rather than offering a number.
+            pass
+    if not key:
+        return {**base, "status": "no_scheme_binding",
+                "headline": "No published cutoff is bound to this reference.",
+                "reason": "This reference declares no curated publication key, so no catalogue entry is "
+                          "bound to it. That is a gap in the evidence available here, not a finding that "
+                          "no publication exists, and it is not support for the threshold now in use."}
+    matches = []
+    for entry in catalog_entries():
+        if entry["scheme_key"] == key and entry["method"] == method:
+            entry["source"] = deepcopy(SOURCES[entry["source_id"]])
+            matches.append(entry)
+    if not matches:
+        return {**base, "status": "no_curated_entry",
+                "headline": f"No reviewed cutoff is curated for {key}.",
+                "reason": f"The catalogue holds no {method or 'matching'} entry bound to {key}. A cutoff "
+                          "published for another scheme of the same organism is a different target set and "
+                          "is not offered here."}
+    usable, mismatched = [], []
+    for entry in matches:
+        published = entry["published_threshold"]
+        expected = entry["locus_count"]
+        if published is None or (expected is not None and targets is not None and expected != targets):
+            mismatched.append(entry)
+        else:
+            usable.append(entry)
+    if not usable:
+        blocked = next((e for e in mismatched if e["published_threshold"] is not None), mismatched[0])
+        if blocked["published_threshold"] is None:
+            reason = (f"{_citation_label(blocked)} is curated for this reference but establishes no "
+                      "transferable numeric cutoff. The citation is context for a local decision, not a number.")
+        else:
+            reason = (f"The catalogue binds ≤ {blocked['published_threshold']} to the full "
+                      f"{blocked['locus_count']}-target set, but this comparison measures {targets}. The "
+                      "published target set is required in full; there is no scaling for a reduced, "
+                      "extended or partially called panel.")
+        return {**base, "status": "target_count_mismatch", "mismatched": mismatched,
+                "headline": "A published cutoff exists for this reference but does not apply as measured.",
+                "reason": reason}
+    if len(usable) == 1:
+        entry = usable[0]
+        headline = (f"Published cutoff for this reference: ≤ {entry['published_threshold']} "
+                    f"{entry['unit']} over {entry['locus_count']} targets — {_citation_label(entry)} "
+                    f"(doi:{entry['source']['doi']}).")
+    else:
+        headline = (f"{len(usable)} published cutoffs are bound to this reference: "
+                    + "; ".join(f"≤ {e['published_threshold']} ({_citation_label(e)})" for e in usable) + ".")
+    return {**base, "status": "available", "entries": usable, "mismatched": mismatched,
+            "headline": headline,
+            "reason": "Not applied. " + base["detail"]}
 
 
 def threshold_guidance_status(snapshot):

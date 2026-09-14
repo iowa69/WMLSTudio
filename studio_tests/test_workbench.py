@@ -21,8 +21,13 @@ from wmlstudio.context_menus import SEPARATOR, Selection
 from wmlstudio.library import export_bundle
 from wmlstudio.project import Project
 from wmlstudio.sample_workflow import set_cluster
-from wmlstudio.storage import import_samples
+from wmlstudio.storage import confirm_organism, import_samples, quarantine_samples
 from wmlstudio.typing import load_scheme
+from wmlstudio.ui_workbench import (
+    REVIEW_STYLES,
+    identification_support,
+    organism_review,
+)
 from wmlstudio.workflow_dialogs import BatchAssignmentDialog, ImportSamplesDialog
 
 ARC = "AACCGTACGTTAG"
@@ -58,9 +63,10 @@ def make_scheme(path, locus="arcA", st="17"):
     return path
 
 
-def assembly(path):
+def assembly(path, tail=""):
+    """A typeable assembly. `tail` makes two isolates genuinely different bytes."""
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(f">one\n{ARC}\n>two\n{GYR}\n")
+    path.write_text(f">one\n{ARC}\n>two\n{GYR}\n" + (f">tail\n{tail}\n" if tail else ""))
     return path
 
 
@@ -163,7 +169,8 @@ def test_assembly_queue_associates_reads_then_runs_real_typing(workbench, qtbot,
 def test_import_dialog_actual_worker_copy_typing_and_st_filename(workbench, qtbot, tmp_path, monkeypatch):
     scheme = make_scheme(workbench.root / "schemes" / "local_mlst")
     workbench.populate_schemes()
-    originals = [assembly(tmp_path / "incoming" / f"sample{i}.fasta") for i in range(2)]
+    originals = [assembly(tmp_path / "incoming" / f"sample{i}.fasta", "ACGT" * (i + 1))
+                 for i in range(2)]
     before = {path: path.read_bytes() for path in originals}
     managed = tmp_path / "managed"
 
@@ -516,5 +523,441 @@ def test_refiling_shows_where_each_managed_copy_goes_before_moving_it(workbench,
     assert "filing decision rather than a laboratory identification" in asked["text"]
     filed = Path(workbench.project.get_sample(sid)["input_path"])
     assert filed.relative_to(managed).parts[0] == "Enterobacter" and filed.is_file()
+    assert source.is_file()
+    assert workbench.test_errors == []
+
+
+# --- the Samples hub: one load, four angles, and a gate before every run -----
+
+
+def column_of(table, title):
+    """The column a header names, so a reordered view never silently changes a test."""
+    return next(index for index in range(table.columnCount())
+                if table.horizontalHeaderItem(index).text() == title)
+
+
+def row_of(table, name):
+    return next(row for row in range(table.rowCount()) if table.item(row, 0).text() == name)
+
+
+def headers(table):
+    return [table.horizontalHeaderItem(i).text() for i in range(table.columnCount())]
+
+
+def local_scheme(window, folder, genus, species="", *, loci=2, name=None):
+    """An installed reference that records the organism it was built from."""
+    path = window.root / "schemes" / folder
+    path.mkdir(parents=True, exist_ok=True)
+    for index in range(loci):
+        (path / f"locus{index:03d}.tfa").write_text(f">locus{index:03d}_1\n{ARC}\n")
+    (path / "scheme.json").write_text(json.dumps(
+        {"name": name or folder, "organism": {"genus": genus, "species": species}}))
+    window.populate_schemes()
+    return path
+
+
+def evidence_for(genus, species, *, basis="genomic_ani", confidence="genomic_reference_supported",
+                 status="confirmed"):
+    accepted = {"genus": genus, "species": species} if status == "confirmed" else {"genus": "", "species": ""}
+    return {"format_version": 1, "status": status, "basis": basis, "confidence": confidence,
+            "proposed": {"genus": genus, "species": species}, "accepted": accepted,
+            "quarantine_reason": None}
+
+
+def identified(window, sid, genus, species, **kwargs):
+    window.project.update_metadata(sid, {"organism": {"genus": genus, "species": species},
+                                         "organism_evidence": evidence_for(genus, species, **kwargs)})
+
+
+def select_only(window, sid):
+    window.selection_ids = {sid}
+    window.refresh()
+    window.update_step_gates()
+
+
+def test_st_and_cgmlst_are_separate_sub_tabs_with_their_own_schemes_and_denominators(workbench, tmp_path):
+    source = assembly(tmp_path / "inbox" / "both.fasta", "AAAA")
+    sid = workbench.project.add_sample(source, "both")
+    identified(workbench, sid, "Klebsiella", "pneumoniae")
+    workbench.project.set_result(sid, {"sample_name": "both", "kind": "fasta", "status": "complete",
+                                       "scheme": "klebsiella_mlst", "scheme_digest": "mlst-digest",
+                                       "st": "17", "alleles": {"arcA": "1", "gyrB": "1"}, "calls": []},
+                                 kind="mlst")
+    targets = {f"core{index:04d}": (str(index + 1) if index < 35 else None) for index in range(40)}
+    workbench.project.set_result(sid, {"sample_name": "both", "kind": "fasta", "status": "incomplete",
+                                       "scheme": "klebsiella_cgmlst", "scheme_digest": "cg-digest",
+                                       "st": None, "alleles": targets, "calls": []}, kind="cgmlst")
+    workbench.refresh()
+
+    assert [workbench.sample_tabs.tabText(i) for i in range(workbench.sample_tabs.count())] == \
+        ["Assembly", "ST", "cgMLST", "HYDRA"]
+
+    roster = workbench.sample_table
+    assert roster.item(row_of(roster, "both"), column_of(roster, "ST (7-locus)")).text() == "ST 17", \
+        "a later cgMLST run must not take over the seven-locus ST column"
+
+    st_table = workbench.step_tables["st"]
+    st_row = row_of(st_table, "both")
+    assert st_table.item(st_row, column_of(st_table, "7-locus scheme")).text() == "klebsiella_mlst"
+    assert st_table.item(st_row, column_of(st_table, "ST")).text() == "ST 17"
+    assert st_table.item(st_row, column_of(st_table, "Loci called")).text() == "2 / 2"
+
+    cg_table = workbench.step_tables["cgmlst"]
+    cg_row = row_of(cg_table, "both")
+    assert cg_table.item(cg_row, column_of(cg_table, "cgMLST scheme")).text() == "klebsiella_cgmlst"
+    assert cg_table.item(cg_row, column_of(cg_table, "Targets in scheme")).text() == "40"
+    assert cg_table.item(cg_row, column_of(cg_table, "Loci called")).text() == "35"
+    assert cg_table.item(cg_row, column_of(cg_table, "Missing")).text() == "5"
+
+    # The two quantities never share a column name, so no reader can line them up.
+    assert "ST" in headers(st_table) and "ST" not in headers(cg_table)
+    assert "Targets in scheme" not in headers(st_table)
+    assert workbench.test_errors == []
+
+
+def test_a_genome_comparison_and_a_typing_panel_that_disagree_are_flagged_in_colour_and_in_words(workbench, tmp_path):
+    local_scheme(workbench, "disagreeing_ecoli", "Escherichia", "coli")
+    source = assembly(tmp_path / "inbox" / "mixed.fasta", "CCCC")
+    sid = workbench.project.add_sample(source, "mixed")
+    identified(workbench, sid, "Klebsiella", "pneumoniae")
+    workbench.project.set_result(sid, {"sample_name": "mixed", "kind": "fasta", "status": "complete",
+                                       "scheme": "disagreeing_ecoli", "scheme_digest": "ec-digest",
+                                       "st": "11", "alleles": {"locus000": "1"}, "calls": []},
+                                 kind="mlst")
+    workbench.refresh()
+
+    roster = workbench.sample_table
+    cell = roster.item(row_of(roster, "mixed"), column_of(roster, "Organism evidence"))
+    assert "Needs organism review" in cell.text()
+    assert cell.background().color().name() == REVIEW_STYLES["conflict"][0].casefold()
+    assert "disagree" in cell.toolTip() and "Klebsiella" in cell.toolTip()
+    st_table = workbench.step_tables["st"]
+    marker = st_table.item(row_of(st_table, "mixed"), column_of(st_table, "Organism review"))
+    assert "Needs organism review" in marker.text(), "the words carry it, not only the colour"
+    assert marker.background().color().name() == REVIEW_STYLES["conflict"][0].casefold()
+
+    # Agreement is the quiet case: no amber, and the panel is still only corroboration.
+    local_scheme(workbench, "agreeing_kp", "Klebsiella", "pneumoniae")
+    workbench.project.set_result(sid, {"sample_name": "mixed", "kind": "fasta", "status": "complete",
+                                       "scheme": "agreeing_kp", "scheme_digest": "kp-digest",
+                                       "st": "258", "alleles": {"locus000": "1"}, "calls": []},
+                                 kind="mlst")
+    workbench.refresh()
+    settled = roster.item(row_of(roster, "mixed"), column_of(roster, "Organism evidence"))
+    assert "Needs organism review" not in settled.text()
+    assert "corroborates" in settled.toolTip()
+    assert "not an independent identification" in settled.toolTip()
+    assert workbench.test_errors == []
+
+
+def test_a_species_complex_or_an_undecided_organism_is_marked_for_review_in_a_second_colour(workbench, tmp_path):
+    complex_source = assembly(tmp_path / "inbox" / "complex.fasta", "GGGG")
+    complex_id = workbench.project.add_sample(complex_source, "complex")
+    identified(workbench, complex_id, "Escherichia", "coli", confidence="complex_only")
+    waiting_source = assembly(tmp_path / "inbox" / "waiting.fasta", "TTTT")
+    waiting_id = workbench.project.add_sample(waiting_source, "waiting")
+    quarantine_samples(workbench.project, [waiting_id], "not_in_reference_panel")
+    workbench.refresh()
+
+    roster = workbench.sample_table
+    column = column_of(roster, "Organism evidence")
+    complex_cell = roster.item(row_of(roster, "complex"), column)
+    waiting_cell = roster.item(row_of(roster, "waiting"), column)
+    assert "species complex" in complex_cell.text()
+    assert complex_cell.background().color().name() == REVIEW_STYLES["conflict"][0].casefold()
+    assert "not in reference panel" in waiting_cell.text()
+    assert waiting_cell.background().color().name() == REVIEW_STYLES["undecided"][0].casefold()
+    assert "Needs organism review" in waiting_cell.text()
+    assert workbench.test_errors == []
+
+
+def test_typing_is_disabled_until_an_organism_and_a_matching_scheme_are_both_set(workbench, tmp_path):
+    source = assembly(tmp_path / "inbox" / "gated.fasta", "AACC")
+    sid = workbench.project.add_sample(source, "gated")
+    quarantine_samples(workbench.project, [sid], "awaiting_identification")
+    select_only(workbench, sid)
+
+    assert not workbench.step_buttons["st"].isEnabled()
+    assert "an accepted organism" in workbench.step_notes["st"].text()
+    assert "Assign organism" in workbench.step_notes["st"].text()
+
+    confirm_organism(workbench.project, [sid], "Testarella", "ficta")
+    select_only(workbench, sid)
+    assert not workbench.step_buttons["st"].isEnabled()
+    assert "seven-locus MLST scheme for Testarella ficta" in workbench.step_notes["st"].text()
+    assert "Schemes" in workbench.step_notes["st"].text()
+
+    local_scheme(workbench, "testarella_mlst", "Testarella", "ficta")
+    select_only(workbench, sid)
+    assert workbench.step_buttons["st"].isEnabled()
+    assert "1 of 1 selected isolates are ready for ST" in workbench.step_notes["st"].text()
+    # A seven-locus scheme is not a core-genome scheme, so cgMLST stays blocked.
+    assert not workbench.step_buttons["cgmlst"].isEnabled()
+    assert "cgMLST scheme for Testarella ficta" in workbench.step_notes["cgmlst"].text()
+    assert workbench.test_errors == []
+
+
+def test_raw_reads_and_profile_only_isolates_say_what_they_need_instead_of_failing_a_run(workbench, tmp_path):
+    reads = tmp_path / "inbox" / "isolate_R1.fastq"
+    reads.parent.mkdir(parents=True, exist_ok=True)
+    reads.write_text("@read1\nACGT\n+\nIIII\n")
+    read_id = workbench.project.add_sample(reads, "reads")
+    identified(workbench, read_id, "Klebsiella", "pneumoniae")
+    local_scheme(workbench, "kp_reads_scheme", "Klebsiella", "pneumoniae")
+    select_only(workbench, read_id)
+    assert not workbench.step_buttons["st"].isEnabled()
+    assert "an assembly" in workbench.step_notes["st"].text()
+    assert "Assemble them on the Assembly tab first" in workbench.step_notes["st"].text()
+    assert workbench.step_buttons["assembly"].isEnabled(), "reads are what the Assembly tab is for"
+
+    profile_id = add_profile(workbench, "profile only")
+    select_only(workbench, profile_id)
+    assert not workbench.step_buttons["assembly"].isEnabled()
+    assert "no sequence file" in workbench.step_notes["assembly"].text()
+    assert workbench.test_errors == []
+
+
+def test_dropping_files_identifies_them_files_them_and_never_makes_a_second_isolate(workbench, qtbot, tmp_path, monkeypatch):
+    inbox = tmp_path / "inbox"
+    first = assembly(inbox / "KPNIH1.fasta", "AAAA")
+    stranger = assembly(inbox / "stranger.fasta", "CCCC")
+    # A panel is present for this test whatever this machine has installed; the
+    # identification itself is stubbed, so the panel is named but never read.
+    panel = tmp_path / "panel"
+    panel.mkdir()
+    monkeypatch.setattr(MainWindow, "installed_species_panel", lambda self: panel)
+
+    def verdict(path, genus="", species="", **extra):
+        record = {"format_version": 1, "input_path": str(path), "input_sha256": "", "kind": "fasta",
+                  "basis": "genomic_ani" if genus else "none",
+                  "confidence": "genomic_reference_supported" if genus else "unresolved",
+                  "status": "proposed", "proposed": {"genus": genus, "species": species},
+                  "accepted": {"genus": "", "species": ""}, "quarantine_reason": None,
+                  "confirmed_by": None, "confirmed_utc": None, "panel": {}, "detail": {},
+                  "margin_ani": None, "runner_up": None, "reason": "", "notes": [],
+                  "limitations": [], "errors": []}
+        record.update(extra)
+        return record
+
+    monkeypatch.setattr("wmlstudio.organism_id.identify_batch", lambda paths, **kwargs: [
+        verdict(path, "Klebsiella", "pneumoniae") if Path(path).name == "KPNIH1.fasta"
+        else verdict(path, quarantine_reason="not_in_reference_panel", status="quarantined")
+        for path in paths])
+
+    workbench.intake_paths([str(inbox)])
+    idle(qtbot, workbench)
+
+    root = workbench.project_path.with_suffix(".files")
+    samples = {sample["name"]: sample for sample in workbench.project.samples()}
+    assert set(samples) == {"KPNIH1", "stranger"}
+    assert Path(samples["KPNIH1"]["input_path"]).relative_to(root).parts[:2] == ("Klebsiella", "pneumoniae")
+    assert Path(samples["stranger"]["input_path"]).relative_to(root).parts[:2] == ("_Unresolved", "Not_in_reference_panel")
+    assert first.is_file() and stranger.is_file(), "the user's own files are never moved"
+    assert "1 are marked 'Needs organism review'" in workbench.progress_text.text()
+
+    roster = workbench.sample_table
+    flagged = roster.item(row_of(roster, "stranger"), column_of(roster, "Organism evidence"))
+    assert "Needs organism review" in flagged.text()
+    assert flagged.background().color().name() == REVIEW_STYLES["undecided"][0].casefold()
+
+    workbench.intake_paths([str(inbox)])
+    idle(qtbot, workbench)
+    assert len(workbench.project.samples()) == 2, "the same bytes stay one isolate"
+    assert "already in this project" in workbench.progress_text.text()
+    assert workbench.test_errors == []
+
+
+def test_the_hydra_organism_is_your_own_assignment_and_gates_the_organism_specific_tools(workbench, tmp_path, monkeypatch):
+    from wmlstudio.provisioning import Requirement
+
+    def store(*args, **kwargs):
+        return Requirement(key="hydra_database", title="HYDRA AMR database store",
+                           capability="HYDRA resistance screening", blocks="every HYDRA run stops",
+                           required=True, state="ready", reason="Test store.", probe="Test probe.",
+                           detail={"organisms": ["Klebsiella pneumoniae", "Staphylococcus aureus"]})
+
+    monkeypatch.setattr("wmlstudio.provisioning.hydra_database_requirement", store)
+    source = assembly(tmp_path / "inbox" / "amr.fasta", "AAAA")
+    sid = workbench.project.add_sample(source, "amr")
+    identified(workbench, sid, "Klebsiella", "pneumoniae")
+    # Choosing a snapshot is what makes the application re-read the installed store.
+    workbench.project.set_setting("hydra_database_root", str(tmp_path / "snapshot"))
+    select_only(workbench, sid)
+
+    assert workbench.hydra_organism.findData("Staphylococcus aureus") > 0
+    assert "point-mutation catalogues" in workbench.hydra_organism_note.text()
+    assert workbench.hydra_organism_for(workbench.project.get_sample(sid)) == "Klebsiella pneumoniae"
+
+    workbench.hydra_organism.setCurrentIndex(workbench.hydra_organism.findData("Staphylococcus aureus"))
+    workbench.apply_hydra_organism("selected")
+    sample = workbench.project.get_sample(sid)
+    assert sample["metadata"]["workflow"]["hydra_organism"] == "Staphylococcus aureus"
+    assert sample["metadata"]["organism"] == {"genus": "Klebsiella", "species": "pneumoniae"}, \
+        "choosing a HYDRA organism never rewrites the organism the evidence supported"
+    assert "your assignment" in workbench.progress_text.text()
+    hydra_table = workbench.step_tables["hydra"]
+    assert hydra_table.item(row_of(hydra_table, "amr"),
+                            column_of(hydra_table, "HYDRA organism")).text() == "Staphylococcus aureus"
+
+    workbench.hydra_organism.setCurrentIndex(workbench.hydra_organism.findData(""))
+    workbench.apply_hydra_organism("project")
+    assert workbench.project.get_sample(sid)["metadata"]["workflow"]["hydra_organism"] == ""
+    assert "stay unavailable" in workbench.progress_text.text()
+    assert workbench.test_errors == []
+
+
+def test_hydra_is_blocked_while_no_amr_database_is_installed_and_says_where_to_get_one(workbench, tmp_path, monkeypatch):
+    from wmlstudio.provisioning import Requirement
+
+    def empty(*args, **kwargs):
+        return Requirement(key="hydra_database", title="HYDRA AMR database store",
+                           capability="HYDRA resistance screening", blocks="every HYDRA run stops",
+                           required=True, state="missing",
+                           reason="No AMR database is installed in any store this application "
+                                  "looks at, so HYDRA has nothing to search.",
+                           probe="Test probe.", detail={"organisms": []})
+
+    monkeypatch.setattr("wmlstudio.provisioning.hydra_database_requirement", empty)
+    source = assembly(tmp_path / "inbox" / "amr.fasta", "AAAA")
+    sid = workbench.project.add_sample(source, "amr")
+    identified(workbench, sid, "Klebsiella", "pneumoniae")
+    workbench.project.set_setting("hydra_database_root", str(tmp_path / "empty-store"))
+    select_only(workbench, sid)
+
+    assert not workbench.step_buttons["hydra"].isEnabled()
+    assert "an installed AMR database" in workbench.step_notes["hydra"].text()
+    assert "nothing to search" in workbench.step_notes["hydra"].text()
+    assert "organism rules are unavailable" in workbench.hydra_organism_note.text()
+    assert "no point mutation can be called" in workbench.hydra_organism_note.text()
+    assert workbench.test_errors == []
+
+
+def test_the_rarely_used_controls_stay_behind_the_advanced_disclosure(workbench):
+    workbench.navigate(1)
+    assert not workbench.samples_advanced.isVisible()
+    assert not workbench.samples_advanced_button.isChecked()
+    for column in ("ST (7-locus)", "AMR genes", "Scheme"):
+        assert workbench.sample_table.isColumnHidden(column_of(workbench.sample_table, column))
+    for column in ("Sample", "Organism evidence", "Storage"):
+        assert not workbench.sample_table.isColumnHidden(column_of(workbench.sample_table, column))
+
+    workbench.samples_advanced_button.setChecked(True)
+    assert workbench.samples_advanced.isVisible()
+    workbench.sample_columns_button.setChecked(True)
+    assert not workbench.sample_table.isColumnHidden(column_of(workbench.sample_table, "AMR genes"))
+    assert workbench.test_errors == []
+
+
+def test_a_typing_panel_match_corroborates_an_organism_but_never_becomes_the_identification():
+    panel_only = {"id": "a", "name": "a", "metadata": {"organism_evidence": {
+        "status": "proposed", "basis": "mlst_panel", "confidence": "panel_compatibility",
+        "proposed": {"genus": "Enterobacter", "species": ""},
+        "accepted": {"genus": "", "species": ""},
+        "detail": {"mlst_top": [{"scheme": "ecloacae", "organism_label": "Enterobacter cloacae"}]}}}}
+    support = identification_support(panel_only, {})
+    assert support["agreement"] == "panel_only"
+    assert "not a species identification" in support["sentence"]
+    assert organism_review(panel_only, {})["needs_review"] is True
+
+    genomic = {"id": "b", "name": "b", "metadata": {
+        "organism": {"genus": "Klebsiella", "species": "pneumoniae"},
+        "organism_evidence": {"status": "confirmed", "basis": "genomic_ani",
+                              "confidence": "genomic_reference_supported",
+                              "proposed": {"genus": "Klebsiella", "species": "pneumoniae"},
+                              "accepted": {"genus": "Klebsiella", "species": "pneumoniae"}}}}
+    alone = identification_support(genomic, {})
+    assert alone["agreement"] == "claim_only"
+    assert "No classical typing panel has corroborated it yet" in alone["sentence"]
+    assert organism_review(genomic, {})["needs_review"] is False
+
+    # An organism a person typed in is a claim too, so a panel that contradicts it
+    # is still a conflict worth a second look — and it is never silently corrected.
+    assigned = {"id": "c", "name": "c", "metadata": {
+        "organism": {"genus": "Enterobacter", "species": "cloacae"},
+        "organism_evidence": {"status": "confirmed", "basis": "user_assigned",
+                              "confidence": "unresolved",
+                              "proposed": {"genus": "Enterobacter", "species": "cloacae"},
+                              "accepted": {"genus": "Enterobacter", "species": "cloacae"}}}}
+    schemes = {"kp_panel": {"name": "kp_panel", "id": "kp_panel", "genus": "Klebsiella",
+                            "species": "pneumoniae", "kind": "mlst"}}
+    disputed = identification_support(assigned, schemes, {"scheme": "kp_panel", "st": "258"})
+    assert disputed["agreement"] == "conflict"
+    assert "You assigned it" in disputed["sentence"] and "Klebsiella" in disputed["sentence"]
+    review = organism_review(assigned, schemes, {"scheme": "kp_panel", "st": "258"})
+    assert review["needs_review"] is True and review["level"] == "conflict"
+    assert assigned["metadata"]["organism"] == {"genus": "Enterobacter", "species": "cloacae"}
+
+
+def test_the_cohort_picker_says_which_isolates_still_need_an_organism(workbench, qtbot, tmp_path):
+    from wmlstudio.cohort_picker import CohortPickerDialog
+    ready = add_profile(workbench, "settled")
+    # A later core-genome result must not empty the seven-locus column of the picker.
+    targets = {f"core{index:04d}": str(index + 1) for index in range(40)}
+    workbench.project.set_result(ready, {"sample_name": "settled", "kind": "profile",
+                                         "scheme": "kp_cgmlst", "scheme_digest": "cg-digest",
+                                         "status": "complete", "st": None, "alleles": targets,
+                                         "calls": []}, kind="cgmlst")
+    source = assembly(tmp_path / "inbox" / "unsettled.fasta", "GGGG")
+    unsettled = workbench.project.add_sample(source, "unsettled")
+    quarantine_samples(workbench.project, [unsettled], "low_confidence")
+    workbench.refresh()
+
+    dialog = CohortPickerDialog(workbench.project.samples(), workbench.project,
+                                "Which isolates?", None, workbench)
+    qtbot.addWidget(dialog)
+    review = column_of(dialog.table, "Organism review")
+    rows = {dialog.table.item(row, 1).text(): row for row in range(dialog.table.rowCount())}
+    assert dialog.table.item(rows["settled"], review).text() == "Ready"
+    flagged = dialog.table.item(rows["unsettled"], review)
+    assert "Needs organism review" in flagged.text()
+    assert flagged.background().color().name() == REVIEW_STYLES["undecided"][0].casefold()
+    assert dialog.table.item(rows["settled"], column_of(dialog.table, "ST (7-locus)")).text() == "17"
+
+
+def test_loading_without_a_reference_panel_says_so_instead_of_quietly_quarantining(workbench, qtbot, tmp_path, monkeypatch):
+    # Pinned to the state the test is about, in both directions: no installed panel
+    # and no installed schemes, whatever this machine happens to have staged.
+    monkeypatch.setattr(MainWindow, "installed_species_panel", lambda self: None)
+    monkeypatch.setattr("wmlstudio.characterization_refs.bundled_reference_root", lambda: None)
+    workbench.scheme_paths = []
+    source = assembly(tmp_path / "inbox" / "orphan.fasta", "AAAA")
+
+    workbench.intake_paths([str(source)])
+    idle(qtbot, workbench)
+
+    sample = workbench.project.samples()[0]
+    root = workbench.project_path.with_suffix(".files")
+    assert Path(sample["input_path"]).relative_to(root).parts[0] == "_Unresolved"
+    assert "No species reference panel is installed" in workbench.progress_text.text()
+    assert "Install the species reference panel" in workbench.progress_text.text()
+    assert source.is_file()
+    assert workbench.test_errors == []
+
+
+def test_running_the_st_step_types_against_a_seven_locus_scheme_and_records_it_as_mlst(workbench, qtbot, tmp_path, monkeypatch):
+    scheme = make_scheme(workbench.root / "schemes" / "kp_seven")
+    (scheme / "scheme.json").write_text(json.dumps(
+        {"name": "kp_seven", "organism": {"genus": "Klebsiella", "species": "pneumoniae"}}))
+    workbench.populate_schemes()
+    source = assembly(tmp_path / "inbox" / "kp.fasta")
+    sid = workbench.project.add_sample(source, "kp")
+    identified(workbench, sid, "Klebsiella", "pneumoniae")
+    monkeypatch.setattr(MainWindow, "review_run_plan", lambda self, *args, **kwargs: {})
+    select_only(workbench, sid)
+    assert workbench.step_buttons["st"].isEnabled()
+
+    workbench.run_step("st")
+    idle(qtbot, workbench)
+
+    assert workbench.project.latest_analysis(sid, "mlst")["st"] == "17"
+    assert workbench.project.latest_analysis(sid, "cgmlst") is None, \
+        "typing seven loci must never be recorded as a core-genome profile"
+    st_table, cg_table = workbench.step_tables["st"], workbench.step_tables["cgmlst"]
+    assert st_table.item(row_of(st_table, "kp"), column_of(st_table, "ST")).text() == "ST 17"
+    assert cg_table.item(row_of(cg_table, "kp"), column_of(cg_table, "cgMLST scheme")).text() == "—"
+    assert cg_table.item(row_of(cg_table, "kp"), column_of(cg_table, "Targets in scheme")).text() == "—"
+    stored = workbench.project.get_sample(sid)["metadata"].get("workflow") or {}
+    assert stored.get("scheme_path") is None, \
+        "a step run chooses a scheme for that run; it does not repin the isolate"
     assert source.is_file()
     assert workbench.test_errors == []

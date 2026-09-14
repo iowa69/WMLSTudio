@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import csv
 import hashlib
+import http.client
 import io
 import json
 import re
@@ -26,18 +27,95 @@ from html.parser import HTMLParser
 from pathlib import Path
 
 from . import __version__
-from .sequence import check_cancelled
-from .typing import load_scheme
+from .sequence import DNA, SequenceError, check_cancelled
+from .typing import SchemeError, load_scheme
 
 API_ROOT = "https://rest.pubmlst.org"
 OFFICIAL_HOSTS = {"rest.pubmlst.org", "bigsdb.pasteur.fr", "www.cgmlst.org", "cgmlst.org"}
 JSON_LIMIT = 16 * 1024 * 1024
 FILE_LIMIT = 1024 * 1024 * 1024
 SNAPSHOT_LIMIT = 8 * 1024 * 1024 * 1024
+# A public service asked to rate-limit us can name a very long wait; honour it up
+# to this bound and then say so, rather than hammering or hanging indefinitely.
+MAX_RETRY_AFTER = 120
+RESUME_LEDGER = "resume.json"
+RESUME_PREFIX = ".resume-"
+# Partial downloads live BESIDE the scheme library, never inside it: paths.scheme_locations
+# hands every directory under the library to the typing code as a scheme, so a
+# half-finished folder kept there would be offered as a reference.
+RESUME_DIRNAME = ".wmlstudio-partial-downloads"
 
 
 class CatalogError(ValueError):
     """A reference could not be fetched or validated without an unsafe assumption."""
+
+
+def _validated_scheme(path, *, cancelled=None):
+    """load_scheme, with its errors reported as catalog errors the caller expects.
+
+    A scheme failure during a download is a download failure: callers documented to
+    catch CatalogError must not have to catch SchemeError from a lower layer too.
+    """
+    try:
+        return load_scheme(path, cancelled=cancelled)
+    except (SchemeError, SequenceError) as error:
+        raise CatalogError(
+            f"The downloaded reference could not be read as a scheme: {error} "
+            "Nothing was installed.") from error
+
+
+def screen_allele_file(path, locus, *, cancelled=None) -> list[str]:
+    """Remove allele records this application cannot read, naming every one removed.
+
+    Public reference services publish occasional allele sequences containing a
+    literal 'X' where a base is unknown. 'X' is not an IUPAC nucleotide code, so a
+    single such record used to fail an entire multi-gigabyte scheme download at the
+    final validation step. The record is excluded instead. It is never rewritten to
+    'N': that would invent a base that was not reported. Each exclusion is returned,
+    recorded in the snapshot manifest and shown to the user, because a genome
+    carrying an excluded allele is reported as an unmatched sequence and not as that
+    allele number.
+    """
+    path = Path(path)
+    try:
+        text = path.read_text(encoding="ascii")
+    except (OSError, UnicodeDecodeError) as error:
+        raise CatalogError(f"Allele data for locus {locus} is not readable ASCII FASTA.") from error
+    records, header, body = [], None, []
+    for line in text.splitlines():
+        check_cancelled(cancelled)
+        if line.startswith(">"):
+            if header is not None:
+                records.append((header, body))
+            header, body = line, []
+        elif header is not None:
+            body.append(line)
+    if header is not None:
+        records.append((header, body))
+    if not records:
+        raise CatalogError(f"The reference service returned no allele records for locus {locus}.")
+    kept, excluded = [], []
+    for header, body in records:
+        sequence = "".join(body).strip().upper()
+        invalid = sorted(set(sequence) - DNA)
+        if invalid or not sequence:
+            reason = "empty sequence" if not sequence else "non-IUPAC " + ", ".join(invalid[:5])
+            excluded.append(f"{locus}:{header[1:].split()[0] if header[1:].split() else '?'} "
+                            f"({reason})")
+        else:
+            kept.append((header, body))
+    if not excluded:
+        return []
+    if not kept:
+        raise CatalogError(
+            f"Every allele record for locus {locus} carries characters this application cannot "
+            f"read ({excluded[0]}); no partial scheme was installed.")
+    lines = []
+    for header, body in kept:
+        lines.append(header)
+        lines.extend(body)
+    path.write_text("\n".join(lines) + "\n", encoding="ascii")
+    return excluded
 
 
 def _safe_url(url: str) -> str:
@@ -58,6 +136,22 @@ def _safe_name(name: str) -> str:
             or name.endswith(".") or name.split(".", 1)[0].upper() in reserved):
         raise CatalogError(f"Reference name {name!r} cannot be stored safely on Windows.")
     return name
+
+
+def _file_digest(path) -> str:
+    with Path(path).open("rb") as handle:
+        return hashlib.file_digest(handle, "sha256").hexdigest()
+
+
+def _exclusion_notes(excluded) -> list[str]:
+    """One plain sentence naming what the snapshot does not contain, and why."""
+    if not excluded:
+        return []
+    shown = ", ".join(excluded[:5]) + (", …" if len(excluded) > 5 else "")
+    return [f"{len(excluded)} allele record(s) were excluded because the provider published "
+            f"characters that are not IUPAC nucleotide codes: {shown}. They were not rewritten to "
+            "'N'. A genome carrying one of these alleles is reported as an unmatched sequence, "
+            "never as that allele number."]
 
 
 def organism_parts(label: str) -> dict:
@@ -87,6 +181,9 @@ class PubMLSTCatalog:
     blocked socket read; cancellation is checked between every received chunk.
     """
 
+    service_name = "PubMLST"
+    RESUMABLE = True
+
     def __init__(self, cache_dir=None, *, opener=None, timeout=20, retries=2,
                  base_url=API_ROOT):
         self.cache_dir = Path(cache_dir) if cache_dir is not None else None
@@ -97,7 +194,28 @@ class PubMLSTCatalog:
         self._cache: dict[str, tuple[float, object]] = {}
         self.catalog_from_cache = False
 
-    def _transfer(self, url, destination=None, *, limit=JSON_LIMIT, cancelled=None):
+    @staticmethod
+    def _retry_after(headers, attempt) -> float:
+        """The wait a rate limiter asked for, bounded; otherwise our own backoff.
+
+        Ignoring Retry-After is why a burst of scheme-metadata reads keeps failing:
+        the service asks for seconds and the old backoff waited half of one.
+        """
+        value = (headers or {}).get("Retry-After") if headers is not None else None
+        try:
+            asked = float(str(value).strip())
+        except (TypeError, ValueError):
+            asked = 0.0
+        return max(0.5 * (attempt + 1), min(asked, MAX_RETRY_AFTER))
+
+    def _wait(self, seconds, cancelled):
+        """Interruptible sleep: cancellation is checked ten times a second."""
+        for _ in range(max(1, int(round(seconds * 10)))):
+            check_cancelled(cancelled)
+            threading.Event().wait(0.1)
+
+    def _transfer(self, url, destination=None, *, limit=JSON_LIMIT, cancelled=None,
+                  progress=None, label=""):
         url = _safe_url(url)
         for attempt in range(self.retries + 1):
             check_cancelled(cancelled)
@@ -114,6 +232,7 @@ class PubMLSTCatalog:
                     digest = hashlib.sha256()
                     chunks = []
                     size = 0
+                    reported = 0
                     output = Path(destination).open("wb") if destination is not None else None
                     try:
                         while chunk := response.read(65536):
@@ -126,6 +245,12 @@ class PubMLSTCatalog:
                                 chunks.append(chunk)
                             else:
                                 output.write(chunk)
+                            # Large bundles arrive chunk-encoded with no declared
+                            # length, so without this the progress bar sits still
+                            # for minutes and the download looks hung.
+                            if progress and size - reported >= 4 * 1024 * 1024:
+                                reported = size
+                                progress(0, 0, f"{label or 'Downloading'}: {size // (1024 * 1024)} MB received")
                         check_cancelled(cancelled)
                         if length is not None and size != int(length):
                             raise CatalogError("Reference download was truncated; no snapshot was installed.")
@@ -138,16 +263,21 @@ class PubMLSTCatalog:
                         "sha256": digest.hexdigest(), "bytes": size}
             except urllib.error.HTTPError as error:
                 if error.code not in {429, 500, 502, 503, 504} or attempt == self.retries:
+                    if error.code == 429:
+                        raise CatalogError(
+                            "The reference service is rate-limiting this computer (HTTP 429). Wait "
+                            "a few minutes and try again, or download one scheme at a time.") from error
                     access = " Public access may require authentication." if error.code in {401, 403} else ""
-                    raise CatalogError(f"PubMLST returned HTTP {error.code}.{access}") from error
-            except (urllib.error.URLError, TimeoutError, ConnectionError) as error:
+                    raise CatalogError(f"{self.service_name} returned HTTP {error.code}.{access}") from error
+                self._wait(self._retry_after(error.headers, attempt), cancelled)
+                continue
+            except (urllib.error.URLError, TimeoutError, ConnectionError,
+                    http.client.IncompleteRead, http.client.HTTPException) as error:
                 if attempt == self.retries:
-                    raise CatalogError(f"Could not reach PubMLST: {error}") from error
+                    raise CatalogError(f"Could not reach {self.service_name}: {error}") from error
             # Short interruptible backoff; GET-only requests are safe to retry.
-            for _ in range(5 * (attempt + 1)):
-                check_cancelled(cancelled)
-                threading.Event().wait(0.1)
-        raise CatalogError("PubMLST download did not complete.")
+            self._wait(0.5 * (attempt + 1), cancelled)
+        raise CatalogError(f"{self.service_name} download did not complete.")
 
     def _json(self, url, *, cancelled=None, refresh=False):
         _safe_url(url)
@@ -261,12 +391,79 @@ class PubMLSTCatalog:
                 progress(index, len(organisms), f"Searched {organism['name']}")
         return {"schemes": schemes, "errors": errors, "organisms_searched": len(organisms)}
 
+    def download_estimate(self, entry) -> dict:
+        """What a download of this scheme actually costs, before a byte is fetched.
+
+        The service supplies no whole-scheme archive, so every target is a separate
+        request. For a cgMLST scheme that is thousands of requests and gigabytes:
+        the user must be told before starting, not after twenty minutes.
+        """
+        count = int(entry.get("locus_count") or 0)
+        return {"requests": count + (1 if entry.get("has_profiles") else 0),
+                "per_target_requests": True, "resumable": True,
+                "notice": (f"This scheme has {count} targets and the service offers no whole-scheme "
+                           f"archive, so {count} separate downloads are needed. A scheme of this "
+                           "size is typically gigabytes on disk and takes many minutes. The "
+                           "download can be cancelled and resumed where it stopped."
+                           if count > 200 else
+                           f"{count} targets are downloaded individually; this is quick.")}
+
+    def _resume_root(self, library_root, current) -> Path:
+        base = _safe_name(f"{current['database']}_{current['scheme_id']}")
+        library_root = Path(library_root).resolve()
+        return library_root.parent / RESUME_DIRNAME / (RESUME_PREFIX + base)
+
+    def resume_state(self, library_root, entry) -> dict | None:
+        """What a kept partial download contains, so a person can resume or discard it.
+
+        Returns None when there is nothing partial. The folder is never a usable
+        scheme; the count is what would not need downloading again.
+        """
+        try:
+            folder = self._resume_root(library_root, dict(entry))
+        except (KeyError, TypeError, CatalogError):
+            return None
+        ledger = folder / RESUME_LEDGER
+        if not ledger.is_file():
+            return None
+        try:
+            stored = json.loads(ledger.read_text(encoding="utf-8"))
+        except (OSError, UnicodeDecodeError, ValueError):
+            return None
+        files = stored.get("files") if isinstance(stored, dict) else None
+        if not isinstance(files, dict):
+            return None
+        return {"path": str(folder), "files_held": len(files),
+                "expected": int(entry.get("locus_count") or 0),
+                "bytes": sum(int(item.get("bytes") or 0) for item in files.values()
+                             if isinstance(item, dict)),
+                "url": stored.get("url", "")}
+
+    def clear_resume(self, library_root, entry) -> bool:
+        """Discard a kept partial download. Installed snapshots are never touched."""
+        try:
+            folder = self._resume_root(library_root, dict(entry))
+        except (KeyError, TypeError, CatalogError):
+            return False
+        if folder.is_dir() and folder.name.startswith(RESUME_PREFIX):
+            shutil.rmtree(folder)
+            return True
+        return False
+
     def download_scheme(self, entry, library_root, *, cancelled=None, progress=None,
-                        max_bytes=SNAPSHOT_LIMIT) -> dict:
+                        max_bytes=SNAPSHOT_LIMIT, resume=True) -> dict:
         """Install a fully validated snapshot; failures never publish a partial directory.
 
         A changed remote version is a new directory. Existing snapshots are never
         overwritten, and an existing destination is revalidated before reuse.
+
+        With ``resume`` (the default), target files already fetched are kept in a
+        clearly-named partial folder beside the library and reused on the next
+        attempt, verified by the SHA-256 recorded when they were received. A
+        thousand-target scheme that fails on target 900 then costs one more target,
+        not another twenty minutes. The partial folder is never a scheme and is
+        never published: publication still requires a complete, validated set. It is
+        discarded automatically when the remote scheme has changed underneath it.
         """
         if not isinstance(entry, dict) or not entry.get("url"):
             raise CatalogError("Choose a PubMLST scheme before downloading.")
@@ -277,9 +474,17 @@ class PubMLSTCatalog:
             raise CatalogError("This scheme does not contain any loci.")
         library_root = Path(library_root).resolve()
         library_root.mkdir(parents=True, exist_ok=True)
-        staging = Path(tempfile.mkdtemp(prefix=".pubmlst-download-", dir=library_root))
+        resume_root = self._resume_root(library_root, current) if resume else None
+        ledger = self._load_ledger(resume_root, details, current)
+        if resume_root is not None:
+            resume_root.mkdir(parents=True, exist_ok=True)
+            staging = resume_root
+        else:
+            staging = Path(tempfile.mkdtemp(prefix=".pubmlst-download-", dir=library_root))
+        keep_staging = resume_root is not None
         sources, names = [], set()
         transferred = 0
+        excluded_alleles = []
         try:
             for index, locus_url in enumerate(details["loci"], 1):
                 check_cancelled(cancelled)
@@ -288,15 +493,34 @@ class PubMLSTCatalog:
                 if name.casefold() in names:
                     raise CatalogError("The scheme repeats a locus filename, including Windows case folding.")
                 names.add(name.casefold())
-                source = self._transfer(locus_url + "/alleles_fasta", staging / f"{name}.tfa",
-                                        limit=min(FILE_LIMIT, max_bytes - transferred), cancelled=cancelled)
+                target = staging / f"{name}.tfa"
+                source = self._reuse(ledger, target, locus_url + "/alleles_fasta")
+                if source is None:
+                    source = self._transfer(locus_url + "/alleles_fasta", target,
+                                            limit=min(FILE_LIMIT, max_bytes - transferred),
+                                            cancelled=cancelled, progress=progress,
+                                            label=f"Target {index} of {len(details['loci'])}")
+                    dropped = screen_allele_file(target, name, cancelled=cancelled)
+                    if dropped:
+                        excluded_alleles.extend(dropped)
+                        source = {**source, "excluded_alleles": dropped,
+                                  "stored_sha256": _file_digest(target)}
+                    self._record(ledger, resume_root, source)
+                else:
+                    excluded_alleles.extend(source.get("excluded_alleles", []))
                 transferred += source["bytes"]
                 sources.append(source)
                 if progress:
                     progress(index, len(details["loci"]) + 1, f"Downloaded {name} alleles")
             if details.get("profiles_csv"):
-                source = self._transfer(details["profiles_csv"], staging / "profiles.tsv",
-                                        limit=min(FILE_LIMIT, max_bytes - transferred), cancelled=cancelled)
+                target = staging / "profiles.tsv"
+                source = self._reuse(ledger, target, details["profiles_csv"])
+                if source is None:
+                    source = self._transfer(details["profiles_csv"], target,
+                                            limit=min(FILE_LIMIT, max_bytes - transferred),
+                                            cancelled=cancelled, progress=progress,
+                                            label="Profile table")
+                    self._record(ledger, resume_root, source)
                 transferred += source["bytes"]
                 sources.append(source)
             metadata = {
@@ -310,7 +534,7 @@ class PubMLSTCatalog:
                 "authenticated": False,
             }
             (staging / "scheme.json").write_text(json.dumps(metadata, ensure_ascii=False, sort_keys=True, indent=2), encoding="utf-8")
-            checked = load_scheme(staging, cancelled=cancelled)
+            checked = _validated_scheme(staging, cancelled=cancelled)
             if checked.locus_count != current["locus_count"]:
                 raise CatalogError("Downloaded reference loci do not match the online scheme.")
             after = self._json(current["url"], cancelled=cancelled, refresh=True)
@@ -324,6 +548,7 @@ class PubMLSTCatalog:
                 "source_digest": source_digest, "scheme_digest": checked.digest,
                 "access_notice": current["access_notice"], "authenticated": False,
                 "downloaded_bytes": transferred,
+                "excluded_alleles": excluded_alleles,
                 "snapshot_note": "Sources were downloaded separately; the server does not provide a transactional multi-file snapshot.",
             }
             (staging / "reference_manifest.json").write_text(json.dumps(manifest, indent=2), encoding="utf-8")
@@ -332,22 +557,98 @@ class PubMLSTCatalog:
             check_cancelled(cancelled)
             created = not destination.exists()
             if destination.exists():
-                if load_scheme(destination, cancelled=cancelled).digest != checked.digest:
+                if _validated_scheme(destination, cancelled=cancelled).digest != checked.digest:
                     raise CatalogError("Existing reference snapshot was modified; it will not be overwritten.")
+                shutil.rmtree(staging)
             else:
-                staging.rename(destination)
-                staging = None
-            notes = list(checked.notes)
-            if current["access_notice"]:
+                (staging / RESUME_LEDGER).unlink(missing_ok=True)
+                try:
+                    staging.rename(destination)
+                except OSError:
+                    # The partial folder sits beside the library, so a library root
+                    # that is itself a mount point needs a copying move.
+                    shutil.move(str(staging), str(destination))
+            staging = None
+            notes = list(checked.notes) + _exclusion_notes(excluded_alleles)
+            if current["access_notice"] and current["access_notice"] not in notes:
                 notes.append(current["access_notice"])
             if progress:
                 progress(1, 1, "Public reference snapshot installed")
             return {"path": str(destination), "scheme_digest": checked.digest,
                     "source_digest": source_digest, "created": created,
-                    "locus_count": checked.locus_count, "entry": current, "notes": notes}
+                    "locus_count": checked.locus_count, "entry": current, "notes": notes,
+                    "excluded_alleles": excluded_alleles, "resume_path": None}
         finally:
             if staging is not None:
-                shutil.rmtree(staging)
+                if keep_staging and staging.is_dir():
+                    self._write_ledger(staging, ledger)
+                else:
+                    shutil.rmtree(staging, ignore_errors=True)
+
+    # -- resume ledger ---------------------------------------------------------
+    # The ledger is bookkeeping, never a scheme: it records which target files were
+    # already received and their SHA-256, so an interrupted download continues
+    # instead of restarting. A file is reused only when its bytes still hash to the
+    # value recorded when they arrived.
+
+    @staticmethod
+    def _scheme_fingerprint(details, current) -> str:
+        return hashlib.sha256(json.dumps(
+            {"loci": details.get("loci"), "last_updated": details.get("last_updated"),
+             "records": details.get("records"), "url": current["url"]},
+            sort_keys=True).encode()).hexdigest()
+
+    def _load_ledger(self, resume_root, details, current):
+        if resume_root is None:
+            return None
+        fingerprint = self._scheme_fingerprint(details, current)
+        path = Path(resume_root) / RESUME_LEDGER
+        if path.is_file():
+            try:
+                stored = json.loads(path.read_text(encoding="utf-8"))
+            except (OSError, UnicodeDecodeError, ValueError):
+                stored = None
+            if (isinstance(stored, dict) and stored.get("fingerprint") == fingerprint
+                    and isinstance(stored.get("files"), dict)):
+                stored["written"] = 0
+                return stored
+            # The scheme changed upstream: a half-finished copy of the previous
+            # definition must never be blended into the new one.
+            shutil.rmtree(resume_root, ignore_errors=True)
+        return {"format_version": 1, "fingerprint": fingerprint, "url": current["url"],
+                "files": {}, "written": 0}
+
+    @staticmethod
+    def _write_ledger(resume_root, ledger) -> None:
+        if ledger is None or resume_root is None:
+            return
+        payload = {key: value for key, value in ledger.items() if key != "written"}
+        try:
+            (Path(resume_root) / RESUME_LEDGER).write_text(
+                json.dumps(payload, sort_keys=True), encoding="utf-8")
+        except OSError:
+            pass
+
+    @staticmethod
+    def _reuse(ledger, target, url):
+        if ledger is None:
+            return None
+        recorded = ledger["files"].get(Path(target).name)
+        if not isinstance(recorded, dict) or recorded.get("url") != url or not target.is_file():
+            return None
+        expected = recorded.get("stored_sha256") or recorded.get("sha256")
+        if not expected or _file_digest(target) != expected:
+            return None
+        return {key: value for key, value in recorded.items() if key != "stored_sha256"} | (
+            {"stored_sha256": recorded["stored_sha256"]} if recorded.get("stored_sha256") else {})
+
+    def _record(self, ledger, resume_root, source) -> None:
+        if ledger is None:
+            return
+        ledger["files"][source["file"]] = source
+        ledger["written"] = ledger.get("written", 0) + 1
+        if ledger["written"] % 25 == 0:
+            self._write_ledger(resume_root, ledger)
 
     def update_scheme(self, installed_path, library_root=None, **kwargs) -> dict:
         installed_path = Path(installed_path)
@@ -361,6 +662,8 @@ class PubMLSTCatalog:
 
 class PasteurCatalog(PubMLSTCatalog):
     """Official BIGSdb-Pasteur API; the same conservative snapshot protocol."""
+
+    service_name = "BIGSdb-Pasteur"
 
     def __init__(self, cache_dir=None, **kwargs):
         super().__init__(cache_dir, base_url="https://bigsdb.pasteur.fr/api", **kwargs)
@@ -403,12 +706,24 @@ class CGMLSTOrgCatalog(PubMLSTCatalog):
     or clinical clustering thresholds are inferred from its scheme definitions.
     """
 
+    service_name = "cgMLST.org"
+    RESUMABLE = False
     TERMS_URL = 'https://www.cgmlst.org/serverpolicy.html'
     TERMS_NOTICE = ('cgMLST.org nomenclature belongs to Ridom GmbH. Individual downloads are limited to non-commercial use; publication acknowledgement is required. Reuse of database copies in a product or service requires permission. Confirm that your intended use is permitted before downloading. This software does not grant data redistribution rights.')
+
+    def download_estimate(self, entry) -> dict:
+        count = int(entry.get("locus_count") or 0)
+        return {"requests": 2, "per_target_requests": False, "resumable": False,
+                "notice": (f"One archive of all {count} target allele sets, plus a locus table to "
+                           "verify it. The archive is tens of megabytes, but the installed scheme "
+                           "is much larger: a scheme of this size can occupy several gigabytes on "
+                           "disk. Check free space before starting.")}
 
     def list_organisms(self, *, cancelled=None, refresh=False):
         parser = _CGCatalogParser()
         raw = self._transfer("https://www.cgmlst.org/ncs", cancelled=cancelled)
+        if b"Illegal Typing ID" in raw or b"ERROR Occured" in raw:
+            raise CatalogError("cgMLST.org reported an error page instead of its scheme catalogue.")
         parser.feed(raw.decode("utf-8"))
         entries = []
         for href, cells in parser.rows:
@@ -448,7 +763,7 @@ class CGMLSTOrgCatalog(PubMLSTCatalog):
                  "access_notice": "Allele nomenclature is public; no central ST/profile table is supplied by this download."}]
 
     def download_scheme(self, entry, library_root, *, cancelled=None, progress=None,
-                        max_bytes=SNAPSHOT_LIMIT, terms_acknowledged=False):
+                        max_bytes=SNAPSHOT_LIMIT, terms_acknowledged=False, resume=True):
         check_cancelled(cancelled)
         if terms_acknowledged is not True:
             raise CatalogError('Review the cgMLST.org server policy and explicitly acknowledge that your intended use is permitted before downloading: ' + self.TERMS_URL)
@@ -457,11 +772,21 @@ class CGMLSTOrgCatalog(PubMLSTCatalog):
         library_root = Path(library_root).resolve()
         library_root.mkdir(parents=True, exist_ok=True)
         staging = Path(tempfile.mkdtemp(prefix=".cgmlst-download-", dir=library_root))
+        excluded_alleles = []
         try:
             table_path = staging / "source_loci.tsv"
             table_source = self._transfer(base + "locus/?content-type=csv", table_path,
-                                          limit=min(JSON_LIMIT, max_bytes), cancelled=cancelled)
-            rows = list(csv.reader(io.StringIO(table_path.read_text(encoding="utf-8-sig")), delimiter="\t"))
+                                          limit=min(JSON_LIMIT, max_bytes), cancelled=cancelled,
+                                          progress=progress, label="Locus table")
+            table_text = table_path.read_text(encoding="utf-8-sig")
+            # The service answers an unknown scheme with HTTP 200 and an HTML error
+            # body, so a wrong identifier must be named rather than reported as a
+            # malformed table.
+            if "Illegal Typing ID" in table_text or "ERROR Occured" in table_text:
+                raise CatalogError(
+                    f"cgMLST.org does not recognise the scheme identifier {slug!r}; refresh the "
+                    "catalogue and choose the scheme again.")
+            rows = list(csv.reader(io.StringIO(table_text), delimiter="\t"))
             if not rows or not rows[0] or rows[0][0].strip() != "Locus":
                 raise CatalogError("cgMLST.org did not return its expected locus table.")
             expected = set()
@@ -474,10 +799,15 @@ class CGMLSTOrgCatalog(PubMLSTCatalog):
                         raise CatalogError("cgMLST.org locus table contains duplicate names.")
                     expected.add(locus)
             if not expected or len(expected) != entry["locus_count"]:
-                raise CatalogError("The current locus table and catalog target count disagree; refresh the catalog.")
+                raise CatalogError(
+                    f"The scheme now lists {len(expected)} targets but the catalogue entry says "
+                    f"{entry['locus_count']}; refresh the catalogue and select the scheme again. A "
+                    "cutoff published for one target set does not carry over to another.")
             archive = staging / "source_alleles.zip"
             archive_source = self._transfer(base + "alleles/", archive,
-                                            limit=min(FILE_LIMIT, max_bytes), cancelled=cancelled)
+                                            limit=min(FILE_LIMIT, max_bytes), cancelled=cancelled,
+                                            progress=progress,
+                                            label=f"{entry['organism']} allele archive")
             sources, seen, unpacked = [table_source, archive_source], set(), table_source['bytes']
             with zipfile.ZipFile(archive) as bundle:
                 for member in bundle.infolist():
@@ -511,8 +841,14 @@ class CGMLSTOrgCatalog(PubMLSTCatalog):
                                 raise CatalogError("An allele archive entry exceeds its declared size.")
                             output.write(chunk)
                             digest.update(chunk)
-                    sources.append({"url": base + "alleles/", "file": target.name,
-                                    "sha256": digest.hexdigest(), "bytes": size})
+                    source = {"url": base + "alleles/", "file": target.name,
+                              "sha256": digest.hexdigest(), "bytes": size}
+                    dropped = screen_allele_file(target, locus, cancelled=cancelled)
+                    if dropped:
+                        excluded_alleles.extend(dropped)
+                        source["excluded_alleles"] = dropped
+                        source["stored_sha256"] = _file_digest(target)
+                    sources.append(source)
                     if progress:
                         progress(len(seen), len(expected), f"Validated archive locus {locus}")
             if seen != {name.casefold() for name in expected}:
@@ -525,27 +861,30 @@ class CGMLSTOrgCatalog(PubMLSTCatalog):
             # The original archive is redundant after extraction; all its bytes
             # remain auditable through the source hash in the snapshot manifest.
             archive.unlink()
-            checked = load_scheme(staging, cancelled=cancelled)
+            checked = _validated_scheme(staging, cancelled=cancelled)
             source_digest = hashlib.sha256(json.dumps(sources, sort_keys=True).encode()).hexdigest()
             manifest = {"format_version": 1, "provider": "cgMLST.org", "entry": entry,
                         'terms_url': self.TERMS_URL, 'terms_notice': self.TERMS_NOTICE,
                         'user_acknowledged_permitted_use': True,
                         "retrieved_at": datetime.now(UTC).isoformat(), "sources": sources,
                         "source_digest": source_digest, "scheme_digest": checked.digest,
+                        "excluded_alleles": excluded_alleles,
                         "downloaded_bytes": archive_source["bytes"] + table_source["bytes"]}
             (staging / "reference_manifest.json").write_text(json.dumps(manifest, indent=2), encoding="utf-8")
             destination = library_root / f"cgmlst_org_{slug}_{checked.digest[:16]}"
             check_cancelled(cancelled)
             created = not destination.exists()
             if destination.exists():
-                if load_scheme(destination, cancelled=cancelled).digest != checked.digest:
+                if _validated_scheme(destination, cancelled=cancelled).digest != checked.digest:
                     raise CatalogError("The existing reference snapshot was modified and will not be overwritten.")
             else:
                 staging.rename(destination)
                 staging = None
             return {"path": str(destination), "scheme_digest": checked.digest,
                     "source_digest": source_digest, "created": created,
-                    "locus_count": checked.locus_count, "entry": entry, "notes": checked.notes}
+                    "locus_count": checked.locus_count, "entry": entry,
+                    "notes": list(checked.notes) + _exclusion_notes(excluded_alleles),
+                    "excluded_alleles": excluded_alleles, "resume_path": None}
         finally:
             if staging is not None:
                 shutil.rmtree(staging)

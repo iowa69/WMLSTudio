@@ -242,3 +242,38 @@ def test_organism_typing_column_is_empty_when_the_assembly_changed(tmp_path):
         assert current and 'withheld' in current
         project.set_result(sid, {'input_sha256': 'b' * 64, 'st': '8'})
         assert feature_fields(project.get_sample(sid))['organism_typing'] == ''
+
+
+def test_a_core_genome_run_never_empties_the_classical_st_column(tmp_path):
+    from wmlstudio.sample_workflow import typing_profiles
+    mlst = {"scheme": "Klebsiella MLST", "scheme_digest": "mlst-v1", "st": "258",
+            "status": "complete", "alleles": {f"gene{i}": "1" for i in range(7)}}
+    cgmlst = {"scheme": "Klebsiella cgMLST", "scheme_digest": "cg-v1", "st": None,
+              "status": "complete", "parameters": {"method": "full-cds-cgmlst-v2"},
+              "alleles": {f"locus{i:04d}": ("3" if i % 2 else None) for i in range(400)}}
+    with Project(tmp_path / "study.wmlstudio") as project:
+        sid = add(project, tmp_path / "a.fasta", "a")
+        project.set_result(sid, mlst)
+        project.set_result(sid, cgmlst)
+        record = dict(project.get_sample(sid), analyses=project.analysis_results(sid))
+
+        profiles = typing_profiles(record)
+        assert profiles["mlst"]["st"] == "258" and profiles["cgmlst"]["scheme_digest"] == "cg-v1"
+        fields = feature_fields(record)
+        assert fields["mlst_st"] == "258" and fields["mlst_scheme"] == "Klebsiella MLST"
+        assert fields["cgmlst_scheme"] == "Klebsiella cgMLST"
+        assert fields["typing_kinds"] == ["mlst", "cgmlst"]
+        # The scheme size and the number of loci actually called stay separate.
+        assert fields["cgmlst_loci"] == 400 and fields["cgmlst_called"] == 200
+
+
+def test_a_sample_with_only_an_st_reports_no_core_genome_profile(tmp_path):
+    with Project(tmp_path / "study.wmlstudio") as project:
+        sid = add(project, tmp_path / "a.fasta", "a")
+        project.set_result(sid, {"scheme": "MLST", "scheme_digest": "mlst-v1", "st": "11",
+                                 "status": "complete", "alleles": {"adk": "1"}})
+        fields = feature_fields(dict(project.get_sample(sid),
+                                     analyses=project.analysis_results(sid)))
+        assert fields["mlst_st"] == "11" and fields["typing_kinds"] == ["mlst"]
+        assert fields["cgmlst_scheme"] == "" and fields["cgmlst_loci"] == 0
+        assert fields["cgmlst_called"] == 0

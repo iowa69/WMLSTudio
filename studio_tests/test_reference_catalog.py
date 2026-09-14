@@ -1,7 +1,9 @@
+import http.client
 import io
 import json
 import urllib.error
 import zipfile
+from pathlib import Path
 
 import pytest
 
@@ -76,6 +78,14 @@ def entry(client):
     return client.list_schemes(client.list_organisms()[0])[0]
 
 
+def published(root):
+    """Scheme folders a user would see. A kept partial download is hidden and is
+    not one: reference_index.filter_scheme_locations drops '.'-prefixed names."""
+    root = Path(root)
+    return [] if not root.is_dir() else sorted(
+        path.name for path in root.iterdir() if not path.name.startswith("."))
+
+
 def test_catalog_discovers_organisms_filters_and_access_notice(remote):
     client, opener, routes = remote
     schemes = client.search_schemes("Examplegenus", scheme_type="MLST", min_loci=2, max_loci=7)
@@ -131,7 +141,7 @@ def test_failed_locus_download_never_installs_partial_reference(tmp_path, remote
     routes[DB + "/loci/gyr/alleles_fasta"] = urllib.error.URLError("network interrupted")
     with pytest.raises(CatalogError, match="reach PubMLST"):
         client.download_scheme(selected, tmp_path / "library")
-    assert list((tmp_path / "library").iterdir()) == []
+    assert published(tmp_path / "library") == []
 
 
 def test_truncation_and_download_quota_fail_without_publication(tmp_path, remote):
@@ -140,7 +150,7 @@ def test_truncation_and_download_quota_fail_without_publication(tmp_path, remote
     routes[DB + "/loci/arc/alleles_fasta"] = lambda url: Response(url, b">arc_1\nACGT\n", length=99)
     with pytest.raises(CatalogError, match="truncated"):
         client.download_scheme(selected, tmp_path / "library")
-    assert list((tmp_path / "library").iterdir()) == []
+    assert published(tmp_path / "library") == []
     with pytest.raises(CatalogError, match="size limit"):
         client.download_scheme(selected, tmp_path / "library", max_bytes=2)
 
@@ -156,7 +166,7 @@ def test_cancellation_cleans_download_staging(tmp_path, remote):
     with pytest.raises(AnalysisCancelled):
         client.download_scheme(entry(client), tmp_path / "library",
                                cancelled=lambda: cancelled, progress=progress)
-    assert list((tmp_path / "library").iterdir()) == []
+    assert published(tmp_path / "library") == []
 
 
 def test_remote_change_during_download_is_rejected(tmp_path, remote):
@@ -174,7 +184,7 @@ def test_remote_change_during_download_is_rejected(tmp_path, remote):
     routes[SCHEME] = changing_details
     with pytest.raises(CatalogError, match="changed during"):
         client.download_scheme(selected, tmp_path / "library")
-    assert list((tmp_path / "library").iterdir()) == []
+    assert published(tmp_path / "library") == []
 
 
 def test_external_resource_url_and_case_collisions_are_rejected(tmp_path, remote):
@@ -187,7 +197,7 @@ def test_external_resource_url_and_case_collisions_are_rejected(tmp_path, remote
     routes[SCHEME]["loci"] = [DB + "/loci/arc", DB + "/loci/ARC"]
     with pytest.raises(CatalogError, match="Windows case"):
         client.download_scheme(selected, tmp_path / "library")
-    assert list((tmp_path / "library").iterdir()) == []
+    assert published(tmp_path / "library") == []
 
 
 def test_tampered_existing_snapshot_is_not_overwritten(tmp_path, remote):
@@ -270,4 +280,209 @@ def test_cg_archive_failures_never_publish_partial_snapshot(tmp_path, members, r
     selected = client.search_schemes('Examplegenus')['schemes'][0]
     with pytest.raises(CatalogError, match=reason):
         client.download_scheme(selected, tmp_path, terms_acknowledged=True)
-    assert list(tmp_path.iterdir()) == []
+    assert published(tmp_path) == []
+
+
+def failing_once(error, then):
+    """A route that raises once and then answers, to exercise retry behaviour."""
+    state = {"raised": False}
+
+    def handler(url):
+        if not state["raised"]:
+            state["raised"] = True
+            raise error
+        return Response(url, then)
+
+    return handler
+
+
+def test_non_iupac_allele_is_excluded_and_named_instead_of_failing_the_scheme(tmp_path):
+    # cgMLST.org publishes occasional alleles containing a literal 'X'. One such
+    # record used to abort the whole multi-gigabyte download at validation.
+    client = cg_remote({'bundle/arc.fasta': f'>arc_1\n{ARC}\n>arc_2\nACGXTACG\n',
+                        'bundle/gyr.fasta': f'>gyr_1\n{GYR}\n'})
+    selected = client.search_schemes('Examplegenus')['schemes'][0]
+    installed = client.download_scheme(selected, tmp_path, terms_acknowledged=True)
+    scheme = load_scheme(installed['path'])
+    assert scheme.loci == ('arc', 'gyr')
+    assert set(scheme.alleles['arc']) == {'1'}, 'the unreadable record is gone, the locus stays'
+    assert installed['excluded_alleles'] == ["arc:arc_2 (non-IUPAC X)"]
+    manifest = json.loads((scheme.path / 'reference_manifest.json').read_text())
+    assert manifest['excluded_alleles'] == ["arc:arc_2 (non-IUPAC X)"]
+    note = next(text for text in installed['notes'] if 'excluded' in text)
+    assert 'not rewritten' in note and 'unmatched sequence' in note
+    # The received bytes stay auditable; the stored bytes are recorded separately.
+    source = next(item for item in manifest['sources'] if item['file'] == 'arc.fasta')
+    assert source['sha256'] != source['stored_sha256']
+
+
+def test_a_locus_whose_every_allele_is_unreadable_installs_nothing(tmp_path):
+    client = cg_remote({'bundle/arc.fasta': '>arc_1\nACGXT\n',
+                        'bundle/gyr.fasta': f'>gyr_1\n{GYR}\n'})
+    selected = client.search_schemes('Examplegenus')['schemes'][0]
+    with pytest.raises(CatalogError, match='Every allele record'):
+        client.download_scheme(selected, tmp_path, terms_acknowledged=True)
+    assert published(tmp_path) == []
+
+
+def test_pubmlst_non_iupac_allele_is_excluded_and_the_snapshot_still_installs(tmp_path, remote):
+    client, _, routes = remote
+    routes[DB + "/loci/arc/alleles_fasta"] = f">arc_1\n{ARC}\n>arc_9\nACG?T\n".encode()
+    installed = client.download_scheme(entry(client), tmp_path / "library")
+    assert installed['excluded_alleles'] == ["arc:arc_9 (non-IUPAC ?)"]
+    scheme = load_scheme(installed['path'])
+    assert set(scheme.alleles['arc']) == {'1'}
+    assert call_assembly(_assembly(tmp_path), scheme)["st"] == "42"
+
+
+def _assembly(tmp_path):
+    path = tmp_path / "assembly.fa"
+    path.write_text(f">a\n{ARC}\n>b\n{GYR}\n")
+    return path
+
+
+def test_a_scheme_error_is_reported_as_a_catalog_error_not_leaked(tmp_path, remote):
+    # A scheme failure during a download is a download failure. Callers documented
+    # to catch CatalogError must not also have to catch SchemeError from typing.
+    client, _, routes = remote
+    routes[DB + "/loci/arc/alleles_fasta"] = f">arc_1\n{ARC}\n>arc_1\n{GYR}\n".encode()
+    with pytest.raises(CatalogError, match='could not be read as a scheme'):
+        client.download_scheme(entry(client), tmp_path / "library")
+    assert published(tmp_path / "library") == []
+
+
+def test_an_entirely_unreadable_locus_stops_the_download(tmp_path, remote):
+    client, _, routes = remote
+    routes[DB + "/loci/arc/alleles_fasta"] = b">arc_1\n\n"
+    with pytest.raises(CatalogError, match='Every allele record'):
+        client.download_scheme(entry(client), tmp_path / "library")
+    assert published(tmp_path / "library") == []
+
+
+def test_an_interrupted_download_resumes_instead_of_refetching_every_locus(tmp_path, remote):
+    client, opener, routes = remote
+    selected = entry(client)
+    routes[DB + "/loci/gyr/alleles_fasta"] = urllib.error.URLError("network interrupted")
+    with pytest.raises(CatalogError, match="reach PubMLST"):
+        client.download_scheme(selected, tmp_path / "library")
+    state = client.resume_state(tmp_path / "library", selected)
+    assert state["files_held"] == 1 and state["expected"] == 2
+    assert Path(state["path"]).name.startswith(".resume-")
+    # A partial download is never a scheme, and it is kept OUTSIDE the library that
+    # paths.scheme_locations hands to the typing code.
+    assert list((tmp_path / "library").iterdir()) == []
+    assert Path(state["path"]).parent.name == ".wmlstudio-partial-downloads"
+    routes[DB + "/loci/gyr/alleles_fasta"] = f">gyr_1\n{GYR}\n".encode()
+    opener.requests.clear()
+    installed = client.download_scheme(selected, tmp_path / "library")
+    assert installed["created"] is True
+    assert DB + "/loci/arc/alleles_fasta" not in opener.requests, "already held, not refetched"
+    assert DB + "/loci/gyr/alleles_fasta" in opener.requests
+    assert call_assembly(_assembly(tmp_path), load_scheme(installed["path"]))["st"] == "42"
+    assert client.resume_state(tmp_path / "library", selected) is None
+
+
+def test_a_changed_remote_scheme_discards_the_partial_rather_than_blending_it(tmp_path, remote):
+    client, opener, routes = remote
+    selected = entry(client)
+    routes[DB + "/loci/gyr/alleles_fasta"] = urllib.error.URLError("network interrupted")
+    with pytest.raises(CatalogError):
+        client.download_scheme(selected, tmp_path / "library")
+    assert client.resume_state(tmp_path / "library", selected)["files_held"] == 1
+    routes[SCHEME]["last_updated"] = "2026-09-14"
+    routes[DB + "/loci/gyr/alleles_fasta"] = f">gyr_1\n{GYR}\n".encode()
+    routes[DB + "/loci/arc/alleles_fasta"] = f">arc_1\n{ARC}\n".encode()
+    opener.requests.clear()
+    client.download_scheme(selected, tmp_path / "library")
+    assert DB + "/loci/arc/alleles_fasta" in opener.requests, "the stale copy was not trusted"
+
+
+def test_a_partial_download_can_be_discarded_without_touching_an_installed_scheme(tmp_path, remote):
+    client, _, routes = remote
+    selected = entry(client)
+    installed = client.download_scheme(selected, tmp_path / "library")
+    routes[SCHEME]["records"] = 2
+    routes[DB + "/loci/gyr/alleles_fasta"] = urllib.error.URLError("network interrupted")
+    with pytest.raises(CatalogError):
+        client.download_scheme(selected, tmp_path / "library")
+    assert client.clear_resume(tmp_path / "library", selected) is True
+    assert client.clear_resume(tmp_path / "library", selected) is False
+    assert Path(installed["path"]).is_dir()
+    assert published(tmp_path / "library") == [Path(installed["path"]).name]
+
+
+def test_resume_can_be_switched_off_and_then_leaves_nothing_behind(tmp_path, remote):
+    client, _, routes = remote
+    selected = entry(client)
+    routes[DB + "/loci/gyr/alleles_fasta"] = urllib.error.URLError("network interrupted")
+    with pytest.raises(CatalogError):
+        client.download_scheme(selected, tmp_path / "library", resume=False)
+    assert list((tmp_path / "library").iterdir()) == []
+    assert not (tmp_path / ".wmlstudio-partial-downloads").exists()
+    assert client.resume_state(tmp_path / "library", selected) is None
+
+
+def test_rate_limiting_is_waited_out_and_then_reported_in_words(tmp_path, remote):
+    client, _, routes = remote
+    client.retries = 1
+    routes[DB + "/loci/arc/alleles_fasta"] = failing_once(
+        urllib.error.HTTPError(DB, 429, "Too Many Requests", {"Retry-After": "0"}, None),
+        f">arc_1\n{ARC}\n".encode())
+    installed = client.download_scheme(entry(client), tmp_path / "library")
+    assert installed["created"] is True
+    routes[DB + "/loci/gyr/alleles_fasta"] = urllib.error.HTTPError(
+        DB, 429, "Too Many Requests", {"Retry-After": "0"}, None)
+    with pytest.raises(CatalogError, match="rate-limiting this computer"):
+        client.download_scheme(entry(client), tmp_path / "library2")
+
+
+def test_a_truncated_chunked_response_is_retried_not_raised_as_an_http_error(tmp_path, remote):
+    client, _, routes = remote
+    client.retries = 1
+    routes[DB + "/loci/arc/alleles_fasta"] = failing_once(
+        http.client.IncompleteRead(b"", 10), f">arc_1\n{ARC}\n".encode())
+    installed = client.download_scheme(entry(client), tmp_path / "library")
+    assert load_scheme(installed["path"]).locus_count == 2
+
+
+def test_cgmlst_org_error_page_is_named_instead_of_read_as_a_locus_table(tmp_path):
+    client = cg_remote()
+    selected = client.search_schemes('Examplegenus')['schemes'][0]
+    client.opener.routes['https://www.cgmlst.org/ncs/schema/Test/locus/?content-type=csv'] = (
+        b'<html><body><b>ERROR Occured #20260914</b><br>Illegal Typing ID!')
+    with pytest.raises(CatalogError, match='does not recognise the scheme identifier'):
+        client.download_scheme(selected, tmp_path, terms_acknowledged=True)
+    assert published(tmp_path) == []
+
+
+def test_a_retargeted_scheme_is_refused_with_both_counts_named(tmp_path):
+    client = cg_remote()
+    selected = client.search_schemes('Examplegenus')['schemes'][0]
+    selected['locus_count'] = 3
+    with pytest.raises(CatalogError, match='2 targets but the catalogue entry says 3'):
+        client.download_scheme(selected, tmp_path, terms_acknowledged=True)
+    assert published(tmp_path) == []
+
+
+def test_download_estimates_warn_before_a_thousand_request_transfer():
+    per_locus = PubMLSTCatalog(opener=Opener({})).download_estimate(
+        {"locus_count": 1748, "has_profiles": True})
+    assert per_locus["requests"] == 1749
+    assert per_locus["resumable"] is True
+    assert "1748 separate downloads" in per_locus["notice"]
+    assert "cancelled and resumed" in per_locus["notice"]
+    small = PubMLSTCatalog(opener=Opener({})).download_estimate({"locus_count": 7})
+    assert small["requests"] == 7 and "quick" in small["notice"]
+    archive = CGMLSTOrgCatalog(opener=Opener({})).download_estimate({"locus_count": 1861})
+    assert archive["requests"] == 2 and archive["resumable"] is False
+    assert "gigabytes" in archive["notice"]
+
+
+def test_download_progress_reports_bytes_while_a_length_free_archive_streams(tmp_path):
+    payload = b'>arc_1\n' + b'ACGT' * 2_000_000 + b'\n'
+    client = cg_remote({'bundle/arc.fasta': payload.decode(), 'bundle/gyr.fasta': f'>gyr_1\n{GYR}\n'})
+    selected = client.search_schemes('Examplegenus')['schemes'][0]
+    seen = []
+    client.download_scheme(selected, tmp_path, terms_acknowledged=True,
+                           progress=lambda current, total, text: seen.append(text))
+    assert any('MB received' in text for text in seen), 'a long transfer must not look frozen'

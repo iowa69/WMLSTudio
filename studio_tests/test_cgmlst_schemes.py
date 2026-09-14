@@ -1,0 +1,379 @@
+"""A catalogued scheme is an identity plus a licence verdict, never a free number.
+
+Nothing here contacts a network service. The pins are compared against themselves
+and against threshold_guidance; studio_scripts/stage_cgmlst_schemes.py --verify is
+the tool that re-reads the live services.
+"""
+
+import importlib.util
+import json
+from pathlib import Path
+
+import pytest
+
+from wmlstudio import cgmlst_schemes
+from wmlstudio.cgmlst_schemes import (
+    CGMLST_TARGET_FLOOR,
+    PROVIDERS,
+    SchemeCatalogError,
+    bundled_entries,
+    catalog_digest,
+    catalog_entries,
+    download_only_entries,
+    download_plan,
+    entry_for,
+    installed_scheme,
+    library_root,
+    library_status,
+    prepare_library,
+    threshold_citations,
+    threshold_for,
+)
+from wmlstudio.threshold_guidance import catalog_entries as publication_entries
+from wmlstudio.threshold_guidance import suggested_threshold
+
+
+def install(root, key, *, loci=None, api=None):
+    """A minimal but real installed scheme folder in the slot the catalogue names."""
+    entry = entry_for(key)
+    folder = library_root(root) / entry["slot"]
+    folder.mkdir(parents=True, exist_ok=True)
+    for index in range(loci if loci is not None else entry["locus_count"]):
+        (folder / f"locus{index:05d}.fasta").write_text(">1\nACGT\n")
+    (folder / "scheme.json").write_text(json.dumps(
+        {"name": entry["scheme_name"], "type": "cgMLST",
+         "API": entry["source_url"] if api is None else api}))
+    return folder
+
+
+def test_every_pinned_scheme_carries_a_complete_verifiable_identity():
+    entries = catalog_entries()
+    assert len(entries) >= 20
+    assert len({entry["key"] for entry in entries}) == len(entries)
+    assert len({entry["slot"] for entry in entries}) == len(entries)
+    for entry in entries:
+        assert entry["provider"] in PROVIDERS
+        assert len(entry["target_list_sha256"]) == 64
+        assert entry["locus_count"] > CGMLST_TARGET_FLOOR
+        assert entry["kind"] == "cgmlst"
+        assert entry["source_url"].startswith("https://")
+        assert entry["binding_basis"].strip()
+    # The catalogue digest is what a staging manifest pins; it must be stable and
+    # must move when any pinned field moves.
+    assert catalog_digest() == catalog_digest()
+    assert len(catalog_digest()) == 64
+
+
+def test_only_a_provider_that_grants_redistribution_may_be_packed():
+    packable = {entry["provider"] for entry in bundled_entries()}
+    assert packable == {"pubmlst"}
+    assert PROVIDERS["pubmlst"]["may_bundle"] is True
+    # Every refusal is recorded with the sentence it rests on, so the verdict can
+    # be re-checked rather than taken on trust.
+    for name in ("pasteur", "cgmlst.org", "enterobase", "chewie-ns"):
+        provider = PROVIDERS[name]
+        assert provider["may_bundle"] is False
+        assert provider["restriction"].strip()
+        assert provider["terms_url"].startswith("https://")
+    assert {entry["provider"] for entry in download_only_entries()} == {"pasteur", "cgmlst.org"}
+    assert all(entry["requires_terms_acknowledgement"] for entry in download_only_entries())
+
+
+def test_threshold_is_offerable_only_when_scheme_and_full_target_count_match():
+    salmonella = threshold_for("pubmlst:senterica-cgmlst-3002", locus_count=3002)
+    assert salmonella["status"] == "threshold_offerable"
+    assert salmonella["threshold"] == 10
+    assert salmonella["entries"][0]["source"]["doi"] == "10.3389/fmicb.2023.1254777"
+    # One missing target is a different target set, so the cutoff is withdrawn -
+    # never scaled, never rounded.
+    partial = threshold_for("pubmlst:senterica-cgmlst-3002", locus_count=3001)
+    assert partial["status"] == "target_count_mismatch"
+    assert partial["threshold"] is None
+    assert "3001" in partial["reason"] and "3002" in partial["reason"]
+    assert partial["entries"], "the citation stays visible even when the number is withheld"
+
+
+def test_equal_target_counts_from_different_providers_never_share_a_threshold():
+    # PubMLST and cgMLST.org both publish a 2,692-target S. marcescens scheme and
+    # they share no target name at all. Only the one the publication names is bound.
+    ridom = threshold_for("cgmlst.org:smarcescens-2692", locus_count=2692)
+    pubmlst = threshold_for("pubmlst:smarcescens-cgmlst-2692", locus_count=2692)
+    assert entry_for("cgmlst.org:smarcescens-2692")["locus_count"] == \
+        entry_for("pubmlst:smarcescens-cgmlst-2692")["locus_count"]
+    assert entry_for("cgmlst.org:smarcescens-2692")["target_list_sha256"] != \
+        entry_for("pubmlst:smarcescens-cgmlst-2692")["target_list_sha256"]
+    assert ridom["status"] == "threshold_offerable"
+    assert ridom["threshold"] == 12
+    assert pubmlst["status"] == "no_bound_cutoff"
+    assert pubmlst["threshold"] is None
+    assert "coincidence" in pubmlst["reason"]
+
+
+def test_a_bound_scheme_with_no_curated_number_returns_the_citation_and_no_number():
+    guidance = threshold_for("cgmlst.org:paeruginosa-3867", locus_count=3867)
+    assert guidance["status"] == "citation_only"
+    assert guidance["threshold"] is None
+    assert guidance["entries"] and guidance["entries"][0]["published_threshold"] is None
+    citations = threshold_citations("cgmlst.org:paeruginosa-3867")
+    assert citations[0]["doi"] == "10.1128/jcm.01987-20"
+    assert citations[0]["published_threshold"] is None
+    assert citations[0]["scheme_key"] == "cgmlst.org:paeruginosa-3867"
+
+
+def test_a_superseded_scheme_version_does_not_inherit_the_old_cutoff():
+    # Bletz 2018 published 6 alleles on the 2,270-target scheme; the provider now
+    # serves 2,147 targets. The number must not follow the organism name across.
+    guidance = threshold_for("cgmlst.org:cdifficile-2147", locus_count=2147)
+    assert guidance["status"] == "no_bound_cutoff"
+    assert guidance["threshold"] is None
+    assert "2,270" in guidance["reason"]
+    assert any(entry["scheme_key"] == "cgmlst.org:cdifficile-2270"
+               for entry in publication_entries())
+
+
+def test_every_bound_scheme_key_exists_in_the_publication_catalogue():
+    published = {entry["scheme_key"] for entry in publication_entries()}
+    bound = {entry["threshold_scheme_key"] for entry in catalog_entries()
+             if entry["threshold_scheme_key"]}
+    assert bound
+    assert bound <= published, sorted(bound - published)
+    for entry in catalog_entries():
+        if not entry["threshold_scheme_key"]:
+            continue
+        rows = [row for row in publication_entries()
+                if row["scheme_key"] == entry["threshold_scheme_key"]
+                and row["locus_count"] is not None]
+        # Where the publication pins a target count it must be this scheme's count.
+        assert all(row["locus_count"] == entry["locus_count"] for row in rows), entry["key"]
+
+
+def test_an_mlst_question_is_refused_rather_than_answered_with_a_cgmlst_number():
+    with pytest.raises(SchemeCatalogError, match="different quantity"):
+        threshold_for("cgmlst.org:saureus-1861", method="mlst")
+    with pytest.raises(SchemeCatalogError, match="Unknown cgMLST scheme"):
+        threshold_for("cgmlst.org:not-a-scheme")
+
+
+def test_library_layout_is_created_with_a_labelled_folder_for_every_scheme(tmp_path):
+    report = prepare_library(tmp_path)
+    base = library_root(tmp_path)
+    assert Path(report["root"]) == base
+    assert len(report["created"]) == len(catalog_entries())
+    assert (base / "README.txt").is_file()
+    for entry in catalog_entries():
+        folder = base / entry["slot"]
+        assert folder.is_dir()
+        readme = (folder / "README.txt").read_text(encoding="utf-8")
+        assert entry["organism"] in readme
+        assert str(entry["locus_count"]) in readme
+        assert entry["terms_url"] in readme
+        slot = json.loads((folder / "scheme_slot.json").read_text(encoding="utf-8"))
+        assert slot["key"] == entry["key"]
+        assert slot["bundled"] is entry["bundled"]
+        assert slot["target_list_sha256"] == entry["target_list_sha256"]
+    # A folder that cannot be packed says so, in words, before any download starts.
+    ridom = (base / entry_for("cgmlst.org:saureus-1861")["slot"] / "README.txt").read_text()
+    assert "CANNOT be packed" in ridom
+    assert "does not grant" in ridom
+
+
+def test_preparing_twice_is_idempotent_and_never_touches_installed_data(tmp_path):
+    prepare_library(tmp_path)
+    folder = install(tmp_path, "cgmlst.org:efaecium-1423", loci=3)
+    (folder / "locus00000.fasta").write_text(">1\nACGTACGT\n")
+    before = (folder / "locus00000.fasta").read_bytes()
+    second = prepare_library(tmp_path)
+    assert second["created"] == []
+    assert second["refreshed"] == []
+    assert (folder / "locus00000.fasta").read_bytes() == before
+
+
+def test_an_installed_scheme_is_recognised_only_when_its_identity_matches(tmp_path):
+    prepare_library(tmp_path)
+    assert installed_scheme(tmp_path, "cgmlst.org:efaecalis-1972") is None
+    install(tmp_path, "cgmlst.org:efaecalis-1972", loci=1972)
+    found = installed_scheme(tmp_path, "cgmlst.org:efaecalis-1972")
+    assert found["count_matched"] is True and found["identity_matched"] is True
+    # The right number of files with somebody else's identity is not this scheme.
+    other = install(tmp_path, "cgmlst.org:abaumannii-2390", loci=2390,
+                    api="https://www.cgmlst.org/ncs/schema/Efaecalis/")
+    mismatch = installed_scheme(tmp_path, "cgmlst.org:abaumannii-2390")
+    assert mismatch["count_matched"] is True
+    assert mismatch["identity_matched"] is False
+    assert Path(mismatch["path"]) == other
+
+
+def test_library_status_withholds_a_cutoff_from_a_short_installed_scheme(tmp_path):
+    prepare_library(tmp_path)
+    install(tmp_path, "cgmlst.org:kpneumoniae-2358", loci=2358)
+    install(tmp_path, "cgmlst.org:efaecium-1423", loci=1400)
+    rows = {row["key"]: row for row in library_status(tmp_path)}
+    complete = rows["cgmlst.org:kpneumoniae-2358"]
+    assert complete["ready"] is True
+    assert complete["threshold"]["status"] == "threshold_offerable"
+    assert complete["threshold"]["threshold"] == 15
+    short = rows["cgmlst.org:efaecium-1423"]
+    assert short["ready"] is False
+    assert short["threshold"]["status"] == "target_count_mismatch"
+    assert short["threshold"]["threshold"] is None
+    absent = rows["cgmlst.org:cfreundii-3250"]
+    assert absent["installed"] is None
+    assert absent["ready"] is False
+    # Nothing is installed, so nothing is offerable - but the folder still exists.
+    assert Path(absent["folder"]).is_dir()
+
+
+def test_download_plan_states_the_cost_and_the_terms_before_any_transfer():
+    ridom = download_plan("cgmlst.org:saureus-1861")
+    assert ridom["requires_acknowledgement"] is True
+    assert ridom["may_be_bundled"] is False
+    assert "archive" in ridom["method"]
+    assert "gigabytes" in ridom["method"]
+    assert ridom["terms_url"] == PROVIDERS["cgmlst.org"]["terms_url"]
+    pasteur = download_plan("pasteur:lmonocytogenes-1748")
+    assert "1748 separate requests" in pasteur["method"]
+    assert pasteur["requires_acknowledgement"] is True
+    oxford = download_plan("pubmlst:senterica-cgmlst-3002")
+    assert oxford["may_be_bundled"] is True
+    assert oxford["requires_acknowledgement"] is False
+
+
+def test_the_threshold_organisms_the_catalogue_cannot_pack_are_named(tmp_path):
+    # The organisms the threshold catalogue binds are overwhelmingly served by a
+    # provider that forbids redistribution. That is a fact about the licences, and
+    # the catalogue must keep stating it rather than quietly shipping fewer schemes.
+    bound = [entry for entry in catalog_entries() if entry["threshold_scheme_key"]]
+    assert bound
+    unpackable = [entry["organism"] for entry in bound if not entry["bundled"]]
+    assert "Klebsiella pneumoniae" in unpackable
+    assert "Listeria monocytogenes" in unpackable
+    assert "Staphylococcus aureus" in unpackable
+    packable = [entry["organism"] for entry in bound if entry["bundled"]]
+    assert "Salmonella enterica" in packable
+    assert "Escherichia coli" in packable
+
+
+def test_slot_descriptions_keep_mlst_and_cgmlst_apart(tmp_path):
+    prepare_library(tmp_path)
+    library = (library_root(tmp_path) / "README.txt").read_text(encoding="utf-8")
+    assert "seven-locus" in library
+    assert "different quantities" in library
+    slot = json.loads((library_root(tmp_path) / entry_for("cgmlst.org:efaecium-1423")["slot"]
+                       / "scheme_slot.json").read_text(encoding="utf-8"))
+    assert slot["kind"] == "cgmlst"
+    assert "never shares a scale" in slot["interpretation"]
+    assert cgmlst_schemes.CGMLST_TARGET_FLOOR == 30
+
+
+def staging_module():
+    spec = importlib.util.spec_from_file_location(
+        "stage_cgmlst_schemes",
+        Path(__file__).resolve().parents[1] / "studio_scripts/stage_cgmlst_schemes.py")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def test_staging_writes_a_definition_pack_that_contains_no_sequence_data(tmp_path):
+    staging = staging_module()
+    report = staging.stage_definitions(tmp_path, fetch=False)
+    manifest = json.loads(Path(report["root"], "manifest.json").read_text(encoding="utf-8"))
+    assert manifest["contains_sequence_data"] is False
+    assert manifest["catalog_digest"] == catalog_digest()
+    assert len(manifest["slots"]) == len(catalog_entries())
+    assert {slot["key"] for slot in manifest["slots"]} == {e["key"] for e in catalog_entries()}
+    written = sorted(path.name for path in Path(report["root"]).rglob("*") if path.is_file())
+    assert set(written) <= {"README.txt", "scheme_slot.json", "manifest.json"}
+
+
+def test_staging_refuses_to_pack_a_scheme_its_provider_does_not_license(tmp_path):
+    staging = staging_module()
+    with pytest.raises(SystemExit) as refused:
+        staging.stage_alleles("cgmlst.org:saureus-1861", tmp_path)
+    message = str(refused.value)
+    assert "may not be staged into a release" in message
+    assert "Ridom" in message
+    assert list(tmp_path.iterdir()) == []
+    with pytest.raises(SystemExit, match="may not be staged"):
+        staging.stage_alleles("pasteur:lmonocytogenes-1748", tmp_path)
+
+
+def test_staged_notices_record_each_provider_verdict_and_its_source(tmp_path):
+    text = staging_module().notices()
+    for provider in PROVIDERS.values():
+        assert provider["name"] in text
+        assert provider["terms_url"] in text
+    assert "May be packed into a WMLSTudio release: NO" in text
+    assert "May be packed into a WMLSTudio release: yes" in text
+    assert cgmlst_schemes.CATALOG_VERSION in text
+
+
+def test_a_scheme_folder_on_disk_resolves_to_its_cutoff_and_citation(tmp_path):
+    prepare_library(tmp_path)
+    folder = install(tmp_path, "cgmlst.org:kpneumoniae-2358", loci=2358)
+    identified = cgmlst_schemes.identify_installed(folder)
+    assert identified["key"] == "cgmlst.org:kpneumoniae-2358"
+    assert identified["locus_count_on_disk"] == 2358
+    guidance = cgmlst_schemes.threshold_for_installed(folder)
+    assert guidance["status"] == "threshold_offerable"
+    assert guidance["threshold"] == 15
+    assert guidance["path"] == str(folder)
+    assert guidance["entries"][0]["source"]["doi"] == "10.1128/jcm.00646-25"
+
+
+def test_an_incomplete_snapshot_on_disk_does_not_inherit_the_published_cutoff(tmp_path):
+    prepare_library(tmp_path)
+    folder = install(tmp_path, "cgmlst.org:kpneumoniae-2358", loci=2300)
+    guidance = cgmlst_schemes.threshold_for_installed(folder)
+    assert guidance["status"] == "target_count_mismatch"
+    assert guidance["threshold"] is None
+    assert "2300" in guidance["reason"]
+
+
+def test_an_unrecognised_scheme_folder_says_so_instead_of_guessing(tmp_path):
+    folder = tmp_path / "somebody_elses_scheme"
+    folder.mkdir()
+    (folder / "locus.fasta").write_text(">1\nACGT\n")
+    (folder / "scheme.json").write_text(json.dumps({"name": "Local scheme", "type": "cgMLST"}))
+    assert cgmlst_schemes.identify_installed(folder) is None
+    guidance = cgmlst_schemes.threshold_for_installed(folder)
+    assert guidance["status"] == "scheme_not_catalogued"
+    assert guidance["threshold"] is None
+    assert "Distances can still be computed" in guidance["reason"]
+    assert cgmlst_schemes.identify_installed(tmp_path / "absent") is None
+
+
+def test_several_cutoffs_on_one_scheme_are_ranked_the_same_way_the_organism_view_ranks_them():
+    # Three publications cite the 1,423-target E. faecium scheme for different
+    # questions. This lookup and threshold_guidance.suggested_threshold must never
+    # show a person two different numbers for the same comparison.
+    guidance = threshold_for("cgmlst.org:efaecium-1423", locus_count=1423)
+    assert guidance["status"] == "threshold_offerable"
+    organism = suggested_threshold("Enterococcus faecium", "cgmlst",
+                                   locus_count=1423, scheme_key="cgmlst.org:efaecium-1423")
+    assert guidance["suggestion"]["id"] == organism["suggestion"]["id"]
+    assert guidance["threshold"] == organism["suggestion"]["published_threshold"]
+    assert guidance["alternatives"], "the disagreeing entries stay visible"
+    assert {row["published_threshold"] for row in guidance["entries"]} == {20, 25}
+    assert all(row["method"] == "cgmlst" for row in guidance["entries"]), \
+        "the SKA SNP cutoff for the same organism is a different quantity"
+
+
+def test_a_scheme_downloaded_into_the_existing_schemes_folder_is_still_recognised(tmp_path):
+    # The online reference dialog installs into <data root>/schemes, not into the
+    # catalogue slot. Passing those paths must still bind the scheme and its cutoff.
+    prepare_library(tmp_path)
+    elsewhere = tmp_path / "schemes" / "cgmlst_org_Saureus_0123456789abcdef"
+    elsewhere.mkdir(parents=True)
+    for index in range(1861):
+        (elsewhere / f"t{index:05d}.fasta").write_text(">1\nACGT\n")
+    (elsewhere / "scheme.json").write_text(json.dumps(
+        {"name": "Staphylococcus aureus cgMLST", "type": "cgMLST",
+         "API": "https://www.cgmlst.org/ncs/schema/Saureus/"}))
+    assert installed_scheme(tmp_path, "cgmlst.org:saureus-1861") is None
+    found = installed_scheme(tmp_path, "cgmlst.org:saureus-1861", extra_paths=[elsewhere])
+    assert found["identity_matched"] is True and found["count_matched"] is True
+    row = next(row for row in library_status(tmp_path, extra_paths=[elsewhere])
+               if row["key"] == "cgmlst.org:saureus-1861")
+    assert row["ready"] is True
+    assert row["threshold"]["threshold"] == 24

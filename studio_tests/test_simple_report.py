@@ -36,6 +36,14 @@ def record(sample_id, vector, *, evidence=None, organism="Klebsiella pneumoniae"
                        "alleles": dict(zip(loci, vector))}}
 
 
+def core_record(sample_id, *, targets=2358, differences=0, organism="Klebsiella pneumoniae", scheme=None):
+    """A core-genome-scale profile: 2,358 targets is the set Glasgow 2025 binds."""
+    loci = tuple(f"locus{index:05d}" for index in range(targets))
+    vector = ["2" if index < differences else "1" for index in range(targets)]
+    return record(sample_id, vector, organism=organism, loci=loci, st="",
+                  scheme=scheme or f"{organism} cgMLST {targets}")
+
+
 def profile(record_dict):
     return {"sample_id": record_dict["id"], "sample_name": record_dict["name"], **record_dict["result"]}
 
@@ -121,33 +129,99 @@ def test_simple_report_gives_every_equally_close_isolate_its_own_denominator():
     assert '<td>5/7<br><span class="muted">71% of loci shared</span></td>' in report
 
 
+def adoption(scheme_digest="pinned", min_overlap=0.95):
+    """The only route to an approved number: every binding field, all three reviews."""
+    return record_decision(
+        "klebsiella-pneumoniae-glasgow2025",
+        {"method": "cgmlst", "organism": "Klebsiella pneumoniae", "scheme_key": "cgmlst.org:kpneumoniae-2358",
+         "locus_count": 2358, "scheme_digest": scheme_digest, "min_overlap": min_overlap,
+         "missing_policy": "Pairwise ignore missing targets.", "caller": "WMLSTudio local caller"},
+        selected_threshold=15, justification="Reviewed locally against this ward outbreak protocol.",
+        protocol_reviewed=True, schema_reviewed=True, epi_reviewed=True)
+
+
 def test_simple_report_states_the_threshold_and_its_citation_or_that_none_is_bound():
-    records = [record("a", "1111111"), record("b", "2111111")]
+    records = [core_record("a"), core_record("b", differences=3)]
     unbound = render(records, snapshot_for(records))
     assert "not a validated rule" in unbound
     assert "10.1128/jcm.01196-22" not in unbound
-    # The catalog is shown as context that exists, never as a rule that was applied.
-    assert "Published cutoffs exist for Klebsiella pneumoniae" in unbound
-    assert "None of them is applied to this report." in unbound
+    # The most recent reviewed source is offered as a suggestion, never as a rule.
+    assert "Suggested, not applied: Glasgow et al. (2025)" in unbound
+    assert "cgmlst.org:kpneumoniae-2358" in unbound and "10.1128/jcm.00646-25" in unbound
+    assert "Selection was based on prior clustering" in unbound  # the authors' own caveat
+    assert "None of this is applied to this report." in unbound
+    assert "The local reference matches the scheme binding recorded with this number" in unbound
 
     cited = snapshot_for(records)
     cited["threshold_evidence"] = record_decision("serratia-marcescens-kampmeier2022", {"method": "cgmlst"})
     citation_only = render(records, cited)
     assert "10.1128/jcm.01196-22" in citation_only
-    assert "No numeric cutoff was adopted from it." in citation_only
-    assert "Published cutoffs exist for" not in citation_only
+    assert "no number was adopted from it" in citation_only
+    assert "it is your own setting" in citation_only
 
     bound = snapshot_for(records, threshold=15)
-    bound["threshold_evidence"] = record_decision(
-        "klebsiella-pneumoniae-glasgow2025",
-        {"method": "cgmlst", "organism": "Klebsiella pneumoniae", "scheme_key": "cgmlst.org:kpneumoniae-2358",
-         "locus_count": 2358, "scheme_digest": "pinned", "min_overlap": 0.95,
-         "missing_policy": "Pairwise ignore missing targets.", "caller": "WMLSTudio local caller"},
-        selected_threshold=15, justification="Reviewed locally against this ward outbreak protocol.",
-        protocol_reviewed=True, schema_reviewed=True, epi_reviewed=True)
+    bound["threshold_evidence"] = adoption()
     applied = render(records, bound)
-    assert "published cutoff at most 15; applied here as at most 15" in applied
+    assert "it is a published cutoff that was reviewed and adopted for this comparison" in applied
+    assert "published cutoff at most 15" in applied
+    assert "applied here as at most 15 allele differences" in applied
     assert "Matching an organism or a locus count is not clinical validation." in applied
+    assert "The authors’ own caveat:" in applied
+    assert "Selection was based on prior clustering" in applied
+    assert "Suggested, not applied" not in applied, "an adopted cutoff is not re-offered as a suggestion"
+
+
+def test_an_adopted_cutoff_stops_being_in_force_when_the_target_count_is_not_the_published_one():
+    """2,358 published targets and 7 compared loci are not the same measurement."""
+    records = [record("a", "1111111"), record("b", "2111111")]
+    snapshot = snapshot_for(records, threshold=15)
+    snapshot["threshold_evidence"] = adoption()
+    report = render(records, snapshot)
+
+    assert "published over 2358 targets and this comparison measured 7" in report
+    assert "not in force" in report
+    assert "it is a published cutoff that was reviewed and adopted" not in report
+    assert "threshold set locally for this comparison" in report
+
+
+def test_simple_report_says_the_published_number_does_not_carry_to_a_different_target_set():
+    records = [core_record("a", targets=120), core_record("b", targets=120, differences=2)]
+    report = render(records, snapshot_for(records))
+
+    assert "Suggested, not applied: Glasgow et al. (2025)" in report
+    assert "the published number was measured over 2358 targets and this comparison used 120" in report
+    assert "No scaling for a different target set exists." in report
+
+
+def test_simple_report_shows_that_reviewed_sources_disagree_instead_of_choosing_for_you():
+    records = [core_record("a", targets=1423, organism="Enterococcus faecium"),
+               core_record("b", targets=1423, organism="Enterococcus faecium", differences=4)]
+    report = render(records, snapshot_for(records))
+
+    assert "Suggested, not applied: Glasgow et al. (2025)" in report  # the most recent bindable source
+    assert "Reviewed sources for Enterococcus faecium do not agree on one number" in report
+    assert "at most 25 allele differences (Higgs et al. (2022))" in report
+    assert "They answer different questions and are not interchangeable." in report
+
+
+def test_simple_report_names_the_newest_source_even_when_it_cannot_supply_a_number():
+    records = [core_record("a", targets=2270, organism="Clostridioides difficile"),
+               core_record("b", targets=2270, organism="Clostridioides difficile", differences=1)]
+    report = render(records, snapshot_for(records))
+
+    assert "Suggested, not applied: Bletz et al. (2018)" in report
+    assert ("The most recent reviewed source for this organism, Siddall et al. (2025), is not bound to a "
+            "scheme this catalog can bind, so it cannot supply a number.") in report
+    assert "doubled it to 6 as a precaution" in report
+
+
+def test_simple_report_suggests_nothing_when_the_isolates_are_not_one_organism():
+    records = [core_record("a", organism="Klebsiella pneumoniae", scheme="Shared core scheme"),
+               core_record("b", organism="Escherichia coli", scheme="Shared core scheme", differences=2)]
+    report = render(records, snapshot_for(records))
+
+    assert "not all the same organism" in report
+    assert "Suggested, not applied" not in report
 
 
 def test_simple_report_shows_failed_and_missing_inputs_instead_of_a_blank_row():
@@ -163,26 +237,42 @@ def test_simple_report_shows_failed_and_missing_inputs_instead_of_a_blank_row():
 
 
 def test_simple_report_says_an_unknown_organism_is_an_evidence_gap_not_an_absent_cutoff():
-    records = [record("a", "1111111", organism="Nocardia farcinica"),
-               record("b", "2111111", organism="Nocardia farcinica")]
+    records = [core_record("a", organism="Nocardia farcinica"),
+               core_record("b", organism="Nocardia farcinica", differences=2)]
     report = render(records, snapshot_for(records))
     assert "This is an evidence gap, not proof that no publications exist." in report
-    assert "Published cutoffs exist for" not in report
+    assert "10.1128/" not in report, "no other organism's citation may stand in for a missing one"
 
 
-def test_simple_report_names_the_scheme_and_never_claims_cgmlst_for_a_seven_locus_comparison():
+def test_no_core_genome_cutoff_is_offered_beside_a_seven_locus_distance():
+    """The single most important separation: two scales, never one threshold."""
     records = [record("a", "1111111"), record("b", "2111111")]
     report = render(records, snapshot_for(records))
 
-    assert "<b>Reference used:</b> Demo MLST · 7 loci per profile" in report
+    assert "This summary is based on classical MLST" in report
+    assert "That is a sequence-type comparison, not a core-genome one." in report
+    assert "so this catalog suggests no cutoff for it" in report
+    assert "they share no scale, no column and no threshold" in report
+    # Not one published number, scheme key or DOI from the core-genome catalog.
+    assert "cgmlst.org:kpneumoniae-2358" not in report
+    assert "Glasgow" not in report and "10.1128/" not in report
+
+
+def test_simple_report_names_the_scheme_and_the_typing_scale_it_measured_on():
+    records = [record("a", "1111111"), record("b", "2111111")]
+    report = render(records, snapshot_for(records))
+
+    assert "<b>Reference used:</b> Demo MLST · 7 loci per profile · classical MLST over 7 loci" in report
     assert "classical MLST-scale reference (7 loci)" in report
-    assert "cgmlst" not in report.casefold()
+    assert "Allele differences to closest (of 7 targets)" in report
 
     wide = [f"locus{index:04d}" for index in range(120)]
-    large = [record("a", ["1"] * 120, scheme="Demo core scheme", loci=wide),
-             record("b", ["2"] + ["1"] * 119, scheme="Demo core scheme", loci=wide)]
+    large = [record("a", ["1"] * 120, scheme="Demo core scheme", loci=wide, organism="Nocardia farcinica"),
+             record("b", ["2"] + ["1"] * 119, scheme="Demo core scheme", loci=wide, organism="Nocardia farcinica")]
     report = render(large, snapshot_for(large))
-    assert "<b>Reference used:</b> Demo core scheme · 120 loci per profile" in report
+    assert "<b>Reference used:</b> Demo core scheme · 120 loci per profile · core-genome typing over 120 targets" in report
+    assert "This summary is based on core-genome typing" in report
+    assert "Those distances are not sequence-type distances." in report
     assert "classical MLST-scale reference" not in report
 
 

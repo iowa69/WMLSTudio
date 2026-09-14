@@ -2,7 +2,7 @@
 
 import re
 
-from PySide6.QtCore import QSettings, Qt
+from PySide6.QtCore import QSettings, Qt, Signal
 from PySide6.QtWidgets import (
     QCheckBox,
     QComboBox,
@@ -13,17 +13,144 @@ from PySide6.QtWidgets import (
     QGroupBox,
     QHBoxLayout,
     QScrollArea,
+    QSpinBox,
     QVBoxLayout,
     QWidget,
 )
 
-from wmlstudio import __version__, display
+from wmlstudio import __version__, display, scheduler
 from wmlstudio.theme import STYLE
 from wmlstudio.widgets import button, label
+
+RESOURCE_HONESTY = ("The memory figure is an admission estimate, not a limit the operating "
+                    "system enforces, and a run can still be cancelled at any time.")
 
 
 def interface_preferences(root):
     return QSettings(str(root / "Interface.ini"), QSettings.Format.IniFormat)
+
+
+def _as_bool(value, fallback=True):
+    """QSettings hands back 'true'/'false' strings on the INI backend."""
+    if isinstance(value, bool):
+        return value
+    text = str(value).strip().lower()
+    if text in {"true", "1", "yes"}:
+        return True
+    if text in {"false", "0", "no"}:
+        return False
+    return fallback
+
+
+def saved_worksize(preferences, hardware=None):
+    """The two numbers this workspace saved, sized for this computer when it saved none."""
+    hardware = hardware or scheduler.detect_hardware()
+    if _as_bool(preferences.value("resources/automatic", True)):
+        return scheduler.auto_worksize(hardware)
+    return scheduler.clamp_worksize(preferences.value("resources/jobs", 1),
+                                    preferences.value("resources/threads", 1), hardware.cpus)
+
+
+def store_worksize(preferences, size) -> None:
+    """Persist the chosen numbers, including whether the user let us size them."""
+    preferences.setValue("resources/automatic", bool(size.automatic))
+    preferences.setValue("resources/jobs", int(size.jobs))
+    preferences.setValue("resources/threads", int(size.threads))
+    preferences.sync()
+
+
+class ComputerPowerPanel(QGroupBox):
+    """Two explicit numbers instead of a policy name, as WMLST presents them.
+
+    Samples at a time and CPU threads each, the constraint between them stated in
+    words, the real CPU count, and one plain sentence saying what the choice means
+    on this computer. Nothing here changes a result: it is throughput only.
+    """
+
+    changed = Signal()
+
+    def __init__(self, preferences, *, hardware=None, parent=None):
+        super().__init__("How much of this computer to use", parent)
+        self.preferences = preferences
+        self.hardware = hardware or scheduler.detect_hardware()
+        ceiling = scheduler.thread_ceiling(self.hardware.cpus)
+        size = saved_worksize(preferences, self.hardware)
+        layout = QVBoxLayout(self)
+        self.automatic = QCheckBox("Size this automatically for this computer (recommended)")
+        self.automatic.setChecked(bool(size.automatic))
+        self.automatic.toggled.connect(self.automatic_changed)
+        layout.addWidget(self.automatic)
+        form = QFormLayout()
+        self.jobs = QSpinBox()
+        self.jobs.setRange(1, ceiling)
+        self.jobs.setValue(size.jobs)
+        self.jobs.setAccessibleName("Samples at a time")
+        self.jobs.setToolTip("How many samples are analysed at the same time.")
+        form.addRow("Samples at a time", self.jobs)
+        self.threads = QSpinBox()
+        self.threads.setRange(1, ceiling)
+        self.threads.setValue(size.threads)
+        self.threads.setAccessibleName("CPU threads for each sample")
+        self.threads.setToolTip("How many CPU threads each of those samples may use for "
+                                "its own search and assembly tools.")
+        form.addRow("CPU threads for each sample", self.threads)
+        layout.addLayout(form)
+        for field in (self.jobs, self.threads):
+            field.valueChanged.connect(self.numbers_changed)
+        self.machine_line = label(self.machine_sentence(), "small", True)
+        layout.addWidget(self.machine_line)
+        self.constraint_line = label(scheduler.worksize_constraint(self.hardware.cpus),
+                                     "small", True)
+        layout.addWidget(self.constraint_line)
+        self.summary_line = label(scheduler.describe_worksize(size), "badge")
+        self.summary_line.setWordWrap(True)
+        layout.addWidget(self.summary_line)
+        layout.addWidget(label(RESOURCE_HONESTY, "small", True))
+        self.sync_enabled()
+        self.apply(size)
+
+    # --- helpers ------------------------------------------------------------
+    def machine_sentence(self) -> str:
+        memory = self.hardware.available_memory
+        free = (f"{memory / scheduler.GIB:.1f} GB of memory is free"
+                if memory is not None else "the free memory could not be read")
+        return f"This computer has {self.hardware.cpus} CPU threads, and {free}."
+
+    def worksize(self):
+        """What the two controls currently say, with the whole rule applied."""
+        if self.automatic.isChecked():
+            return scheduler.auto_worksize(self.hardware)
+        return scheduler.clamp_worksize(self.jobs.value(), self.threads.value(),
+                                        self.hardware.cpus)
+
+    def apply(self, size=None) -> None:
+        """Show the resulting size, save it, and make it the default for new runs."""
+        size = size if size is not None else self.worksize()
+        for field, value in ((self.jobs, size.jobs), (self.threads, size.threads)):
+            if field.value() != value:
+                field.blockSignals(True)
+                field.setValue(value)
+                field.blockSignals(False)
+        self.summary_line.setText(scheduler.describe_worksize(size))
+        store_worksize(self.preferences, size)
+        scheduler.set_default_worksize(size)
+
+    def sync_enabled(self) -> None:
+        automatic = self.automatic.isChecked()
+        for field in (self.jobs, self.threads):
+            field.setEnabled(not automatic)
+
+    # --- the controls -------------------------------------------------------
+    def automatic_changed(self) -> None:
+        self.sync_enabled()
+        self.apply()
+        self.changed.emit()
+
+    def numbers_changed(self) -> None:
+        if self.automatic.isChecked():
+            return
+        self.apply()
+        self.changed.emit()
 
 
 def scaled_style_fragment(text, percent):
@@ -60,13 +187,27 @@ class InterfaceSettingsPanel(QWidget):
         self.display_settings = display.read_display_settings(self.display_root)
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
+        # The user could not find these controls at all, so the page says what it
+        # is in the words somebody looks for before it shows a single combo box.
+        layout.addWidget(label(display.DISPLAY_TITLE, "cardTitle"))
+        layout.addWidget(label(display.DISPLAY_INTRO, "muted", True))
         form = QFormLayout()
+        self.window_size = QComboBox()
+        self.window_size.addItem("Fit this screen", "")
+        for width, height in display.available_window_sizes(self.available_size()):
+            self.window_size.addItem(display.describe_window_size(width, height),
+                                     display.window_size_token(width, height))
+        saved = display.read_window_size(self.display_root)
+        self.window_size.setCurrentIndex(max(0, self.window_size.findData(
+            display.window_size_token(*saved) if saved else "")))
+        self.window_size.currentIndexChanged.connect(self.apply_window_size)
+        form.addRow("Window size", self.window_size)
         self.scale = QComboBox()
         for value in display.TEXT_SCALE_CHOICES:
             self.scale.addItem(f"{value}%" + (" · recommended" if value == 100 else ""), value)
         self.scale.setCurrentIndex(max(0, self.scale.findData(window.ui_scale)))
         self.scale.currentIndexChanged.connect(self.apply_scale)
-        form.addRow("Interface text size", self.scale)
+        form.addRow("Text size (applies at once)", self.scale)
         self.display_scale = QComboBox()
         self.display_scale.addItem("Follow my system setting (recommended)", 0)
         for value in display.available_scale_choices(self.available_size()):
@@ -75,7 +216,7 @@ class InterfaceSettingsPanel(QWidget):
         chosen = self.display_settings["scale_percent"] if self.display_settings["mode"] == "fixed" else 0
         self.display_scale.setCurrentIndex(max(0, self.display_scale.findData(chosen)))
         self.display_scale.currentIndexChanged.connect(self.apply_display_scale)
-        form.addRow("Whole interface size", self.display_scale)
+        form.addRow("Whole interface size (needs a restart)", self.display_scale)
         self.graph_scale = QComboBox()
         for value in display.TEXT_SCALE_CHOICES:
             self.graph_scale.addItem(f"{value}%", value)
@@ -86,13 +227,14 @@ class InterfaceSettingsPanel(QWidget):
         self.motion.setChecked(bool(window.project.get_setting("motion", True)))
         self.motion.toggled.connect(window.set_motion)
         form.addRow("Motion", self.motion)
-        self.policy = QComboBox()
-        for title, value in (("Balanced", "balanced"), ("Faster throughput", "fast"), ("Low memory", "low_memory")):
-            self.policy.addItem(title, value)
-        self.policy.setCurrentIndex(max(0, self.policy.findData(self.preferences.value("resource_policy", "balanced"))))
-        self.policy.currentIndexChanged.connect(lambda: self.preferences.setValue("resource_policy", self.policy.currentData()))
-        form.addRow("Default analysis resources", self.policy)
         layout.addLayout(form)
+        layout.addWidget(label(display.WINDOW_SIZE_NOTICE, "small", True))
+        # Shown before anything is changed, because the restart is the reason a
+        # person gives up on the whole-interface size and never finds it again.
+        self.scale_explainer = label(
+            "Whole interface size magnifies everything — text, rows, buttons and spacing. "
+            + display.RESTART_NOTICE, "small", True)
+        layout.addWidget(self.scale_explainer)
         self.restart_notice = label(display.RESTART_NOTICE, "badge")
         self.restart_notice.setWordWrap(True)
         self.restart_notice.setVisible(False)
@@ -103,6 +245,8 @@ class InterfaceSettingsPanel(QWidget):
         layout.addWidget(self.hidden_notice)
         layout.addWidget(label(display.EXPORT_NOTICE, "small", True))
         layout.addWidget(self.build_preview())
+        self.resources = ComputerPowerPanel(self.preferences, parent=self)
+        layout.addWidget(self.resources)
         layout.addWidget(label("Text size applies immediately. Graph zoom stays independent: use the graph's own zoom and fit controls. Each analysis and report reviews its own cohort.", "muted", True))
         layout.addStretch(1)
         self.advanced_button = button("Advanced settings ▸", self.toggle_advanced)
@@ -180,9 +324,21 @@ class InterfaceSettingsPanel(QWidget):
     def refresh_preview(self):
         self.preview_note.setText(
             f"Text {self.window_ref.ui_scale}% · graph text {self.graph_scale.currentData()}% · "
-            f"{self.display_scale.currentText()}")
+            f"{self.display_scale.currentText()} · window {self.window_size.currentText()}")
 
     # --- the controls -------------------------------------------------------
+    def apply_window_size(self):
+        """Resize the window now; "Fit this screen" forgets the saved size."""
+        chosen = display.parse_window_size(self.window_size.currentData())
+        if chosen is None:
+            display.clear_window_size(self.display_root)
+        else:
+            display.write_window_size(*chosen, root=self.display_root)
+        resize = getattr(self.window_ref, "set_window_size", None)
+        if callable(resize):
+            resize(chosen)
+        self.refresh_preview()
+
     def apply_scale(self):
         self.window_ref.set_ui_scale(self.scale.currentData())
         self.refresh_preview()
@@ -236,6 +392,14 @@ class InterfaceSettingsDialog(QDialog):
     @property
     def scale(self):
         return self.panel.scale
+
+    @property
+    def window_size(self):
+        return self.panel.window_size
+
+    @property
+    def resources(self):
+        return self.panel.resources
 
     @property
     def motion(self):

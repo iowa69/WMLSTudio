@@ -67,6 +67,20 @@ ORGANISM_EVIDENCE_VERSION = 1
 _EVIDENCE_STATUS = {"proposed", "confirmed", "quarantined"}
 _EVIDENCE_BYTES = 64 * 1024
 
+# What a project files without asking. Only a whole-genome comparison against the
+# installed panel is strong enough to move a file into a genus folder on its own;
+# everything weaker is imported all the same and waits in the needs-review tree.
+INTAKE_DEFAULT_POLICY = {"auto_confirm": True, "min_confidence": "genomic_reference_supported"}
+
+
+def default_storage_root(project: Project) -> Path:
+    """The managed folder that belongs to this project file, beside it on disk.
+
+    Derived from the project's own current path, so a project that moved with its
+    folder computes the folder it moved to rather than the one it was created in.
+    """
+    return project.path.with_suffix(".files")
+
 
 def safe_component(value: object, fallback: str = "Unknown") -> str:
     """Produce a bounded Windows-safe path component, never a traversal segment."""
@@ -127,10 +141,21 @@ def organism_evidence(value) -> dict | None:
     return evidence
 
 
-def _stored_quarantine(metadata: dict) -> str | None:
-    """Read a stored quarantine bucket tolerantly; unknown reasons still need review."""
+def review_bucket(metadata: dict) -> str | None:
+    """The needs-review folder a stored decision record implies, or None when filed.
+
+    Only an accepted organism leaves the review tree. A proposal nobody has
+    accepted yet is not a decision, so it keeps waiting under its own bucket
+    rather than drifting into a genus folder the next time files are re-filed.
+    An unknown reason still needs review; it never becomes "no reason".
+    """
+    metadata = metadata if isinstance(metadata, dict) else {}
     evidence = metadata.get("organism_evidence")
-    if not isinstance(evidence, dict) or evidence.get("status") != "quarantined":
+    if not isinstance(evidence, dict):
+        return None
+    if evidence.get("status") == "confirmed":
+        return None
+    if evidence.get("status") not in {"quarantined", "proposed"}:
         return None
     token = str(evidence.get("quarantine_reason") or "awaiting_identification")
     return token if token in QUARANTINE_BUCKETS else "awaiting_identification"
@@ -351,6 +376,33 @@ def _copy_atomic(source: Path, destination: Path, cancelled=None) -> str:
             temporary.unlink(missing_ok=True)
 
 
+def known_digests(project: Project) -> dict[str, str]:
+    """Every input fingerprint this project already holds, mapped to its isolate.
+
+    Both the user's original and the managed copy are recorded, so a file
+    re-offered from either location is recognised as one this project already has.
+    """
+    known: dict[str, str] = {}
+    for sample in project.samples():
+        workflow = (sample.get("metadata") or {}).get("workflow", {})
+        for digest in (workflow.get("source_sha256"), workflow.get("managed_sha256")):
+            if isinstance(digest, str) and digest:
+                known.setdefault(digest.lower(), sample["id"])
+    return known
+
+
+def sample_for_digest(project: Project, sha256: str) -> str | None:
+    """The isolate this project already holds for these exact bytes, or None.
+
+    Identity is the file's SHA-256, never its name: the same assembly offered
+    twice under two names is one isolate, and two different files that happen to
+    share a name are not.
+    """
+    if not isinstance(sha256, str) or not re.fullmatch(r"[0-9a-fA-F]{64}", sha256):
+        raise ValueError("A duplicate check needs a complete SHA-256.")
+    return known_digests(project).get(sha256.lower())
+
+
 def import_samples(
     project: Project, assignments, storage_root=None, managed: bool = True, append_st: bool = False,
     cancelled=None, progress=None, *, duplicates: str = "allow", notes=None,
@@ -369,14 +421,8 @@ def import_samples(
     if duplicates not in {"allow", "skip"}:
         raise ValueError(f"Unsupported duplicate import policy: {duplicates}")
     assignments = list(assignments)
-    root = Path(storage_root or project.path.parent / "Sequences").expanduser().resolve()
-    known: dict[str, str] = {}
-    if duplicates == "skip":
-        for sample in project.samples():
-            workflow = (sample.get("metadata") or {}).get("workflow", {})
-            for digest in (workflow.get("source_sha256"), workflow.get("managed_sha256")):
-                if isinstance(digest, str) and digest:
-                    known.setdefault(digest.lower(), sample["id"])
+    root = Path(storage_root or default_storage_root(project)).expanduser().resolve()
+    known = known_digests(project) if duplicates == "skip" else {}
     staged = []
     created = []
     skipped = []
@@ -459,13 +505,413 @@ def import_managed(
                           storage_root, append_st=append_st, cancelled=cancelled)
 
 
+def filing_policy(project: Project | None = None, override=None) -> dict:
+    """What this project files by itself and what it holds back for a person.
+
+    A project that has never been given a policy files only whole-genome
+    comparison supported calls without asking. Everything weaker — a genus-only
+    reference, a complex this panel cannot split, an MLST panel match, nothing at
+    all — is still imported, and waits in the needs-review tree under its reason.
+    """
+    from wmlstudio.organism_id import (
+        SETTING_AUTO_CONFIRM,
+        SETTING_MIN_CONFIDENCE,
+        resolve_policy,
+    )
+    if override is not None:
+        return resolve_policy(override)
+    stored = {}
+    if project is not None:
+        for key, field in ((SETTING_AUTO_CONFIRM, "auto_confirm"),
+                           (SETTING_MIN_CONFIDENCE, "min_confidence")):
+            value = project.get_setting(key, None)
+            if value is not None:
+                stored[field] = value
+    return resolve_policy({**INTAKE_DEFAULT_POLICY, **stored})
+
+
+def set_filing_policy(project: Project, *, auto_confirm=None, min_confidence=None) -> dict:
+    """Record the filing policy on the project and return what now applies.
+
+    Raising the floor never retroactively re-files anything: it decides what the
+    next intake may file without a person looking at it.
+    """
+    from wmlstudio.organism_id import SETTING_AUTO_CONFIRM, SETTING_MIN_CONFIDENCE
+    requested = dict(filing_policy(project))
+    if auto_confirm is not None:
+        requested["auto_confirm"] = bool(auto_confirm)
+    if min_confidence is not None:
+        requested["min_confidence"] = str(min_confidence)
+    effective = filing_policy(None, requested)
+    with project.transaction():
+        project.set_setting(SETTING_AUTO_CONFIRM, effective["auto_confirm"])
+        project.set_setting(SETTING_MIN_CONFIDENCE, effective["min_confidence"])
+        project.record_history(None, "filing_policy_changed", effective)
+    return effective
+
+
+def _unidentified(path: Path, name, reason: str, bucket: str = "awaiting_identification") -> dict:
+    """An assignment for a file nothing has decided about yet; it still imports."""
+    assignment = {"path": str(path), "genus": "", "species": "", "typing_mode": "auto",
+                  "quarantine": bucket,
+                  "organism_evidence": {"status": "quarantined", "quarantine_reason": bucket,
+                                        "basis": "none", "confidence": "unresolved",
+                                        "proposed": {"genus": "", "species": ""},
+                                        "accepted": {"genus": "", "species": ""},
+                                        "reason": reason}}
+    if name:
+        assignment["name"] = name
+    return assignment
+
+
+def _phase_progress(progress, base: int, span: int, total: int):
+    """Report one stage of intake against one overall bar."""
+    if progress is None:
+        return None
+
+    def report(done, count, message):
+        scaled = base + (span * int(done)) // max(int(count), 1)
+        progress(min(scaled, total), total, message)
+    return report
+
+
+def _identification_report(identify, species_panel_root, kpsc_panel_root, verdicts,
+                           identifiers, needs_review) -> dict:
+    """State plainly whether identification could run, and what it could not do.
+
+    A missing reference panel is a provisioning fact the user can act on. It is
+    reported as one, rather than leaving every sample sitting in needs-review with
+    no explanation of why nothing was proposed.
+    """
+    panels = [str(root) for root in (species_panel_root, kpsc_panel_root) if root]
+    errors, seen = [], set()
+    for verdict in verdicts:
+        for error in verdict.get("errors") or []:
+            message = f"{error.get('tier')}: {error.get('message')}"
+            if message not in seen:
+                seen.add(message)
+                errors.append(message)
+    available = bool(identify and panels)
+    if not identify:
+        notice = ("Identification was not run, so every imported file is waiting in Needs "
+                  "review until an organism is decided.")
+    elif not panels:
+        notice = ("No species reference panel is installed, so no genomic comparison was "
+                  "attempted. Every file was imported and is waiting in Needs review. Install "
+                  "the species reference panel, then identify these samples again to file them "
+                  "by organism.")
+    elif needs_review:
+        notice = (f"{len(needs_review)} of {len(identifiers)} imported files are waiting in "
+                  "Needs review: the installed references did not support an organism firmly "
+                  "enough to file them, so none was filed into a genus folder on a guess.")
+    else:
+        notice = ""
+    return {"available": available, "attempted": bool(identify), "panels": panels,
+            "errors": errors, "notice": notice}
+
+
+def intake_samples(
+    project: Project, paths, *, storage_root=None, species_panel_root=None, kpsc_panel_root=None,
+    scheme_paths=(), policy=None, names=None, managed: bool = True, append_st: bool = False,
+    identify: bool = True, cancelled=None, progress=None,
+) -> dict:
+    """Load files once: identify them, then file and record each of them exactly once.
+
+    This is the whole of "add samples to the project". Identification runs on the
+    user's own files before a byte is copied, the verdict decides the folder, and
+    the copy is made straight into that folder, so nothing is imported to one place
+    and moved to another. A file this cannot identify is imported all the same and
+    waits under ``_Unresolved`` with the reason it is there; it is never blocked,
+    and it is never pushed into a genus folder the evidence does not support.
+
+    Bytes already in the project are recognised and skipped, so offering the same
+    file again — from the same folder or a copy of it — never produces a second
+    isolate. Returns a report naming what was imported, what was skipped and which
+    isolate it duplicates, what is waiting for review, and whether identification
+    could run at all, so a caller can say why rather than appearing to do nothing.
+    """
+    from wmlstudio.organism_id import assignment_for, identify_batch
+    inputs = []
+    for value in paths:
+        path = Path(value).expanduser().resolve()
+        if not path.is_file():
+            raise FileNotFoundError(f"Sequence input does not exist: {path}")
+        inputs.append(path)
+    labels = {str(Path(key).expanduser().resolve()): value
+              for key, value in dict(names or {}).items()}
+    effective = filing_policy(project, policy)
+    root = Path(storage_root or default_storage_root(project)).expanduser().resolve()
+    total = max(2 * len(inputs), 1)
+    if not inputs:
+        return {"imported": [], "skipped": [], "verdicts": [], "filed": {}, "needs_review": [],
+                "policy": effective, "storage_root": str(root),
+                "identification": {"available": False, "attempted": False, "panels": [],
+                                   "errors": [], "notice": "No files were offered."}}
+
+    known = known_digests(project)
+    skipped: list[dict] = []
+    representatives: list[Path] = []
+    digests: dict[str, str] = {}
+    twins: dict[str, list[Path]] = {}
+    for index, path in enumerate(inputs):
+        check_cancelled(cancelled)
+        if progress:
+            progress(index, total, f"Checking {path.name}")
+        digest = file_sha256(path, cancelled).lower()
+        if digest in known:
+            skipped.append({"path": str(path), "sha256": digest, "duplicate_of": known[digest]})
+        elif digest in digests:
+            twins.setdefault(digest, []).append(path)
+        else:
+            digests[digest] = str(path)
+            representatives.append(path)
+
+    verdicts: list[dict] = []
+    assignments: list[dict] = []
+    if representatives and identify:
+        verdicts = identify_batch(
+            representatives, species_panel_root=species_panel_root,
+            kpsc_panel_root=kpsc_panel_root, scheme_paths=list(scheme_paths), cancelled=cancelled,
+            progress=_phase_progress(progress, 0, len(inputs), total))
+    by_path = {str(Path(verdict["input_path"]).expanduser().resolve()): verdict
+               for verdict in verdicts}
+    for path in representatives:
+        verdict = by_path.get(str(path))
+        if verdict is None:
+            assignments.append(_unidentified(
+                path, labels.get(str(path)),
+                "Identification was not run for this file, so no organism evidence was reviewed."
+                if not identify else
+                "Identification did not complete for this file, so no organism was proposed."))
+        else:
+            assignments.append(assignment_for(verdict, policy=effective,
+                                              name=labels.get(str(path))))
+
+    notes: list[dict] = []
+    identifiers = import_samples(
+        project, assignments, root, managed=managed, append_st=append_st, cancelled=cancelled,
+        progress=_phase_progress(progress, len(inputs), len(inputs), total),
+        duplicates="skip", notes=notes)
+    skipped.extend(notes)
+
+    filed, needs_review = {}, []
+    imported_by_digest = {}
+    for sample_id in identifiers:
+        sample = project.get_sample(sample_id)
+        filed[sample_id] = sample["input_path"]
+        workflow = sample["metadata"].get("workflow", {})
+        digest = str(workflow.get("source_sha256") or "").lower()
+        if digest:
+            imported_by_digest[digest] = sample_id
+        if review_bucket(sample["metadata"]):
+            needs_review.append(sample_id)
+    for digest, paths_for_digest in twins.items():
+        for path in paths_for_digest:
+            skipped.append({"path": str(path), "sha256": digest,
+                            "duplicate_of": imported_by_digest.get(digest, "")})
+
+    identification = _identification_report(
+        identify, species_panel_root, kpsc_panel_root, verdicts, identifiers, needs_review)
+    project.record_history(None, "samples_intake", {
+        "policy": effective, "storage_root": str(root), "imported": len(identifiers),
+        "skipped": len(skipped), "needs_review": len(needs_review),
+        "identification_available": identification["available"]})
+    if progress:
+        progress(total, total, "Import complete")
+    return {"imported": identifiers, "skipped": skipped, "verdicts": verdicts,
+            "filed": filed, "needs_review": needs_review, "policy": effective,
+            "storage_root": str(root), "identification": identification}
+
+
+def _reidentification_targets(project: Project, sample_ids):
+    """Which samples a fresh identification may act on, and why the rest may not."""
+    samples = {sample["id"]: sample for sample in project.samples()}
+    requested = list(dict.fromkeys(sample_ids)) if sample_ids is not None else None
+    for sample_id in requested or ():
+        if sample_id not in samples:
+            raise KeyError(f"Unknown sample: {sample_id}")
+    targets, skipped = [], []
+    for sample in samples.values():
+        if requested is not None and sample["id"] not in requested:
+            continue
+        waiting = review_bucket(sample["metadata"])
+        if sample.get("profile_only") or not sample.get("input_path"):
+            reason = "A profile-only sample has no sequence file to identify."
+        elif sample["status"] == "running":
+            reason = "Wait for this sample's analysis before identifying it again."
+        elif not Path(sample["input_path"]).is_file():
+            reason = "This sample's sequence file is not where the project recorded it."
+        elif waiting is None:
+            reason = ("This sample's organism was already accepted. Change it with a manual "
+                      "reassignment rather than a fresh identification.")
+        else:
+            targets.append(sample)
+            continue
+        if requested is not None:
+            skipped.append((sample["id"], reason))
+    return targets, skipped
+
+
+def reidentify_samples(
+    project: Project, sample_ids=None, *, species_panel_root=None, kpsc_panel_root=None,
+    scheme_paths=(), policy=None, storage_root=None, cancelled=None, progress=None,
+) -> dict:
+    """Identify samples that are waiting for review again, then file what is decided.
+
+    This is what "install the reference panel and try again" means: the files are
+    already in the project, so nothing is re-imported and nothing is copied twice.
+    A sample whose organism a person already accepted is left alone — a fresh
+    comparison never overwrites a decision somebody made.
+    """
+    from wmlstudio.organism_id import apply_policy, identify_batch, proposed_destination
+    effective = filing_policy(project, policy)
+    targets, skipped = _reidentification_targets(project, sample_ids)
+    paths = [Path(sample["input_path"]) for sample in targets]
+    verdicts = identify_batch(paths, species_panel_root=species_panel_root,
+                              kpsc_panel_root=kpsc_panel_root, scheme_paths=list(scheme_paths),
+                              cancelled=cancelled, progress=progress) if paths else []
+    by_path = {str(Path(verdict["input_path"]).expanduser().resolve()): verdict
+               for verdict in verdicts}
+    accepted, waiting = [], []
+    for sample in targets:
+        check_cancelled(cancelled)
+        verdict = by_path.get(str(Path(sample["input_path"]).expanduser().resolve()))
+        if verdict is None:
+            skipped.append((sample["id"], "Identification did not complete for this sample."))
+            continue
+        decided = apply_policy(verdict, effective)
+        bucket, genus, species = proposed_destination(decided, policy=effective)
+        if bucket is None and genus:
+            confirm_organism(project, [sample["id"]], genus, species, evidence=decided,
+                             typing_mode="manual", basis=decided.get("basis") or "genomic_ani",
+                             confidence=decided.get("confidence") or "unresolved",
+                             confirmed_by=decided.get("confirmed_by") or "auto_policy")
+            accepted.append((sample["id"], genus, species))
+        else:
+            project.update_metadata(sample["id"], {
+                "organism_evidence": organism_evidence(decided)})
+            project.record_history(sample["id"], "organism_identified", {
+                "basis": decided.get("basis"), "confidence": decided.get("confidence"),
+                "status": decided.get("status"), "proposed": decided.get("proposed"),
+                "bucket": bucket})
+            waiting.append((sample["id"], bucket))
+    moved = refile_samples(project, [sample["id"] for sample in targets],
+                           storage_root=storage_root, cancelled=cancelled)
+    identification = _identification_report(
+        True, species_panel_root, kpsc_panel_root, verdicts,
+        [sample["id"] for sample in targets], [sample_id for sample_id, _ in waiting])
+    return {"accepted": accepted, "waiting": waiting, "skipped": [*skipped, *moved["skipped"]],
+            "moved": moved["moved"], "verdicts": verdicts, "policy": effective,
+            "identification": identification}
+
+
+def missing_managed_copies(project: Project) -> list[dict]:
+    """Managed copies this project expects and cannot find. Stats files, hashes none."""
+    missing = []
+    for sample in project.samples():
+        workflow = (sample.get("metadata") or {}).get("workflow", {})
+        if not workflow.get("managed") or not sample.get("input_path"):
+            continue
+        if Path(sample["input_path"]).is_file():
+            continue
+        missing.append({"sample_id": sample["id"], "name": sample["name"],
+                        "path": sample["input_path"],
+                        "storage_root": str(workflow.get("storage_root") or ""),
+                        "managed_sha256": str(workflow.get("managed_sha256") or "")})
+    return missing
+
+
+def _relocation_candidates(project: Project, storage_root, recorded: str) -> list[Path]:
+    """Folders a managed tree could have moved to, most explicit first."""
+    roots, seen = [], set()
+    options = [storage_root, default_storage_root(project)]
+    if recorded:
+        options.append(project.path.parent / Path(recorded).name)
+    for option in options:
+        if not option:
+            continue
+        path = Path(option).expanduser().resolve()
+        if str(path) not in seen:
+            seen.add(str(path))
+            roots.append(path)
+    return roots
+
+
+def relocate_managed_storage(project: Project, *, storage_root=None, cancelled=None,
+                             progress=None) -> dict:
+    """Re-point managed copies that travelled with the project, verified byte for byte.
+
+    A portable project is reopened from wherever its folder now is — another
+    computer, another drive letter — and the absolute paths recorded at import no
+    longer exist. A candidate in the same place under the new root is adopted only
+    when its SHA-256 equals the fingerprint recorded for that sample's managed copy,
+    so a file that merely has the right name is never adopted as this isolate's
+    evidence. Nothing is copied, moved or deleted; only the recorded location changes.
+    """
+    outstanding = missing_managed_copies(project)
+    report: dict[str, list] = {"relocated": [], "unresolved": []}
+    for index, entry in enumerate(outstanding):
+        check_cancelled(cancelled)
+        if progress:
+            progress(index, len(outstanding), f"Looking for {Path(entry['path']).name}")
+        sample_id, expected = entry["sample_id"], entry["managed_sha256"].lower()
+        if not re.fullmatch(r"[0-9a-f]{64}", expected):
+            report["unresolved"].append((sample_id, "No managed-copy SHA-256 is recorded for this "
+                                                    "sample, so no replacement can be verified."))
+            continue
+        recorded_root = entry["storage_root"]
+        if not recorded_root:
+            report["unresolved"].append((sample_id, "No managed storage location is recorded for "
+                                                    "this sample."))
+            continue
+        try:
+            relative = Path(entry["path"]).relative_to(Path(recorded_root))
+        except ValueError:
+            report["unresolved"].append((sample_id, "The recorded file is not inside the recorded "
+                                                    "managed storage location."))
+            continue
+        adopted = None
+        for root in _relocation_candidates(project, storage_root, recorded_root):
+            check_cancelled(cancelled)
+            candidate = root / relative
+            if not candidate.is_file() or candidate.is_symlink():
+                continue
+            if file_sha256(candidate, cancelled) != expected:
+                report["unresolved"].append((sample_id, f"A file exists at {candidate} but its "
+                                                        "contents differ from the managed copy "
+                                                        "recorded for this sample; it was not adopted."))
+                adopted = False
+                break
+            with project.transaction():
+                current = project.get_sample(sample_id)
+                if current["status"] == "running" or current["input_path"] != entry["path"]:
+                    raise ValueError("Sample input changed or analysis is running; retry later.")
+                project.set_input_path(sample_id, candidate)
+                project.update_metadata(sample_id, {"workflow": {
+                    "managed": True, "storage_root": str(root), "managed_sha256": expected}})
+                if current["metadata"].get("workflow", {}).get("source_kind") == "assembly":
+                    project.update_metadata(sample_id, {"assembly": {"assembly_path": str(candidate)}})
+                project.record_history(sample_id, "managed_storage_relocated", {
+                    "from": entry["path"], "to": str(candidate), "sha256": expected,
+                    "verified": "sha256 matches the recorded managed copy"})
+            report["relocated"].append((sample_id, str(candidate)))
+            adopted = True
+            break
+        if adopted is None:
+            report["unresolved"].append((sample_id, "The managed copy was not found under any "
+                                                    "folder this project knows about."))
+    if progress:
+        progress(len(outstanding), len(outstanding), "Storage check complete")
+    return report
+
+
 def _filing(project: Project, sample: dict, storage_root, append_st, quarantine) -> dict:
     """Shared destination computation, so a preview can never drift from a move."""
     metadata = sample["metadata"]
     workflow = metadata.get("workflow", {})
     source = Path(sample["input_path"]).resolve()
     root = Path(storage_root or workflow.get("storage_root") or
-                project.path.parent / "Sequences").expanduser().resolve()
+                default_storage_root(project)).expanduser().resolve()
     append = bool(workflow.get("append_st", False)) if append_st is None else append_st
     result = sample.get("result") or {}
     st = result.get("st") if sample["status"] == "completed" and result.get("status") == "complete" else None
@@ -477,7 +923,7 @@ def _filing(project: Project, sample: dict, storage_root, append_st, quarantine)
         detected = detected if isinstance(detected, dict) else {}
         organism = {"genus": detected.get("genus") or identified.get("genus", ""),
                     "species": detected.get("species") or identified.get("species", "")}
-    bucket = _stored_quarantine(metadata) if quarantine is None else quarantine_token(quarantine)
+    bucket = review_bucket(metadata) if quarantine is None else quarantine_token(quarantine)
     # An assembled isolate must never inherit its original FASTQ extension.
     naming_source = (Path(safe_component(sample["name"]) + ".fasta")
                      if workflow.get("source_kind") == "assembly" else original)

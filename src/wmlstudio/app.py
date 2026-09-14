@@ -22,6 +22,7 @@ from PySide6.QtWidgets import (
     QInputDialog,
     QLineEdit,
     QMainWindow,
+    QMenu,
     QMessageBox,
     QProgressBar,
     QScrollArea,
@@ -35,7 +36,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from wmlstudio import __version__
+from wmlstudio import __version__, display
 from wmlstudio.comparison import minimum_spanning_forest, pairwise_distances
 from wmlstudio.context_menus import ContextMenuMixin
 from wmlstudio.demo import create_demo
@@ -98,6 +99,11 @@ class BaseWindow(QMainWindow):
         if QApplication.platformName() != "offscreen" and self.screen():
             available = self.screen().availableGeometry()
             self.resize(min(1380, available.width() - 40), min(940, available.height() - 60))
+        # A window size the user chose in Settings outlives the session, but never
+        # a size this screen cannot show: that is how a window becomes unreachable.
+        chosen = display.read_window_size()
+        if chosen:
+            self.resize(*display.clamp_window_size(*chosen, self.available_screen_size()))
         self.setAcceptDrops(True)
         main = QWidget()
         main.setObjectName("main")
@@ -138,6 +144,7 @@ class BaseWindow(QMainWindow):
         self.build_reports()
         self.build_settings()
         self.install_workspace_headers()
+        self.fold_duplicate_pages()
         self.page_shown = {key: hook for key, hook in
                            (("compare", getattr(self, "refresh_comparison", None)),)
                            if callable(hook)}
@@ -159,6 +166,7 @@ class BaseWindow(QMainWindow):
         self.pages.setAutoFillBackground(True)
         self.motion_enabled = bool(self.project.get_setting("motion", True))
         self.set_motion(self.motion_enabled)
+        self.apply_saved_resources()
         self.populate_schemes()
         self.refresh()
         self.navigate(0)
@@ -190,7 +198,9 @@ class BaseWindow(QMainWindow):
         # navigate's checked-state loop and nav_names (breadcrumb, Alt+1…7 menu)
         # keep working untouched.
         self.nav_buttons = []
-        self.nav_names = ["Overview", "Isolate library", "Compare", "Scheme library", "Characterization", "Reports", "Settings"]
+        # "Samples" is the hub the rest of the workspace hangs off, and it is the
+        # word the people using this say; "Isolate library" was ours, not theirs.
+        self.nav_names = ["Overview", "Samples", "Compare", "Scheme library", "Characterization", "Reports", "Settings"]
         layout.addWidget(label("Your isolates, your evidence and your report each keep their own cohort. Nothing is included automatically.", "small", True))
         layout.addStretch()
         tip, content = card()
@@ -246,6 +256,25 @@ class BaseWindow(QMainWindow):
             if layout is None:
                 continue
             self.page_headers[key] = workspace_header(self, layout, key, index=0)
+
+    def fold_duplicate_pages(self):
+        """Stop offering a top-level tab whose content is already a Samples sub-tab.
+
+        Samples is the hub, so anything that also lives there must not be a second
+        place to look. Nothing is folded unless the sub-tab really exists, and the
+        page itself is kept: every `navigate(<int>)` call site keeps its meaning and
+        still lands on the same content (ui_tabs.WorkspaceTabs.fold_page).
+        """
+        from wmlstudio.ui_tabs import FOLDABLE
+        folded = []
+        for key, (host, title) in FOLDABLE.items():
+            tabs = self.pages.subtabs(host)
+            if tabs is None or not any(tabs.tabText(index) == title
+                                       for index in range(tabs.count())):
+                continue
+            if self.pages.fold_page(key, host, title):
+                folded.append(key)
+        return folded
 
     def heading(self, layout, title, subtitle):
         layout.addWidget(label(title, "title"))
@@ -438,16 +467,22 @@ class BaseWindow(QMainWindow):
 
     def build_settings(self):
         _, layout = self.page()
-        self.heading(layout, "Make yourself at home", "A few settings, and a straightforward guide to what this version can do.")
+        self.heading(layout, "Make yourself at home",
+                     "Window size, text size, screen resolution, where your data lives, and a "
+                     "straightforward guide to what this version can do.")
         # Page 6 used to be unreachable: the workbench intercepted it and opened a
         # modal dialog instead. It is a real tab now, so the dialog's controls and
         # this page share one implementation (InterfaceSettingsPanel).
         from wmlstudio.interface_settings import InterfaceSettingsPanel
         self.settings_tabs = QTabWidget()
         self.settings_tabs.setObjectName("settingsTabs")
-        # "&&" because QTabBar reads a single "&" as a keyboard mnemonic.
+        # "&&" because QTabBar reads a single "&" as a keyboard mnemonic. The tab is
+        # named for what a person searches for — the size of the window and of the
+        # text — because this is the page they reported as missing.
         self.interface_panel = InterfaceSettingsPanel(self, references=False)
-        self.settings_tabs.addTab(self.interface_panel, "Display && text size")
+        self.settings_tabs.addTab(self.interface_panel, "Window, text && display")
+        self.settings_tabs.setTabToolTip(0, "Window size, text size, screen resolution and "
+                                            "how much of this computer analyses may use.")
         data_page = QWidget()
         content = QVBoxLayout(data_page)
         self.motion = QCheckBox("Gentle interface animations")
@@ -466,6 +501,10 @@ class BaseWindow(QMainWindow):
             if callable(handler):
                 content.addWidget(button(text, handler))
         content.addWidget(label("Updates create immutable reference snapshots; results you already have keep their original provenance.", "small", True))
+        # One list of everything installable, so a person never has to know which
+        # menu owns which download. The Update menu opens the same page.
+        content.addWidget(button("What is installed, and what can be updated…",
+                                 self.open_update_center))
         content.addWidget(button("Problem → solution guide", self.open_workflow_guide, True))
         content.addStretch()
         self.settings_tabs.addTab(data_page, "Data && references")
@@ -484,6 +523,80 @@ class BaseWindow(QMainWindow):
         self.settings_guide = guide
         self.settings_tabs.addTab(guide, "What this version can and cannot do")
         layout.addWidget(self.settings_tabs, 1)
+
+    # --- menus this window owns ----------------------------------------------
+    def menu_named(self, title):
+        """The menu bar action carrying a menu with this title, or None."""
+        for entry in self.menuBar().actions():
+            if entry.menu() is not None and entry.text().replace("&", "") == title:
+                return entry
+        return None
+
+    def register_command(self, action):
+        """Make a menu action findable in the Ctrl+K command search, when there is one."""
+        commands = getattr(self, "command_actions", None)
+        if isinstance(commands, list) and action is not None:
+            commands.append((action.text(), action))
+        return action
+
+    def extend_display_menu(self):
+        """Put window size and the display settings where somebody looks for them.
+
+        The controls existed in Settings and were reported as "not present", so the
+        View menu now names them in the words a person searches with, and offers the
+        window sizes directly.
+        """
+        entry = self.menu_named("View")
+        menu = entry.menu() if entry is not None else self.menuBar().addMenu("&View")
+        menu.addSeparator()
+        sizes = menu.addMenu("Window size")
+        for width, height in display.available_window_sizes(self.available_screen_size()):
+            sizes.addAction(display.describe_window_size(width, height),
+                            lambda checked=False, w=width, h=height: self.set_window_size((w, h)))
+        sizes.addSeparator()
+        sizes.addAction("Fit this screen", lambda: self.set_window_size(None))
+        full = sizes.addAction("Full screen", self.toggle_full_screen)
+        full.setShortcut(QKeySequence("F11"))
+        self.register_command(full)
+        self.register_command(menu.addAction(
+            "Text too small? Window size, text size and screen resolution…",
+            self.open_display_settings))
+        return menu
+
+    def open_update_center(self):
+        """The one page listing everything installable and its installed version."""
+        from wmlstudio.update_center import open_update_center
+        return open_update_center(self)
+
+    def build_update_menu(self):
+        """A menu for everything that can be installed or updated, and nothing else."""
+        from wmlstudio.update_center import MENU_ENTRIES, ROUTES
+        bar = self.menuBar()
+        menu = QMenu("&Update", self)
+        self.register_command(menu.addAction("What is installed, and what can be updated…",
+                                             self.open_update_center))
+        menu.addSeparator()
+        for key, title in MENU_ENTRIES:
+            handler = next((getattr(self, name) for name in ROUTES.get(key, ())
+                            if callable(getattr(self, name, None))), None)
+            # A thing with no installer on this window is opened in the Update
+            # Centre, which states what it is and how it is installed instead.
+            self.register_command(menu.addAction(
+                title, handler or (lambda checked=False, k=key:
+                                   self.open_update_center().start(k))))
+        menu.addSeparator()
+        for title, method in (("Open the data folder", "open_data_folder"),
+                              ("Download practice data…", "download_practice_cohort")):
+            handler = getattr(self, method, None)
+            if callable(handler):
+                menu.addAction(title, handler)
+        help_entry = self.menu_named("Help")
+        if help_entry is not None:
+            bar.insertMenu(help_entry, menu)
+        else:
+            bar.addMenu(menu)
+        self.update_menu = menu
+        return menu
 
     def add_shortcuts(self):
         for shortcut, callback in [("Ctrl+O", self.browse_files), ("Ctrl+Shift+O", self.open_project_dialog), ("Ctrl+S", self.save_project_copy)]:
@@ -529,7 +642,11 @@ class BaseWindow(QMainWindow):
             select(sorted(self.focus.ids))
 
     def preview_interface_scale(self):
-        """Show the Display & text size controls, where the sample strip previews the size."""
+        """Show the display controls, where the sample strip previews the size."""
+        return self.open_display_settings()
+
+    def open_display_settings(self):
+        """Window size, text size and screen resolution, in one obvious place."""
         self.navigate(self.page_index.get("settings", 6))
         tabs = getattr(self, "settings_tabs", None)
         if tabs is not None:
@@ -537,6 +654,54 @@ class BaseWindow(QMainWindow):
         panel = getattr(self, "interface_panel", None)
         if panel is not None and hasattr(panel, "refresh_preview"):
             panel.refresh_preview()
+        return panel
+
+    # --- window size ---------------------------------------------------------
+    def available_screen_size(self):
+        """The usable area of the screen this window is on, for clamping a size."""
+        screen = self.screen()
+        if screen is None:
+            return (display.MINIMUM_WINDOW_WIDTH, display.MINIMUM_WINDOW_HEIGHT)
+        return screen.availableGeometry().size()
+
+    def set_window_size(self, size=None):
+        """Resize the window itself. None means 'fit this screen' again.
+
+        This is the window, not the screen: the display resolution belongs to the
+        operating system and nothing here changes it.
+        """
+        width, height = display.clamp_window_size(*(size or (1380, 940)),
+                                                  available_size=self.available_screen_size())
+        if self.isFullScreen() or self.isMaximized():
+            self.showNormal()
+        self.resize(width, height)
+        self.notify(f"Window size {display.describe_window_size(width, height)}. "
+                    + display.WINDOW_SIZE_NOTICE)
+        return width, height
+
+    def toggle_full_screen(self):
+        """Full screen and back, for a small laptop screen."""
+        self.showNormal() if self.isFullScreen() else self.showFullScreen()
+        return self.isFullScreen()
+
+    # --- how much of this computer to use ------------------------------------
+    def apply_saved_resources(self):
+        """Make this workspace's saved jobs × threads the default for new runs."""
+        from wmlstudio.interface_settings import interface_preferences, saved_worksize
+        from wmlstudio.scheduler import set_default_worksize
+        try:
+            return set_default_worksize(saved_worksize(interface_preferences(self.root)))
+        except (OSError, ValueError):
+            return None
+
+    def analysis_allocation(self, memory_gb=1):
+        """The admission plan a run should use when it states none of its own."""
+        from wmlstudio.scheduler import resources_for_run
+        try:
+            return resources_for_run({}, memory_gb=memory_gb)
+        except ValueError as error:
+            self.notify(str(error))
+            return None
 
     def set_motion(self, enabled):
         self.motion_enabled = enabled
@@ -732,7 +897,8 @@ class BaseWindow(QMainWindow):
             return
         scheme = self.scheme_combo.currentData()
         self.project.set_setting("scheme_path", scheme or "")
-        self.worker = AnalysisWorker(samples, scheme, parent=self)
+        self.worker = AnalysisWorker(samples, scheme, parent=self,
+                                     resource_plan=self.analysis_allocation())
         self.worker.sample_started.connect(self.sample_started)
         self.worker.sample_finished.connect(self.sample_finished)
         self.worker.sample_failed.connect(self.sample_failed)
@@ -1171,6 +1337,16 @@ from wmlstudio.ui_workbench import WorkbenchMixin  # noqa: E402
 
 class MainWindow(ContextMenuMixin, WorkbenchMixin, ComparisonWorkspaceMixin, CharacterizationWorkspaceMixin, ReportWorkspaceMixin, BaseWindow):
     """Native workbench composed from focused workflow controllers."""
+
+    def build_menus(self):
+        """The workbench's menus, then the two this window owns.
+
+        Update is inserted before Help so the bar reads File … View, Update, Help;
+        the display entries extend the View menu the workbench already built.
+        """
+        super().build_menus()
+        self.extend_display_menu()
+        self.build_update_menu()
 
 
 def main(argv=None):

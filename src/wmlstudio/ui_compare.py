@@ -44,17 +44,24 @@ from wmlstudio.context_menus import TableWidgetAdapter
 from wmlstudio.identification import cached_scheme, scheme_organism
 from wmlstudio.investigation import (
     DIFF_ROW_FIELDS,
+    SCALE_SEPARATION,
+    TYPING_SCALES,
     InvestigationStore,
     build_snapshot,
     incremental_distances,
     proximity_rows,
+    scheme_key_from,
+    scheme_threshold_suggestion,
     snapshot_diff,
     snapshot_diff_caption,
     snapshot_diff_html,
     snapshot_diff_rows,
     snapshot_graph,
+    typing_scale,
 )
 from wmlstudio.jobs import AnalysisWorker
+from wmlstudio.project import CGMLST_LOCUS_FLOOR
+from wmlstudio.project import typing_kind as stored_typing_kind
 from wmlstudio.sample_workflow import current_input_sha256, hydra_evidence_status
 from wmlstudio.sequence import AnalysisCancelled, SequenceReader, check_cancelled, file_sha256
 from wmlstudio.ui_common import FlowLayout, cell, gene_names, make_table, organism_for
@@ -65,9 +72,55 @@ from wmlstudio.widgets import TreeView, button, label, render_side_by_side
 # this many stored profiles the baseline is drawn only when the user asks, with
 # the wait stated on the button rather than spent silently.
 BASELINE_AUTODRAW_LIMIT = 120
+# The two comparisons this page can show. They are two answers to two different
+# questions over two different locus sets, so each keeps its own reference, its
+# own target count, its own threshold, its own legend and its own exports, and
+# no view ever mixes their numbers.
+TYPING_VIEWS = ("mlst", "cgmlst")
+COUNTERPART = {"mlst": "cgmlst", "cgmlst": "mlst"}
 
 
-def _available_profiles(project, sample):
+def typing_title(kind):
+    return TYPING_SCALES.get(str(kind), TYPING_SCALES["unclassified"])["title"]
+
+
+def _summary_kind(row):
+    """The typing kind of one stored profile, from the kind column where it exists.
+
+    The fallback repeats ``project.classify_typing`` over exactly the fields a
+    lightweight summary row carries, so a project written before the kind column
+    existed is classified the same way rather than dropped out of both views.
+    """
+    kind = str(row.get('typing_kind') or '').strip().casefold()
+    if kind in TYPING_VIEWS:
+        return kind
+    declared = str(row.get('analysis_kind') or '').strip().casefold()
+    if declared in TYPING_VIEWS:
+        return declared
+    count = int(row.get('locus_count') or 0)
+    if not count or not row.get('scheme_digest'):
+        return 'unclassified'
+    return 'cgmlst' if count > CGMLST_LOCUS_FLOOR else 'mlst'
+
+
+def _profile_kinds(project, sample_id):
+    """{scheme_digest: typing kind} for one sample, read from the kind column."""
+    if not hasattr(project, 'analysis_summaries'):
+        return {}
+    try:
+        rows = project.analysis_summaries(sample_id)
+    except KeyError:
+        return {}
+    return {row['scheme_digest']: _summary_kind(row) for row in rows if row.get('scheme_digest')}
+
+
+def _available_profiles(project, sample, kind=None):
+    """Current profiles for one isolate, optionally only those of one typing kind.
+
+    ``kind`` filters on the stored typing kind, never on the scheme's name: a
+    classical ST and a core-genome profile are separate evidence, and neither
+    stands in for the other when the requested one is absent.
+    """
     if sample.get('status') != 'completed':
         return []  # Archived evidence is retained, but failed/pending work is not current.
     results = project.analysis_results(sample['id']) if hasattr(project, 'analysis_results') else []
@@ -79,13 +132,19 @@ def _available_profiles(project, sample):
     current_hash = current_input_sha256(sample) or primary.get('input_sha256')
     if current_hash:
         results = [r for r in results if not r.get('input_sha256') or r['input_sha256'] == current_hash]
-    return [r for r in results if r.get('alleles') and r.get('scheme_digest')]
+    results = [r for r in results if r.get('alleles') and r.get('scheme_digest')]
+    if kind is None:
+        return results
+    recorded = _profile_kinds(project, sample['id'])
+    return [r for r in results
+            if recorded.get(r.get('scheme_digest'), stored_typing_kind(r)) == kind]
 
 
-def _requested_results(project, request, cancelled=None):
+def _requested_results(project, request, cancelled=None, kind=None):
     """Read profile evidence without touching Qt widgets; safe in worker threads."""
     samples = project.samples()
     chosen = request['chosen'] if request['chosen'] is not None else {s['id'] for s in samples}
+    kind = kind or request.get('typing_kind')
     available = []
     for sample in samples:
         check_cancelled(cancelled)
@@ -93,7 +152,7 @@ def _requested_results(project, request, cancelled=None):
         if (sample['id'] not in chosen or (request['genus'] and genus != request['genus'])
                 or (request['species'] and species != request['species'])):
             continue
-        for result in _available_profiles(project, sample):
+        for result in _available_profiles(project, sample, kind):
             available.append(dict(result, sample_id=sample['id'], sample_name=sample['name'],
                                   metadata=sample.get('metadata', {}),
                                   primary_st=(sample.get('result') or {}).get('st'),
@@ -118,15 +177,38 @@ def _requested_results(project, request, cancelled=None):
 
 
 def _calculate_comparison(project, request, cancelled=None):
+    """One comparison of one typing kind, plus the other kind's tree when asked for.
+
+    The two kinds are computed separately and returned separately. Nothing is
+    merged, averaged or carried across: the counterpart is a second answer to a
+    second question about the same isolates, built without an investigation of
+    its own so that showing it can never write a snapshot for the wrong scale.
+    """
     revision = project.comparison_revision()
     if request.get('revision', revision) != revision:
         raise ValueError('Stored profiles changed before comparison began. Build the comparison again.')
-    results, total = _requested_results(project, request, cancelled)
+    kind = request.get('typing_kind') or 'mlst'
+    payload = _kind_comparison(project, request, kind, revision,
+                               investigation_id=request.get('investigation_id'), cancelled=cancelled)
+    counterpart = request.get('counterpart_kind')
+    if counterpart and counterpart != kind:
+        # The other tree is grouped by its own link threshold. Reusing this
+        # tree's number would put a core-genome cohort under a seven-locus
+        # cutoff, or the reverse, which is the mistake this page exists to avoid.
+        other = dict(request, threshold=request.get('counterpart_threshold',
+                                                    request.get('threshold', 1)))
+        payload['counterpart'] = _kind_comparison(project, other, counterpart, revision,
+                                                  investigation_id=None, cancelled=cancelled)
+    return payload
+
+
+def _kind_comparison(project, request, kind, revision, *, investigation_id=None, cancelled=None):
+    results, total = _requested_results(project, request, cancelled, kind=kind)
     available_count = len(results)
     if len(results) > 500:
-        return {'results': [], 'rows': [], 'edges': [], 'total': total, 'too_large': True}
+        return {'results': [], 'rows': [], 'edges': [], 'total': total, 'too_large': True,
+                'typing_kind': kind, 'scale': typing_scale([], kind)}
     store = InvestigationStore(project)
-    investigation_id = request.get('investigation_id')
     prior = store.snapshot(investigation_id) if investigation_id else None
     cache = store.cache(investigation_id) if investigation_id else None
     if investigation_id:
@@ -152,7 +234,8 @@ def _calculate_comparison(project, request, cancelled=None):
                             'primary_scheme': primary.get('scheme'), 'amr_genes': gene_names(sample),
                             'organism': ' '.join([genus, species]).strip()})
         if len(results) > 500:
-            return {'results': [], 'rows': [], 'edges': [], 'total': total, 'too_large': True}
+            return {'results': [], 'rows': [], 'edges': [], 'total': total, 'too_large': True,
+                    'typing_kind': kind, 'scale': typing_scale([], kind)}
     if investigation_id:
         rows, cache, reuse = incremental_distances(results, request['overlap'], cache, cancelled=cancelled)
     else:
@@ -160,7 +243,7 @@ def _calculate_comparison(project, request, cancelled=None):
         reuse = {'reused_pairs': 0, 'computed_pairs': len(rows)}
     edges = forest_from_distances(rows, cancelled=cancelled)
     snapshot = build_snapshot(results, rows, request.get('threshold', 1), request['overlap'],
-                              previous=prior, reuse=reuse, cancelled=cancelled)
+                              previous=prior, reuse=reuse, kind=kind, cancelled=cancelled)
     check_cancelled(cancelled)
     if project.comparison_revision() != revision:
         raise ValueError('Stored profiles changed during comparison. No mixed-version comparison was displayed; build again.')
@@ -178,7 +261,10 @@ def _calculate_comparison(project, request, cancelled=None):
                             protocol=plan['protocol'], saved_threshold=plan['threshold'],
                             saved_min_overlap=plan['min_overlap'], threshold_evidence=plan.get('threshold_evidence', {}))
     return {'results': results, 'rows': rows, 'edges': edges, 'total': total, 'too_large': False,
-            'snapshot': snapshot, 'cache': cache, 'reuse': reuse, 'available_count': available_count}
+            'snapshot': snapshot, 'cache': cache, 'reuse': reuse, 'available_count': available_count,
+            'typing_kind': kind,
+            'scale': typing_scale(results, kind, scheme=snapshot.get('scheme'),
+                                  scheme_digest=snapshot.get('scheme_digest'))}
 
 
 class ComparisonCallingWorker(AnalysisWorker):
@@ -325,8 +411,10 @@ class ComparisonWorkspaceMixin:
     def investigation_summary(self):
         """Small, JSON-safe status for the guided overview; never loads a matrix."""
         active = getattr(self, 'active_investigation_id', None)
+        kind = getattr(self, 'typing_kind', 'mlst')
         if not active:
             return {'id': None, 'name': 'Unsaved investigation', 'saved': False,
+                    'typing_kind': kind, 'typing_title': typing_title(kind),
                     'cohort_count': len(self.cohort_ids) if self.cohort_ids is not None else len(self.project.samples()),
                     'profiles': len(getattr(self, '_last_comparison', []))}
         try:
@@ -334,6 +422,8 @@ class ComparisonWorkspaceMixin:
         except KeyError:
             return {'id': None, 'name': 'Investigation unavailable', 'saved': False}
         return {'id': active, 'name': plan['name'], 'saved': True, 'cohort_count': len(plan['sample_ids']),
+                'typing_kind': kind, 'typing_title': typing_title(kind),
+                'target_loci': (self._current_snapshot or {}).get('target_loci'),
                 'scheme': plan['scheme'], 'scheme_digest': plan['scheme_digest'],
                 'threshold': plan['threshold'], 'min_overlap': plan['min_overlap'], 'protocol': plan['protocol'],
                 'snapshots': len(plan['snapshots']), 'review_groups': len(plan['review_groups']),
@@ -357,25 +447,75 @@ class ComparisonWorkspaceMixin:
         self.dual_toggle.blockSignals(True)
         self.dual_toggle.setChecked(bool(self.project.get_setting('compare.dual_graph', False)))
         self.dual_toggle.blockSignals(False)
+        stored_kind = self.project.get_setting('compare.typing_kind', None)
+        self._typing_kind_chosen = stored_kind in TYPING_VIEWS
+        self.typing_kind = self.comparison_mode = stored_kind if stored_kind in TYPING_VIEWS else 'mlst'
+        self._load_kind_state()
+        self.advanced_toggle.blockSignals(True)
+        self.advanced_toggle.setChecked(bool(self.project.get_setting('compare.advanced_open', False)))
+        self.advanced_toggle.blockSignals(False)
+        self.set_advanced_visible(self.advanced_toggle.isChecked())
+        self.counterpart_toggle.blockSignals(True)
+        self.counterpart_toggle.setChecked(bool(self.project.get_setting('compare.counterpart_graph', False)))
+        self.counterpart_toggle.blockSignals(False)
         active = self.project.get_setting('investigations.active', None)
         self.active_investigation_id = active if active in {p['id'] for p in store.list()} else None
         if not self.active_investigation_id and self.cohort_ids is None:
             self.cohort_ids = set()
+        self.refresh_cohort_table()
+        self._restore_kind_scheme()
+        self._populate_investigation_combo()
+        if self.active_investigation_id:
+            self.select_investigation(self.active_investigation_id)
+        self.set_dual_graph(self.dual_toggle.isChecked())
+        self.set_counterpart_graph(self.counterpart_toggle.isChecked())
+
+    def _populate_investigation_combo(self):
+        """List the investigations of the typing view on screen, plus the active one.
+
+        An investigation pins one reference, so it belongs to one typing kind.
+        Offering a cgMLST investigation inside the MLST tree would silently swap
+        the quantity being compared, so those entries are simply not listed here.
+        """
+        store = InvestigationStore(self.project)
         self.investigation_combo.blockSignals(True)
         self.investigation_combo.clear()
         self.investigation_combo.addItem('Unsaved investigation', None)
         for plan in store.list():
-            self.investigation_combo.addItem(plan['name'], plan['id'])
+            kind = self._digest_kinds.get(plan.get('scheme_digest'))
+            if kind in TYPING_VIEWS and kind != self.typing_kind and plan['id'] != self.active_investigation_id:
+                continue
+            suffix = '' if kind in TYPING_VIEWS else ' · reference not in this project'
+            self.investigation_combo.addItem(plan['name'] + suffix, plan['id'])
         self.investigation_combo.setCurrentIndex(max(0, self.investigation_combo.findData(self.active_investigation_id)))
         self.investigation_combo.blockSignals(False)
-        if self.active_investigation_id:
-            self.select_investigation(self.active_investigation_id)
-        self.set_dual_graph(self.dual_toggle.isChecked())
 
     def _investigation_chosen(self, *_args):
         self.select_investigation(self.investigation_combo.currentData())
 
+    def _follow_investigation_typing_kind(self, investigation_id):
+        """An investigation pins one reference, so it belongs to one typing view.
+
+        Opening it opens that view instead of drawing its cohort as an empty tree
+        under the other kind's threshold.
+        """
+        try:
+            plan = InvestigationStore(self.project).get(investigation_id)
+        except KeyError:
+            return
+        kind = self._digest_kinds.get(plan.get('scheme_digest'))
+        if kind not in TYPING_VIEWS or kind == self.typing_kind:
+            return
+        self._store_kind_state()
+        self.typing_kind = self.comparison_mode = kind
+        self._typing_kind_chosen = True
+        self.project.set_setting('compare.typing_kind', kind)
+        self._load_kind_state()
+        self._refresh_typing_menu()
+
     def select_investigation(self, investigation_id):
+        if investigation_id:
+            self._follow_investigation_typing_kind(investigation_id)
         self.active_investigation_id = investigation_id
         self.project.set_setting('investigations.active', investigation_id)
         self._comparison_cache = None
@@ -501,7 +641,14 @@ class ComparisonWorkspaceMixin:
     def refresh_cluster_table(self):
         if not hasattr(self, 'cluster_table'):
             return
-        groups = (self._current_snapshot or {}).get('groups', [])
+        snapshot = self._current_snapshot or {}
+        groups = snapshot.get('groups', [])
+        # Group rows carry distances, so they carry the target set those distances
+        # were counted over; a "2" here is not a "2" in the other typing view.
+        units = (f"{snapshot.get('target_loci')} "
+                 f"{TYPING_SCALES.get(snapshot.get('typing_kind') or '', TYPING_SCALES['unclassified'])['target_word']}"
+                 if snapshot.get('target_loci') else 'loci')
+        scale = snapshot.get('scale_caption') or self.typing_view_title()
         self._cluster_filling = True
         self.cluster_table.setSortingEnabled(False)
         self.cluster_table.setRowCount(len(groups))
@@ -509,8 +656,10 @@ class ComparisonWorkspaceMixin:
             title = group['name'] + (' · chaining' if group.get('chained') else '')
             for col, value in enumerate((title, len(group['members']), group.get('change', ''))):
                 item = cell(value, group['id'])
-                item.setToolTip(f"{group['status']} · {group.get('reason', '')}\n"
-                                f"Maximum direct distance: {group.get('max_direct_distance')}\n"
+                item.setToolTip(f"{scale}\n"
+                                f"{group['status']} · {group.get('reason', '')}\n"
+                                f"Maximum direct distance: {group.get('max_direct_distance')} "
+                                f"allele differences over {units}\n"
                                 f"Unassessed within-group pairs: {group.get('unassessed_within_pairs', 0)}\n"
                                 f"Membership change: {group.get('change')}\nClick to select all group members.")
                 self.cluster_table.setItem(row, col, item)
@@ -536,8 +685,11 @@ class ComparisonWorkspaceMixin:
         self.sync_graph_selection(ids, role)
         if role == 'current':
             self.graph_report_button.setEnabled(bool(ids))
-        snapshot = self._baseline_snapshot if role == 'baseline' else self._current_snapshot
-        text = f"{len(ids)} selected" + (' in the baseline tree' if role == 'baseline' else '')
+        snapshot = {'baseline': self._baseline_snapshot,
+                    'counterpart': self._counterpart_snapshot}.get(role, self._current_snapshot)
+        where = {'baseline': ' in the baseline tree',
+                 'counterpart': f' in the {typing_title(self.counterpart_kind())} tree'}.get(role, '')
+        text = f"{len(ids)} selected" + where
         if len(ids) == 1 and snapshot:
             rows = proximity_rows(snapshot, ids)
             if rows:
@@ -547,32 +699,46 @@ class ComparisonWorkspaceMixin:
         self.graph_selection_label.setText(text + ' · Ctrl-click adds; click a cluster row selects its members.')
 
     def _selection_overlap(self, ids, role):
-        """Say plainly how much of a selection the other tree even contains."""
-        other = self._graph_view('current' if role == 'baseline' else 'baseline')
-        if not self.dual_toggle.isChecked() or not ids or not getattr(other, '_results', None):
+        """Say plainly how much of a selection each other open tree contains."""
+        if not ids:
             return ''
-        shared = len(set(map(str, ids)) & set(other._results))
-        if role == 'baseline':
-            return (f" · {shared} still in the current comparison · {len(ids) - shared} no longer in it")
-        return f" · {shared} also in the baseline tree · {len(ids) - shared} added since the baseline"
+        keys = set(map(str, ids))
+        parts = []
+        if self.dual_toggle.isChecked() and role in {'current', 'baseline'}:
+            other = self._graph_view('current' if role == 'baseline' else 'baseline')
+            if getattr(other, '_results', None):
+                shared = len(keys & set(other._results))
+                parts.append(f" · {shared} still in the current comparison · {len(ids) - shared} no longer in it"
+                             if role == 'baseline' else
+                             f" · {shared} also in the baseline tree · {len(ids) - shared} added since the baseline")
+        if self.counterpart_toggle.isChecked() and role in {'current', 'counterpart'}:
+            other = self._graph_view('current' if role == 'counterpart' else 'counterpart')
+            named = self.typing_view_title() if role == 'counterpart' else typing_title(self.counterpart_kind())
+            shared = len(keys & set(getattr(other, '_results', {}) or {}))
+            # A missing profile of the other kind is unknown evidence about that
+            # isolate; it is never reported as closeness or as a zero distance.
+            parts.append(f" · {shared} also have a {named} profile · "
+                         f"{len(ids) - shared} have no {named} profile")
+        return ''.join(parts)
 
     def sync_graph_selection(self, ids, role):
-        """Mirror a selection into the other tree, for the isolates it actually holds."""
+        """Mirror a selection into every other open tree; it is the same isolate."""
         if self._syncing_graph_selection or not self.link_selection.isChecked():
             return
-        if not self.dual_toggle.isChecked():
-            return
-        other = self._graph_view('current' if role == 'baseline' else 'baseline')
-        if other is None or not getattr(other, '_results', None):
-            return
+        keys = set(map(str, ids))
         self._syncing_graph_selection = True
         try:
-            other.select_ids(set(map(str, ids)) & set(other._results))
+            for other_role, view in self._graph_views().items():
+                if other_role == role or view is None or not self._view_active(other_role):
+                    continue
+                if not getattr(view, '_results', None):
+                    continue
+                view.select_ids(keys & set(view._results))
         finally:
             self._syncing_graph_selection = False
 
     def highlight_graphs(self, text):
-        """Highlight matching isolates in both trees; a view aid, never a filter."""
+        """Highlight matching isolates in every open tree; a view aid, never a filter."""
         counts = {}
         for role, view in self._graph_views().items():
             if view is not None and hasattr(view, 'highlight'):
@@ -582,6 +748,9 @@ class ComparisonWorkspaceMixin:
         message = f"{counts.get('current', 0)} matched here"
         if self.dual_toggle.isChecked():
             message += f" · {counts.get('baseline', 0)} in the baseline tree"
+        if self.counterpart_toggle.isChecked():
+            message += (f" · {counts.get('counterpart', 0)} in the "
+                        f"{typing_title(self.counterpart_kind())} tree")
         self.graph_selection_label.setText(message + ' · highlighting changes no stored evidence.')
         return counts
 
@@ -593,10 +762,10 @@ class ComparisonWorkspaceMixin:
             return
         self.report_ids = ids
         self.report_scope.setCurrentIndex(0)
-        # A report sourced from the baseline tree must carry the baseline snapshot,
-        # or its distances would not be the ones in the picture beside them.
-        self._report_investigation_snapshot = (self._baseline_snapshot if role == 'baseline'
-                                               else self._current_snapshot)
+        # A report sourced from another tree must carry that tree's snapshot, or
+        # its distances would not be the ones in the picture beside them — and a
+        # cgMLST distance would be printed under a classical MLST heading.
+        self._report_investigation_snapshot = self.export_snapshot(role)
         self.refresh_report_table()
         self.navigate(5)
 
@@ -730,17 +899,56 @@ class ComparisonWorkspaceMixin:
         self.refresh_cohort_table()
         self.refresh_comparison()
 
-    def set_comparison_mode(self, mode):
-        if mode == 'snp':
-            callback = getattr(self, 'run_ska_selected', None)
-            if callback:
-                return callback()
-            self.notify('SNP comparison requires a reviewed ST/cgMLST cohort and the native SNP backend. No allele distances were relabelled as SNPs.')
+    def suggested_scheme_key(self):
+        """The curated publication key this view's reference declares, or ''.
+
+        Only an explicit declaration is accepted — from the stored profiles, from
+        the installed reference's own metadata, or from a binding a person
+        has already attested in the guidance dialog. Nothing is matched by name.
+        """
+        return self._reference_binding()['scheme_key']
+
+    def _reference_binding(self):
+        """The catalogue pin and publication key of the reference now on screen."""
+        results = getattr(self, '_last_comparison', []) or []
+        binding = {'catalog_key': '',
+                   'scheme_key': scheme_key_from(*results[:1],
+                                                 getattr(self, 'threshold_evidence', {}) or {})}
+        paths = [self.compare_scheme.currentData()]
+        paths.extend(result.get('scheme_path') for result in results[:1])
+        for path in paths:
+            if not path or str(path).startswith('digest:'):
+                continue
+            facts = self.comparison_scheme_facts(path)
+            binding['catalog_key'] = binding['catalog_key'] or facts.get('catalog_key', '')
+            binding['scheme_key'] = binding['scheme_key'] or facts.get('scheme_key', '')
+        return binding
+
+    def threshold_suggestion(self):
+        """The published cutoff bound to this exact reference; never applied for you."""
+        snapshot = self._current_snapshot or {}
+        binding = self._reference_binding()
+        return scheme_threshold_suggestion(
+            binding['scheme_key'], method=self.typing_kind, targets=snapshot.get('target_loci'),
+            scheme=snapshot.get('scheme', ''), catalog_key=binding['catalog_key'])
+
+    def refresh_threshold_suggestion(self):
+        if not hasattr(self, 'guidance_row'):
             return
-        self.comparison_mode = mode
-        self.comparison_settings.setWindowTitle('MLST / ST comparison settings' if mode == 'st' else 'cgMLST comparison settings')
-        self.comparison_settings.show()
-        self.comparison_settings.raise_()
+        suggestion = self.threshold_suggestion()
+        self._threshold_suggestion = suggestion
+        visible = bool(self._current_snapshot) and suggestion['status'] in {'available', 'target_count_mismatch'}
+        if visible:
+            self.guidance_banner.setText(suggestion['headline'] + ' ' + suggestion['reason'])
+            self.guidance_banner.setToolTip('\n'.join(filter(None, [
+                suggestion['headline'], suggestion['reason'],
+                'Catalogue ' + suggestion['catalog_version'] + ', reviewed ' + suggestion['reviewed_on'] + '.',
+                *[f"{entry['scope']} — {entry['source']['citation']} ({entry['source']['url']})"
+                  for entry in suggestion['entries']],
+                suggestion['interpretation'], SCALE_SEPARATION])))
+            self.guidance_button.setEnabled(suggestion['status'] == 'available')
+        self.guidance_row.setVisible(visible)
+        self._refresh_threshold_units()
 
     def apply_threshold_guidance(self, evidence):
         """Called after explicit reference/protocol review in the guidance dialog."""
@@ -748,6 +956,15 @@ class ComparisonWorkspaceMixin:
         if evidence.get('approved_threshold') is not None:
             context = evidence.get('context') or {}
             snapshot = self._current_snapshot or {}
+            method = str(context.get('method') or '').strip().casefold()
+            if method and method != self.typing_kind:
+                raise ValueError(
+                    f'That cutoff was reviewed for a {typing_title(method)} comparison and this tree is a '
+                    f'{self.typing_view_title()} comparison. ' + SCALE_SEPARATION)
+            if context.get('locus_count') is not None and snapshot.get('target_loci') is not None and (
+                    context['locus_count'] != snapshot['target_loci']):
+                raise ValueError('The reviewed target count no longer matches the displayed comparison. '
+                                 'A published cutoff applies to its full target set, with no scaling.')
             choice = self.compare_scheme.currentData()
             digest = context.get('scheme_digest')
             matches = digest and digest == snapshot.get('scheme_digest')
@@ -823,18 +1040,21 @@ class ComparisonWorkspaceMixin:
         self.overlap.setSingleStep(0.05)
         self.overlap.setValue(0.95)
         self.overlap.setToolTip("Minimum shared called loci divided by all loci. Missing data never becomes a matching allele.")
+        # The link threshold is the one number a novice must see, so it lives on
+        # the page beside the tree rather than inside this dialog; its suffix
+        # always names the target set the number is counted over.
         self.cluster_threshold = QSpinBox()
         self.cluster_threshold.setRange(0, 100000)
         self.cluster_threshold.setValue(1)
-        self.cluster_threshold.setToolTip('User-defined single-linkage threshold, not a universal clinical cutoff. Pin an organism, scheme and local protocol in a saved investigation.')
+        self.cluster_threshold.valueChanged.connect(self._remember_threshold)
         self.cluster_threshold.valueChanged.connect(self.refresh_comparison)
-        for text, control in [('Shared ≥', self.overlap), ('Group ≤', self.cluster_threshold)]:
-            group = QWidget()
-            row = QHBoxLayout(group)
-            row.setContentsMargins(0, 0, 0, 0)
-            row.addWidget(label(text, 'small'))
-            row.addWidget(control)
-            controls.addWidget(group)
+        self.overlap.valueChanged.connect(self._remember_overlap)
+        overlap_row = QWidget()
+        overlap_layout = QHBoxLayout(overlap_row)
+        overlap_layout.setContentsMargins(0, 0, 0, 0)
+        overlap_layout.addWidget(label('Shared ≥', 'small'))
+        overlap_layout.addWidget(self.overlap)
+        controls.addWidget(overlap_row)
         controls.addWidget(button("Apply comparison", lambda: (self.comparison_settings.hide(), self.refresh_comparison()), True))
         settings_layout.addLayout(controls)
         chooser = QWidget(self)
@@ -864,15 +1084,19 @@ class ComparisonWorkspaceMixin:
         options.setMenu(investigation_menu)
         investigations.addWidget(options)
         investigations.addWidget(button('Choose cohort…', self.choose_comparison_cohort, True))
-        modes = QToolButton()
-        modes.setText('Analysis ▾')
-        modes.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
-        mode_menu = QMenu(modes)
-        mode_menu.addAction('MLST / ST…', lambda: self.set_comparison_mode('st'))
-        mode_menu.addAction('cgMLST…', lambda: self.set_comparison_mode('cgmlst'))
-        mode_menu.addAction('SNP follow-up…', lambda: self.set_comparison_mode('snp'))
-        modes.setMenu(mode_menu)
-        investigations.addWidget(modes)
+        # The separate MLST and cgMLST trees are chosen here, and the button says
+        # which one is on screen. They are never merged into one "analysis": a
+        # classical ST distance and a core-genome distance are different
+        # quantities and must not share a view, a threshold or a scale.
+        self.typing_menu = QToolButton()
+        self.typing_menu.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
+        typing_menu = QMenu(self.typing_menu)
+        typing_menu.addAction('Classical MLST tree (sequence type)…', lambda: self.show_typing_view('mlst'))
+        typing_menu.addAction('cgMLST tree (core-genome targets)…', lambda: self.show_typing_view('cgmlst'))
+        typing_menu.addSeparator()
+        typing_menu.addAction('SNP follow-up…', lambda: self.set_comparison_mode('snp'))
+        self.typing_menu.setMenu(typing_menu)
+        investigations.addWidget(self.typing_menu)
         investigations.addWidget(button('Compare', self.refresh_comparison))
         layout.addLayout(investigations)
         self.cohort_search = QLineEdit()
@@ -880,7 +1104,10 @@ class ComparisonWorkspaceMixin:
         self.cohort_search.textChanged.connect(self.refresh_cohort_table)
         left.addWidget(self.cohort_search)
         self.show_all_comparison_schemes = QCheckBox('Show all schemes')
-        self.show_all_comparison_schemes.setToolTip('Include schemes for other organisms. Schemes with unknown organism metadata remain available in either mode.')
+        self.show_all_comparison_schemes.setToolTip(
+            'Include schemes for other organisms. A scheme whose organism is unrecorded stays listed '
+            'either way. References of the other typing kind are never listed here: they belong to '
+            'the other tree.')
         self.show_all_comparison_schemes.toggled.connect(self.refresh_cohort_table)
         settings_layout.addWidget(self.show_all_comparison_schemes)
         settings_layout.addWidget(button('Graph label fields…', self.edit_graph_label_fields))
@@ -905,13 +1132,29 @@ class ComparisonWorkspaceMixin:
         content = QVBoxLayout(right)
         content.setContentsMargins(0, 0, 0, 0)
         content.setSpacing(6)
+        # Default strip: the one threshold that defines the groups, and a door to
+        # everything else. This page was the most crowded in the application, so
+        # only what a first-time user needs is shown before Advanced is opened.
         toolbar = FlowLayout()
+        threshold_row = QWidget()
+        threshold_layout = QHBoxLayout(threshold_row)
+        threshold_layout.setContentsMargins(0, 0, 0, 0)
+        threshold_layout.addWidget(label('Group ≤', 'small'))
+        threshold_layout.addWidget(self.cluster_threshold)
+        toolbar.addWidget(threshold_row)
+        self.advanced_toggle = QToolButton()
+        self.advanced_toggle.setCheckable(True)
+        self.advanced_toggle.setText('Advanced ▸')
+        self.advanced_toggle.setToolTip('Baseline tree, the other typing view, colours, highlighting and exports.')
+        self.advanced_toggle.toggled.connect(self.set_advanced_visible)
+        toolbar.addWidget(self.advanced_toggle)
+        self.advanced_panel = QWidget()
+        advanced = FlowLayout(self.advanced_panel)
         self.color_by = QComboBox()
         self.color_by.setProperty('compactCharacters', 9)
         self.color_by.addItem("Colour: cluster", "cluster")
         self.color_by.addItem("Colour: ST", "st")
         self.color_by.currentIndexChanged.connect(self.set_graph_color_by)
-        settings_layout.addWidget(self.color_by)
         graph_options = QToolButton()
         graph_options.setText('Graph options')
         graph_options.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
@@ -933,32 +1176,44 @@ class ComparisonWorkspaceMixin:
                        lambda: self.open_investigation_history(self.baseline_reference()[1]))
         # A checkable menu entry instead of a toolbar checkbox: the graph toolbar
         # wraps at 1080 px, and a wrapped row is taken straight out of the graph.
-        self.link_selection = menu.addAction('Link selection across both trees')
+        self.link_selection = menu.addAction('Link selection across every open tree')
+        self.link_selection.setToolTip('Selecting an isolate in one tree selects the same isolate in the '
+                                       'others. It is the same isolate; the distances around it are not '
+                                       'the same measurement.')
         self.link_selection.setCheckable(True)
         self.link_selection.setChecked(True)
         menu.addSeparator()
         graph_options.setMenu(menu)
-        toolbar.addWidget(graph_options)
+        advanced.addWidget(graph_options)
         self.dual_toggle = QCheckBox('Compare with baseline tree')
         self.dual_toggle.setToolTip('Show the tree as it was first built beside the tree as it is now.\n'
                                     'Both are layouts of allele differences, not family trees, and two trees '
                                     'can differ because the cohort changed rather than because evidence did.')
         self.dual_toggle.toggled.connect(self.set_dual_graph)
-        toolbar.addWidget(self.dual_toggle)
+        advanced.addWidget(self.dual_toggle)
+        self.counterpart_toggle = QCheckBox('Show the other typing view')
+        self.counterpart_toggle.setToolTip(
+            'Show the same isolates typed the other way, in their own tree with their own reference, '
+            'target count, threshold and legend.\n' + SCALE_SEPARATION)
+        self.counterpart_toggle.toggled.connect(self.set_counterpart_graph)
+        advanced.addWidget(self.counterpart_toggle)
         self.graph_search = QLineEdit()
         self.graph_search.setPlaceholderText('Highlight isolates…')
         self.graph_search.setMinimumWidth(120)
-        self.graph_search.setToolTip('Highlight matching isolates in both trees. Highlighting is a view aid; '
-                                     'it changes no stored evidence and no group membership.')
+        self.graph_search.setToolTip('Highlight matching isolates in every open tree. Highlighting is a view '
+                                     'aid; it changes no stored evidence and no group membership.')
         self.graph_search.textChanged.connect(self.highlight_graphs)
-        toolbar.addWidget(self.graph_search)
+        advanced.addWidget(self.graph_search)
+        advanced.addWidget(self.color_by)
         self.export_tree_choice = QComboBox()
         self.export_tree_choice.setProperty('compactCharacters', 9)
         self.export_tree_choice.addItem('Export: current tree', 'current')
         self.export_tree_choice.addItem('Export: baseline tree', 'baseline')
-        self.export_tree_choice.setToolTip('Which of the two trees the export entries act on.')
+        self.export_tree_choice.addItem('Export: other typing view', 'counterpart')
+        self.export_tree_choice.setToolTip('Which tree the export entries act on. Each export carries its own '
+                                           'typing kind, reference and target count.')
         self.export_tree_choice.hide()
-        toolbar.addWidget(self.export_tree_choice)
+        advanced.addWidget(self.export_tree_choice)
         export = QComboBox()
         export.setProperty('compactCharacters', 9)
         export.addItems(["Export…", "PNG image", "SVG vector", "GraphML", "Newick (MST topology)",
@@ -967,8 +1222,12 @@ class ComparisonWorkspaceMixin:
                          "Baseline + current image (JPEG)", "Change summary (TSV)",
                          "Change summary (JSON)"])
         export.activated.connect(lambda index: self.export_graph_action(index, export))
-        toolbar.addWidget(export)
+        advanced.addWidget(export)
+        advanced.addWidget(button('Reference & overlap settings…', self.comparison_settings.show))
         content.addLayout(toolbar)
+        self.advanced_panel.hide()
+        content.addWidget(self.advanced_panel)
+        content.addWidget(self._build_guidance_row())
         for text, method, default in [("Labels", "set_labels_visible", True), ("ST", "set_show_st", True),
                                       ("Edge distances", "set_edge_labels_visible", True),
                                       ("Merge identical", "set_merge_identical", False), ("Cluster halos", "set_halos_visible", True)]:
@@ -982,10 +1241,25 @@ class ComparisonWorkspaceMixin:
         self.tree.setMinimumHeight(200)
         self.baseline_tree = ComparisonTreeView()
         self.baseline_tree.setMinimumHeight(200)
+        self.counterpart_tree = ComparisonTreeView()
+        self.counterpart_tree.setMinimumHeight(200)
         # The baseline half is hidden until it is asked for, so the single-tree
         # page is laid out exactly as it was before the second tree existed.
         self.graph_split = QSplitter(Qt.Orientation.Horizontal)
         self.graph_split.setChildrenCollapsible(False)
+        self.counterpart_pane, counterpart_column = self._graph_pane()
+        self.counterpart_caption = self._graph_caption()
+        counterpart_column.addWidget(self.counterpart_caption)
+        counterpart_column.addWidget(self.counterpart_tree, 1)
+        self.counterpart_notice = label('', 'small', True)
+        self.counterpart_notice.hide()
+        counterpart_column.addWidget(self.counterpart_notice)
+        # Its own legend, never merged into the other tree's: two kinds can both
+        # have a "Cluster 001" and they are not the same group of isolates.
+        self.counterpart_legend = QLabel()
+        self.counterpart_legend.setWordWrap(True)
+        self.counterpart_legend.setTextFormat(Qt.TextFormat.RichText)
+        counterpart_column.addWidget(self.counterpart_legend)
         self.baseline_pane, baseline_column = self._graph_pane()
         self.baseline_caption = self._graph_caption()
         baseline_column.addWidget(self.baseline_caption)
@@ -1000,8 +1274,10 @@ class ComparisonWorkspaceMixin:
         self.current_caption = self._graph_caption()
         current_column.addWidget(self.current_caption)
         current_column.addWidget(self.tree, 1)
+        self.graph_split.addWidget(self.counterpart_pane)
         self.graph_split.addWidget(self.baseline_pane)
         self.graph_split.addWidget(self.current_pane)
+        self.counterpart_pane.hide()
         self.baseline_pane.hide()
         self.current_caption.hide()
         tabs.addTab(self.graph_split, "Graph")
@@ -1053,17 +1329,30 @@ class ComparisonWorkspaceMixin:
         self.active_investigation_id = None
         self._current_snapshot = None
         self._cluster_filling = False
-        self.comparison_mode = 'unspecified'
-        self._legends = {'current': {}, 'baseline': {}}
+        # Which of the two comparisons this page is showing. comparison_mode is
+        # the same value under the name the guidance dialog already reads, so a
+        # published cgMLST cutoff can never be reviewed against an MLST tree.
+        self.typing_kind = 'mlst'
+        self.comparison_mode = 'mlst'
+        self._typing_kind_chosen = False
+        self._digest_kinds = {}
+        self._kind_counts = dict.fromkeys(TYPING_VIEWS, 0)
+        self._counterpart_snapshot = None
+        self._counterpart_results = []
+        self._counterpart_payload = None
+        self._threshold_suggestion = {}
+        self._legends = {'current': {}, 'baseline': {}, 'counterpart': {}}
         self._syncing_graph_selection = False
         self._pending_baseline_graph_state = None
         self._reset_baseline_state()
         self._comparison_timer = QTimer(self)
         self._comparison_timer.setSingleShot(True)
         self._comparison_timer.timeout.connect(self._start_pending_comparison)
-        for view, role in ((self.tree, 'current'), (self.baseline_tree, 'baseline')):
+        for view, role in ((self.tree, 'current'), (self.baseline_tree, 'baseline'),
+                           (self.counterpart_tree, 'counterpart')):
             self._bind_graph_view(view, role)
         self.install_graph_menus()
+        self._refresh_typing_menu()
         QTimer.singleShot(0, self.restore_investigations)
 
     def _graph_pane(self):
@@ -1096,10 +1385,19 @@ class ComparisonWorkspaceMixin:
             view.nodeActivated.connect(self.inspect_graph_sample)
 
     def _graph_views(self):
-        return {'current': self.tree, 'baseline': self.baseline_tree}
+        return {'current': self.tree, 'baseline': self.baseline_tree,
+                'counterpart': self.counterpart_tree}
 
     def _graph_view(self, role):
-        return self.baseline_tree if role == 'baseline' else self.tree
+        return self._graph_views().get(role, self.tree)
+
+    def _view_active(self, role):
+        """Whether a pane is actually on screen; a hidden tree is not a second opinion."""
+        if role == 'baseline':
+            return self.dual_toggle.isChecked()
+        if role == 'counterpart':
+            return self.counterpart_toggle.isChecked()
+        return True
 
     def _reset_baseline_state(self):
         self._baseline_snapshot = None
@@ -1107,6 +1405,145 @@ class ComparisonWorkspaceMixin:
         self._baseline_drawn = False
         self._baseline_diff = None
         self._baseline_draw_requested = False
+
+    # --- the two typing views ------------------------------------------------
+    def _build_guidance_row(self):
+        """A published cutoff for this exact reference, offered and never applied."""
+        row = QWidget()
+        layout = QHBoxLayout(row)
+        layout.setContentsMargins(0, 0, 0, 0)
+        self.guidance_banner = label('', 'small', True)
+        layout.addWidget(self.guidance_banner, 1)
+        self.guidance_button = button('Review this cutoff…', self.show_threshold_guidance)
+        layout.addWidget(self.guidance_button)
+        self.guidance_row = row
+        row.hide()
+        return row
+
+    def set_advanced_visible(self, shown):
+        """Open or close the rarely-used graph controls; nothing else changes."""
+        shown = bool(shown)
+        self.advanced_panel.setVisible(shown)
+        self.advanced_toggle.setText('Advanced ▾' if shown else 'Advanced ▸')
+        if hasattr(self, 'project'):
+            self.project.set_setting('compare.advanced_open', shown)
+
+    def typing_view_title(self, kind=None):
+        return typing_title(kind or self.typing_kind)
+
+    def counterpart_kind(self):
+        return COUNTERPART.get(self.typing_kind, 'cgmlst')
+
+    def _kind_setting(self, name, kind=None):
+        return f'compare.{name}.{kind or self.typing_kind}'
+
+    def _store_kind_state(self):
+        """Keep this view's threshold, overlap, reference and investigation to itself."""
+        if not hasattr(self, 'cluster_threshold'):
+            return
+        kind = self.typing_kind
+        self.project.set_setting(self._kind_setting('threshold', kind), self.cluster_threshold.value())
+        self.project.set_setting(self._kind_setting('overlap', kind), self.overlap.value())
+        self.project.set_setting(self._kind_setting('scheme', kind), self.compare_scheme.currentData() or '')
+        self.project.set_setting(self._kind_setting('investigation', kind), self.active_investigation_id)
+
+    def _load_kind_state(self):
+        """Restore this view's own settings. Defaults are never inherited across kinds."""
+        for control, name, default in ((self.cluster_threshold, 'threshold', 1),
+                                       (self.overlap, 'overlap', 0.95)):
+            value = self.project.get_setting(self._kind_setting(name), default)
+            control.blockSignals(True)
+            try:
+                control.setValue(type(default)(value))
+            except (TypeError, ValueError):
+                control.setValue(default)
+            control.blockSignals(False)
+        self.threshold_evidence = {}
+        self._refresh_threshold_units()
+
+    def _restore_kind_scheme(self):
+        """Re-select this view's own reference once the selector has been rebuilt."""
+        stored = self.project.get_setting(self._kind_setting('scheme'), '')
+        index = self.compare_scheme.findData(stored) if stored else -1
+        if index >= 0:
+            self.compare_scheme.blockSignals(True)
+            self.compare_scheme.setCurrentIndex(index)
+            self.compare_scheme.blockSignals(False)
+
+    def _remember_threshold(self, value):
+        """Each view's threshold is remembered under its own key, never shared."""
+        self.project.set_setting(self._kind_setting('threshold'), int(value))
+
+    def _remember_overlap(self, value):
+        self.project.set_setting(self._kind_setting('overlap'), float(value))
+
+    def _refresh_threshold_units(self, targets=None):
+        """Say what the link threshold counts, so 3 of 7 is never read as 3 of 2 358."""
+        scale = (self._current_snapshot or {}).get('scale_caption')
+        if targets is None:
+            targets = (self._current_snapshot or {}).get('target_loci')
+        word = TYPING_SCALES.get(self.typing_kind, TYPING_SCALES['unclassified'])['target_word']
+        self.cluster_threshold.setSuffix(f' of {targets} {word}' if targets else ' differences')
+        suggestion = self._threshold_suggestion or {}
+        self.cluster_threshold.setToolTip('\n'.join(filter(None, [
+            f'Single-linkage link threshold for the {self.typing_view_title()} tree'
+            + (f' ({scale}).' if scale else '.'),
+            'A local protocol parameter, not a universal clinical cutoff.',
+            suggestion.get('headline', ''), suggestion.get('reason', ''), SCALE_SEPARATION])))
+
+    def _refresh_typing_menu(self):
+        if not hasattr(self, 'typing_menu'):
+            return
+        counts = getattr(self, '_kind_counts', {}) or {}
+        self.typing_menu.setText(f'Typing: {self.typing_view_title()} ▾')
+        self.typing_menu.setToolTip('\n'.join([
+            'Which comparison this page is showing.',
+            *(f"{typing_title(kind)}: {counts.get(kind, 0)} isolate(s) with a stored profile"
+              for kind in TYPING_VIEWS),
+            SCALE_SEPARATION]))
+
+    def show_typing_view(self, kind, *, chosen=True):
+        """Switch the page to the classical MLST tree or to the cgMLST tree.
+
+        The two views share no threshold, no minimum overlap, no reference, no
+        investigation and no snapshot. Switching stores what this view had and
+        restores what the other view had, so neither can inherit a cutoff that was
+        justified for the other's target set.
+        """
+        if kind not in TYPING_VIEWS:
+            raise ValueError(f'Unknown typing view {kind!r}; expected one of {", ".join(TYPING_VIEWS)}.')
+        if chosen:
+            self._typing_kind_chosen = True
+            self.project.set_setting('compare.typing_kind', kind)
+        if kind == self.typing_kind:
+            self._refresh_typing_menu()
+            return
+        self._store_kind_state()
+        self.typing_kind = self.comparison_mode = kind
+        self._comparison_cache = None
+        self._current_snapshot = None
+        self._counterpart_snapshot, self._counterpart_results = None, []
+        self._reset_baseline_state()
+        self._load_kind_state()
+        self._refresh_typing_menu()
+        self.refresh_cohort_table()
+        self._restore_kind_scheme()
+        self._populate_investigation_combo()
+        stored = self.project.get_setting(self._kind_setting('investigation'), None)
+        known = {plan['id'] for plan in InvestigationStore(self.project).list()}
+        self.select_investigation(stored if stored in known else None)
+        if not self.active_investigation_id:
+            self.refresh_comparison()
+
+    def set_comparison_mode(self, mode):
+        """Menu entry point: 'st'/'mlst' and 'cgmlst' open their own separate trees."""
+        if mode == 'snp':
+            callback = getattr(self, 'run_ska_selected', None)
+            if callback:
+                return callback()
+            self.notify('SNP comparison requires a reviewed ST/cgMLST cohort and the native SNP backend. No allele distances were relabelled as SNPs.')
+            return
+        self.show_typing_view('mlst' if mode in {'st', 'mlst'} else 'cgmlst')
 
     def available_profiles(self, sample):
         return _available_profiles(self.project, sample)
@@ -1136,8 +1573,14 @@ class ComparisonWorkspaceMixin:
         self.invalidate_comparison_scheme_labels()
         return super().populate_schemes()
 
-    def comparison_scheme_label(self, path):
-        """Read bounded metadata once per path/reference revision, never alleles."""
+    def comparison_scheme_facts(self, path):
+        """Everything the reference selector needs about one installed scheme folder.
+
+        Read once per path per reference revision and cached: name, organism,
+        which typing kind the folder is, how many targets it holds, and the
+        curated publication key it declares for itself (empty when it declares
+        none — an unbound reference gets no published cutoff offered).
+        """
         path = Path(path)
         # Do not resolve, stat or glob before this lookup: even metadata-only
         # directory scans stall repeated progress refreshes on Windows.
@@ -1155,9 +1598,36 @@ class ComparisonWorkspaceMixin:
             metadata = {}
         name = str(metadata.get('name') or path.name.replace('_', ' '))
         _, organism = scheme_organism(SimpleNamespace(metadata=metadata, name=name))
-        value = (name, organism.get('genus', ''), organism.get('species', ''))
-        self._scheme_label_cache[key] = value
-        return value
+        entry = {}
+        try:
+            from wmlstudio.reference_index import scheme_entries
+            entry = next(iter(scheme_entries((path,))), {})
+        except (ImportError, OSError, ValueError):
+            entry = {}          # An unreadable folder has an unknown kind, not a guessed one.
+        # A scheme installed into the cgMLST library carries the catalogue pin it
+        # was staged for. That pin, not the folder's name, is what binds a
+        # published cutoff to this reference.
+        slot = {}
+        try:
+            from wmlstudio.cgmlst_schemes import SLOT_FILENAME
+            candidate = path / SLOT_FILENAME
+            if candidate.is_file() and candidate.stat().st_size <= 1024 * 1024:
+                value = json.loads(candidate.read_text(encoding='utf-8'))
+                slot = value if isinstance(value, dict) else {}
+        except (ImportError, OSError, UnicodeDecodeError, ValueError):
+            slot = {}           # An unreadable pin binds no published cutoff at all.
+        facts = {'name': name, 'genus': organism.get('genus', ''), 'species': organism.get('species', ''),
+                 'kind': slot.get('kind') or entry.get('kind', 'unknown'),
+                 'locus_count': entry.get('locus_count', 0),
+                 'catalog_key': str(slot.get('key') or ''),
+                 'scheme_key': scheme_key_from(slot, metadata)}
+        self._scheme_label_cache[key] = facts
+        return facts
+
+    def comparison_scheme_label(self, path):
+        """Read bounded metadata once per path/reference revision, never alleles."""
+        facts = self.comparison_scheme_facts(path)
+        return facts['name'], facts['genus'], facts['species']
 
     def refresh_cohort_table(self):
         if not hasattr(self, "cohort_table") or self._cohort_filling:
@@ -1166,6 +1636,21 @@ class ComparisonWorkspaceMixin:
         try:
             samples = self.project.samples()
             summaries = {sample['id']: self.available_profile_summaries(sample) for sample in samples}
+            # Which isolates have which kind of profile, read from the stored kind
+            # of each analysis rather than from a scheme's name. A project with no
+            # profile of the shown kind opens on the kind it actually has, unless
+            # a person asked for the empty one on purpose.
+            self._digest_kinds = {row['scheme_digest']: _summary_kind(row)
+                                  for rows in summaries.values() for row in rows if row.get('scheme_digest')}
+            self._kind_counts = {kind: sum(any(_summary_kind(row) == kind for row in rows)
+                                           for rows in summaries.values()) for kind in TYPING_VIEWS}
+            if (not self._typing_kind_chosen and not self._kind_counts[self.typing_kind]
+                    and any(self._kind_counts.values())):
+                self.typing_kind = self.comparison_mode = next(
+                    kind for kind in TYPING_VIEWS if self._kind_counts[kind])
+                self._load_kind_state()
+            self._refresh_typing_menu()
+            word = TYPING_SCALES.get(self.typing_kind, TYPING_SCALES['unclassified'])['target_word']
             taxa = [organism_for(s) for s in samples]
             self.fill_filter(self.compare_genus, [t[0] for t in taxa], "All genera")
             selected_genus = self.compare_genus.currentData()
@@ -1181,19 +1666,33 @@ class ComparisonWorkspaceMixin:
                         self.compare_species.currentData() and species and species != self.compare_species.currentData()):
                     continue
                 for result in summaries[sample['id']]:
-                    fingerprints[result["scheme_digest"]] = result.get("scheme") or "Unnamed scheme"
-            for digest, name in sorted(fingerprints.items(), key=lambda p: (p[1], p[0])):
-                self.compare_scheme.addItem(f"Saved: {name} · {digest[:8]}", "digest:" + digest)
+                    # Only references of the shown typing kind are offered here.
+                    # A cgMLST reference in the MLST selector would put a 2,000
+                    # target distance under a 7-locus threshold.
+                    if _summary_kind(result) != self.typing_kind:
+                        continue
+                    fingerprints[result["scheme_digest"]] = (result.get("scheme") or "Unnamed scheme",
+                                                             result.get("locus_count") or 0)
+            for digest, (name, loci) in sorted(fingerprints.items(), key=lambda p: (p[1][0], p[0])):
+                self.compare_scheme.addItem(
+                    f"Saved: {name} · {loci} {word} · {digest[:8]}" if loci else f"Saved: {name} · {digest[:8]}",
+                    "digest:" + digest)
             if selected_scheme and selected_scheme.startswith('digest:') and self.compare_scheme.findData(selected_scheme) < 0:
                 self.compare_scheme.addItem('Pinned reference · ' + selected_scheme[7:15], selected_scheme)
             for path in self.scheme_paths:
-                name, genus, species = self.comparison_scheme_label(path)
+                facts = self.comparison_scheme_facts(path)
+                name, genus, species = facts['name'], facts['genus'], facts['species']
+                if facts['kind'] in TYPING_VIEWS and facts['kind'] != self.typing_kind:
+                    continue
                 if not self.show_all_comparison_schemes.isChecked() and (
                     (selected_genus and genus and genus != selected_genus) or
                     (self.compare_species.currentData() and species and species != self.compare_species.currentData())
                 ):
                     continue
-                self.compare_scheme.addItem('Call: ' + name + (' · organism unknown' if not genus else ''), str(path))
+                suffix = ' · organism unknown' if not genus else ''
+                if facts['kind'] not in TYPING_VIEWS:
+                    suffix += ' · typing kind unknown'
+                self.compare_scheme.addItem('Call: ' + name + suffix, str(path))
             self.compare_scheme.setCurrentIndex(max(0, self.compare_scheme.findData(selected_scheme)))
             self.compare_scheme.blockSignals(False)
             chosen = self.cohort_ids if self.cohort_ids is not None else {s["id"] for s in samples}
@@ -1213,8 +1712,12 @@ class ComparisonWorkspaceMixin:
             self.cohort_table.setRowCount(len(visible))
             for row, sample in enumerate(visible):
                 genus, species, _ = organism_for(sample)
+                # Name the typing kind of every stored profile: "not called" for
+                # this view must never look like "not called at all".
+                stored = sorted({f"{typing_title(_summary_kind(row))}: {row.get('scheme') or 'Unnamed scheme'}"
+                                 for row in summaries[sample['id']]})
                 values = ["", sample["name"], " ".join([genus, species]).strip() or "Unknown",
-                          "; ".join(sorted({r.get("scheme", "") for r in summaries[sample['id']]})) or "Not called"]
+                          "; ".join(stored) or "Not called"]
                 for col, value in enumerate(values):
                     item = cell(value, sample["id"])
                     if col == 0:
@@ -1264,6 +1767,7 @@ class ComparisonWorkspaceMixin:
 
     def comparison_scheme_changed(self):
         if not self._cohort_filling:
+            self.project.set_setting(self._kind_setting('scheme'), self.compare_scheme.currentData() or '')
             self.tree_status.setText("Scheme selection changed. Build from saved evidence, or choose Call this scheme for missing profiles.")
 
     def comparison_results(self):
@@ -1275,11 +1779,23 @@ class ComparisonWorkspaceMixin:
                 'choice': self.compare_scheme.currentData(), 'genus': self.compare_genus.currentData(),
                 'species': self.compare_species.currentData(), 'overlap': self.overlap.value(),
                 'threshold': self.cluster_threshold.value(), 'investigation_id': self.active_investigation_id,
-                'investigation_revision': plan.get('updated_at')}
+                'investigation_revision': plan.get('updated_at'), 'typing_kind': self.typing_kind,
+                'counterpart_kind': self.counterpart_kind() if self.counterpart_toggle.isChecked() else None,
+                'counterpart_threshold': self.counterpart_threshold()}
+
+    def counterpart_threshold(self):
+        """The other typing view's own stored link threshold; never this view's."""
+        try:
+            return max(0, int(self.project.get_setting(
+                self._kind_setting('threshold', self.counterpart_kind()), 1)))
+        except (TypeError, ValueError):
+            return 1
 
     def _comparison_key(self, request, revision):
         return (str(self.project.path), revision, request['chosen'], request['choice'],
-                request['genus'], request['species'], request['overlap'], request.get('investigation_id'))
+                request['genus'], request['species'], request['overlap'], request.get('investigation_id'),
+                request.get('typing_kind'), request.get('counterpart_kind'),
+                request.get('counterpart_threshold'))
 
     def _clear_comparison(self):
         self.distance_rows, self._last_comparison = [], []
@@ -1299,6 +1815,7 @@ class ComparisonWorkspaceMixin:
         self.refresh_profile_matrix([])
         self.refresh_statistics([], [])
         self.refresh_cluster_table()
+        self.refresh_threshold_suggestion()
 
     def refresh_comparison(self):
         if not hasattr(self, "tree") or self._comparison_closing:
@@ -1378,18 +1895,22 @@ class ComparisonWorkspaceMixin:
 
     def _apply_comparison(self, payload):
         results, edges = payload['results'], payload['edges']
+        kind = payload.get('typing_kind') or self.typing_kind
         try:
             self.distance_rows = payload['rows']
             snapshot = payload.get('snapshot')
             if snapshot is None or snapshot['threshold'] != self.cluster_threshold.value():
                 snapshot = build_snapshot(results, payload['rows'], self.cluster_threshold.value(), self.overlap.value(),
-                                          previous=snapshot, reuse=payload.get('reuse'))
+                                          previous=snapshot, reuse=payload.get('reuse'), kind=kind)
                 if self.active_investigation_id:
                     plan = InvestigationStore(self.project).get(self.active_investigation_id)
                     snapshot.update(preview=True, investigation_id=plan['id'], investigation_name=plan['name'],
                                     protocol=plan['protocol'], saved_threshold=plan['threshold'],
                                     saved_min_overlap=plan['min_overlap'], threshold_evidence=plan.get('threshold_evidence', {}))
             self._current_snapshot = snapshot
+            # The view states its own quantity before it draws anything, so an
+            # edge label of "3" always arrives with the target set it counts over.
+            self.tree.set_scale(payload.get('scale') or typing_scale(results, kind))
             self.tree.draw_results(results, edges, self.cluster_threshold.value(), groups=snapshot['groups'])
             if self._pending_graph_state is not None and hasattr(self.tree, "restore_state"):
                 self.tree.blockSignals(True)
@@ -1404,14 +1925,23 @@ class ComparisonWorkspaceMixin:
             self.refresh_statistics(results, edges)
             excluded = sum(not row["comparable"] for row in self.distance_rows)
             total = payload['total']
-            name = results[0].get("scheme", "") if results else "No compatible profiles"
-            self.tree_status.setText(f"{name} · {len(results)} / {total} cohort members have this profile · {len(edges)} edges · {excluded} pairs excluded. Missing/incompatible profiles are not silently compared.")
+            scale = payload.get('scale') or typing_scale(results, kind)
+            name = scale['caption'] if results else f"{scale['title']} · no compatible profiles"
+            # With no profiles there is no target set to count over, and saying
+            # "of loci" would imply one. State the bare threshold instead.
+            units = (f" of {scale['targets']} {scale['target_word']}" if scale['targets']
+                     else ' allele differences')
+            self.tree_status.setText(f"{name} · {len(results)} / {total} cohort members have a "
+                                     f"{scale['title']} profile · {len(edges)} edges · {excluded} pairs excluded. "
+                                     'Missing/incompatible profiles are not silently compared.')
             if 'available_count' in payload:
-                self.tree_status.setText(f"{name} · {payload['available_count']} / {total} stored profiles · "
-                                        f"link ≤ {self.cluster_threshold.value()} alleles · shared ≥ {self.overlap.value():.0%} · {excluded} pairs excluded.")
+                self.tree_status.setText(f"{name} · {payload['available_count']} / {total} stored "
+                                        f"{scale['title']} profiles · link ≤ {self.cluster_threshold.value()}"
+                                        f"{units} · shared ≥ {self.overlap.value():.0%} · {excluded} pairs excluded.")
             self.tree_status.setToolTip('Shared-locus fraction = shared callable loci / union of profile loci. '
                                        'Unprofiled, mixed and insufficient-overlap pairs have no assigned distance. '
-                                       'Single-link components can chain distant isolates. Thresholds are exploratory unless a pinned local protocol is documented; similarity is not proof of transmission.')
+                                       'Single-link components can chain distant isolates. Thresholds are exploratory unless a pinned local protocol is documented; similarity is not proof of transmission.\n'
+                                       + SCALE_SEPARATION)
             if payload.get('reuse'):
                 reuse = payload['reuse']
                 self.tree_status.setText(self.tree_status.text() + f" Reused {reuse['reused_pairs']} pairs; computed {reuse['computed_pairs']}.")
@@ -1430,10 +1960,93 @@ class ComparisonWorkspaceMixin:
                         self.color_by.addItem(str(field), field)
                 self.color_by.setCurrentIndex(max(0, self.color_by.findData(current)))
                 self.color_by.blockSignals(False)
+            self._apply_counterpart(payload.get('counterpart'))
+            self._apply_shared_legend()
             self.refresh_baseline_graph()
             self.refresh_graph_captions()
+            self.refresh_threshold_suggestion()
         except Exception as exc:
             self.tree_status.setText(str(exc))
+
+    # --- the other typing view ----------------------------------------------
+    def set_counterpart_graph(self, enabled):
+        """Show or hide the other typing kind's tree for the same isolates."""
+        enabled = bool(enabled)
+        self.counterpart_pane.setVisible(enabled)
+        self.current_caption.setVisible(enabled or self.dual_toggle.isChecked())
+        self._update_export_choice()
+        self.project.set_setting('compare.counterpart_graph', enabled)
+        if enabled:
+            self.graph_split.setSizes([1] * self.graph_split.count())
+            self.refresh_comparison()
+        else:
+            self.clear_counterpart_graph()
+            self.refresh_graph_captions()
+
+    def clear_counterpart_graph(self):
+        self._counterpart_snapshot, self._counterpart_results, self._counterpart_payload = None, [], None
+        self.counterpart_tree.blockSignals(True)
+        self.counterpart_tree.draw_results([], [], 1)
+        self.counterpart_tree.blockSignals(False)
+        self._legends['counterpart'] = {}
+        self._render_graph_legend()
+
+    def _apply_counterpart(self, payload):
+        """Draw the other kind's tree from its own results, threshold and legend.
+
+        Nothing is shared with the tree beside it: its own reference, its own
+        target count and its own link threshold, because the two numbers are not
+        the same measurement and must never be read off one scale.
+        """
+        if not self.counterpart_toggle.isChecked():
+            return
+        kind = self.counterpart_kind()
+        self._counterpart_payload = payload
+        if not payload or payload.get('too_large') or not payload.get('results'):
+            self._counterpart_snapshot, self._counterpart_results = None, []
+            self.counterpart_tree.blockSignals(True)
+            self.counterpart_tree.set_scale(typing_scale([], kind))
+            self.counterpart_tree.draw_results([], [], 1)
+            self.counterpart_tree.blockSignals(False)
+            self._legends['counterpart'] = {}
+            self.counterpart_tree.hide()
+            self.counterpart_notice.setText(
+                f'This cohort has no stored {typing_title(kind)} profiles, so there is no second tree to '
+                f'draw. A missing {typing_title(kind)} profile is unknown evidence, not a distance of zero.'
+                if not (payload or {}).get('too_large') else
+                'Too many profiles for an interactive second tree; export the larger cohort instead.')
+            self.counterpart_notice.show()
+            self.counterpart_caption.setText(f'{typing_title(kind)} · no stored profiles')
+            self.counterpart_caption.setToolTip(self.counterpart_notice.text())
+            return
+        self.counterpart_notice.hide()
+        self.counterpart_tree.show()
+        threshold = self.counterpart_threshold()
+        snapshot = payload['snapshot']
+        if snapshot.get('threshold') != threshold:
+            snapshot = build_snapshot(payload['results'], payload['rows'], threshold,
+                                      payload['snapshot'].get('min_overlap', self.overlap.value()), kind=kind)
+        self._counterpart_snapshot = snapshot
+        self._counterpart_results = payload['results']
+        self.counterpart_tree.blockSignals(True)
+        self.counterpart_tree.set_scale(payload.get('scale') or typing_scale(payload['results'], kind))
+        self.counterpart_tree.draw_results(payload['results'], payload['edges'], threshold,
+                                           groups=snapshot['groups'])
+        self.counterpart_tree.blockSignals(False)
+        self._legends['counterpart'] = self.counterpart_tree.legend()
+        self._render_graph_legend()
+
+    def _update_export_choice(self):
+        """Offer an export target only for the trees that are actually on screen."""
+        if not hasattr(self, 'export_tree_choice'):
+            return
+        active = self.dual_toggle.isChecked() or self.counterpart_toggle.isChecked()
+        self.export_tree_choice.setVisible(active)
+        for index in range(self.export_tree_choice.count()):
+            role = self.export_tree_choice.itemData(index)
+            self.export_tree_choice.model().item(index).setEnabled(self._view_active(role))
+        if not self._view_active(self.export_tree_choice.currentData() or 'current'):
+            self.export_tree_choice.setCurrentIndex(0)
 
     def type_comparison_scheme(self):
         if self.busy():
@@ -1457,7 +2070,6 @@ class ComparisonWorkspaceMixin:
         if QMessageBox.question(self, "Call comparison scheme", f"Call {Path(choice).name} for {len(samples)} input samples?\n\nPrimary MLST/ST results are retained. New profiles are stored separately and reused on subsequent comparisons. FASTQ files cannot be typed without assembly.") != QMessageBox.StandardButton.Yes:
             return
         saved_profiles = {s['id']: self.available_profiles(s) for s in samples}
-        analysis_kind = self.comparison_mode
         samples = [dict(s, metadata={**s.get("metadata", {}), "workflow": {
             **s.get('metadata', {}).get('workflow', {}), "typing_mode": "manual", "scheme_path": choice}}) for s in samples]
         self.worker_role = "secondary"
@@ -1475,9 +2087,10 @@ class ComparisonWorkspaceMixin:
         def saved(sid, result):
             if result.get("alleles"):
                 result["scheme_path"] = choice
-                if analysis_kind in {'st', 'cgmlst'}:
-                    result['analysis_kind'] = 'mlst' if analysis_kind == 'st' else 'cgmlst'
-                    result['analysis_kind_source'] = 'user-selected comparison mode; not independent reference validation'
+                # The typing kind is classified from the profile that was
+                # produced, never stamped from whichever view happened to be
+                # open: a 2,000-target result filed as classical MLST would put
+                # a core-genome distance under a seven-locus threshold.
                 self.project.set_analysis(sid, result)
                 self.project.set_setting("last_comparison_digest", result["scheme_digest"])
             else:
@@ -1495,6 +2108,16 @@ class ComparisonWorkspaceMixin:
         if self.closing_after_cancel:
             return
         digest = self.project.get_setting("last_comparison_digest", "")
+        self.refresh_cohort_table()
+        # A newly called reference decides which tree it belongs in. If that is
+        # not the tree on screen, the page follows the evidence and says so,
+        # rather than showing the new profiles under the other kind's threshold.
+        kind = self._digest_kinds.get(digest)
+        if kind in TYPING_VIEWS and kind != self.typing_kind:
+            self.notify(f'That reference produces {typing_title(kind)} profiles, so the '
+                        f'{typing_title(kind)} tree is now shown. The {self.typing_view_title()} tree '
+                        'keeps its own threshold and reference.')
+            self.show_typing_view(kind)
         index = self.compare_scheme.findData("digest:" + digest)
         if index >= 0:
             self.compare_scheme.setCurrentIndex(index)
@@ -1502,6 +2125,11 @@ class ComparisonWorkspaceMixin:
 
     def refresh_profile_matrix(self, results):
         loci = sorted({locus for result in results for locus in result.get("alleles", {})})
+        if hasattr(self, 'graph_tabs'):
+            index = self.graph_tabs.indexOf(self.profile_table)
+            if index >= 0:
+                self.graph_tabs.setTabToolTip(index, f'{self.typing_view_title()} profiles only · '
+                                                     f'{len(loci)} loci in this reference.\n' + SCALE_SEPARATION)
         # "_sample_id" is not a column; it is how a right-click on a sorted matrix
         # resolves the isolate under the cursor instead of trusting the row number.
         self.profile_model.replace(["Sample", "ST", "Scheme", *loci],
@@ -1511,11 +2139,16 @@ class ComparisonWorkspaceMixin:
     def refresh_statistics(self, results, edges):
         comparable = [p for p in self.distance_rows if p["comparable"]]
         distances = sorted(p["distance"] for p in comparable)
-        total_loci = len(results[0].get("alleles", {})) if results else 0
-        parts = ["<h2>Cohort evidence</h2>", f"<p>{len(results)} profiles · {total_loci} loci · {len(comparable)} comparable pairs · {len(self.distance_rows) - len(comparable)} excluded pairs</p>"]
+        scale = typing_scale(results, (self._current_snapshot or {}).get('typing_kind') or self.typing_kind)
+        total_loci = scale['targets']
+        parts = [f"<h2>{html.escape(scale['title'])} cohort evidence</h2>",
+                 f"<p>{html.escape(scale['caption'])}</p>",
+                 f"<p class='notice'>{html.escape(SCALE_SEPARATION)}</p>",
+                 f"<p>{len(results)} profiles · {total_loci} {scale['target_word']} · {len(comparable)} comparable pairs · {len(self.distance_rows) - len(comparable)} excluded pairs</p>"]
         if distances:
             median = (distances[(len(distances) - 1) // 2] + distances[len(distances) // 2]) / 2
-            parts.append(f"<p><b>Allele differences:</b> minimum {distances[0]}, median {median:g}, maximum {distances[-1]}.</p>")
+            parts.append(f"<p><b>Allele differences over {total_loci} {scale['target_word']}:</b> minimum "
+                         f"{distances[0]}, median {median:g}, maximum {distances[-1]}.</p>")
             distribution = Counter(distances)
             parts.append("<h3>Distance distribution</h3><table cellpadding='5'><tr><th>Differences</th><th>Pairs</th></tr>" + "".join(f"<tr><td>{distance}</td><td>{count}</td></tr>" for distance, count in sorted(distribution.items())) + "</table>")
         parts.append("<h3>Per-sample completeness</h3><table cellpadding='5'><tr><th>Sample</th><th>Called loci</th><th>Missing</th></tr>")
@@ -1563,6 +2196,10 @@ class ComparisonWorkspaceMixin:
             if self._pending_baseline_graph_state is None and hasattr(self.baseline_tree, "export_state"):
                 self.project.set_setting("graph_style.baseline", self.baseline_tree.export_state())
             return
+        if role == 'counterpart':
+            if hasattr(self.counterpart_tree, 'export_state'):
+                self.project.set_setting('graph_style.counterpart', self.counterpart_tree.export_state())
+            return
         if self._pending_graph_state is None and hasattr(self.tree, "export_state"):
             self.project.set_setting("graph_style", self.tree.export_state())
 
@@ -1570,9 +2207,8 @@ class ComparisonWorkspaceMixin:
         self._legends[role] = dict(values)
         self._render_graph_legend()
 
-    def _render_graph_legend(self):
-        """One legend row for both trees; a pinned colour makes it a shared key."""
-        values = {**self._legends.get('baseline', {}), **self._legends.get('current', {})}
+    @staticmethod
+    def _legend_markup(values):
         entries = []
         for name, value in list(values.items())[:8]:
             color = QColor(str(value))
@@ -1580,8 +2216,22 @@ class ComparisonWorkspaceMixin:
             entries.append(f'<span style="color:{swatch}">●</span> {html.escape(str(name))}')
         if len(values) > 8:
             entries.append(f'+ {len(values) - 8} categories · all groups in the Groups tab')
-        self.graph_legend.setText(' &nbsp; '.join(entries))
+        return ' &nbsp; '.join(entries)
+
+    def _render_graph_legend(self):
+        """One legend row for the current and baseline trees, which share a scale.
+
+        The other typing view keeps its own key beneath its own tree: two kinds
+        can each hold a "Cluster 001", and they are not the same isolates.
+        """
+        values = {**self._legends.get('baseline', {}), **self._legends.get('current', {})}
+        self.graph_legend.setText(self._legend_markup(values))
         self.graph_legend.setToolTip('\n'.join(str(key) for key in values))
+        counterpart = self._legends.get('counterpart', {})
+        self.counterpart_legend.setText(self._legend_markup(counterpart))
+        self.counterpart_legend.setToolTip(
+            f'{typing_title(self.counterpart_kind())} groups only.\n' + SCALE_SEPARATION)
+        self.counterpart_legend.setVisible(bool(counterpart))
 
     # --- right-click on the comparison views --------------------------------
     def install_graph_menus(self):
@@ -1657,11 +2307,11 @@ class ComparisonWorkspaceMixin:
         """Show or hide the baseline tree; hidden it costs no layout and no scene."""
         enabled = bool(enabled)
         self.baseline_pane.setVisible(enabled)
-        self.current_caption.setVisible(enabled)
-        self.export_tree_choice.setVisible(enabled)
+        self.current_caption.setVisible(enabled or self.counterpart_toggle.isChecked())
+        self._update_export_choice()
         self.project.set_setting('compare.dual_graph', enabled)
         if enabled:
-            self.graph_split.setSizes([1, 1])
+            self.graph_split.setSizes([1] * self.graph_split.count())
             self.refresh_baseline_graph()
         else:
             self.clear_baseline_graph()
@@ -1771,25 +2421,40 @@ class ComparisonWorkspaceMixin:
             return
         self.create_investigation_dialog()
 
+    @staticmethod
+    def _scale_words(snapshot):
+        """'cgMLST · 2358 targets' for a snapshot, or a plain 'not recorded'."""
+        kind = (snapshot or {}).get('typing_kind') or ''
+        targets = (snapshot or {}).get('target_loci')
+        word = TYPING_SCALES.get(kind, TYPING_SCALES['unclassified'])['target_word']
+        return ' · '.join(filter(None, [typing_title(kind) if kind else '',
+                                        f'{targets} {word}' if targets else '']))
+
     def refresh_graph_captions(self):
-        """Say which cohort and which moment each tree is, in both captions."""
+        """Say which quantity, which cohort and which moment each tree is."""
         current = self._current_snapshot or {}
         threshold = self.cluster_threshold.value()
+        words = self._scale_words(current)
         self.current_caption.setText(
-            f"Current · {len(current.get('profiles', []))} isolates · link ≤ {threshold}"
-            if current else 'Current · no comparison built yet')
+            ' · '.join(filter(None, ['Current', words, f"{len(current.get('profiles', []))} isolates",
+                                     f'link ≤ {threshold}']))
+            if current else f'Current · {self.typing_view_title()} · no comparison built yet')
         self.current_caption.setToolTip(
-            f"The comparison as it is now · link ≤ {threshold} allele differences · "
-            f"shared ≥ {self.overlap.value():.0%} of loci. "
-            'This is a layout of allele differences, not a phylogeny and not a transmission chain.')
+            f"The {self.typing_view_title()} comparison as it is now · reference "
+            f"{current.get('scheme') or 'not recorded'} "
+            f"({str(current.get('scheme_digest') or 'no fingerprint')[:12]}) · link ≤ {threshold} "
+            f"allele differences · shared ≥ {self.overlap.value():.0%} of loci.\n"
+            'This is a layout of allele differences, not a phylogeny and not a transmission chain.\n'
+            + SCALE_SEPARATION)
+        self._refresh_counterpart_caption()
         if not self._baseline_snapshot:
             return
         snapshot = self._baseline_snapshot
         when = str(snapshot.get('created_at') or '')[:16].replace('T', ' ')
         summary = snapshot_diff_caption(self._baseline_diff) if self._baseline_diff else ''
-        self.baseline_caption.setText(
-            f"Baseline · {when or 'date not recorded'} · {len(snapshot.get('profiles', []))} isolates "
-            f"· link ≤ {snapshot.get('threshold')}" + (f" · {summary}" if summary else ''))
+        self.baseline_caption.setText(' · '.join(filter(None, [
+            'Baseline', when or 'date not recorded', self._scale_words(snapshot),
+            f"{len(snapshot.get('profiles', []))} isolates", f"link ≤ {snapshot.get('threshold')}", summary])))
         tooltip = [f"Baseline snapshot {str(snapshot.get('snapshot_id') or '')[:12]} of "
                    f"{snapshot.get('investigation_name') or 'this investigation'}, frozen "
                    f"{snapshot.get('created_at') or 'at an unrecorded time'}.",
@@ -1804,6 +2469,25 @@ class ComparisonWorkspaceMixin:
         if self._baseline_diff and not self._baseline_diff['policy']['comparable']:
             tooltip.append(self._baseline_diff['policy']['reason'])
         self.baseline_caption.setToolTip('\n'.join(tooltip))
+
+    def _refresh_counterpart_caption(self):
+        if not self.counterpart_toggle.isChecked():
+            return
+        kind = self.counterpart_kind()
+        snapshot = self._counterpart_snapshot
+        if not snapshot:
+            return
+        self.counterpart_caption.setText(' · '.join(filter(None, [
+            self._scale_words(snapshot) or typing_title(kind),
+            f"{len(snapshot.get('profiles', []))} isolates",
+            f"link ≤ {snapshot.get('threshold')}"])))
+        self.counterpart_caption.setToolTip('\n'.join([
+            f"The same isolates, typed the other way: {typing_title(kind)} · reference "
+            f"{snapshot.get('scheme') or 'not recorded'} "
+            f"({str(snapshot.get('scheme_digest') or 'no fingerprint')[:12]}) · "
+            f"link ≤ {snapshot.get('threshold')} over {snapshot.get('target_loci')} targets.",
+            'This tree keeps its own threshold and its own legend. Its distances are never '
+            'comparable with the tree beside it.', SCALE_SEPARATION]))
 
     def refresh_changes_view(self):
         if not hasattr(self, 'changes_view'):
@@ -1825,11 +2509,13 @@ class ComparisonWorkspaceMixin:
 
     def _apply_shared_legend(self):
         """Pin one colour per category across both trees, so the legend is shared."""
-        views = [view for view in self._graph_views().values()
-                 if view is not None and getattr(view, '_results', None)]
+        views = [view for role, view in self._graph_views().items()
+                 if view is not None and self._view_active(role) and getattr(view, '_results', None)]
         if len(views) < 2 or (self.color_by.currentData() or 'cluster') == 'cluster':
             # Cluster colour already derives from the lineage-stable group number,
             # so the two trees agree by construction and pinning would only lie.
+            # Across typing kinds it would lie outright: the groups are different
+            # isolates measured over different loci.
             for view in views:
                 view.set_pinned_legend({})
             return
@@ -1890,13 +2576,13 @@ class ComparisonWorkspaceMixin:
 
     def export_role(self):
         """Which tree the export entries act on; 'current' unless the user chose otherwise."""
-        if not self.dual_toggle.isChecked():
-            return 'current'
-        return self.export_tree_choice.currentData() or 'current'
+        role = self.export_tree_choice.currentData() or 'current'
+        return role if self._view_active(role) else 'current'
 
     def export_snapshot(self, role=None):
         role = role or self.export_role()
-        return self._baseline_snapshot if role == 'baseline' else self._current_snapshot
+        return {'baseline': self._baseline_snapshot,
+                'counterpart': self._counterpart_snapshot}.get(role, self._current_snapshot)
 
     def export_graph_action(self, index, combo):
         combo.setCurrentIndex(0)
@@ -1908,6 +2594,9 @@ class ComparisonWorkspaceMixin:
         if role == 'baseline' and not self._baseline_drawn:
             self.notify('Show the baseline tree first: there is nothing drawn to export.')
             return
+        if role == 'counterpart' and not self._counterpart_results:
+            self.notify(f'There is no stored {typing_title(self.counterpart_kind())} tree to export.')
+            return
         if index == 1 and role == 'current':
             return self.save_tree()
         if index == 5 and role == 'current':
@@ -1916,38 +2605,47 @@ class ComparisonWorkspaceMixin:
                    4: ("nwk", "save_newick"), 5: ('json', 'distances'), 6: ("tsv", None),
                    7: ('jpg', 'save_image'), 8: ('tsv', 'profiles'), 9: ('tsv', 'groups')}
         extension, method = formats[index]
-        path, _ = QFileDialog.getSaveFileName(self, "Export comparison", f"comparison.{extension}", f"{extension.upper()} (*.{extension})")
-        if not path:
-            return
+        # The typing kind is in the suggested file name as well as in the file,
+        # so an MLST export and a cgMLST export cannot be confused on disk.
+        kind = self.counterpart_kind() if role == 'counterpart' else self.typing_kind
         try:
-            self.check_output(path)
             snapshot = self.export_snapshot(role)
+            path, _ = QFileDialog.getSaveFileName(self, "Export comparison", f"{kind}-comparison.{extension}", f"{extension.upper()} (*.{extension})")
+            if not path:
+                return
+            self.check_output(path)
             if method in {'profiles', 'groups'}:
-                self.write_comparison_table(path, method, snapshot=snapshot if role == 'baseline' else None)
+                self.write_comparison_table(path, method, snapshot=snapshot if role != 'current' else None)
             elif method == 'distances':
                 from wmlstudio.export import write_distances
                 write_distances(snapshot.get('pairs', []), path, snapshot.get('min_overlap', 0.95))
             elif method:
                 view = self._graph_view(role)
-                title = ('Baseline allele-distance minimum spanning forest'
-                         if role == 'baseline' else None)
+                title = {'baseline': 'Baseline allele-distance minimum spanning forest',
+                         'counterpart': f"{typing_title(kind)} allele-distance minimum spanning forest"}.get(role)
                 if method in {'save_graphml', 'save_newick'}:
                     getattr(view, method)(path)
                 else:
                     getattr(view, method)(path, title=title, subtitle=self._export_subtitle(role))
             else:
-                self.write_distance_matrix(path, snapshot=snapshot if role == 'baseline' else None)
-            self.notify(('Baseline snapshot exported exactly as it was stored.' if role == 'baseline'
-                         else 'Comparison exported with its current cohort and evidence.'))
+                self.write_distance_matrix(path, snapshot=snapshot if role != 'current' else None)
+            self.notify({'baseline': 'Baseline snapshot exported exactly as it was stored.',
+                         'counterpart': f'{typing_title(kind)} tree exported with its own reference and '
+                                        'target count.'}.get(
+                             role, 'Comparison exported with its current cohort and evidence.'))
         except Exception as exc:
             self.error(exc)
 
     def _export_subtitle(self, role):
-        if role != 'baseline' or not self._baseline_snapshot:
-            return None
-        snapshot = self._baseline_snapshot
-        return (f"Baseline snapshot frozen {snapshot.get('created_at') or 'at an unrecorded time'} · "
-                f"link ≤ {snapshot.get('threshold')} · not a phylogeny or transmission tree")
+        snapshot = self.export_snapshot(role)
+        if role == 'baseline' and snapshot:
+            return (f"{self._scale_words(snapshot)} · baseline snapshot frozen "
+                    f"{snapshot.get('created_at') or 'at an unrecorded time'} · "
+                    f"link ≤ {snapshot.get('threshold')} · not a phylogeny or transmission tree")
+        if role == 'counterpart' and snapshot:
+            return (f"{self._scale_words(snapshot)} · link ≤ {snapshot.get('threshold')} · "
+                    'a separate measurement from the other tree; not a phylogeny or transmission tree')
+        return None
 
     def export_baseline_comparison(self, index):
         """The two trees together, and the change summary that explains them."""
@@ -1990,8 +2688,10 @@ class ComparisonWorkspaceMixin:
         return render_side_by_side(
             self.baseline_tree, self.tree,
             left_title=f"Baseline · {str(baseline.get('created_at') or '')[:16].replace('T', ' ')} · "
+                       f"{self._scale_words(baseline)} · "
                        f"{len(baseline.get('profiles', []))} isolates · link ≤ {baseline.get('threshold')}",
-            right_title=f"Current · {len(current.get('profiles', []))} isolates · "
+            right_title=f"Current · {self._scale_words(current)} · "
+                        f"{len(current.get('profiles', []))} isolates · "
                         f"link ≤ {current.get('threshold')}",
             left_subtitle=self._export_subtitle('baseline'),
             right_subtitle=None, headline=headline, width=width, height=height)

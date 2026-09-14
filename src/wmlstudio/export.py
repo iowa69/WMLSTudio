@@ -29,10 +29,22 @@ _FIELDS = (
     "amr_classes", "virulence_genes", "plasmid_replicons", "stress_genes",
     "hydra_source_sample", "hydra_report_sha256", "cluster_label", "cluster_highlight",
     "additional_profiles",
+    # Classical MLST and cgMLST are different quantities, so they get their own
+    # columns: the headline "st"/"scheme" pair is whichever analysis ran last,
+    # and a core-genome run must not make a sequence type unreadable. cgmlst_loci
+    # is the scheme size and cgmlst_called the loci actually called; a missing
+    # call is not an allele, so the denominator travels with the numerator.
+    "typing_kinds", "mlst_st", "mlst_scheme", "mlst_status",
+    "cgmlst_scheme", "cgmlst_status", "cgmlst_loci", "cgmlst_called",
     "hydra_evidence_status", "hydra_evidence_reason",
     "investigation_cluster", "investigation_cluster_id", "investigation_cluster_status",
     "nearest_allele_distance", "nearest_isolates", "within_threshold_isolates",
-    "comparison_scheme_digest", "comparison_threshold", "comparison_min_overlap",
+    # A distance without its denominators is not interpretable, and a distance
+    # without its target count cannot be told from one on the other scale.
+    "nearest_shared_loci", "nearest_total_loci",
+    "comparison_scheme", "comparison_scheme_digest", "comparison_total_loci",
+    "comparison_typing", "comparison_threshold", "comparison_threshold_source",
+    "comparison_min_overlap",
     "organism_typing",
 )
 
@@ -49,10 +61,11 @@ def _snapshot(
     records: Iterable[Mapping[str, Any]], selected_ids=None, highlight_clusters=None,
     investigation=None,
 ) -> list[dict[str, Any]]:
-    proximity = {}
+    proximity, provenance = {}, None
     if investigation:
         from wmlstudio.investigation import proximity_rows
         proximity = {p['sample_id']: p for p in proximity_rows(investigation)}
+        provenance = threshold_provenance(investigation)
     rows = []
     for record in select_records(records, selected_ids):
         if "result" in record:
@@ -81,7 +94,16 @@ def _snapshot(
                            investigation_cluster_status=close['group_status'], nearest_allele_distance=close['nearest_distance'],
                            nearest_isolates=[p['neighbour_name'] for p in close['nearest']],
                            within_threshold_isolates=[p['neighbour_name'] for p in close['within_threshold']],
+                           # One denominator per equally-close isolate, in the
+                           # same order: ties can have been compared over
+                           # different locus sets, and one figure would hide it.
+                           nearest_shared_loci=[p['shared_loci'] for p in close['nearest']],
+                           nearest_total_loci=[p['total_loci'] for p in close['nearest']],
+                           comparison_scheme=investigation.get('scheme', ''),
                            comparison_scheme_digest=investigation['scheme_digest'], comparison_threshold=investigation['threshold'],
+                           comparison_total_loci=provenance['total_loci'],
+                           comparison_typing=provenance['typing']['kind'],
+                           comparison_threshold_source=provenance['source'],
                            comparison_min_overlap=investigation['min_overlap'])
         rows.append(row)
     # Validate and detach nested data before opening any destination.
@@ -225,6 +247,14 @@ def write_distances(
             "non-comparable distances are null."
         ),
         "scheme_requirement": "Identical nonempty scheme names and scheme fingerprints.",
+        # Every pair carries its own shared_loci/total_loci, because a distance
+        # without its denominators cannot be read, and a distance without its
+        # target count cannot be told from one measured on the other scale.
+        "target_count_requirement": (
+            "Read each distance only with the shared_loci / total_loci recorded on its own pair. "
+            "A classical MLST distance over seven loci and a cgMLST distance over hundreds to thousands "
+            "of targets are different quantities: they share no scale, no column and no threshold."
+        ),
         "interpretation": "Allele similarity alone does not establish an outbreak or transmission.",
         "pairs": _snapshot(rows),
     }
@@ -236,6 +266,174 @@ def write_distances(
 
 def _escape(value: Any) -> str:
     return html.escape(_display(value), quote=True)
+
+
+def _mlst_cell(row):
+    """The classical sequence type alone. A core-genome run never fills this in."""
+    st = row.get('mlst_st')
+    if not st:
+        return 'No classical MLST result'
+    return 'ST ' + _display(st) + ' · ' + _display(row.get('mlst_scheme') or 'unnamed scheme')
+
+
+def _cgmlst_cell(row):
+    """Called targets over the scheme's own size; a missing call is not an allele."""
+    scheme = row.get('cgmlst_scheme')
+    if not scheme:
+        return 'No cgMLST result'
+    return (_display(scheme) + ' · ' + _display(row.get('cgmlst_called') or 0) + '/'
+            + _display(row.get('cgmlst_loci') or 0) + ' targets called')
+
+
+def _count_words(value, unit='allele differences'):
+    """'1 allele difference' / '12 allele differences', read aloud in a meeting."""
+    singular = unit[:-1] if unit.endswith('s') else unit
+    return f"{_display(value)} {singular if value == 1 else unit}"
+
+
+def snapshot_organisms(snapshot, organisms=None):
+    """The organism names this comparison actually covers, with no inference."""
+    source = organisms if organisms is not None else [
+        profile.get('organism') for profile in snapshot.get('profiles') or ()]
+    return sorted({str(name).strip() for name in source if name and str(name).strip()})
+
+
+def threshold_provenance(snapshot, organisms=None):
+    """Everything a report must state beside any tree, cluster or distance it prints.
+
+    One dict: the reference and its full target count, the typing scale that
+    count puts the comparison on, the threshold actually in force, and whether
+    that number is a published cutoff the user adopted or the user's own
+    setting. ``source`` answers exactly that, so a report can never present a
+    suggestion as an applied value; ``suggestion`` is populated only when the
+    threshold is the user's own, and carries ``applied`` false of its own.
+
+    An adopted cutoff brings its citation, DOI and the authors' own caveat with
+    it. A citation whose binding has since changed is demoted back to the user's
+    own setting and says so: approval never transfers silently to a new policy.
+    """
+    from wmlstudio.investigation import threshold_guidance_status
+    from wmlstudio.threshold_guidance import SCALE_SEPARATION, suggested_threshold, typing_scale
+    profiles = snapshot.get('profiles') or []
+    # The scheme's own size, not the loci one isolate happened to call: a
+    # missing call is unknown, so it must not shrink the denominator.
+    total_loci = max((profile.get('total_loci') or 0) for profile in profiles) if profiles else 0
+    # A snapshot that records its own typing kind is believed; otherwise the
+    # target count decides, on the same floor the analysis planner uses.
+    scale = typing_scale(total_loci)
+    declared = str(snapshot.get('typing_kind') or '').strip().casefold()
+    if declared in {'mlst', 'cgmlst'}:
+        scale = {**scale, 'kind': declared}
+    binding = threshold_guidance_status(snapshot)
+    evidence = snapshot.get('threshold_evidence') or {}
+    adopted = binding['status'] == 'matches_reviewed_context'
+    status, reason = binding['status'], binding['reason']
+    published_loci = evidence.get('published_locus_count')
+    if adopted and published_loci and total_loci and int(published_loci) != int(total_loci):
+        # The reference fingerprint can match while the comparison ran a
+        # different number of targets. A distance over a different target set is
+        # a different quantity, so the published number is not in force here.
+        adopted, status = False, 'target_count_conflict'
+        reason = ('The adopted cutoff was published over ' + str(published_loci) + ' targets and this comparison '
+                  'measured ' + str(total_loci) + '. A distance over a different target set is a different '
+                  'quantity, so the published number is not in force; the threshold shown is a local setting. '
+                  + reason)
+    names = snapshot_organisms(snapshot, organisms)
+    organism = names[0] if len(names) == 1 else ''
+    provenance = {
+        'scheme': str(snapshot.get('scheme') or 'Unnamed reference'),
+        'scheme_digest': str(snapshot.get('scheme_digest') or ''),
+        'total_loci': total_loci, 'typing': scale,
+        'threshold': snapshot.get('threshold'), 'min_overlap': snapshot.get('min_overlap'),
+        'source': 'adopted_publication' if adopted else 'own_setting',
+        'status': status, 'reason': reason,
+        'organism': organism, 'organisms': names,
+        'citation': str(evidence.get('citation') or '') if isinstance(evidence.get('citation'), str) else '',
+        'doi': str(evidence.get('doi') or ''), 'caveat': str(evidence.get('caveat') or ''),
+        'short_citation': str(evidence.get('short_citation') or ''),
+        'published_threshold': evidence.get('published_threshold'),
+        'published_unit': str(evidence.get('published_unit') or 'allele differences'),
+        'published_scheme': evidence.get('scheme_scope') or '',
+        'published_locus_count': evidence.get('published_locus_count'),
+        'scale_separation': SCALE_SEPARATION, 'suggestion': None, 'suggestion_blocked': '',
+    }
+    if adopted:
+        provenance['statement'] = (
+            'The threshold in force is a published cutoff that was reviewed and adopted here: at most '
+            + _count_words(snapshot.get('threshold')) + ' on ' + provenance['scheme'] + ' ('
+            + str(total_loci) + ' targets). ' + reason)
+        return provenance
+    provenance['statement'] = (
+        'The threshold in force is a local setting, not a published cutoff: at most '
+        + _count_words(snapshot.get('threshold')) + ' on ' + provenance['scheme'] + ' ('
+        + str(total_loci) + ' targets). ' + reason)
+    if organism:
+        # Suggested only: the payload carries applied=False, and nothing in this
+        # function can turn it into the threshold above. A snapshot measures
+        # allele differences, so only allele-distance entries can be relevant;
+        # on a classical-scale reference the catalog refuses to suggest at all.
+        provenance['suggestion'] = suggested_threshold(organism, 'cgmlst', locus_count=total_loci)
+    elif names:
+        provenance['suggestion_blocked'] = (
+            'These isolates are not all the same organism (' + ', '.join(names)
+            + '), so no organism-specific cutoff is suggested for them.')
+    return provenance
+
+
+def _suggestion_html(suggestion):
+    """A catalog suggestion, printed as a suggestion and never as a setting."""
+    if not suggestion:
+        return []
+    # The headline leads with "Suggested, not applied"; a second label in front
+    # of it would only push those words further from the number.
+    parts = ['<p class="muted">' + _escape(suggestion['headline']) + ' ' + _escape(suggestion['notice']) + '</p>']
+    entry = suggestion.get('suggestion')
+    if entry:
+        parts.append('<p class="muted"><b>Citation:</b> ' + _escape(entry['source']['citation'])
+                     + ' doi:' + _escape(entry['source']['doi']) + ' · ' + _escape(entry['source']['locator'])
+                     + '<br><b>The authors’ own caveat:</b> “' + _escape(entry['caveat']) + '”'
+                     + ('<br><b>Missing data in the source protocol:</b> ' + _escape(entry['missing_policy'])
+                        if entry.get('missing_policy') else '') + '</p>')
+        match = suggestion.get('scheme_match') or {}
+        if match.get('checked'):
+            parts.append('<p class="muted"><b>Does it fit this comparison?</b> ' + _escape(match['reason']) + '</p>')
+    if suggestion.get('disagreement'):
+        parts.append('<p class="muted"><b>Other reviewed sources:</b> ' + _escape(suggestion['disagreement']) + '</p>')
+    return parts
+
+
+def threshold_provenance_html(snapshot, organisms=None):
+    """The block that must sit beside any printed tree, cluster or distance."""
+    return _provenance_html(threshold_provenance(snapshot, organisms))
+
+
+def _provenance_html(provenance):
+    """The same block from an already-built payload, so one report builds it once."""
+    adopted = provenance['source'] == 'adopted_publication'
+    parts = ['<h3>Scheme, threshold and where the threshold comes from</h3>',
+             '<p><b>Measured on:</b> ' + _escape(provenance['scheme']) + ' · '
+             + _escape(provenance['total_loci']) + ' targets in the scheme · '
+             + _escape(provenance['typing']['label']) + '</p>',
+             '<p><b>Threshold in force:</b> at most ' + _escape(_count_words(provenance['threshold']))
+             + ' — <b>' + ('a published cutoff, reviewed and adopted here'
+                           if adopted else 'your own setting, not a published cutoff') + '.</b></p>',
+             '<p>' + _escape(provenance['statement']) + '</p>']
+    if adopted or provenance['citation'] or provenance['doi']:
+        parts.append('<p><b>Citation:</b> ' + _escape(provenance['citation'] or 'No citation recorded')
+                     + (' doi:' + _escape(provenance['doi']) if provenance['doi'] else '')
+                     + (' · <b>published cutoff:</b> at most '
+                        + _escape(_count_words(provenance['published_threshold'], provenance['published_unit']))
+                        if provenance['published_threshold'] is not None else '')
+                     + (' on ' + _escape(provenance['published_scheme']) if provenance['published_scheme'] else '')
+                     + (' over ' + _escape(provenance['published_locus_count']) + ' targets'
+                        if provenance['published_locus_count'] else '') + '</p>')
+        if provenance['caveat']:
+            parts.append('<p class="notice"><b>The authors’ own caveat:</b> “' + _escape(provenance['caveat']) + '”</p>')
+    parts.extend(_suggestion_html(provenance['suggestion']))
+    if provenance['suggestion_blocked']:
+        parts.append('<p class="muted">' + _escape(provenance['suggestion_blocked']) + '</p>')
+    parts.append('<p class="muted">' + _escape(provenance['typing']['note']) + '</p>')
+    return ''.join(parts)
 
 
 def investigation_document(snapshot, selected_ids=None):
@@ -252,6 +450,10 @@ def investigation_document(snapshot, selected_ids=None):
                     groups=[g for g in snapshot.get('groups', []) if focus.intersection(g['members'])],
                     review_groups=[g for g in snapshot.get('review_groups', []) if focus.intersection(g['sample_ids'])],
                     proximity=proximity_rows(snapshot, focus),
+                    # Travels with every exported distance: the scheme, its full
+                    # target count, the typing scale and whether the threshold is
+                    # a published cutoff or the reader's own setting.
+                    threshold_provenance=threshold_provenance(snapshot),
                     scope_note='Only focal isolates are sample records. Named neighbours and group members are explicitly labelled comparison-cohort context.')
     return json.loads(json.dumps(metadata, ensure_ascii=False, allow_nan=False))
 
@@ -259,11 +461,15 @@ def investigation_document(snapshot, selected_ids=None):
 def investigation_html(snapshot, selected_ids=None, sections=None):
     """Offline, escaped investigation and isolate-proximity section, also printable."""
     doc = investigation_document(snapshot, selected_ids)
+    provenance = doc['threshold_provenance']
     parts = ['<section><h2>Investigation · ' + _escape(doc.get('investigation_name') or 'Unsaved cohort') + '</h2>',
              '<p>' + _escape(doc['scope_note']) + '</p>',
-             '<p><b>Reference:</b> ' + _escape(doc['scheme']) + '<br><b>Scheme SHA-256:</b> ' + _escape(doc['scheme_digest']) +
+             '<p><b>Reference:</b> ' + _escape(doc['scheme']) + ' · ' + _escape(provenance['total_loci']) +
+             ' targets · ' + _escape(provenance['typing']['label']) +
+             '<br><b>Scheme SHA-256:</b> ' + _escape(doc['scheme_digest']) +
              '<br><b>Snapshot:</b> ' + _escape(doc['snapshot_id']) + ' · ' + _escape(doc['created_at']) + '</p>',
-             f"<p><b>Single-link threshold:</b> ≤ {_escape(doc['threshold'])} allele differences. "
+             f"<p><b>Single-link threshold:</b> ≤ {_escape(doc['threshold'])} allele differences over "
+             f"{_escape(provenance['total_loci'])} targets. "
              f"<b>Minimum shared / total loci:</b> {_escape(doc['min_overlap'])}. "
              f"<b>Cohort:</b> {doc['cohort_size']} isolates; {len(doc['focal_sample_ids'])} focal isolates.</p>",
              '<p><b>Local protocol:</b> ' + _escape(doc.get('protocol') or 'Exploratory; not clinically calibrated') + '</p>',
@@ -271,12 +477,14 @@ def investigation_html(snapshot, selected_ids=None, sections=None):
     if doc.get('preview'):
         parts.append('<p class="notice"><b>Unsaved threshold preview.</b> The saved protocol threshold was ' +
                      _escape(doc.get('saved_threshold')) + '; this report explicitly uses the threshold shown above.</p>')
+    # Printed whether or not a citation exists: a report that shows a tree, a
+    # cluster or a distance must always say which scheme and target count it was
+    # measured on, and whether the threshold is published or the reader's own.
+    parts.append(_provenance_html(provenance))
     evidence = doc.get('threshold_evidence') or {}
     if evidence:
-        from wmlstudio.investigation import threshold_guidance_status
-        binding = threshold_guidance_status(snapshot)
         parts.append('<h3>Published threshold guidance and local application</h3>')
-        parts.append('<p class="notice"><b>' + _escape(binding['status'].replace('_', ' ')) + ':</b> ' + _escape(binding['reason']) + '</p>')
+        parts.append('<p class="notice"><b>' + _escape(provenance['status'].replace('_', ' ')) + ':</b> ' + _escape(provenance['reason']) + '</p>')
         for key, value in evidence.items():
             if isinstance(value, (str, int, float, bool)) or value is None:
                 parts.append('<p><b>' + _escape(key.replace('_', ' ')) + ':</b> ' + _escape(value) + '</p>')
@@ -304,7 +512,8 @@ def investigation_html(snapshot, selected_ids=None, sections=None):
                      ' · <b>Callable loci:</b> ' + str(profile['callable_loci']) + '/' + str(profile['total_loci']) +
                      (' · <b>AMR context:</b> ' + _escape(profile.get('amr_genes') or 'Not recorded') + ' · ' + _escape(profile.get('amr_evidence_status') or 'Identity unverified') if sections is None or sections.get('amr') else '') + '</p>')
         parts.append('<p>Nearest accepted distance: ' + _escape(focal['nearest_distance'] if focal['nearest_distance'] is not None else 'Not comparable') +
-                     f". {focal['compared_count']} neighbours compared; {focal['excluded_count']} comparisons excluded.</p>")
+                     ' of ' + _escape(provenance['total_loci']) + ' targets (' + _escape(provenance['typing']['label']) +
+                     f"). {focal['compared_count']} neighbours compared; {focal['excluded_count']} comparisons excluded.</p>")
         rows = focal['within_threshold'] or focal['nearest']
         if rows:
             parts.append('<table border="1" cellpadding="5" cellspacing="0"><tr><th>Comparison-cohort neighbour</th><th>Allele differences</th><th>Shared / total loci</th><th>Overlap</th></tr>')
@@ -411,10 +620,15 @@ def review_report_html(records, *, selected_ids, investigation=None, options=Non
         # only in a message that disappears once the file has been saved.
         parts.append('<p class="notice"><b>This scope was not chosen for this report.</b> ' +
                      _escape(scope_note or '') + '</p>')
-    parts.append('<h2>At a glance</h2><table cellpadding="6" cellspacing="0" border="1"><tr><th>Isolate</th><th>Organism</th><th>Primary ST</th><th>Typing / QC state</th>' +
+    # Two columns, never one: a seven-locus sequence type and a core-genome
+    # profile are different quantities and must not share a cell or a scale.
+    parts.append('<h2>At a glance</h2><table cellpadding="6" cellspacing="0" border="1"><tr><th>Isolate</th><th>Organism</th>'
+                 '<th>MLST sequence type</th><th>cgMLST profile (called / scheme size)</th><th>Typing / QC state</th>' +
                  ('<th>AMR evidence</th>' if settings['amr'] else '') + '</tr>')
     for row in rows:
-        values = [row.get('sample_name'), row.get('organism') or 'Unassigned', row.get('st') or 'Unassigned', row.get('status') or row.get('job_status') or 'Not analysed']
+        values = [row.get('sample_name'), row.get('organism') or 'Unassigned',
+                  _mlst_cell(row), _cgmlst_cell(row),
+                  row.get('status') or row.get('job_status') or 'Not analysed']
         if settings['amr']:
             genes = row.get('amr_genes') or []
             values.append('; '.join(genes) if genes else 'No determinants reported' if row.get('hydra_evidence_status') == 'current' else row.get('hydra_evidence_status') or 'Not assessed')
@@ -434,7 +648,10 @@ def review_report_html(records, *, selected_ids, investigation=None, options=Non
         parts.append('<section><h2>' + _escape(row.get('sample_name')) + '</h2>')
         if row.get('cluster_label'):
             parts.append('<p class="notice"><b>User-defined review highlight:</b> ' + _escape(row['cluster_label']) + ' (not an inferred transmission assignment)</p>')
-        parts.append('<p><b>Primary typing:</b> ' + _escape(row.get('scheme') or 'Not assessed') + ' · ST ' + _escape(row.get('st') or 'Unassigned') + '</p>')
+        parts.append('<p><b>Classical MLST:</b> ' + _escape(_mlst_cell(row)) +
+                     '<br><b>cgMLST:</b> ' + _escape(_cgmlst_cell(row)) +
+                     '<br><span class="muted">A sequence type and a core-genome profile answer different '
+                     'questions and are never combined into one distance or one threshold.</span></p>')
         if row.get('error') or row.get('missing_input'):
             parts.append('<p class="notice">' + _escape(row.get('error') or 'Original sequence input unavailable; stored profile evidence only.') + '</p>')
         if settings['qc']:

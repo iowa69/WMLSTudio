@@ -189,6 +189,33 @@ def set_cluster(project, sample_ids, label: str, color: str = "#2F8A78", highlig
             }})
 
 
+def typing_profiles(record) -> dict:
+    """The classical MLST and the cgMLST profile this record carries, kept apart.
+
+    Read from what the record already holds — its headline result and any
+    additional profiles attached to it — so presentation code never has to ask
+    the database which of the two a scheme was. Either may be None: a sample with
+    an ST and no core-genome profile reports no cgMLST, and the ST is never
+    offered in its place.
+    """
+    from wmlstudio.project import typing_kind
+    result = record.get("result") or (record if "result" not in record else {})
+    profiles: dict[str, dict | None] = {"mlst": None, "cgmlst": None}
+    seen = set()
+    for profile in [result, *(record.get("analyses") or ()),
+                    *(record.get("additional_profiles") or ())]:
+        if not isinstance(profile, dict) or not profile.get("scheme_digest"):
+            continue
+        digest = str(profile["scheme_digest"])
+        if digest in seen:
+            continue
+        seen.add(digest)
+        kind = typing_kind(profile)
+        if kind in profiles and profiles[kind] is None:
+            profiles[kind] = profile
+    return profiles
+
+
 def _organism_typing(record):
     """Organism-specific calls as one line, or empty when none are current.
 
@@ -230,6 +257,12 @@ def feature_fields(record, highlight=None) -> dict:
     # silently emptied the hydra_* fields in every export.
     decision = metadata.get("organism_evidence")
     decision = decision if isinstance(decision, dict) else {}
+    # Classical MLST and cgMLST are reported in their own columns: the headline
+    # result is whichever analysis ran last, and an ST must not disappear from a
+    # row because a core-genome run happened after it.
+    profiles = typing_profiles(record)
+    mlst, cgmlst = profiles["mlst"] or {}, profiles["cgmlst"] or {}
+    cg_alleles = cgmlst.get("alleles") if isinstance(cgmlst.get("alleles"), dict) else {}
     return {
         "genus": genus, "species": species, "organism": organism,
         "organism_source": "assigned" if assigned.get("genus") else "local_scheme_detection" if organism else "unknown",
@@ -241,6 +274,13 @@ def feature_fields(record, highlight=None) -> dict:
         # assembly leaves the column empty rather than reading as this one's.
         "organism_typing": _organism_typing(record),
         "typing_mode": workflow.get("typing_mode", metadata.get("typing_mode", "")),
+        "typing_kinds": [kind for kind in ("mlst", "cgmlst") if profiles[kind]],
+        "mlst_st": mlst.get("st"), "mlst_scheme": mlst.get("scheme") or "",
+        "mlst_status": mlst.get("status") or "",
+        "cgmlst_scheme": cgmlst.get("scheme") or "", "cgmlst_status": cgmlst.get("status") or "",
+        # Scheme size and called loci are separate numbers: a missing call is not
+        # an allele, and the denominator belongs beside the numerator.
+        "cgmlst_loci": len(cg_alleles), "cgmlst_called": sum(1 for v in cg_alleles.values() if v),
         "amr_genes": genes("AMR"), "virulence_genes": genes("VIRULENCE"),
         "plasmid_replicons": genes("PLASMID"), "stress_genes": genes("STRESS"),
         "amr_classes": sorted({hit["class"] for hit in primary if hit.get("element_type") == "AMR" and hit.get("class")}),

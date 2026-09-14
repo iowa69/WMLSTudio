@@ -49,6 +49,14 @@ ROUNDING_LABELS = {
 # scale the screen cannot fit would leave the window partly off-screen.
 MINIMUM_WINDOW_WIDTH = 1000
 MINIMUM_WINDOW_HEIGHT = 680
+# The same ceiling --window-size accepts, so the menu and the command line agree.
+MAXIMUM_WINDOW_WIDTH = 7680
+MAXIMUM_WINDOW_HEIGHT = 4320
+
+# Window sizes offered by name, smallest first. These are window sizes, not screen
+# resolutions: the screen keeps whatever resolution the operating system gave it.
+WINDOW_SIZE_CHOICES = ((1000, 680), (1280, 800), (1366, 768), (1440, 900),
+                       (1600, 1000), (1920, 1080), (2560, 1440))
 
 DEFAULTS = {"mode": "system", "scale_percent": 100, "rounding": "exact"}
 
@@ -60,6 +68,15 @@ RECOVERY_NOTICE = ("If the window ever becomes too large to use, start WMLSTudio
                    "--display-scale 100.")
 EXPORT_NOTICE = ("Exported and reported images keep a fixed size so the picture looks the same "
                  "on every computer.")
+# The words a person actually searches with when they cannot read the screen.
+DISPLAY_SEARCH_TERMS = ("window size", "screen resolution", "text too small", "zoom",
+                        "make everything bigger", "high DPI")
+DISPLAY_TITLE = "Window size, text size and screen resolution"
+DISPLAY_INTRO = ("Text too small, or the window too big for your screen? Everything that makes "
+                 "WMLSTudio bigger, smaller or easier to read is on this page. None of it "
+                 "changes a distance, a threshold or an exported result.")
+WINDOW_SIZE_NOTICE = ("This resizes the WMLSTudio window only. Your screen keeps the resolution "
+                      "your operating system gave it.")
 
 
 def display_preferences(root=None) -> QSettings:
@@ -137,10 +154,7 @@ def clamp_text_scale(percent) -> int:
 
 def max_scale_percent(available_size) -> int:
     """The largest whole-interface scale whose minimum window still fits this screen."""
-    width = getattr(available_size, "width", None)
-    height = getattr(available_size, "height", None)
-    width = width() if callable(width) else available_size[0]
-    height = height() if callable(height) else available_size[1]
+    width, height = _sides(available_size)
     if width <= 0 or height <= 0:
         return 100
     fit = min(width / MINIMUM_WINDOW_WIDTH, height / MINIMUM_WINDOW_HEIGHT)
@@ -151,6 +165,92 @@ def available_scale_choices(available_size) -> tuple[int, ...]:
     """Offer only the scales this screen can actually show the whole window at."""
     ceiling = max_scale_percent(available_size)
     return tuple(percent for percent in SCALE_CHOICES if percent <= ceiling) or (100,)
+
+
+def _sides(available_size):
+    """(width, height) from a QSize, a QRect-like size or a plain pair."""
+    width = getattr(available_size, "width", None)
+    height = getattr(available_size, "height", None)
+    width = width() if callable(width) else available_size[0]
+    height = height() if callable(height) else available_size[1]
+    return int(width), int(height)
+
+
+def clamp_window_size(width, height, available_size=None):
+    """A window size inside the supported range, and inside this screen when known."""
+    width = max(MINIMUM_WINDOW_WIDTH, min(MAXIMUM_WINDOW_WIDTH, _as_int(width, 0)))
+    height = max(MINIMUM_WINDOW_HEIGHT, min(MAXIMUM_WINDOW_HEIGHT, _as_int(height, 0)))
+    if available_size is not None:
+        screen_width, screen_height = _sides(available_size)
+        if screen_width >= MINIMUM_WINDOW_WIDTH:
+            width = min(width, screen_width)
+        if screen_height >= MINIMUM_WINDOW_HEIGHT:
+            height = min(height, screen_height)
+    return width, height
+
+
+def available_window_sizes(available_size=None):
+    """Offer only the named sizes this screen can actually show in full."""
+    if available_size is None:
+        return WINDOW_SIZE_CHOICES
+    screen_width, screen_height = _sides(available_size)
+    fitting = tuple((width, height) for width, height in WINDOW_SIZE_CHOICES
+                    if width <= screen_width and height <= screen_height)
+    return fitting or ((MINIMUM_WINDOW_WIDTH, MINIMUM_WINDOW_HEIGHT),)
+
+
+def describe_window_size(width, height) -> str:
+    """How one size is written wherever it is offered or reported."""
+    return f"{int(width)} × {int(height)}"
+
+
+def window_size_token(width, height) -> str:
+    """A size as one plain string, for a combo box entry or a stored preference.
+
+    A tuple cannot be used there: Qt wraps arbitrary Python objects, and looking
+    one up again with `findData` does not reliably match an equal tuple.
+    """
+    return f"{int(width)}x{int(height)}"
+
+
+def parse_window_size(token):
+    """'1280x800' back to (1280, 800), clamped. Anything else is None."""
+    try:
+        width, height = (int(part) for part in str(token).lower().split("x"))
+    except (AttributeError, TypeError, ValueError):
+        return None
+    return clamp_window_size(width, height)
+
+
+def read_window_size(root=None):
+    """The window size the user last chose, or None when they never chose one."""
+    try:
+        preferences = display_preferences(root)
+        width = _as_int(preferences.value("display/window_width", 0), 0)
+        height = _as_int(preferences.value("display/window_height", 0), 0)
+    except (OSError, ValueError):
+        return None
+    if width < MINIMUM_WINDOW_WIDTH or height < MINIMUM_WINDOW_HEIGHT:
+        return None
+    return clamp_window_size(width, height)
+
+
+def write_window_size(width, height, *, root=None):
+    """Persist a chosen window size beside the other display keys."""
+    width, height = clamp_window_size(width, height)
+    preferences = display_preferences(root)
+    preferences.setValue("display/window_width", width)
+    preferences.setValue("display/window_height", height)
+    preferences.sync()
+    return width, height
+
+
+def clear_window_size(root=None) -> None:
+    """Forget the chosen size, so the window sizes itself to the screen again."""
+    preferences = display_preferences(root)
+    preferences.remove("display/window_width")
+    preferences.remove("display/window_height")
+    preferences.sync()
 
 
 def apply_display_settings(override_percent=None, *, root=None, environment=None,

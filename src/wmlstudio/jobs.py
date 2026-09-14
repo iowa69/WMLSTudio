@@ -22,6 +22,10 @@ class AnalysisWorker(QThread):
     sample_cancelled = Signal(str)
     progress = Signal(int, str)
 
+    # resource_plan is the reviewed allocation for this run: the run plan dialog's
+    # numbers, or the two the Settings page holds (samples at a time × threads
+    # each, scheduler.resources_for_run). With none, this worker stays on the
+    # conservative single-sample fallback rather than sizing the machine itself.
     def __init__(self, samples, scheme_path=None, max_reads=100000, parent=None,
                  installed_scheme_paths=None, resource_plan=None):
         super().__init__(parent)

@@ -57,9 +57,16 @@ class CohortPickerDialog(QDialog):
         self._folder = None
         self._filling = False
         self._profiles = {}
+        # The classical ST is read from the analysis stored as MLST, not from the
+        # headline result: the headline is whichever analysis ran last, and a
+        # core-genome run must not empty the seven-locus column.
+        self._mlst = {}
         for sample in self.samples:
             primary = sample.get("result") or {}
             secondary = project.analysis_summaries(sample["id"]) if project else []
+            for row in secondary:
+                if row.get("typing_kind") == "mlst":
+                    self._mlst[sample["id"]] = {"scheme": row.get("scheme") or "", "st": row.get("st")}
             self._profiles[sample["id"]] = sorted({str(profile.get("scheme") or "unnamed")
                 for profile in secondary if profile.get("scheme_digest") != primary.get("scheme_digest")
                 and profile.get("input_sha256") and primary.get("input_sha256")
@@ -97,7 +104,11 @@ class CohortPickerDialog(QDialog):
         install_context_menu(self.folders, "picker.folders", self.show_context_menu,
                              dialect="folders", folder_ids=self.folder_members)
         splitter.addWidget(self.folders)
-        self.table = make_table(["Include", "Isolate", "Collection date", "Organism", "ST", "Additional saved profiles", "Quality / state"])
+        # "ST (7-locus)" is read from the classical profile alone: a core-genome run
+        # is a different measurement and must never appear in this column.
+        self.table = make_table(["Include", "Isolate", "Collection date", "Organism",
+                                 "Organism review", "ST (7-locus)", "Additional saved profiles",
+                                 "Quality / state"])
         self.table.setColumnWidth(0, 60)
         self.table.itemChanged.connect(self.item_changed)
         self.table.cellDoubleClicked.connect(self.toggle_row)
@@ -178,6 +189,7 @@ class CohortPickerDialog(QDialog):
         return result
 
     def refresh_rows(self):
+        from wmlstudio.ui_workbench import organism_review, paint_review
         self._filling = True
         self.table.setSortingEnabled(False)
         self.table.blockSignals(True)
@@ -190,19 +202,30 @@ class CohortPickerDialog(QDialog):
                 continue
             metadata = sample.get("metadata") or {}
             result = sample.get("result") or {}
+            mlst = self._mlst.get(sample["id"], {})
             date = (metadata.get("annotations") or {}).get("collection_date") or metadata.get("collection_date") or metadata.get("isolation_date") or metadata.get("date") or "Not recorded"
-            values = ["", sample["name"], date, " ".join(taxon), result.get("st") if result.get("st") is not None else "Unassigned",
-                      "; ".join(self._profiles[sample["id"]]) or "Not called", result.get("status") or sample.get("status")]
+            # An organism nobody has settled travels with the isolate into whatever
+            # is started from here, so the chooser says so before it is chosen.
+            review = organism_review(sample, None, mlst)
+            values = ["", sample["name"], date, " ".join(taxon),
+                      review["label"] if review["needs_review"] else "Ready",
+                      mlst.get("st") if mlst.get("st") is not None else "Unassigned",
+                      "; ".join(self._profiles[sample["id"]]) or "Not called",
+                      result.get("status") or sample.get("status")]
             if query and query not in " ".join(map(str, values)).casefold():
                 continue
-            rows.append((sample["id"], values))
+            rows.append((sample["id"], values, review))
         self.table.setRowCount(len(rows))
-        for row, (identifier, values) in enumerate(rows):
+        for row, (identifier, values, review) in enumerate(rows):
             for column, value in enumerate(values):
                 item = cell(value, identifier)
                 if column == 0:
                     item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
                     item.setCheckState(Qt.CheckState.Checked if identifier in self.selected_ids else Qt.CheckState.Unchecked)
+                if column in (3, 4):
+                    paint_review(item, review)
+                    if not review["needs_review"]:
+                        item.setToolTip(review["detail"])
                 self.table.setItem(row, column, item)
         self.table.blockSignals(False)
         self.table.setSortingEnabled(True)

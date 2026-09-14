@@ -376,3 +376,69 @@ def test_native_blast_virulence_complete_and_disrupted_truth(tmp_path):
     gene_result = result['loci'][0]['genes'][0]
     assert gene_result['status'] == 'detected' and gene_result['intact_cds_copies'] == 0
     assert 'internal in-frame stop codon' in gene_result['hits'][0]['cds_qc']['reasons']
+
+
+def isolate_record(identifier='iso-1', name='Isolate 1', genus='Staphylococcus', species='aureus'):
+    """A project sample row in the shape the characterization plan dialog reads."""
+    return {'id': identifier, 'name': name, 'input_path': f'/inputs/{identifier}.fasta',
+            'metadata': {'organism': {'genus': genus, 'species': species}},
+            'result': {'kind': 'fasta'}}
+
+
+def test_a_characterization_run_is_refused_when_hydra_has_no_reference_data(qtbot, tmp_path):
+    """Refuse up front instead of failing each isolate after its other assays ran."""
+    from wmlstudio.ui_characterization import CharacterizationPlanDialog
+
+    empty = tmp_path / 'amr-store'
+    empty.mkdir()
+    dialog = CharacterizationPlanDialog([isolate_record()], database_root=str(empty))
+    qtbot.addWidget(dialog)
+    # Whatever else this machine has installed, an empty store always blocks a run.
+    assert dialog.hydra_check is not None and dialog.hydra_check['ready'] is False
+    assert 'every gene and mutation this screen can name' in dialog.hydra_state.text()
+    # Not offered as a choice that would fail: switched off, disabled, reason shown.
+    assert dialog.hydra.isEnabled() is False and dialog.hydra.isChecked() is False
+    assert 'HYDRA cannot start' in dialog.hydra.toolTip()
+    dialog.species.setChecked(False)
+    dialog.virulence.setChecked(False)
+    for control in dialog.module_boxes.values():
+        control.setChecked(False)
+    dialog.hydra.setChecked(True)
+    dialog.accept()
+    assert dialog.plan is None
+    assert 'HYDRA cannot start' in dialog.feedback.text()
+    assert 'Nothing is ever downloaded during a run.' in dialog.feedback.text()
+
+
+def test_the_other_assays_still_run_when_hydra_is_not_part_of_the_plan(qtbot, tmp_path):
+    from wmlstudio.ui_characterization import CharacterizationPlanDialog
+
+    empty = tmp_path / 'amr-store'
+    empty.mkdir()
+    dialog = CharacterizationPlanDialog([isolate_record()], database_root=str(empty))
+    qtbot.addWidget(dialog)
+    dialog.hydra.setChecked(False)
+    dialog.species.setChecked(False)
+    dialog.virulence.setChecked(False)
+    for control in dialog.module_boxes.values():
+        control.setChecked(False)
+    dialog.accept()
+    assert dialog.plan is not None and dialog.plan['hydra'] is False
+    assert dialog.plan['sample_ids'] == ['iso-1']
+
+
+def test_an_isolate_outside_every_installed_catalogue_is_named_before_the_run(tmp_path):
+    """Gene screening still runs for it; that is not evidence it carries no mutation."""
+    from wmlstudio.ui_characterization import CharacterizationPlanDialog
+
+    accepted = ['Escherichia', 'Staphylococcus_aureus']
+    covered = CharacterizationPlanDialog.organism_covered(
+        isolate_record(genus='Staphylococcus', species='aureus'), accepted)
+    genus_level = CharacterizationPlanDialog.organism_covered(
+        isolate_record(genus='Escherichia', species='coli'), accepted)
+    outside = CharacterizationPlanDialog.organism_covered(
+        isolate_record(genus='Listeria', species='monocytogenes'), accepted)
+    unknown = CharacterizationPlanDialog.organism_covered(
+        isolate_record(genus='', species=''), accepted)
+    assert covered is True and genus_level is True
+    assert outside is False and unknown is False
