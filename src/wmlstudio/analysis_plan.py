@@ -20,7 +20,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from wmlstudio.scheduler import GIB, detect_hardware, plan_resources
+from wmlstudio.scheduler import GIB, detect_hardware
 from wmlstudio.ui_common import cell, make_table, organism_for
 from wmlstudio.widgets import label
 
@@ -128,38 +128,33 @@ class RunPlanDialog(QDialog):
             thresholds.addLayout(group)
             self.threshold_controls[key] = field
         form.addRow("AMR thresholds", thresholds)
+        # Two numbers, not five. A threads box, a RAM box, a policy list, a CPU
+        # budget and a concurrency box overlapped and contradicted one another;
+        # how much of a computer to use is "how many at once" and "how big each".
+        from wmlstudio.scheduler import auto_worksize, thread_ceiling, worksize_constraint
+        ceiling = thread_ceiling(self.hardware.cpus)
+        suggested = auto_worksize(self.hardware)
+        self.jobs = QSpinBox()
+        self.jobs.setRange(1, ceiling)
+        self.jobs.setValue(suggested.jobs)
+        form.addRow("Samples at a time", self.jobs)
         self.threads = QSpinBox()
-        self.threads.setRange(1, self.hardware.cpus)
-        self.threads.setValue(min(4, self.hardware.cpus))
-        form.addRow("Threads per sample", self.threads)
+        self.threads.setRange(1, ceiling)
+        self.threads.setValue(suggested.threads)
+        form.addRow("CPU threads for each sample", self.threads)
         self.memory = QSpinBox()
         self.memory.setRange(3, 512)
         self.memory.setValue(3)
         self.memory.setSuffix(" GB")
-        form.addRow("RAM reservation per sample", self.memory)
-        self.resource_policy = QComboBox()
-        for title, value in [("Balanced", "balanced"), ("Fast · smaller RAM reserve", "fast"),
-                             ("Low memory · one sample at a time", "low_memory")]:
-            self.resource_policy.addItem(title, value)
-        form.addRow("Scheduling policy", self.resource_policy)
-        resource_row = QHBoxLayout()
-        self.cpu_budget = QSpinBox()
-        self.cpu_budget.setRange(1, self.hardware.cpus)
-        self.cpu_budget.setValue(self.hardware.cpus)
-        resource_row.addWidget(label("Total CPU budget", "small"))
-        resource_row.addWidget(self.cpu_budget)
-        self.parallel = QSpinBox()
-        self.parallel.setRange(0, self.hardware.cpus)
-        self.parallel.setSpecialValueText("Automatic")
-        resource_row.addWidget(label("Concurrent samples", "small"))
-        resource_row.addWidget(self.parallel)
-        form.addRow("Queue limits", resource_row)
+        form.addRow("Memory for each sample", self.memory)
+        form.addRow(label(worksize_constraint(self.hardware.cpus), "small", True))
         layout.addWidget(self.advanced)
+        # resource_summary already exists above, outside the Advanced disclosure,
+        # so the plain sentence about this computer is readable without opening it.
         self.resource_feedback = label("", "small", True)
         form.addRow(self.resource_feedback)
-        for field in (self.threads, self.memory, self.cpu_budget, self.parallel):
+        for field in (self.jobs, self.threads, self.memory):
             field.valueChanged.connect(self.refresh_resources)
-        self.resource_policy.currentIndexChanged.connect(self.refresh_resources)
         self.refresh_resources()
         self.feedback = label(
             "No databases are downloaded during analysis. AMR detections are sequence evidence, not measured susceptibility.",
@@ -183,22 +178,27 @@ class RunPlanDialog(QDialog):
             self.database.setText(path)
 
     def calculate_resources(self):
-        return plan_resources(threads_per_sample=self.threads.value(), memory_gb=self.memory.value(),
-                              cpu_budget=self.cpu_budget.value(), max_parallel=self.parallel.value() or None,
-                              policy=self.resource_policy.currentData(), hardware=self.hardware)
+        from wmlstudio.scheduler import plan_for
+        return plan_for(self.jobs.value(), self.threads.value(),
+                        memory_gb=self.memory.value(), hardware=self.hardware)
 
     def refresh_resources(self):
+        from wmlstudio.scheduler import clamp_worksize, describe_worksize
         try:
             plan = self.calculate_resources()
-            self.resource_summary.setText(
-                f"Automatic queue: up to {plan.max_parallel} samples × {plan.threads_per_sample} threads. "
-                "CPU and available memory are checked again when work starts.")
-            available = f"{self.hardware.available_memory / GIB:.1f} GiB available" if self.hardware.available_memory is not None else "RAM unavailable: single-job fallback"
+            size = clamp_worksize(self.jobs.value(), self.threads.value(), self.hardware.cpus)
+            self.resource_summary.setText(describe_worksize(size))
+            available = (f"{self.hardware.available_memory / GIB:.1f} GiB free"
+                         if self.hardware.available_memory is not None
+                         else "free memory unknown, so one sample at a time")
+            trimmed = (" The request was reduced to fit this computer."
+                       if getattr(plan, "reduced_for_memory", False) else "")
             self.resource_feedback.setText(
-                f"Detected {self.hardware.cpus} available CPUs · {available}. "
-                f"Up to {plan.max_parallel} samples × {plan.threads_per_sample} threads; "
-                f"{plan.memory_gb} GiB reserved per sample, {plan.reserve_gb:.1f} GiB left for other work. "
-                "RAM is an admission estimate, not an OS-enforced process limit. Cancellation remains available.")
+                f"{self.hardware.cpus} CPU threads · {available}. "
+                f"{plan.memory_gb} GiB is set aside for each sample and "
+                f"{plan.reserve_gb:.1f} GiB is left for everything else.{trimmed} "
+                "That figure reserves a place in the queue rather than capping the program, "
+                "and free memory is checked again when the run starts. You can always cancel.")
         except ValueError as exc:
             self.resource_summary.setText(str(exc))
             self.resource_feedback.setText(str(exc))
@@ -230,19 +230,18 @@ class RunPlanDialog(QDialog):
                 self.feedback.setText(str(exc))
                 return
         if self.hydra.isChecked():
-            from wmlstudio.hydra_runtime import runtime_capabilities
+            # Refuse here, naming every missing piece, rather than starting a run
+            # that dies partway with a message about a tool the user never chose.
+            from wmlstudio import provisioning
 
             try:
-                capabilities = runtime_capabilities(self.database.text())
-                if not capabilities["available"]:
-                    self.feedback.setText(capabilities["message"])
+                check = provisioning.hydra_prerequisites(selected=self.database.text() or None)
+                if not check["ready"]:
+                    self.feedback.setText(check["message"])
                     return
-                if not capabilities["databases"]:
-                    self.feedback.setText(
-                        "Install or select a HYDRA database snapshot before requesting AMR analysis."
-                    )
-                    return
-            except ValueError as exc:
+                if check.get("warnings"):
+                    self.feedback.setText(check["database"]["label"] + " " + " ".join(check["warnings"]))
+            except (OSError, ValueError) as exc:
                 self.feedback.setText(str(exc))
                 return
         choice = self.database_choice.currentData()

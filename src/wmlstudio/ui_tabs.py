@@ -56,7 +56,7 @@ PAGE_PURPOSE = {
 # getattr at build time so a missing method degrades to a hidden button.
 NEXT_STEP = {
     "overview": ("Import sequences…", "browse_files"),
-    "isolates": ("Import…", "browse_files"),
+    "isolates": ("Add samples…", "browse_files"),
     "compare": ("Choose cohort…", "choose_comparison_cohort"),
     "schemes": ("Browse online / install updates…", "open_reference_manager"),
     "evidence": ("Choose isolates…", "choose_feature_cohort"),

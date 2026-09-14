@@ -219,7 +219,12 @@ def test_a_run_that_states_no_resources_of_its_own_uses_the_chosen_numbers(no_de
     assert explicit.to_dict() == before.to_dict()
     scheduler.set_default_worksize(None)
     assert scheduler.default_worksize() is None
-    assert scheduler.resources_for_run({}).to_dict() == before.to_dict()
+    # Compare the choice, not the moment: memory_budget_gb and reserve_gb are read
+    # from free RAM, which moves between two calls on a machine that is doing
+    # anything else, and comparing them made this test fail under load.
+    restored = scheduler.resources_for_run({})
+    chosen_fields = ("max_parallel", "threads_per_sample", "memory_gb", "policy", "cpu_budget")
+    assert {k: restored.to_dict()[k] for k in chosen_fields} == {k: before.to_dict()[k] for k in chosen_fields}
 
 
 @pytest.mark.parametrize("cpus,available_gb", [(2, 7), (4, 6), (8, 5)])

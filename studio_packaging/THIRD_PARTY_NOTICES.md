@@ -131,6 +131,15 @@ silently included by the HYDRA starter-staging command. Its reference files,
 mutation companions, manifest and observed provider release are hashed in
 `wmlstudio/resources/hydra/starter/snapshot_provenance.json`.
 
+The bundled starter is pinned to NCBI AMRFinderPlus reference release
+2026-08-07.1, staged 2026-09-12. The application reports that release, the day it
+was staged and its age in days wherever the store is shown — the AMR reference
+databases window, `studio_scripts/check_setup.py`, and every HYDRA report's
+execution provenance — so a user can see how stale the bundled evidence is
+before reporting from it. Updating publishes a new snapshot beside the old one:
+nothing is replaced, and analyses already recorded keep the reference snapshot
+they were run against.
+
 ## Bundled organism-module reference panels
 
 The independent species/virulence starter and the organism-specific typing
