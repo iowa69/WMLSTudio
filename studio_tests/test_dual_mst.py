@@ -440,7 +440,7 @@ def window(qtbot, tmp_path, monkeypatch):
 
 def imported(window, name, vector="1111", ward="ICU"):
     return window.project.add_profile(name, {
-        "sample_name": name, "scheme": "Study cgMLST", "scheme_digest": "study-reference",
+        "sample_name": name, "scheme": "Study MLST", "scheme_digest": "study-reference",
         "status": "profile_imported", "alleles": dict(zip("abcd", vector)), "calls": [],
         "st": "20" if vector.startswith("1") else "44", "input_sha256": "a" * 64,
     }, {"organism": {"genus": "Staphylococcus", "species": "aureus"}, "annotations": {"ward": ward}})
@@ -450,7 +450,7 @@ def build(window, ids, threshold=1, investigation_id=None, name="Ward A"):
     """Save (or re-save) the investigation and build it, which stores a snapshot."""
     window.refresh_cohort_table()
     plan = InvestigationStore(window.project).save(
-        name, list(ids), investigation_id=investigation_id, scheme="Study cgMLST",
+        name, list(ids), investigation_id=investigation_id, scheme="Study MLST",
         scheme_digest="study-reference", threshold=threshold, min_overlap=0.95,
         protocol="Synthetic test protocol; not a clinical cutoff")
     window.cohort_ids = set(ids)
@@ -487,7 +487,7 @@ def test_each_tree_holds_its_own_cohort_and_says_which_moment_it_is(window):
     assert window.baseline_caption.text().startswith("Baseline · ")
     assert "2 isolates" in window.baseline_caption.text()
     assert "+1 isolate" in window.baseline_caption.text()
-    assert window.current_caption.text() == "Current · 3 isolates · link ≤ 1"
+    assert window.current_caption.text() == "Current · Classical MLST · 4 loci · 3 isolates · link ≤ 1"
     assert "frozen" in window.baseline_caption.toolTip()
     assert "study-refer" in window.baseline_caption.toolTip()
     assert "nothing here is recalculated" in window.baseline_caption.toolTip()
@@ -589,7 +589,7 @@ def test_without_a_saved_investigation_the_pane_offers_to_save_one(window):
 def test_a_baseline_larger_than_the_autodraw_limit_waits_to_be_asked(window, monkeypatch):
     count = ui_compare.BASELINE_AUTODRAW_LIMIT + 10
     stored = {"snapshot_id": "big", "created_at": "2026-01-01T00:00:00+00:00", "threshold": 1,
-              "min_overlap": 0.95, "scheme": "Study cgMLST", "scheme_digest": "study-reference",
+              "min_overlap": 0.95, "scheme": "Study MLST", "scheme_digest": "study-reference",
               "groups": [], "pairs": [],
               "profiles": [{"sample_id": f"s{index}", "sample_name": f"Isolate {index}",
                             "known_alleles": {"a": "1"}, "callable_loci": 1, "total_loci": 4}
@@ -778,3 +778,296 @@ def test_a_right_click_on_a_group_row_acts_on_its_isolates_not_on_the_group_iden
     adapter = window._context_adapters["compare.groups"]
     assert set(adapter.group_members({group["id"]})) == set(group["members"])
     assert group["id"] not in adapter.group_members({group["id"]})
+
+
+# ---------------------------------------------------------------------------
+# Separate trees for classical MLST and for cgMLST
+# ---------------------------------------------------------------------------
+
+CG_TARGETS = 1748                                 # the full Institut Pasteur BIGSdb-Lm target set
+CG_SCHEME_KEY = "pasteur:lmonocytogenes-1748"
+
+
+def core_profile(name, vector, targets=CG_TARGETS, key=CG_SCHEME_KEY):
+    """A core-genome profile that declares its own kind and its own published key."""
+    alleles = {f"LMO{index:05d}": "1" for index in range(targets)}
+    for index, value in enumerate(vector):
+        alleles[f"LMO{index:05d}"] = value
+    return {"sample_name": name, "scheme": "Pasteur cgMLST", "scheme_digest": "cgmlst-reference",
+            "status": "profile_imported", "alleles": alleles, "calls": [], "input_sha256": "a" * 64,
+            "scheme_metadata": {"type": "cgmlst", "scheme_key": key}}
+
+
+def core_typed(window, name, core="11", **kwargs):
+    """An isolate with a core-genome profile and no classical ST at all."""
+    return window.project.add_profile(name, core_profile(name, core, **kwargs),
+                                      {"organism": {"genus": "Listeria", "species": "monocytogenes"}})
+
+
+def both_typed(window, name, mlst="1111", core="11", ward="ICU", **kwargs):
+    """One isolate carrying a classical ST and a core-genome profile, filed apart."""
+    sid = imported(window, name, mlst, ward)
+    window.project.set_analysis(sid, core_profile(name, core, **kwargs))
+    return sid
+
+
+def cohort(window, ids):
+    window.cohort_ids = set(ids)
+    window.refresh_cohort_table()
+    window.refresh_comparison()
+
+
+def test_the_two_typing_views_are_separate_trees_with_their_own_reference_and_targets(window):
+    a, b = both_typed(window, "A", "1111", "11"), both_typed(window, "B", "2111", "21")
+    cohort(window, [a, b])
+    assert window.typing_kind == "mlst"
+    assert set(window.tree._results) == {a, b}
+    assert window._current_snapshot["typing_kind"] == "mlst"
+    assert window._current_snapshot["target_loci"] == 4
+    assert window._current_snapshot["scheme_digest"] == "study-reference"
+    assert "Classical MLST · 4 loci" in window.current_caption.text()
+    assert window.tree.scale["targets"] == 4
+    window.show_typing_view("cgmlst")
+    assert set(window.tree._results) == {a, b}
+    assert window._current_snapshot["typing_kind"] == "cgmlst"
+    assert window._current_snapshot["target_loci"] == CG_TARGETS
+    assert window._current_snapshot["scheme_digest"] == "cgmlst-reference"
+    assert f"cgMLST · {CG_TARGETS} targets" in window.current_caption.text()
+    assert window.tree.scale["targets"] == CG_TARGETS
+    assert window.test_errors == []
+
+
+def test_a_threshold_set_on_one_tree_is_never_carried_into_the_other(window):
+    a, b = both_typed(window, "A", "1111", "11"), both_typed(window, "B", "2111", "21")
+    cohort(window, [a, b])
+    window.cluster_threshold.setValue(1)
+    assert " of 4 loci" in window.cluster_threshold.suffix()
+    window.show_typing_view("cgmlst")
+    window.cluster_threshold.setValue(12)
+    assert window._current_snapshot["threshold"] == 12
+    assert f" of {CG_TARGETS} targets" in window.cluster_threshold.suffix()
+    window.show_typing_view("mlst")
+    assert window.cluster_threshold.value() == 1
+    assert window._current_snapshot["threshold"] == 1
+    window.show_typing_view("cgmlst")
+    assert window.cluster_threshold.value() == 12
+    assert window.test_errors == []
+
+
+def test_selecting_an_isolate_in_one_typing_tree_selects_it_in_the_other(window):
+    a, b = both_typed(window, "A", "1111", "11"), both_typed(window, "B", "2111", "21")
+    cohort(window, [a, b])
+    window.counterpart_toggle.setChecked(True)
+    assert set(window.counterpart_tree._results) == {a, b}
+    assert window.counterpart_tree.scale["targets"] == CG_TARGETS
+    window.tree.select_ids([a])
+    assert window.counterpart_tree.selected_ids() == [a]
+    assert "1 also have a cgMLST profile · 0 have no cgMLST profile" in window.graph_selection_label.text()
+    window.counterpart_tree.select_ids([b])
+    assert window.tree.selected_ids() == [b]
+    assert window.test_errors == []
+
+
+def test_an_isolate_with_no_core_genome_profile_is_absent_from_that_tree_not_near_in_it(window):
+    a, b = both_typed(window, "A", "1111", "11"), imported(window, "B", "2111")
+    cohort(window, [a, b])
+    window.counterpart_toggle.setChecked(True)
+    assert set(window.tree._results) == {a, b}
+    assert set(window.counterpart_tree._results) == {a}
+    window.tree.select_ids([a, b])
+    assert "1 also have a cgMLST profile · 1 have no cgMLST profile" in window.graph_selection_label.text()
+    assert window.counterpart_tree.edges == []
+    assert window.test_errors == []
+
+
+def test_each_tree_keeps_its_own_legend_instead_of_one_shared_key(window):
+    # One allele apart on the classical loci, two apart on the core genome: the
+    # same pair groups in one tree and not in the other, which is the whole point.
+    a, b = both_typed(window, "A", "1111", "11"), both_typed(window, "B", "2111", "22")
+    cohort(window, [a, b])
+    window.counterpart_toggle.setChecked(True)
+    assert list(window._legends["current"]) == ["Cluster 001"]
+    assert list(window._legends["counterpart"]) == ["Unlinked isolate"]
+    # The shared legend row belongs to the current and baseline trees, which are
+    # one scale; the other kind's group names are never merged into it.
+    assert "Cluster 001" in window.graph_legend.text()
+    assert "Unlinked isolate" not in window.graph_legend.text()
+    assert "Unlinked isolate" in window.counterpart_legend.text()
+    assert "cgMLST groups only" in window.counterpart_legend.toolTip()
+    assert window.test_errors == []
+
+
+def test_a_baseline_of_another_typing_kind_refuses_the_numeric_comparison():
+    records = [profile("a", "1111"), profile("b", "2111")]
+    rows = pairwise_distances(records)
+    classical = build_snapshot(records, rows, 1, 0.95, kind="mlst")
+    core = build_snapshot(records, rows, 1, 0.95, kind="cgmlst")
+    diff = snapshot_diff(classical, core)
+    assert diff["policy"]["comparable"] is False
+    assert diff["pairs"] is None and diff["groups"] is None and diff["mst_edges"] is None
+    assert "Classical MLST comparison" in diff["policy"]["reason"]
+    assert "cgMLST comparison" in diff["policy"]["reason"]
+    assert any("different quantities" in caveat for caveat in diff["caveats"])
+    assert diff["isolates"]["retained"] == ["a", "b"]
+    assert diff["summary"]["distance_changed"] is None
+
+
+def test_a_snapshot_with_no_recorded_typing_kind_is_not_refused_for_that_reason():
+    records = [profile("a", "1111"), profile("b", "2111")]
+    rows = pairwise_distances(records)
+    older = {**build_snapshot(records, rows, 1, 0.95), "typing_kind": ""}
+    current = build_snapshot(records, rows, 1, 0.95, kind="cgmlst")
+    diff = snapshot_diff(older, current)
+    assert diff["policy"]["comparable"] is True
+    assert all(item["field"] != "typing_kind" for item in diff["policy"]["differences"])
+
+
+def test_a_published_cutoff_for_this_exact_reference_is_offered_with_its_citation(window):
+    a, b = core_typed(window, "A", "11"), core_typed(window, "B", "21")
+    cohort(window, [a, b])
+    assert window.typing_kind == "cgmlst", "a project with only core-genome profiles opens on that tree"
+    suggestion = window._threshold_suggestion
+    assert suggestion["status"] == "available"
+    assert suggestion["auto_apply"] is False
+    assert [entry["published_threshold"] for entry in suggestion["entries"]] == [7]
+    assert window.cluster_threshold.value() == 1, "a published number is never applied on its own"
+    banner = window.guidance_banner.text()
+    assert "≤ 7" in banner and "1748 targets" in banner
+    assert "10.1038/nmicrobiol.2016.185" in banner
+    assert "Not applied" in banner
+    assert window.guidance_row.isHidden() is False
+    assert window.guidance_button.isEnabled() is True
+    assert window.test_errors == []
+
+
+def test_a_partial_target_set_is_refused_rather_than_scaled(window):
+    a = core_typed(window, "A", "11", targets=40)
+    b = core_typed(window, "B", "21", targets=40)
+    cohort(window, [a, b])
+    suggestion = window._threshold_suggestion
+    assert suggestion["status"] == "target_count_mismatch"
+    assert "no scaling" in suggestion["reason"]
+    assert window.guidance_row.isHidden() is False
+    assert window.guidance_button.isEnabled() is False
+    assert window.cluster_threshold.value() == 1
+    assert window.test_errors == []
+
+
+def test_a_reference_with_no_curated_binding_reports_a_gap_not_a_number(window):
+    a, b = both_typed(window, "A", "1111", "11"), both_typed(window, "B", "2111", "21")
+    cohort(window, [a, b])
+    assert window.typing_kind == "mlst"
+    assert window._threshold_suggestion["status"] == "no_scheme_binding"
+    assert window.guidance_row.isHidden() is True
+    assert "gap in the evidence" in window.cluster_threshold.toolTip()
+    assert window.test_errors == []
+
+
+def test_the_crowded_graph_controls_start_behind_an_advanced_disclosure(window):
+    imported(window, "A")
+    assert window.advanced_panel.isHidden() is True
+    assert window.advanced_toggle.text() == "Advanced ▸"
+    for control in (window.dual_toggle, window.counterpart_toggle, window.graph_search,
+                    window.color_by, window.export_tree_choice):
+        assert control.parent() is window.advanced_panel
+    assert window.cluster_threshold.isHidden() is False
+    window.advanced_toggle.setChecked(True)
+    assert window.advanced_panel.isHidden() is False
+    assert window.advanced_toggle.text() == "Advanced ▾"
+    assert window.project.get_setting("compare.advanced_open") is True
+
+
+def test_each_tree_exports_under_its_own_typing_kind_and_target_count(window, monkeypatch, tmp_path):
+    from pathlib import Path
+
+    from PySide6.QtWidgets import QComboBox
+    a, b = both_typed(window, "A", "1111", "11"), both_typed(window, "B", "2111", "21")
+    cohort(window, [a, b])
+    window.counterpart_toggle.setChecked(True)
+    offered = []
+
+    def chosen(_parent, _title, suggested, _filters):
+        offered.append(suggested)
+        return str(tmp_path / Path(suggested).name), ""
+
+    monkeypatch.setattr(ui_compare.QFileDialog, "getSaveFileName", chosen)
+    combo = QComboBox()
+    window.export_graph_action(4, combo)
+    window.export_tree_choice.setCurrentIndex(window.export_tree_choice.findData("counterpart"))
+    window.export_graph_action(4, combo)
+    assert offered == ["mlst-comparison.nwk", "cgmlst-comparison.nwk"]
+    assert "Classical MLST" in (tmp_path / "mlst-comparison.nwk").read_text(encoding="utf-8")
+    core = (tmp_path / "cgmlst-comparison.nwk").read_text(encoding="utf-8")
+    assert f"cgMLST · Pasteur cgMLST · {CG_TARGETS} targets" in core
+    assert window.test_errors == []
+
+
+def test_the_other_typing_view_groups_by_its_own_threshold_not_by_this_one(window):
+    # Two allele differences on the core genome, one on the classical loci.
+    a, b = both_typed(window, "A", "1111", "11"), both_typed(window, "B", "2111", "22")
+    cohort(window, [a, b])
+    window.show_typing_view("cgmlst")
+    window.cluster_threshold.setValue(4)
+    window.show_typing_view("mlst")
+    window.cluster_threshold.setValue(1)
+    window.counterpart_toggle.setChecked(True)
+    assert window._current_snapshot["threshold"] == 1
+    assert window._counterpart_snapshot["threshold"] == 4
+    assert window.counterpart_tree.cluster_threshold == 4
+    assert [g["status"] for g in window._counterpart_snapshot["groups"]] == ["cluster"]
+    assert "link ≤ 4" in window.counterpart_caption.text()
+    assert "of 4 loci" in window.cluster_threshold.suffix(), "the visible spinbox stays on this tree"
+    assert window.test_errors == []
+
+
+def test_opening_an_investigation_opens_the_typing_view_its_reference_belongs_to(window):
+    a, b = both_typed(window, "A", "1111", "11"), both_typed(window, "B", "2111", "21")
+    cohort(window, [a, b])
+    assert window.typing_kind == "mlst"
+    plan = InvestigationStore(window.project).save(
+        "Core review", [a, b], scheme="Pasteur cgMLST", scheme_digest="cgmlst-reference",
+        threshold=7, min_overlap=0.95, protocol="Synthetic test protocol; not a clinical cutoff")
+    window.select_investigation(plan["id"])
+    assert window.typing_kind == "cgmlst"
+    assert window._current_snapshot["typing_kind"] == "cgmlst"
+    assert window._current_snapshot["target_loci"] == CG_TARGETS
+    assert window.cluster_threshold.value() == 7
+    assert window.test_errors == []
+
+
+def test_asking_for_a_tree_this_project_has_no_profiles_for_says_so(window):
+    a, b = core_typed(window, "A", "11"), core_typed(window, "B", "21")
+    cohort(window, [a, b])
+    assert window.typing_kind == "cgmlst" and set(window.tree._results) == {a, b}
+    window.show_typing_view("mlst")
+    assert window.typing_kind == "mlst", "an explicit choice is not overridden by what happens to exist"
+    assert window.tree._results == {}
+    assert window._current_snapshot["profiles"] == []
+    assert "Classical MLST" in window.tree_status.text()
+    status = window.tree_status.text()
+    assert "0 / 2 stored Classical MLST profiles" in status
+    assert "of loci" not in status, "with no profiles there is no target set to count over"
+    assert "link \u2264 1 allele differences" in status
+    # The cohort table still shows what these isolates do have, so "not called"
+    # in this view never reads as "not typed at all".
+    stored = {window.cohort_table.item(row, 3).text() for row in range(window.cohort_table.rowCount())}
+    assert stored == {"cgMLST: Pasteur cgMLST"}
+    assert window.test_errors == []
+
+
+def test_each_views_threshold_survives_leaving_and_reopening_the_project(window, tmp_path, qtbot):
+    a, b = both_typed(window, "A", "1111", "11"), both_typed(window, "B", "2111", "21")
+    cohort(window, [a, b])
+    window.cluster_threshold.setValue(2)
+    window.show_typing_view("cgmlst")
+    window.cluster_threshold.setValue(11)
+    original = window.project.path
+    assert window.switch_project(tmp_path / "elsewhere.wmlstudio") is True
+    qtbot.waitUntil(lambda: window.comparison_worker is None, timeout=5000)
+    assert window.switch_project(original) is True
+    qtbot.waitUntil(lambda: window.comparison_worker is None, timeout=5000)
+    assert window.typing_kind == "cgmlst"
+    assert window.cluster_threshold.value() == 11
+    window.show_typing_view("mlst")
+    assert window.cluster_threshold.value() == 2
+    assert window.test_errors == []

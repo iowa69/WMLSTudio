@@ -61,7 +61,8 @@ class ReportWorkspaceMixin:
         simple_layout.addWidget(label(
             'One short document in plain words: a picture of how close the isolates are, the resistance '
             'genes that were found, and each isolate’s closest match. It prints which isolates it covered '
-            'and where that choice came from, and it never calls a gene a susceptibility result.',
+            'and where that choice came from, says which typing it is based on and how many targets the '
+            'reference holds, and it never calls a gene a susceptibility result.',
             'small', True))
         simple_row = FlowLayout()
         simple_row.addWidget(button('Make a simple summary (PDF)…', lambda: self.simple_report(), True))
@@ -112,6 +113,13 @@ class ReportWorkspaceMixin:
         row.addWidget(button('Graph PNG / JPEG…', self.export_report_graph))
         content.addLayout(row)
         content.addWidget(label("Reports describe sequence evidence, not measured susceptibility or proof of transmission. Profile bundles carry results and metadata without sequence files.", "small", True))
+        # Stated on the page as well as in the document, so a reader knows what
+        # to look for before they open the PDF.
+        content.addWidget(label("Every report that shows a tree, a cluster or a distance names the reference and its "
+                                "full target count, the threshold in force, and whether that threshold is a published "
+                                "cutoff you adopted or your own setting — with the citation, its DOI and the authors’ "
+                                "own caveat when it is published. A sequence type and a core-genome profile are "
+                                "reported as separate quantities and never share a threshold.", "small", True))
         layout.addWidget(panel)
 
     def report_options(self):

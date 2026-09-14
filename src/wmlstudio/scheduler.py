@@ -17,6 +17,13 @@ from pathlib import Path
 from wmlstudio.sequence import AnalysisCancelled
 
 GIB = 1024 ** 3
+#: The least memory a single sample is ever scheduled with. Below this the work
+#: genuinely cannot proceed, so the user is told rather than left with a run that
+#: stops without a result.
+MINIMUM_SAMPLE_MEMORY_GB = 2
+#: How far a per-sample request may be scaled down to fit the machine. Within this
+#: the request is read as a generous default; beyond it, as a genuine requirement.
+REDUCIBLE_MEMORY_FACTOR = 3
 
 
 @dataclass(frozen=True)
@@ -94,6 +101,8 @@ class ResourcePlan:
     reserve_gb: float
     policy: str = "balanced"
     memory_detected: bool = True
+    #: True when the per-sample memory request was lowered to fit this computer.
+    reduced_for_memory: bool = False
 
     def to_dict(self):
         return asdict(self)
@@ -138,13 +147,29 @@ def plan_resources(*, threads_per_sample=4, memory_gb=8, cpu_budget=None,
         if isinstance(memory_budget_gb, bool) or not isinstance(memory_budget_gb, (float, int)) or not 0 < memory_budget_gb < 1e6:
             raise ValueError("Memory budget must be a finite positive GiB value")
         budget = min(budget, float(memory_budget_gb))
-    parallel = min(cpus // threads, int(budget // memory_gb), max_parallel or cpus)
+    # A modest laptop must still be able to work. Asking for 8 GiB per sample on a
+    # machine with 6 GiB free used to raise, the assembly task failed, and because
+    # typing only starts after a successful assembly the run stopped with no result
+    # and no explanation the user could connect to memory. Run one smaller job
+    # instead of refusing, and say what was reduced.
+    if budget < memory_gb:
+        # A modest shortfall means the default per-sample figure was a little
+        # generous for this computer, so run one smaller job. A request many times
+        # larger than the machine is a real requirement that cannot be met, and
+        # quietly handing it a fraction would only fail later and less clearly.
+        if budget < MINIMUM_SAMPLE_MEMORY_GB or memory_gb > budget * REDUCIBLE_MEMORY_FACTOR:
+            raise ValueError(
+                f"Only {budget:.1f} GiB is safely available for jobs and each sample requests "
+                f"{memory_gb} GiB. Close other programs to free memory, or lower the memory "
+                f"each sample may use.")
+    per_sample = min(memory_gb, max(MINIMUM_SAMPLE_MEMORY_GB, int(budget)))
+    parallel = min(cpus // threads, int(budget // per_sample), max_parallel or cpus)
     if policy == "low_memory" or hardware.available_memory is None:
         parallel = min(parallel, 1)
-    if parallel < 1:
-        raise ValueError(f"Only {budget:.1f} GiB is safely available for jobs; each sample requests {memory_gb} GiB. Reduce per-sample memory or free RAM.")
-    return ResourcePlan(threads, memory_gb, parallel, cpus, round(budget, 3),
-                        round(reserve, 3), policy, hardware.available_memory is not None).validate()
+    parallel = max(1, parallel)
+    return ResourcePlan(threads, per_sample, parallel, cpus, round(budget, 3),
+                        round(reserve, 3), policy, hardware.available_memory is not None,
+                        per_sample < memory_gb).validate()
 
 
 def resource_plan(value=None, **defaults):
@@ -155,8 +180,159 @@ def resource_plan(value=None, **defaults):
     return plan_resources(**defaults)
 
 
+# --- how much of this computer to use, said in two numbers -----------------
+# Two explicit numbers instead of a policy name, which is the model WMLST uses
+# and people read without help: JOBS is how many samples run at the same time,
+# THREADS is how many CPU threads each of those samples may hand to its native
+# tools. Both are clamped to [1, min(CPU count, 64)] -- 64 is the Windows
+# processor-group boundary -- and jobs x threads is clamped to the CPU count,
+# because asking for more threads than the machine has makes every sample
+# slower rather than faster. Nothing here changes a result: it is throughput.
+
+#: Neither number may exceed this, whatever the machine reports.
+THREAD_LIMIT = 64
+#: Automatic sizing: threads one concurrent sample occupies, and the threads it
+#: is then told to use. The same number by design -- a slot is four threads and
+#: it spends them on four threads.
+CPUS_PER_JOB = 4
+THREADS_PER_JOB = 4
+
+
+@dataclass(frozen=True)
+class WorkSize:
+    """Samples at a time, threads each, and the machine the numbers were sized for."""
+
+    jobs: int
+    threads: int
+    cpus: int
+    automatic: bool = False
+    # "", "cpu" or "memory": what actually held these numbers down, so the
+    # interface can say why rather than showing an unexplained smaller number.
+    limited_by: str = ""
+
+    @property
+    def total_threads(self) -> int:
+        return self.jobs * self.threads
+
+    def to_dict(self):
+        return asdict(self)
+
+
+def cpu_count(hardware=None) -> int:
+    """CPU threads this process may actually use. Never 0, never None."""
+    return max(1, (hardware or detect_hardware()).cpus)
+
+
+def thread_ceiling(cpus=None) -> int:
+    """The largest value either number may take on this computer."""
+    return max(1, min(_whole(cpus, 0) or cpu_count(), THREAD_LIMIT))
+
+
+def _whole(value, fallback=1) -> int:
+    """Coerce a spin box or a stored preference to a whole number."""
+    try:
+        return int(float(str(value).strip()))
+    except (TypeError, ValueError):
+        return int(fallback)
+
+
+def clamp_worksize(jobs, threads, cpus=None, *, automatic=False, limited_by="") -> WorkSize:
+    """Both numbers into range, then jobs x threads into the CPU count."""
+    cpus = max(1, _whole(cpus, 0) or cpu_count())
+    ceiling = thread_ceiling(cpus)
+    jobs = min(ceiling, max(1, _whole(jobs)))
+    threads = min(ceiling, max(1, _whole(threads)))
+    if jobs * threads > cpus:
+        # The per-sample threads come down, never the number of samples: the
+        # user asked for that many samples at once and still gets them.
+        threads = max(1, cpus // jobs)
+        limited_by = limited_by or "cpu"
+    return WorkSize(jobs, threads, cpus, bool(automatic), str(limited_by))
+
+
+def auto_worksize(hardware=None, *, memory_gb=1) -> WorkSize:
+    """Size this computer: one sample per four CPU threads, four threads each.
+
+    Below four threads the machine cannot fill a whole slot, so one sample takes
+    every thread. Free memory only ever reduces the number of samples, and an
+    unreadable memory figure means one sample at a time rather than a guess.
+    """
+    hardware = hardware or detect_hardware()
+    cpus = max(1, hardware.cpus)
+    if cpus < CPUS_PER_JOB:
+        size = clamp_worksize(1, cpus, cpus, automatic=True)
+    else:
+        size = clamp_worksize(cpus // CPUS_PER_JOB, THREADS_PER_JOB, cpus, automatic=True)
+    if hardware.available_memory is None:
+        return replace(size, jobs=1, limited_by="memory")
+    available = hardware.available_memory / GIB
+    budget = max(0.0, available - max(1.0, available * .20))
+    affordable = int(budget // max(1, memory_gb))
+    if affordable < size.jobs:
+        size = replace(size, jobs=max(1, affordable), limited_by="memory")
+    return size
+
+
+def describe_worksize(size) -> str:
+    """The plain sentence the Settings page shows: what this choice actually means."""
+    samples = "sample" if size.jobs == 1 else "samples"
+    threads = "thread" if size.threads == 1 else "threads"
+    sentence = (f"{size.jobs} {samples} at a time, {size.threads} {threads} each, using "
+                f"{size.total_threads} of your {size.cpus} CPU threads.")
+    if size.limited_by == "memory":
+        sentence += " Free memory, not the processor, is what holds this down."
+    elif size.limited_by == "cpu":
+        sentence += (" The threads for each sample came down so that the two numbers "
+                     "together fit this computer.")
+    return sentence
+
+
+def worksize_constraint(cpus=None) -> str:
+    """The rule in words, to stand beside the two numbers it governs."""
+    cpus = max(1, _whole(cpus, 0) or cpu_count())
+    return (f"Samples at a time × threads each can never be more than the {cpus} CPU threads "
+            f"this computer has. Ask for more and the threads for each sample are reduced, "
+            f"never the samples. Each number may be 1 to {thread_ceiling(cpus)}.")
+
+
+def plan_for(jobs, threads=None, *, memory_gb=1, policy="balanced", hardware=None):
+    """Turn the two numbers into the admission plan run_bounded already enforces."""
+    hardware = hardware or detect_hardware()
+    size = jobs if isinstance(jobs, WorkSize) else clamp_worksize(jobs, threads, hardware.cpus)
+    return plan_resources(threads_per_sample=size.threads, memory_gb=memory_gb,
+                          max_parallel=size.jobs, policy=policy, hardware=hardware)
+
+
+#: The Settings page's two numbers, for runs that state none of their own. None
+#: means "nothing has been chosen", which is why importing this module changes
+#: no existing behaviour: only a caller that sets it is affected.
+_DEFAULT_WORKSIZE = None
+
+
+def set_default_worksize(size):
+    """Record the chosen size application-wide, or clear it with None."""
+    global _DEFAULT_WORKSIZE
+    if size is None:
+        _DEFAULT_WORKSIZE = None
+    elif isinstance(size, WorkSize):
+        _DEFAULT_WORKSIZE = clamp_worksize(size.jobs, size.threads, size.cpus,
+                                           automatic=size.automatic)
+    else:
+        _DEFAULT_WORKSIZE = clamp_worksize(size["jobs"], size["threads"], size.get("cpus"),
+                                           automatic=size.get("automatic", False))
+    return _DEFAULT_WORKSIZE
+
+
+def default_worksize():
+    """The chosen size, or None when the user has never chosen one."""
+    return _DEFAULT_WORKSIZE
+
+
 def resources_for_run(plan=None, *, memory_gb=1):
     plan = plan or {}
+    if _DEFAULT_WORKSIZE is not None and not plan.get("resource_plan") and "threads" not in plan:
+        # This run named no resources of its own, so the Settings page answers.
+        return plan_for(_DEFAULT_WORKSIZE, memory_gb=plan.get("memory_gb", memory_gb))
     return resource_plan(plan.get("resource_plan"), threads_per_sample=plan.get("threads", 4),
                          memory_gb=plan.get("memory_gb", memory_gb), policy=plan.get("resource_policy", "balanced"))
 

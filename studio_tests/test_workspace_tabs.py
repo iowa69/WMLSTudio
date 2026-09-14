@@ -150,6 +150,37 @@ def test_a_page_without_sub_tabs_refuses_a_sub_tab_instead_of_crashing(tabs):
     assert tabs.show_subtab("schemes", "Grouped view") is False
 
 
+def test_a_page_folds_into_a_samples_sub_tab_without_moving_any_index(tabs):
+    """Samples is the hub; a page that also lives there must not be offered twice."""
+    inner = QTabWidget()
+    inner.addTab(QWidget(), "Samples")
+    inner.addTab(QWidget(), "Schemes")
+    tabs.register_subtabs("isolates", inner)
+    assert tabs.fold_page("schemes") is True
+    assert tabs.folded_pages() == {"schemes": ("isolates", "Schemes")}
+    assert tabs.tabBar().isTabVisible(PAGE_KEYS.index("schemes")) is False
+    # Every existing call site keeps working, by key and by its old number.
+    assert tabs.page_index() == {key: index for index, key in enumerate(PAGE_KEYS)}
+    assert tabs.index_of("schemes") == PAGE_KEYS.index("schemes")
+    assert tabs.show_page("schemes") is True
+    assert tabs.current_key() == "isolates"
+    assert inner.currentIndex() == 1
+    assert tabs.show_page(PAGE_KEYS.index("schemes")) is True
+    assert tabs.current_key() == "isolates"
+    assert tabs.unfold_page("schemes") is True
+    assert tabs.tabBar().isTabVisible(PAGE_KEYS.index("schemes")) is True
+    assert tabs.show_page("schemes") is True
+    assert tabs.current_key() == "schemes"
+
+
+def test_folding_refuses_a_page_or_a_host_it_does_not_have(tabs):
+    assert tabs.fold_page("does-not-exist") is False
+    assert tabs.fold_page("compare", "does-not-exist", "Anything") is False
+    assert tabs.fold_page("compare", "compare", "Itself") is False
+    assert tabs.unfold_page("compare") is False
+    assert tabs.folded_pages() == {}
+
+
 def test_seven_tabs_fit_the_narrowest_supported_window_without_scroll_buttons(tabs):
     """At 1080 px the tab bar is the navigation; it must not need arrows to reach a page."""
     assert tabs.tabBar().sizeHint().width() <= 1032
@@ -173,12 +204,20 @@ def test_purpose_lines_state_their_limits_where_a_claim_could_be_read_in(tabs):
 
 
 @pytest.fixture
-def window(qtbot, tmp_path):
+def window(qtbot, tmp_path, monkeypatch):
     from wmlstudio.app import MainWindow
+    # A modal warning box in a headless run blocks the event loop for good, so the
+    # window records its errors here instead of showing them.
+    errors = []
+    monkeypatch.setattr(MainWindow, "error", lambda self, message: errors.append(str(message)))
     widget = MainWindow(storage_root=tmp_path / "workspace")
+    widget.test_errors = errors
     qtbot.addWidget(widget)
     widget.show()
     yield widget
+    if widget.worker is not None and widget.worker.isRunning():
+        widget.worker.cancel()
+    settled(widget, qtbot)
     widget.close()
 
 
@@ -238,8 +277,11 @@ def test_page_six_is_a_real_settings_tab_and_no_longer_opens_a_dialog(window, mo
     assert window.settings_tabs.count() == 3
     # QTabBar reads a single "&" as a mnemonic, so the titles escape it.
     shown = [window.settings_tabs.tabText(i).replace("&&", "&") for i in range(3)]
-    assert shown == ["Display & text size", "Data & references",
+    assert shown == ["Window, text & display", "Data & references",
                      "What this version can and cannot do"]
+    # The user could not find the display controls at all, so the tab is named
+    # for what it does and its tooltip repeats the words they would search for.
+    assert "screen resolution" in window.settings_tabs.tabToolTip(0)
 
 
 def test_the_settings_tab_keeps_the_boundaries_paragraph_word_for_word(window):
@@ -305,3 +347,100 @@ def test_the_tab_bar_reaches_every_page_on_the_narrowest_supported_window(window
     window.resize(1380, 940)
     qtbot.waitUntil(lambda: window.sidebar.isVisible(), timeout=5000)
     assert window.pages.tabBar().sizeHint().width() <= window.pages.width()
+
+
+# ---------------------------------------------------------------------------
+# The menu bar this window owns: a dedicated Update menu for everything that
+# can be installed, and the display entries a user could not find before.
+# ---------------------------------------------------------------------------
+
+
+def test_the_menu_bar_carries_a_dedicated_update_menu_before_help(window):
+    titles = [entry.text().replace("&", "") for entry in window.menuBar().actions()
+              if entry.menu() is not None]
+    assert "Update" in titles
+    assert titles.index("Update") == titles.index("Help") - 1
+    assert titles.index("Update") > titles.index("View")
+
+
+def test_the_update_menu_names_every_installable_thing_once(window):
+    from wmlstudio.update_center import MENU_ENTRIES
+    entries = [action.text() for action in window.update_menu.actions()
+               if not action.isSeparator()]
+    assert entries[0].startswith("What is installed")
+    for _key, title in MENU_ENTRIES:
+        assert title in entries, title
+    assert len(entries) == len(set(entries)), "nothing is offered twice"
+    # A menu entry that cannot be used is worse than no entry at all.
+    for action in window.update_menu.actions():
+        if not action.isSeparator():
+            assert action.text().strip() and action.isEnabled(), action.text()
+    # The same commands are reachable from the Ctrl+K search, which is where a
+    # user who cannot find a menu looks next.
+    commands = [title for title, _ in window.command_actions]
+    assert any(title.startswith("What is installed") for title in commands)
+
+
+def settled(window, qtbot):
+    """Wait until the background probe has finished and its result has been handled."""
+    # worker_role is cleared by analysis_finished, so an empty role means the
+    # queued finish has actually run — closing the project before it does raises.
+    qtbot.waitUntil(lambda: window.worker is None or
+                    (not window.worker.isRunning() and not window.worker_role), timeout=60000)
+
+
+def update_centre(window, qtbot):
+    """Open the Update Centre and wait for its background probe to land."""
+    from wmlstudio.update_center import open_update_center
+    centre = open_update_center(window)
+    qtbot.addWidget(centre)
+    qtbot.waitUntil(lambda: centre.report is not None, timeout=60000)
+    settled(window, qtbot)
+    assert window.test_errors == []
+    return centre
+
+
+def test_the_update_centre_lists_installed_state_and_never_checks_a_server(window, qtbot):
+    from wmlstudio.update_center import UpdateCenter, open_update_center
+    centre = update_centre(window, qtbot)
+    assert isinstance(centre, UpdateCenter)
+    assert open_update_center(window) is centre, "one page per window, not one per click"
+    settled(window, qtbot)
+    keys = [item["key"] for item in centre.report["items"]]
+    from wmlstudio.provisioning import ORDER
+    assert keys == list(ORDER)
+    assert centre.table.rowCount() == len(ORDER)
+    assert "until you press a button" in centre.status.text() or centre.report["summary"]
+    row = keys.index("species_panel")
+    # This workspace has no downloaded panel, and the page says so rather than
+    # implying an update was checked for online.
+    assert centre.table.item(row, 1).text() == "Not installed"
+    assert centre.table.cellWidget(row, 4).text() == "Install…"
+    assert centre.table.cellWidget(row, 4).isEnabled() is True
+    centre.close()
+
+
+def test_an_update_row_uses_the_installer_the_application_already_has(window, qtbot,
+                                                                     monkeypatch):
+    centre = update_centre(window, qtbot)
+    called = []
+    monkeypatch.setattr(type(window), "install_species_panel",
+                        lambda self: called.append("species"))
+    assert centre.start("species_panel") is True
+    assert called == ["species"]
+    assert "Check what is installed" in centre.status.text()
+    centre.close()
+
+
+def test_an_item_with_no_installer_here_explains_how_it_is_installed(window, qtbot,
+                                                                     monkeypatch):
+    from PySide6.QtWidgets import QMessageBox
+    centre = update_centre(window, qtbot)
+    shown = []
+    monkeypatch.setattr(QMessageBox, "information",
+                        lambda parent, title, text, *args: shown.append((title, text)))
+    # BLAST+ ships beside the application; nothing downloads it on a user's behalf.
+    assert centre.start("blast_tools") is False
+    assert shown and "BLAST" in shown[0][0]
+    assert "stage_bio_tools" in shown[0][1] or "Tools/blast" in shown[0][1]
+    centre.close()

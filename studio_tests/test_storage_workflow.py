@@ -216,3 +216,117 @@ def test_assignment_retains_custom_metadata_and_archives_previous_result(project
     assert sample["result"] is None and sample["status"] == "queued"
     event = next(event for event in project.history(sample_id) if event["action"] == "result_invalidated")
     assert event["details"]["result"]["st"] == "1"
+
+
+def typed(project, sample_id, digest):
+    """One classical ST and one core-genome profile, stored the way the app stores them."""
+    project.set_result(sample_id, {"scheme": "Klebsiella MLST", "scheme_digest": "mlst-v1",
+                                   "st": "258", "status": "complete", "input_sha256": digest,
+                                   "alleles": {f"gene{index}": "1" for index in range(7)}})
+    project.set_analysis(sample_id, {"scheme": "Klebsiella cgMLST", "scheme_digest": "cg-v1",
+                                     "st": None, "status": "complete", "input_sha256": digest,
+                                     "alleles": {f"locus{index:04d}": "3" for index in range(400)},
+                                     "parameters": {"method": "full-cds-cgmlst-v2"}})
+
+
+def hydra_report(digest):
+    return {"samples": [{"sample": "isolate", "summary": {"amr_genes": 2},
+                         "hits": [{"gene": "blaKPC-2", "element_type": "AMR", "class": "CARBAPENEM",
+                                   "primary": True}],
+                         "mlst": {}, "species": {}, "input_sha256": digest}],
+            "import_provenance": {"sha256": "a" * 64}, "execution_provenance": {}, "databases": []}
+
+
+def test_a_saved_project_reopens_with_every_sample_result_and_evidence_still_usable(tmp_path):
+    from wmlstudio.sample_workflow import hydra_evidence_status, link_hydra
+    from wmlstudio.storage import confirm_organism
+    path = tmp_path / "study.wmlstudio"
+    original = sequence(tmp_path / "inbox" / "isolate.fasta", "ACGTACGTAC")
+    root = tmp_path / "study.files"
+    with Project(path) as project:
+        sid = import_samples(project, [{"path": original, "typing_mode": "manual",
+                                        "genus": "Klebsiella", "species": "pneumoniae"}], root)[0]
+        copied = Path(project.get_sample(sid)["input_path"])
+        digest = hashlib.sha256(copied.read_bytes()).hexdigest()
+        typed(project, sid, digest)
+        confirm_organism(project, [sid], "Klebsiella", "pneumoniae")
+        link_hydra(project, hydra_report(digest), {"isolate": sid})
+        project.create_collection("Ward A")
+        before = project.get_sample(sid)
+        planned = plan_filing(project, sid)
+
+    with Project(path) as project:
+        sample = project.get_sample(sid)
+        assert sample["name"] == before["name"] and sample["status"] == "completed"
+        assert sample["input_path"] == str(copied) and Path(sample["input_path"]).is_file()
+        assert sample["missing_input"] is False
+        assert sample["metadata"]["organism"] == {"genus": "Klebsiella", "species": "pneumoniae"}
+        assert sample["metadata"]["organism_evidence"]["status"] == "confirmed"
+        assert sample["metadata"]["workflow"]["managed"] is True
+        assert project.latest_analysis(sid, "mlst")["st"] == "258"
+        assert len(project.latest_analysis(sid, "cgmlst")["alleles"]) == 400
+        assert hydra_evidence_status(sample)["status"] == "current"
+        assert sample["metadata"]["hydra"]["summary"]["amr_genes"] == 2
+        assert project.collections()[0]["name"] == "Ward A"
+        # Immediately usable means the reopened project plans exactly what the open
+        # one planned: the same managed root, the same destination, the same ST.
+        assert plan_filing(project, sid) == planned
+        assert planned["root"] == root and planned["st"] == "258"
+
+
+def test_a_project_that_moved_with_its_folder_finds_its_managed_copies_again(tmp_path):
+    from wmlstudio.storage import (
+        missing_managed_copies,
+        relocate_managed_storage,
+    )
+    original = sequence(tmp_path / "inbox" / "isolate.fasta", "ACGTACGTAC")
+    first = tmp_path / "drive_e"
+    first.mkdir()
+    with Project(first / "study.wmlstudio") as project:
+        sid = import_samples(project, [{"path": original, "typing_mode": "manual",
+                                        "genus": "Klebsiella"}], first / "study.files")[0]
+        digest = hashlib.sha256(Path(project.get_sample(sid)["input_path"]).read_bytes()).hexdigest()
+        typed(project, sid, digest)
+        relative = Path(project.get_sample(sid)["input_path"]).relative_to(first / "study.files")
+
+    moved = tmp_path / "drive_f"
+    first.rename(moved)
+    with Project(moved / "study.wmlstudio") as project:
+        outstanding = missing_managed_copies(project)
+        assert [entry["sample_id"] for entry in outstanding] == [sid]
+        assert project.get_sample(sid)["missing_input"] is True
+
+        report = relocate_managed_storage(project)
+        assert report["relocated"] == [(sid, str(moved / "study.files" / relative))]
+        assert report["unresolved"] == []
+        sample = project.get_sample(sid)
+        assert sample["missing_input"] is False
+        assert Path(sample["input_path"]).read_bytes() == original.read_bytes()
+        assert sample["metadata"]["workflow"]["storage_root"] == str(moved / "study.files")
+        assert project.latest_analysis(sid, "mlst")["st"] == "258"
+        assert missing_managed_copies(project) == []
+        event = next(e for e in project.history(sid) if e["action"] == "managed_storage_relocated")
+        assert event["details"]["sha256"] == digest
+
+
+def test_a_file_with_the_right_name_but_other_contents_is_never_adopted_as_the_copy(tmp_path):
+    from wmlstudio.storage import relocate_managed_storage
+    original = sequence(tmp_path / "inbox" / "isolate.fasta", "ACGTACGTAC")
+    first = tmp_path / "before"
+    first.mkdir()
+    with Project(first / "study.wmlstudio") as project:
+        sid = import_samples(project, [{"path": original, "typing_mode": "manual",
+                                        "genus": "Klebsiella"}], first / "study.files")[0]
+        relative = Path(project.get_sample(sid)["input_path"]).relative_to(first / "study.files")
+
+    moved = tmp_path / "after"
+    first.rename(moved)
+    impostor = moved / "study.files" / relative
+    impostor.write_text(">contig\nTTTTTTTTTT\n")
+    with Project(moved / "study.wmlstudio") as project:
+        stale = project.get_sample(sid)["input_path"]
+        report = relocate_managed_storage(project)
+        assert report["relocated"] == []
+        assert "contents differ" in report["unresolved"][0][1]
+        assert project.get_sample(sid)["input_path"] == stale
+        assert impostor.read_text() == ">contig\nTTTTTTTTTT\n"

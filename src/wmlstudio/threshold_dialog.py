@@ -2,7 +2,7 @@
 
 import html
 import json
-from urllib.parse import urlencode
+from urllib.parse import urlencode, urlsplit
 
 from PySide6.QtCore import Qt, QUrl
 from PySide6.QtGui import QDesktopServices
@@ -28,11 +28,16 @@ from .threshold_guidance import (
     CATALOG_VERSION,
     ORGANISMS,
     REVIEWED_ON,
+    SOURCES,
     guidance_for,
     record_decision,
 )
 from .ui_common import organism_for
 from .widgets import button, label
+
+# Only the hosts the curated catalog itself names, read from the catalog so the
+# two cannot drift apart. Every other link, and every non-https link, is inert.
+_SOURCE_HOSTS = frozenset(filter(None, (urlsplit(source["url"]).hostname for source in SOURCES.values())))
 
 
 class ThresholdGuideDialog(QDialog):
@@ -120,13 +125,19 @@ class ThresholdGuideDialog(QDialog):
 
     def refresh_entries(self):
         self.entries.clear()
+        # Newest first, per method: the list is ordered by guidance_for, and the
+        # marker says which entry is the most recent for its own method rather
+        # than letting position alone imply it.
         guidance = guidance_for(self.organism.currentText())
         for entry in guidance['entries']:
             value = entry['published_threshold']
-            title = f"{entry['method']} · {'No numeric rule' if value is None else '≤ ' + str(value)} · {entry['source']['published']}"
+            title = (f"{entry['method']} · {'No numeric rule' if value is None else '≤ ' + str(value)}"
+                     f" · {entry['source']['published']}"
+                     + ('  · most recent' if entry['most_recent'] else '')
+                     + ('' if entry['bindable'] else '  · citation only'))
             item = QListWidgetItem(title)
             item.setData(Qt.ItemDataRole.UserRole, entry)
-            item.setToolTip(entry['scope'])
+            item.setToolTip(entry['scope'] + '\n\n' + entry['caveat'])
             self.entries.addItem(item)
         self.apply_value.setChecked(False)
         if self.entries.count():
@@ -146,7 +157,14 @@ class ThresholdGuideDialog(QDialog):
         source = entry['source']
         value = entry['published_threshold']
         body = f"<h2>{e(entry['organism'])}</h2><h3>{e(entry['method'])}: {e('No numeric rule curated' if value is None else '≤ ' + str(value) + ' ' + entry['unit'])}</h3>"
+        body += ("<p><b>Suggested, never applied.</b> Nothing below is in use until you bind the exact scheme, "
+                 "match its full target count and record your own justification. "
+                 + ("This is the most recent reviewed source for this organism and method."
+                    if entry['most_recent'] else
+                    "A more recent reviewed source exists for this organism and method; read it before adopting this one.")
+                 + "</p>")
         body += f"<p>{e(entry['scope'])}</p><p><b>Scheme key:</b> {e(entry['scheme_key'] or 'Not curated; citation only')}<br><b>Target count:</b> {e(entry['locus_count'] or 'Not established here')}<br><b>Missing data:</b> {e(entry['missing_policy'])}</p>"
+        body += f"<p><b>The authors’ own caveat:</b> “{e(entry['caveat'])}”</p>"
         body += f"<p><b>Limitations:</b> {e(entry['limitations'])}</p><p>{e(source['citation'])}<br><a href='{e(source['url'])}'>{e(source['doi'])}</a><br>{e(source['locator'])}</p>"
         body += "<p><b>Your protocol:</b></p><pre>" + e(json.dumps(self.context(), indent=2)) + "</pre>"
         self.text.setHtml(body)
@@ -163,7 +181,7 @@ class ThresholdGuideDialog(QDialog):
 
     @staticmethod
     def open_source(url):
-        if url.scheme() == 'https' and url.host() in {'journals.asm.org', 'www.nature.com'}:
+        if url.scheme() == 'https' and url.host() in _SOURCE_HOSTS:
             QDesktopServices.openUrl(url)
 
     def accept(self):

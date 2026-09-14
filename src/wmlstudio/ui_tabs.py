@@ -20,7 +20,9 @@ NAV_SYMBOLS = ("◫", "▤", "⌘", "▥", "◈", "↗", "⚙")
 
 TAB_LABELS = {
     "overview": "Overview",
-    "isolates": "Isolates",
+    # Samples is the hub: every other page acts on a cohort chosen here, and
+    # "samples" is the word the people using this application use.
+    "isolates": "Samples",
     "compare": "Compare",
     "schemes": "Schemes",
     "evidence": "Evidence",
@@ -28,16 +30,26 @@ TAB_LABELS = {
     "settings": "Settings",
 }
 
+#: The page each key folds into once its content also exists as a Samples sub-tab,
+#: with the sub-tab title to select there. `WorkspaceTabs.fold_page` applies one of
+#: these: the top-level tab stops being shown, every index keeps its meaning, and
+#: navigating to the key still lands on the same content.
+FOLDABLE = {
+    "schemes": ("isolates", "Schemes"),
+    "evidence": ("isolates", "Evidence"),
+}
+
 # One plain sentence per tab. A tab that carries a scientific claim states its
 # limit in the same sentence; the interface must never imply more than the data.
 PAGE_PURPOSE = {
     "overview": "See where this investigation stands and what to do next.",
-    "isolates": "Keep every isolate, its organism and its files in one place.",
+    "isolates": "Every sample, its organism and its files in one place — the hub for all the "
+                "other pages.",
     "compare": "See which isolates have similar allele profiles. Similarity is not proof of transmission.",
     "schemes": "Manage the local allele databases your typing runs against.",
     "evidence": "Review identity, resistance and virulence evidence for isolates you choose. Genotype is not measured susceptibility.",
     "reports": "Turn reviewed evidence into a document you can share.",
-    "settings": "Make text size, screen scaling and data locations comfortable.",
+    "settings": "Window size, text size, screen resolution and where your data lives.",
 }
 
 # (button text, name of the MainWindow method the button calls). Resolved with
@@ -49,7 +61,7 @@ NEXT_STEP = {
     "schemes": ("Browse online / install updates…", "open_reference_manager"),
     "evidence": ("Choose isolates…", "choose_feature_cohort"),
     "reports": ("Choose report isolates…", "choose_report_cohort"),
-    "settings": ("Try this size on a sample row", "preview_interface_scale"),
+    "settings": ("Window size, text size and screen resolution", "open_display_settings"),
 }
 
 
@@ -87,6 +99,7 @@ class WorkspaceTabs(QTabWidget):
         self._keys: list[str] = []
         self._hooks: dict[str, object] = {}
         self._subtabs: dict[str, QTabWidget] = {}
+        self._folded: dict[str, tuple[str, str]] = {}
         self._depth = 0
         self.currentChanged.connect(self._current_changed)
 
@@ -139,8 +152,47 @@ class WorkspaceTabs(QTabWidget):
         index = self.index_of(target)
         if index < 0:
             return False
+        host = self._folded.get(self.key_at(index))
+        if host is not None:
+            # This page now lives as a sub-tab of another one. Every call site that
+            # asks for it by key or by its old number still arrives at the content.
+            host_index = self.index_of(host[0])
+            if host_index >= 0:
+                self.setCurrentIndex(host_index)
+                self.show_subtab(host[0], host[1])
+                return True
         self.setCurrentIndex(index)
         return True
+
+    # --- folding a page into another page's sub-tabs ------------------------
+    def fold_page(self, key, host_key=None, subtab_title=None) -> bool:
+        """Stop showing a top-level tab whose content is now a sub-tab elsewhere.
+
+        The page itself is kept, so `widget(index)`, `page_index()` and every
+        `navigate(<int>)` call site keep meaning what they meant; only the tab stops
+        being offered twice. Returns False when the page or its host is unknown.
+        """
+        if host_key is None or subtab_title is None:
+            host_key, subtab_title = FOLDABLE.get(str(key), (None, None))
+        index, host_index = self.index_of(key), self.index_of(host_key)
+        if index < 0 or host_index < 0 or index == host_index:
+            return False
+        self._folded[str(key)] = (str(host_key), str(subtab_title))
+        self.setTabVisible(index, False)
+        if self.currentIndex() == index:
+            self.show_page(key)
+        return True
+
+    def unfold_page(self, key) -> bool:
+        """Offer a folded page as its own tab again."""
+        index = self.index_of(key)
+        if index < 0 or self._folded.pop(str(key), None) is None:
+            return False
+        self.setTabVisible(index, True)
+        return True
+
+    def folded_pages(self) -> dict[str, tuple[str, str]]:
+        return dict(self._folded)
 
     # --- per-page show hook -------------------------------------------------
     def set_show_hook(self, key, callback) -> None:

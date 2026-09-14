@@ -269,3 +269,111 @@ def test_collections_persist_and_do_not_delete_samples(tmp_path, sequence):
         project.delete_collection(collection)
         assert len(project.samples()) == 2
         assert project.collections() == []
+
+
+MLST = {"scheme": "Klebsiella MLST", "scheme_digest": "mlst-v1", "st": "258", "status": "complete",
+        "alleles": {f"gene{index}": "1" for index in range(7)}}
+CGMLST = {"scheme": "Klebsiella cgMLST", "scheme_digest": "cg-v1", "st": None, "status": "complete",
+          "alleles": {f"locus{index:04d}": "3" for index in range(400)},
+          "parameters": {"method": "full-cds-cgmlst-v2"}}
+
+
+def test_a_stored_profile_says_which_typing_it_is_and_on_what_basis():
+    from wmlstudio.project import classify_typing
+    assert classify_typing(MLST) == {"kind": "mlst", "basis": "7 loci, at classical scheme size"}
+    assert classify_typing(CGMLST)["kind"] == "cgmlst"
+    assert "full-cds-cgmlst-v2" in classify_typing(CGMLST)["basis"]
+    # A caller that already knows is believed, and a declared scheme type outranks size.
+    assert classify_typing({**MLST, "analysis_kind": "cgmlst"})["kind"] == "cgmlst"
+    small = {"scheme_digest": "x", "alleles": {"a": "1"}, "scheme_metadata": {"type": "cgMLST"}}
+    assert classify_typing(small)["kind"] == "cgmlst"
+    assert "declares type" in classify_typing(small)["basis"]
+    # Quality-only work is not a profile of either kind and is never sorted as one.
+    quality = {"status": "qc_only", "st": None, "alleles": {}, "scheme_digest": None}
+    assert classify_typing(quality) == {"kind": "unclassified",
+                                        "basis": "no allelic profile is stored"}
+
+
+def test_classical_st_and_core_genome_profiles_are_retrievable_independently(tmp_path, sequence):
+    path = tmp_path / "study.wmlstudio"
+    with Project(path) as project:
+        sample_id = project.add_sample(sequence, "Isolate 1")
+        project.set_result(sample_id, MLST)
+        project.set_analysis(sample_id, CGMLST)
+
+        assert project.latest_analysis(sample_id, "mlst")["st"] == "258"
+        assert project.latest_analysis(sample_id, "cgmlst")["scheme_digest"] == "cg-v1"
+        assert len(project.latest_analysis(sample_id, "cgmlst")["alleles"]) == 400
+        grouped = project.analyses_by_kind(sample_id)
+        assert [result["scheme_digest"] for result in grouped["mlst"]] == ["mlst-v1"]
+        assert [result["scheme_digest"] for result in grouped["cgmlst"]] == ["cg-v1"]
+        assert grouped["unclassified"] == []
+        assert project.typing_kind_index()[sample_id] == {"mlst": 1, "cgmlst": 1,
+                                                          "unclassified": 0}
+        kinds = {row["scheme_digest"]: row["typing_kind"]
+                 for row in project.analysis_summaries(sample_id)}
+        assert kinds == {"mlst-v1": "mlst", "cg-v1": "cgmlst"}
+        # The stored scientific payload is exactly what was handed in; the kind is
+        # recorded beside it, never injected into the result.
+        assert "typing_kind" not in project.latest_analysis(sample_id, "mlst")
+
+    with Project(path) as project:
+        assert project.latest_analysis(sample_id, "mlst")["st"] == "258"
+        assert len(project.latest_analysis(sample_id, "cgmlst")["alleles"]) == 400
+
+
+def test_a_core_genome_run_does_not_take_over_the_classical_st(tmp_path, sequence):
+    with Project(tmp_path / "study.wmlstudio") as project:
+        sample_id = project.add_sample(sequence)
+        project.set_result(sample_id, MLST)
+        project.set_result(sample_id, CGMLST)
+        # The headline result is whatever ran last, but the ST is still the ST.
+        assert project.get_sample(sample_id)["result"]["scheme_digest"] == "cg-v1"
+        assert project.latest_analysis(sample_id, "mlst")["st"] == "258"
+        assert project.latest_analysis(sample_id, "cgmlst")["st"] is None
+        event = next(e for e in project.history(sample_id)
+                     if e["action"] == "analysis_completed" and e["details"]["scheme_digest"] == "cg-v1")
+        assert event["details"]["typing_kind"] == "cgmlst"
+
+
+def test_each_typing_kind_can_be_collected_across_the_project_without_the_other(tmp_path, sequence):
+    with Project(tmp_path / "study.wmlstudio") as project:
+        first = project.add_sample(sequence, "One")
+        second = project.add_sample(sequence, "Two")
+        project.set_result(first, MLST)
+        project.set_analysis(first, CGMLST)
+        project.set_result(second, MLST)
+
+        classical = project.results_of_kind("mlst")
+        assert sorted(row["sample_name"] for row in classical) == ["One", "Two"]
+        assert {row["st"] for row in classical} == {"258"}
+        core = project.results_of_kind("cgmlst")
+        assert [row["sample_id"] for row in core] == [first]
+        assert core[0]["job_status"] == "completed"
+        # A sample with no core-genome profile is absent from that view, never
+        # represented there by its ST.
+        assert second not in {row["sample_id"] for row in core}
+        assert project.latest_analysis(second, "cgmlst") is None
+        with pytest.raises(ValueError, match="Unknown typing kind"):
+            project.results_of_kind("snp")
+
+
+def test_a_schema_three_project_gains_typing_kinds_without_rewriting_its_results(tmp_path, sequence):
+    path = tmp_path / "legacy.wmlstudio"
+    with Project(path) as project:
+        sample_id = project.add_sample(sequence)
+        project.set_result(sample_id, MLST)
+        project.set_analysis(sample_id, CGMLST)
+        stored = project.analysis_results(sample_id)
+    with sqlite3.connect(path) as connection:
+        connection.execute("CREATE TABLE legacy AS SELECT sample_id, scheme_digest, result, "
+                           "updated_at FROM analyses")
+        connection.execute("DROP TABLE analyses")
+        connection.execute("ALTER TABLE legacy RENAME TO analyses")
+        connection.execute("PRAGMA user_version = 3")
+    with Project(path) as project:
+        assert project.analysis_results(sample_id) == stored
+        assert project.latest_analysis(sample_id, "mlst")["st"] == "258"
+        assert project.latest_analysis(sample_id, "cgmlst")["scheme_digest"] == "cg-v1"
+        assert any(event["action"] == "schema_migrated" and event["details"]["to"] == 4
+                   for event in project.history())
