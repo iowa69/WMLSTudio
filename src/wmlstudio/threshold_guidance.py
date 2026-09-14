@@ -7,10 +7,10 @@ caller, missing-data policy, or clustering threshold.
 
 from __future__ import annotations
 
-from copy import deepcopy
-from datetime import date, datetime, timezone
 import hashlib
 import json
+from copy import deepcopy
+from datetime import date, datetime, timezone
 
 CATALOG_VERSION = "2026-09-12.1"
 REVIEWED_ON = "2026-09-12"

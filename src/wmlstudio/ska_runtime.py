@@ -8,16 +8,15 @@ separate evidence and cannot inherit a cutoff from the reference-free run.
 from __future__ import annotations
 
 import csv
-from datetime import datetime, timezone
-import hashlib
 import json
 import math
 import os
-from pathlib import Path
 import subprocess
 import sys
 import uuid
+from datetime import datetime, timezone
 from itertools import combinations
+from pathlib import Path
 
 from .sequence import SequenceReader, check_cancelled, file_sha256, file_signature
 

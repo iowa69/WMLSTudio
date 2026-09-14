@@ -13,6 +13,7 @@ from pathlib import Path
 
 from . import __version__
 from .hydra import _validate_sample, load_hydra_report
+from .organism_modules import module_tasks, registered_modules, stamp_applicability
 from .sample_workflow import _execution_input_sha256, _sha256, current_input_sha256
 from .sequence import (
     AnalysisCancelled,
@@ -23,7 +24,7 @@ from .sequence import (
     inspect_sequence,
 )
 from .species_evidence import identify_species
-from .virulence_evidence import screen_virulence
+from .virulence_evidence import apply_locus_sts, screen_virulence
 
 LIMITATIONS = [
     'Genomic similarity alone does not establish transmission, direction, source attribution or an outbreak.',
@@ -214,12 +215,17 @@ def synthesize_accessory_evidence(hydra_sample, source, contig_lengths, *, virul
 
 
 def characterize_assembly(path, reference_root=None, hydra_report=None, cancelled=None, progress=None, *, threads=2,
-                          hydra_sample_name=None, species=True, virulence=True, blastn_path=None, makeblastdb_path=None):
+                          hydra_sample_name=None, species=True, virulence=True, modules=None, organism=None,
+                          blastn_path=None, makeblastdb_path=None):
     """Run selected independent assays, retaining each result/failure and provenance.
 
     ``hydra_report`` is a normalized native report (or original report JSON path),
     not metadata merely linked by filename. No report/input identity is invented.
     References must be installed explicitly with provision_characterization_references.
+    ``modules`` opts in to registered organism-specific assays by key; unselected
+    modules report not_run. ``organism`` is a (genus, species) pair used only to
+    stamp how applicable each module's reference panel is to this isolate: it
+    never gates execution and no assay writes an organism assignment.
     """
     path = Path(path).resolve()
     qc = inspect_sequence(path, cancelled=cancelled)
@@ -228,12 +234,14 @@ def characterize_assembly(path, reference_root=None, hydra_report=None, cancelle
     result = {'format_version': 1, 'sample_name': qc['sample_name'], 'input_path': str(path),
               'input_sha256': qc['input_sha256'], 'qc': qc['qc'], 'limitations': list(LIMITATIONS),
               'provenance': {'software': 'WMLSTudio', 'version': __version__, 'created_utc': datetime.now(UTC).isoformat()}}
-    modules = [('species_evidence', species, identify_species, {}),
-               ('virulence', virulence, screen_virulence, {'threads': threads, 'blastn_path': blastn_path, 'makeblastdb_path': makeblastdb_path})]
-    for key, enabled, function, options in modules:
+    assays = [('species_evidence', species, identify_species, {}, 'Assay not selected.'),
+              ('virulence', virulence, screen_virulence, {'threads': threads, 'blastn_path': blastn_path, 'makeblastdb_path': makeblastdb_path},
+               'Assay not selected.')]
+    assays += module_tasks(modules, reference_root, threads=threads, blastn_path=blastn_path, makeblastdb_path=makeblastdb_path)
+    for key, enabled, function, options, reason in assays:
         check_cancelled(cancelled)
         if not enabled or reference_root is None:
-            result[key] = _not_run('Assay not selected.' if not enabled else 'Install or select a verified characterization reference snapshot first.')
+            result[key] = _not_run(reason if not enabled else 'Install or select a verified characterization reference snapshot first.')
             continue
         try:
             result[key] = function(path, reference_root, cancelled=cancelled, progress=progress, **options)
@@ -241,6 +249,13 @@ def characterize_assembly(path, reference_root=None, hydra_report=None, cancelle
             raise
         except (ValueError, OSError, RuntimeError) as error:
             result[key] = {'status': 'failed', 'reason': str(error)}
+    # A locus ST can only come from the exact-allele engine; the BLAST screen
+    # never assigns one, so it is attached here or stays None.
+    for key, module in registered_modules().items():
+        block = result.get(key)
+        if module.locus_st_provider and isinstance(block, dict) and block.get('status') not in {'not_run', 'failed'}:
+            apply_locus_sts(result.get('virulence'), module.locus_st_provider(block))
+    stamp_applicability(result, organism)
     contig_lengths = {}
     with SequenceReader(path, cancelled) as reader:
         for record in reader:
@@ -252,6 +267,7 @@ def characterize_assembly(path, reference_root=None, hydra_report=None, cancelle
                                               virulence_hits=result['virulence'].get('hits', [])))
     if file_sha256(path, cancelled) != qc['input_sha256']:
         raise ValueError('Assembly changed during characterization; results were not accepted.')
-    states = {result[key]['status'] for key in ('species_evidence', 'virulence', 'drug_associations', 'plasmid_hypotheses')}
+    states = {result[key]['status'] for key in ('species_evidence', 'virulence', 'drug_associations',
+                                                'plasmid_hypotheses', *registered_modules()) if key in result}
     result['status'] = 'failed' if 'failed' in states else ('ambiguous' if 'ambiguous' in states else ('completed' if 'completed' in states else 'not_run'))
     return result
