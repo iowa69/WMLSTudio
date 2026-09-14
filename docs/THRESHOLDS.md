@@ -19,19 +19,22 @@ the organism name or the locus count matches.
 
 ## Honest coverage, in one line each
 
-The catalogue lists **29 organisms** and holds **28 entries**
-drawn from **7 cited sources**, covering **17 of the 29** with at least one entry.
+The catalogue lists **31 organisms** and holds **34 entries**
+drawn from **13 cited sources**, covering **20 of the 31** with at least one entry.
 
 | Tier | Organisms | What you get |
 | --- | --- | --- |
-| A — a published cutoff bound to a named scheme | **8** | A number the software will let you adopt, after review |
-| B — a published number with no scheme this catalogue can bind | **9** | A citation to read. The software refuses to adopt the number |
-| C — listed for surveillance, no curated publication | **12** | An explicit evidence gap, with no number at all |
+| A — a published cutoff bound to a named scheme | **13** | A number the software will let you adopt, after review |
+| B — a published number with no scheme this catalogue can bind | **7** | A citation to read. The software refuses to adopt the number |
+| C — listed for surveillance, no curated publication | **11** | An explicit evidence gap, with no number at all |
 
 Tier A is the honest answer to "thresholds pre-set for common human and
-paediatric pathogens with references": **eight organisms, eleven entries, five
-papers.** That is below the 10–15 that was asked for. The gap is named in full
-below rather than closed by inventing numbers.
+paediatric pathogens with references": **thirteen organisms, seventeen entries,
+eleven papers.** Six organisms were added by primary-source review after the
+first audit reported eight; each was independently re-checked against the paper
+before it was admitted, and four candidates were **rejected** in the same pass
+(see "What was searched for and refused"). No number was added that a source
+does not state.
 
 ## Tier A — published cutoff, bound to a named scheme
 
@@ -51,6 +54,12 @@ exact scheme its number was measured on and the full target count it requires.
 | *Klebsiella pneumoniae* | ≤ 15 allele differences | `cgmlst.org:kpneumoniae-2358` | 2,358 | Glasgow 2025 |
 | *Serratia marcescens* | ≤ 12 allele differences | `cgmlst.org:smarcescens-2692` | 2,692 | Kampmeier 2022 |
 | *Staphylococcus aureus* | ≤ 24 allele differences | `cgmlst.org:saureus-1861` | 1,861 | Glasgow 2025 |
+| *Listeria monocytogenes* | ≤ 7 allelic mismatches | `pasteur:lmonocytogenes-1748` | 1,748 | Moura 2016 |
+| *Listeria monocytogenes* | ≤ 7 allele differences | `cgmlst.org:lmonocytogenes-1701` | 1,701 | Van Walle 2018 (ECDC evaluation) |
+| *Clostridioides difficile* | ≤ 6 allele differences | `cgmlst.org:cdifficile-2270` | 2,270 | Bletz 2018 |
+| *Mycobacterium tuberculosis* complex | ≤ 5 allele differences | `cgmlst.org:mtbc-2891` | 2,891 | Kohl 2018 |
+| *Salmonella enterica* | ≤ 10 allele differences | `enterobase:senterica-cgmlst-3002` | 3,002 | Leeper 2023 (PulseNet USA) |
+| *Legionella pneumophila* | ≤ 4 allele differences | `cgmlst.org:lpneumophila-1521` | 1,521 | Moran-Gilad 2015 (preliminary) |
 
 Read the caveats that travel with each entry:
 
@@ -76,8 +85,11 @@ Read the caveats that travel with each entry:
 
 ## Tier B — a number you can read, not one the software will adopt
 
-Sixteen of these seventeen entries come from one source: **Siddall, Starkey and
-Patel (2025)**, a Mayo Clinic *local* related-isolate criterion run on
+Seventeen entries, covering **seven organisms that have nothing better**. The
+other nine organisms in this table also appear in tier A, from a different
+laboratory — see the disagreement note below. Sixteen of the seventeen come from
+one source: **Siddall, Starkey and Patel (2025)**, a Mayo Clinic *local*
+related-isolate criterion run on
 SeqSphere+ 10.0.5 with SKESA 2.3.0. The paper's exact scheme identity is not
 curated here, so the catalogue records the number, the context and the refusal
 together. A local validation criterion is not transferable by species name.
@@ -116,7 +128,7 @@ hoc scheme for it.
 
 ## Tier C — listed, but no curated cutoff at all
 
-These twelve are on the surveillance work-list and have **no entry**. That is an
+These eleven are on the surveillance work-list and have **no entry**. That is an
 evidence gap in this catalogue, not proof that no publication exists.
 
 | Organism | Catalogue status |
@@ -131,8 +143,7 @@ evidence gap in this catalogue, not proof that no publication exists.
 | Morganella morganii | no curated cutoff |
 | Providencia stuartii | no curated cutoff |
 | Staphylococcus capitis | no curated cutoff |
-| Streptococcus pneumoniae | no curated cutoff |
-| Salmonella enterica | no curated cutoff |
+| Streptococcus pneumoniae | no curated cutoff — searched, none found |
 
 `guidance_for()` returns status `no_curated_transferable_cutoff` for each, with
 the message "No reviewed transferable cutoff in this catalog. This is an evidence
@@ -145,23 +156,50 @@ not minor ones.
 
 Covered with a bindable cutoff (tier A): *S. aureus*, *E. coli*,
 *K. pneumoniae*, *E. faecium*, *E. faecalis*, *S. marcescens* (a classic NICU
-outbreak organism), *A. baumannii*, *C. freundii*.
+outbreak organism), *A. baumannii*, *C. freundii*, and now *L. monocytogenes*
+(maternal-neonatal listeriosis), *S. enterica*, *C. difficile*, *M. tuberculosis*
+complex and *L. pneumophila*.
 
 Covered by citation only (tier B): *S. agalactiae* — the leading cause of
 early-onset neonatal sepsis — *S. pyogenes*, *S. epidermidis* and
-*S. lugdunensis* (CoNS device infections), *C. difficile*, *E. cloacae* complex,
-*L. pneumophila*.
+*S. lugdunensis* (CoNS device infections), *E. cloacae* complex.
 
-**Not covered at all:** *Streptococcus pneumoniae*, *Salmonella enterica*,
-*Staphylococcus capitis* (the NICU-adapted NRCS-A clone), *Listeria
-monocytogenes*, *Neisseria meningitidis*, *Haemophilus influenzae*,
-*Campylobacter jejuni*. The last four are not even on the work-list.
+**Not covered at all:** *Streptococcus pneumoniae*, *Staphylococcus capitis*
+(the NICU-adapted NRCS-A clone), *Neisseria meningitidis*, *Haemophilus
+influenzae*, *Campylobacter jejuni*. The last three are not even on the
+work-list.
 
-Six of those seven organisms are in the `mixed-genus-20` practice cohort and in
+*S. agalactiae* is the most painful of these, and it was searched specifically.
+The one verifiable published cutoff is SNP-based and computed **separately per
+clonal complex** against a different reference genome for each CC, so there is no
+single cgMLST scheme and no single locus count to bind it to. It stays in tier B
+rather than being dressed up as a cgMLST threshold.
+
+Several of those organisms are in the `mixed-genus-20` practice cohort and in
 the broad species panel. WMLSTudio will happily identify, file, type and compare
 them — and will then tell you, correctly, that it has **no threshold to offer**.
 That is the intended behaviour, and it is why the guidance panel prints an
 evidence-gap message instead of a number.
+
+## What was searched for and refused
+
+The tier A additions came from a primary-source review that also produced four
+refusals. They are recorded because a documented negative is the useful result
+here: it stops the same ground being re-searched, and it stops a weak number
+being adopted later by someone who assumes nobody looked.
+
+| Organism | Why no entry |
+| --- | --- |
+| *Streptococcus pneumoniae* | No cgMLST scheme with a published outbreak cutoff was found. cgmlst.org publishes no pneumococcal scheme; PubMLST's Pneumococcal Genome Library publishes cgLIN **hierarchical barcoding levels**, which are a clustering construct, not a validated outbreak threshold |
+| *Streptococcus agalactiae* | The only verifiable cutoff is SNP-based and computed per clonal complex against per-CC references — not bindable to one scheme and one locus count |
+| *Enterobacter cloacae* complex | No cgMLST scheme exists for the complex as a taxon. cgmlst.org hosts only a single-species *E. hormaechei* scheme; PubMLST hosts only 7-gene MLST |
+| *Salmonella enterica*, European practice | ECDC and EFSA set the cutoff **per outbreak** (5 and 7 allele differences in two different 2023–2024 assessments, on a 3,255-locus chewBBACA scheme, not EnteroBase's 3,002). There is no single European number to curate, so only the PulseNet USA criterion is recorded |
+
+**EnteroBase HC5 is deliberately not catalogued.** It is a single-linkage
+hierarchical clustering level, and its own authors write that such clusters "may
+not necessarily represent traditional transmission chains", recommending that a
+transmission chain "continue to be based on epidemiological criteria in addition
+to genetic similarities". Recording HC5 as a threshold would misrepresent it.
 
 ## Nothing in the ZIP can bind a tier A threshold today
 

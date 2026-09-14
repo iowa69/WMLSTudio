@@ -33,7 +33,7 @@ surface; **open** — not started. An engine-only capability is not a delivered 
 | 5 | Highlight / delete / add samples inline | interface | Archive as the default, restorable removals, Recently removed, focus accent distinct from saved highlights |
 | 6 | High-resolution screen support the user can adjust | interface | Settings scales and `--display-scale`; graph text size redraws both trees without moving a node |
 | 7 | Simple report: MST picture, resistance, proximity | interface | Reports tab action plus the `one_page` preset in the export path |
-| 8 | Thresholds pre-set for common pathogens with references | interface | Catalogue and dialog; coverage audited honestly in `docs/THRESHOLDS.md` |
+| 8 | Thresholds pre-set for common pathogens with references | interface | 13 scheme-bound organisms from 11 papers, plus the refusals; audited in `docs/THRESHOLDS.md` |
 | 9 | Practice datasets, 10 single-species and 20 mixed-genus | interface | Data menu download with caveats, plus `studio_scripts/fetch_practice_cohort.py` |
 | 10 | Manual genus/species override | interface | Assign from the context menu, re-file on change, CSV assignment import |
 | 11 | Organism-specific tools (SCCmec, Kleborate-style) | interface | Plan-dialog selection, results column, drill-down, report section, CLI flags |
@@ -57,9 +57,20 @@ surface; **open** — not started. An engine-only capability is not a delivered 
 - [x] Settle the organism-module registry order. It was decided by whichever
       assay module was imported first, so a table and its export could reorder
       their columns between runs.
-- [ ] Widen the threshold catalogue, or record why each remaining organism cannot
-      be curated. Twelve listed organisms still have no cutoff at all, including
-      *S. pneumoniae*, *S. enterica* and *S. capitis*.
+- [x] Widen the threshold catalogue, or record why each remaining organism cannot
+      be curated. Primary-source review added six organisms — *L. monocytogenes*,
+      *C. difficile*, *M. tuberculosis* complex, *S. enterica*, *L. pneumophila*
+      and a second *L. monocytogenes* scheme — taking tier A from 8 organisms to
+      13, inside the 10–15 that was asked for. Each was independently re-checked
+      against the paper before admission, and four candidates were refused and
+      recorded: *S. pneumoniae* (no scheme-bound cutoff exists), *S. agalactiae*
+      (SNP-based, computed per clonal complex), *E. cloacae* complex (no scheme
+      for the taxon) and European *Salmonella* practice (set per outbreak).
+      EnteroBase HC5 was deliberately not catalogued: it is a hierarchical
+      clustering level whose own authors decline to equate it with transmission.
+- [ ] Eleven listed organisms still have no cutoff, now including *S. pneumoniae*
+      and *S. capitis*. *N. meningitidis*, *H. influenzae* and *C. jejuni* remain
+      off the work-list entirely.
 - [ ] Guard the per-window `setStyleSheet` re-polish that makes repeated window
       construction grow superlinearly in one process.
 - [ ] Run the frozen SCCmec self-comparison for real: it needs a format 2 bundled
