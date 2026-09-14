@@ -1037,6 +1037,18 @@ class TreeView(QGraphicsView):
         self._redraw()
 
     def _render(self, painter, width, height, *, title=None, subtitle=None):
+        # A saved or reported picture keeps the standard lettering, so the same
+        # comparison reads the same on every computer whatever the reader set
+        # their own screen to. Only export paths reach here, never a repaint.
+        if graph_text_scale() != 100:
+            reader_scale = graph_text_scale()
+            set_graph_text_scale(100)
+            self._redraw()
+            try:
+                return self._render(painter, width, height, title=title, subtitle=subtitle)
+            finally:
+                set_graph_text_scale(reader_scale)
+                self._redraw()
         bounds = self.canvas.itemsBoundingRect().adjusted(-35, -35, 35, 35)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
         painter.fillRect(QRectF(0, 0, width, height), QColor(BACKGROUND))

@@ -83,7 +83,7 @@ def journey_summary(
     total = counts["total"]
     steps = [
         JourneyStep("inputs", "1  Define your isolates", "Which files belong to each isolate?",
-                    "samples", "Review samples & reads",
+                    "samples", "Review samples && reads",
                     f"{total} isolates · {counts['linked_mates']} linked read mates · "
                     f"{counts['pending']} pending", "ready" if total else "empty"),
         JourneyStep("identity", "2  Check identity & quality", "Are these the organisms I expect?",
@@ -100,7 +100,7 @@ def journey_summary(
                     f"{counts['amr']} current linked AMR results. Drug associations are not measured "
                     "susceptibility; plasmid markers are hypotheses, not transmission proof."),
         JourneyStep("relatedness", "5  Investigate relatedness", "Who is close, and is the comparison reliable?",
-                    "compare", "Open investigation & graph",
+                    "compare", "Open investigation && graph",
                     f"{counts['comparison']} isolates in the explicit comparison cohort. "
                     "Choose one scheme snapshot; inspect shared loci and cluster chaining."),
         JourneyStep("report", "6  Freeze & communicate", "Which findings belong in this report?",

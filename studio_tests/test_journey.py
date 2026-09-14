@@ -95,3 +95,21 @@ def test_map_connected_to_native_navigation(qtbot, tmp_path):
     assert window.workflow_guide.isVisible()
     window.workflow_guide.close()
     window.close()
+
+
+def test_stage_button_labels_do_not_turn_an_ampersand_into_a_keyboard_shortcut():
+    """Qt reads '&' in button text as a mnemonic, so 'samples & reads' drew as 'samples _reads'.
+
+    The investigation map is the first thing a new user reads, so a mangled word
+    there costs more trust than it looks like it should.
+    """
+    from PySide6.QtWidgets import QPushButton
+
+    from wmlstudio.journey import journey_summary
+    for step in journey_summary([])["steps"]:
+        # Only the action label becomes a QPushButton (journey_widgets.py). The
+        # titles are QLabels, which render '&' literally, so they stay unescaped.
+        assert "&" not in step.action_label.replace("&&", ""), \
+            f"unescaped ampersand in button label {step.action_label!r}"
+        # Qt strips the escape when it renders, so the user reads a real ampersand.
+        assert QPushButton(step.action_label).text() == step.action_label

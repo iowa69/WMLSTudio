@@ -31,7 +31,7 @@ surface; **open** — not started. An engine-only capability is not a delivered 
 | 3 | Right-click menu in every tab | interface | 29 handlers across all 15 registered views |
 | 4 | Dual MST — original beside current | interface | Baseline pointer, snapshot replay beside the current tree, change summary with not-assessed states |
 | 5 | Highlight / delete / add samples inline | interface | Archive as the default, restorable removals, Recently removed, focus accent distinct from saved highlights |
-| 6 | High-resolution screen support the user can adjust | interface, one gap | Settings scales and `--display-scale`; the graph text size is saved but not yet redrawn |
+| 6 | High-resolution screen support the user can adjust | interface | Settings scales and `--display-scale`; graph text size redraws both trees without moving a node |
 | 7 | Simple report: MST picture, resistance, proximity | interface | Reports tab action plus the `one_page` preset in the export path |
 | 8 | Thresholds pre-set for common pathogens with references | interface | Catalogue and dialog; coverage audited honestly in `docs/THRESHOLDS.md` |
 | 9 | Practice datasets, 10 single-species and 20 mixed-genus | interface | Data menu download with caveats, plus `studio_scripts/fetch_practice_cohort.py` |
@@ -45,15 +45,18 @@ surface; **open** — not started. An engine-only capability is not a delivered 
       organism modules stop reporting `not_run` on the shipped snapshot. CI stages
       it fresh, so this is a developer-tree gap; check `frozen-check.json` to see
       which state a given build actually shipped.
-- [ ] Regenerate `uv.lock` for the new `pyyaml` development dependency. Until then
-      CI fails at `uv sync --locked`, and the characterization staging step fails
-      closed because the SCCmec rule document cannot be parsed.
-- [ ] `WorkbenchMixin.set_graph_text_scale` and the `widgets.py` graph text scale
-      it calls: the Settings control persists the value and nothing consumes it.
-- [ ] `organism_typing` as a flat export field in `export._FIELDS` and
-      `sample_workflow.feature_fields`.
-- [ ] Delete the dead `navigate` override in `ui_workbench.py` and the temporary
-      shim in `app.py` that neutralises it.
+- [x] Regenerate `uv.lock` for the new `pyyaml` development dependency, with
+      isolated uv 0.10.11 (archive SHA-256 verified against its published sum).
+      `uv lock --check` resolves; only pyyaml was added.
+- [x] `WorkbenchMixin.set_graph_text_scale` and the `widgets.py` scale it calls.
+      Lettering only: no node moves and no edge length changes, so a rescaled
+      tree is the same tree.
+- [x] `organism_typing` as a flat export field, gated on `current_characterization`
+      so typing from an earlier assembly leaves the column empty.
+- [x] Delete the dead `navigate` override and the temporary shim in `app.py`.
+- [x] Settle the organism-module registry order. It was decided by whichever
+      assay module was imported first, so a table and its export could reorder
+      their columns between runs.
 - [ ] Widen the threshold catalogue, or record why each remaining organism cannot
       be curated. Twelve listed organisms still have no cutoff at all, including
       *S. pneumoniae*, *S. enterica* and *S. capitis*.

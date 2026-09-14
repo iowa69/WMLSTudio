@@ -494,3 +494,36 @@ def test_graph_text_scale_resizes_lettering_without_moving_the_tree():
         assert _graph_font(6).pointSize() >= 6
     finally:
         set_graph_text_scale(previous)
+
+
+def test_exported_image_keeps_the_standard_text_size_whatever_the_reader_chose(qtbot, tmp_path):
+    """The Settings page promises a saved picture looks the same on every computer.
+
+    Graph text size is a per-reader comfort setting. If it leaked into exports,
+    two people reporting the same comparison would produce different figures.
+    """
+    from wmlstudio.widgets import TreeView, graph_text_scale, set_graph_text_scale
+    view = TreeView()
+    qtbot.addWidget(view)
+    view.resize(900, 600)
+    view.draw_results([
+        {"sample_id": "a", "sample_name": "A", "st": "1", "alleles": {"x": "1"}, "status": "completed"},
+        {"sample_id": "b", "sample_name": "B", "st": "2", "alleles": {"x": "2"}, "status": "completed"},
+    ], [], 10)
+    previous = graph_text_scale()
+    observed = []
+    original = view.canvas.render
+    try:
+        # Record the scale in force at the moment the scene is painted into the
+        # export, rather than comparing rendered bytes: node positions carry over
+        # between redraws, so image equality would assert layout, not text size.
+        view.canvas.render = lambda *args, **kwargs: (observed.append(graph_text_scale()),
+                                                      original(*args, **kwargs))[1]
+        set_graph_text_scale(150)
+        view.save_image(tmp_path / "enlarged.png")
+        assert observed == [100], f"export painted the scene at reader scale {observed}"
+        # The reader's own setting survives the export untouched.
+        assert graph_text_scale() == 150
+    finally:
+        del view.canvas.render
+        set_graph_text_scale(previous)

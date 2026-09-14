@@ -189,6 +189,17 @@ def set_cluster(project, sample_ids, label: str, color: str = "#2F8A78", highlig
             }})
 
 
+def _organism_typing(record):
+    """Organism-specific calls as one line, or empty when none are current.
+
+    Imported here because the registry imports its assay modules on first use,
+    and a flat export must not pay for that until it asks for the column.
+    """
+    from wmlstudio.characterization import current_characterization
+    from wmlstudio.organism_modules import summarize_record
+    return summarize_record(current_characterization(record).get("evidence") or {})
+
+
 def feature_fields(record, highlight=None) -> dict:
     result = record.get("result") or (record if "result" not in record else {})
     metadata = record.get("metadata", {})
@@ -226,6 +237,9 @@ def feature_fields(record, highlight=None) -> dict:
         "organism_confidence": str(decision.get("confidence") or ""),
         "organism_status": str(decision.get("status") or ""),
         "organism_quarantine": str(decision.get("quarantine_reason") or ""),
+        # Gated on current_characterization, so typing belonging to an earlier
+        # assembly leaves the column empty rather than reading as this one's.
+        "organism_typing": _organism_typing(record),
         "typing_mode": workflow.get("typing_mode", metadata.get("typing_mode", "")),
         "amr_genes": genes("AMR"), "virulence_genes": genes("VIRULENCE"),
         "plasmid_replicons": genes("PLASMID"), "stress_genes": genes("STRESS"),

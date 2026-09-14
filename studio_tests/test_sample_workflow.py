@@ -216,3 +216,29 @@ def test_organism_evidence_does_not_displace_the_hydra_provenance_fields(tmp_pat
         assert fields['hydra_source_sample'] == 'isolate'
         assert fields['hydra_report_sha256'] == 'abc'
         assert fields['hydra_amr_genes'] == 1
+
+
+def test_organism_typing_column_is_empty_when_the_assembly_changed(tmp_path):
+    """Typing from an earlier assembly must not be exported as this one's.
+
+    The flat column is a convenience for someone reading a spreadsheet rather
+    than the drill-down, which is exactly the reader least able to notice that
+    a call belonged to a different input.
+    """
+    from wmlstudio.characterization import persist_characterization
+    from wmlstudio.sequence import file_sha256
+    with Project(tmp_path / 'study.sqlite') as project:
+        source = tmp_path / 'assembly.fa'
+        sid = add(project, source, 'isolate')
+        digest = file_sha256(source)
+        project.set_result(sid, {'input_sha256': digest, 'st': '7'})
+        persist_characterization(project, sid, {
+            'format_version': 1, 'input_sha256': digest, 'input_path': str(source),
+            'sccmec': {'status': 'typed', 'candidate_types': ['IV'],
+                       'summary': 'SCCmec candidate type IV'}})
+        current = feature_fields(project.get_sample(sid))['organism_typing']
+        # The module reports its own conservative wording; the column carries it
+        # verbatim rather than restating a type the assay declined to assert.
+        assert current and 'withheld' in current
+        project.set_result(sid, {'input_sha256': 'b' * 64, 'st': '8'})
+        assert feature_fields(project.get_sample(sid))['organism_typing'] == ''

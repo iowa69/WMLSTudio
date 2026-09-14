@@ -79,6 +79,7 @@ class OrganismModule:
 
 
 REGISTRY: dict[str, OrganismModule] = {}
+_ORDER: dict[str, int] = {}
 
 
 def register(module):
@@ -92,8 +93,21 @@ def register(module):
     unsupported = set(module.option_keys) - {'threads', 'blastn_path', 'makeblastdb_path'}
     if unsupported:
         raise ValueError(f'Organism module {module.key!r} requests unsupported options: {sorted(unsupported)}.')
+    _ORDER.setdefault(module.key, len(_ORDER))
     REGISTRY[module.key] = module
     return module
+
+
+def _declared_order(item):
+    """Order modules by _ASSAY_MODULES, then by their order within their own file.
+
+    Whichever assay module Python happens to import first must not decide the
+    column order a user sees, or the order of the columns in an exported table.
+    """
+    key, module = item
+    origin = (getattr(module.runner, '__module__', '') or '').rsplit('.', 1)[-1]
+    position = _ASSAY_MODULES.index(origin) if origin in _ASSAY_MODULES else len(_ASSAY_MODULES)
+    return (position, _ORDER.get(key, len(_ORDER)))
 
 
 def _load():
@@ -105,6 +119,11 @@ def _load():
         _LOADED = True
     for name in _ASSAY_MODULES:
         __import__(f'{__package__}.{name}')
+    # An assay already imported by another path registered ahead of its turn, so
+    # settle the order once here rather than leaving it to import timing.
+    ordered = sorted(REGISTRY.items(), key=_declared_order)
+    REGISTRY.clear()
+    REGISTRY.update(ordered)
     return REGISTRY
 
 
