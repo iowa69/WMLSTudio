@@ -311,9 +311,18 @@ def test_cli_module_selection_records_applicability_and_never_fakes_a_negative(t
     assert completed.returncode == 0, completed.stderr
     output = json.loads(completed.stdout)
     assert output["sccmec"]["applicability"] == "recommended"
-    assert output["sccmec"]["status"] == "not_run"
-    # A snapshot without the panel is diagnosable, not a negative SCCmec result.
-    assert "sccmec.targets" in output["sccmec"]["reason"]
+    # The guarantee under test is that nothing is fabricated, and it has to hold
+    # in both reference states: the bundled snapshot may be format 1 with no
+    # sccmec section, or a freshly staged format 2 panel that really runs the
+    # assay. Pinning one of them makes this pass on a developer's machine and
+    # fail in CI, which is how it failed before.
+    if output["sccmec"]["status"] == "not_run":
+        # A snapshot without the panel is diagnosable, not a negative SCCmec result.
+        assert "sccmec.targets" in output["sccmec"]["reason"]
+    else:
+        # A real run on twelve bases cannot support a type, and must not invent one.
+        assert output["sccmec"]["status"] in {"ambiguous", "untypeable", "partial"}
+        assert not output["sccmec"].get("official_type")
     assert "not_detected" not in json.dumps(output["sccmec"])
     assert output["klebsiella_capsule"]["applicability"] == "off_panel"
     assert output["klebsiella_capsule"]["reason"] == "Assay not selected."
