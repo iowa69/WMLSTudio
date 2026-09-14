@@ -1,5 +1,23 @@
 # Active work
 
+## Investigation-first revision: the 100-isolate outbreak scenario
+
+- [ ] Translate the 15 user questions into a source-backed problem-to-result workflow contract.
+- [ ] Connect native workspace pages through a persistent investigation map, clear scope and actionable evidence states.
+- [ ] Add independent species evidence and linked virulence/plasmid/drug-association interpretation without unsupported phenotype or transmission claims.
+- [ ] Save named investigations, all-pair threshold clusters, review groups and immutable incremental snapshots.
+- [ ] Make graph selection, rich labels, cluster halos and proximity/cohort reports a continuous workflow.
+- [ ] Allocate CPU and RAM automatically across cancellable sample jobs and record actual resource plans.
+- [ ] Review filename-based read association and explicitly attach validated FASTQ pairs to existing assemblies without replacing their evidence.
+- [ ] Evaluate and implement defensible optional sequence-level refinement and missing-locus second-pass workflows with actual runtime checks.
+- [ ] Test representative local Klebsiella, Acinetobacter and Enterococcus inputs; preserve originals and record reproducible commands and limitations.
+- [ ] Publish a native in-app workflow guide and problem-to-solution documentation with verified screenshots and capability boundaries.
+- [ ] Run regression, real-data, native Windows/package and usability acceptance gates before release handoff.
+
+This revision starts from `2135c3e` on `investigation-v0.3`. Raw local sequence
+data remain private and unchanged; only source, tests and sequence-free validation
+summaries may be versioned. The existing 0.2 release remains available unchanged.
+
 ## Workbench revision requested after user acceptance feedback
 
 - [x] Replace page-opacity rendering and implement a consistent dark native theme.

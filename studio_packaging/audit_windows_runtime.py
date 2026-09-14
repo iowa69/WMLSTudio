@@ -23,7 +23,7 @@ mfuuid.dll mpr.dll msvcrt.dll mswsock.dll ncrypt.dll netapi32.dll normaliz.dll
 ntdll.dll ole32.dll oleacc.dll oleaut32.dll opengl32.dll powrprof.dll propsys.dll
 psapi.dll rpcrt4.dll secur32.dll setupapi.dll shell32.dll shlwapi.dll shcore.dll
 uiautomationcore.dll user32.dll userenv.dll usp10.dll uxtheme.dll ucrtbase.dll version.dll winhttp.dll
-wininet.dll winmm.dll winspool.drv wintrust.dll wlanapi.dll wldap32.dll ws2_32.dll
+wininet.dll winmm.dll winscard.dll winspool.drv wintrust.dll wlanapi.dll wldap32.dll ws2_32.dll wsock32.dll
 wtsapi32.dll xinput1_4.dll
 """.split())
 
@@ -71,9 +71,13 @@ def audit(bundle):
     reports = {
         "blast_isolated": verify_directory(bundle / "_internal/Tools/blast/bin"),
         "skesa_isolated": verify_directory(bundle / "_internal/wmlstudio/resources/tools/skesa"),
+        "ska2_isolated": verify_directory(bundle / "_internal/Tools/ska2"),
         "pyinstaller_managed": verify_directory(bundle, recursive=True, excluded_roots=[
             bundle / "_internal/Tools", bundle / "_internal/wmlstudio/resources/tools"]),
     }
+    fastqc_jre = bundle / "_internal/Tools/fastqc/jre"
+    if fastqc_jre.is_dir():
+        reports["fastqc_java_isolated"] = verify_java_runtime(fastqc_jre)
     notices = json.loads((bundle / "_internal/notices/licenses/manifest.json").read_text(encoding="utf-8"))
     runtime = notices.get("native_runtime", [])
     if {item["name"] for item in runtime} != {"msvcp140.dll", "vcruntime140.dll", "vcruntime140_1.dll"}:
@@ -85,6 +89,35 @@ def audit(bundle):
             raise ValueError(f"Native runtime differs from its official-wheel provenance: {item['name']}")
     return {"bundle": str(bundle), "status": "passed", "policy": "Windows11 system allowlist, never runner DLL inventory",
             "groups": reports, "native_runtime": runtime, "tls_providers": tls}
+
+
+def verify_java_runtime(root):
+    """JVM DLLs resolve only against their own directory and app-local JRE bin.
+
+    Do not let a DLL in Python, Qt, BLAST, or a runner's redist mask a missing
+    Java dependency. HotSpot loads server/jvm.dll explicitly from the JRE.
+    """
+    root = Path(root).resolve()
+    java_bin = root / "bin"
+    records = []
+    for binary in sorted(root.rglob("*")):
+        if not binary.is_file() or binary.suffix.lower() not in {".exe", ".dll"}:
+            continue
+        available = {path.name.casefold() for folder in (binary.parent, java_bin)
+                     for path in folder.iterdir() if path.is_file()}
+        # java.exe explicitly loads server/jvm.dll before JVM code loads AWT,
+        # fontmanager or other modules that import the already-loaded JVM.
+        if (java_bin / "server/jvm.dll").is_file():
+            available.add("jvm.dll")
+        imports = imported_dlls(binary)
+        missing = [name for name in imports if name not in available and name not in SYSTEM_DLLS
+                   and not name.startswith(("api-ms-win-", "ext-ms-win-"))]
+        if missing:
+            raise ValueError(f"Missing isolated Java runtime dependency for {binary.name}: {', '.join(missing)}")
+        records.append({"binary": binary.relative_to(root).as_posix(), "imports": imports})
+    if not records or not (java_bin / "java.exe").is_file() or not (java_bin / "server/jvm.dll").is_file():
+        raise ValueError("Incomplete app-local Windows Java runtime")
+    return records
 
 
 def verify_tls_providers(bundle):

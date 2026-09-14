@@ -368,6 +368,41 @@ class Project:
                 (sample_id,),
             )]
 
+    def analysis_summaries(self, sample_id: str) -> list[dict[str, Any]]:
+        """Lightweight labels/fingerprints without decoding locus/call arrays in Python.
+
+        SQLite JSON support is present in packaged CPython. Older external
+        SQLite builds use a correctness-preserving fallback, not guessed labels.
+        """
+        with self._lock:
+            self._check_open()
+            if self._connection.execute('SELECT 1 FROM samples WHERE id = ?', (sample_id,)).fetchone() is None:
+                raise KeyError(f'Unknown sample: {sample_id}')
+            fields = ('scheme', 'input_sha256', 'status', 'analysis_kind', 'kind', 'scheme_path', 'st')
+            expressions = ', '.join(f"json_extract(a.result, '$.{field}') AS {field}" for field in fields)
+            try:
+                rows = self._connection.execute(
+                    'SELECT a.scheme_digest, a.updated_at, ' + expressions + ', '
+                    "CASE WHEN json_type(a.result, '$.alleles') = 'object' "
+                    "THEN (SELECT COUNT(*) FROM json_each(a.result, '$.alleles')) ELSE 0 END AS locus_count "
+                    'FROM analyses a WHERE a.sample_id = ? ORDER BY a.updated_at, a.scheme_digest',
+                    (sample_id,),
+                ).fetchall()
+                return [dict(row) for row in rows]
+            except sqlite3.OperationalError as error:
+                if not any(message in str(error).lower() for message in ('no such function: json_', 'no such table: json_each')):
+                    raise
+                summaries = []
+                for row in self._connection.execute(
+                    'SELECT scheme_digest, updated_at, result FROM analyses WHERE sample_id = ? ORDER BY updated_at, scheme_digest',
+                    (sample_id,),
+                ):
+                    result = json.loads(row['result'])
+                    summaries.append({**{field: result.get(field) for field in fields},
+                                      'scheme_digest': row['scheme_digest'], 'updated_at': row['updated_at'],
+                                      'locus_count': len(result['alleles']) if isinstance(result.get('alleles'), dict) else 0})
+                return summaries
+
     def set_status(self, sample_id: str, status: str, error: str = "") -> None:
         if status not in STATUSES:
             raise ValueError(f"Unknown job status {status!r}.")

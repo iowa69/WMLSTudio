@@ -20,6 +20,7 @@ from PySide6.QtWidgets import (
     QTreeWidget,
     QTreeWidgetItem,
     QVBoxLayout,
+    QWidget,
 )
 
 from wmlstudio.background import FunctionWorker
@@ -38,7 +39,8 @@ from wmlstudio.widgets import DropZone, Helix, Metric, button, card, label
 class WorkbenchMixin:
     def __init__(self, *args, **kwargs):
         self.selection_ids = set()
-        self.cohort_ids = None
+        self.cohort_ids = set()
+        self.feature_ids = set()
         self.report_ids = set()
         self.library_filter = None
         self.worker_role = ""
@@ -53,11 +55,20 @@ class WorkbenchMixin:
         self._run_cancelled = False
         self._task_succeeded = False
         self._typing_override = None
+        self._progress_dialog = None
+        self.ui_scale = 100
         super().__init__(*args, **kwargs)
         from wmlstudio import theme
         if hasattr(theme, "apply_dark_palette"):
             theme.apply_dark_palette(QApplication.instance())
         QApplication.instance().setStyleSheet(theme.STYLE)
+        from wmlstudio.interface_settings import interface_preferences
+        preferences = interface_preferences(self.root)
+        try:
+            initial_scale = int(preferences.value("scale", 100))
+        except (TypeError, ValueError):
+            initial_scale = 100
+        self.set_ui_scale(initial_scale)
         for combo in self.findChildren(QComboBox):
             combo.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon)
             combo.setMinimumContentsLength(int(combo.property("compactCharacters") or 18))
@@ -73,20 +84,19 @@ class WorkbenchMixin:
         if hasattr(self.tree, "restore_state"):
             self._pending_graph_state = self.project.get_setting("graph_style", {"version": 1})
         self.refresh()
-        self.statusBar().showMessage("Local genomics workbench · Select samples to begin")
+        self.statusBar().showMessage("Local genomics workbench · Import isolates, then choose an analysis")
 
     def build_overview(self):
         _, layout = self.page()
         hero, content = card()
         row = QHBoxLayout()
         words = QVBoxLayout()
-        words.addWidget(label("YOUR GENOMICS LIBRARY", "eyebrow"))
-        words.addWidget(label("Every isolate. One connected workspace.", "title", True))
-        words.addWidget(label("Browse by organism and ST, keep your input copies safe, and return to any saved analysis.", "muted", True))
+        words.addWidget(label("FROM A QUESTION TO REVIEWABLE EVIDENCE", "eyebrow"))
+        words.addWidget(label("Your investigation, connected.", "title", True))
+        words.addWidget(label("Identify, characterize, compare and report the same isolates. Add new samples without losing earlier work.", "muted", True))
         actions = FlowLayout()
         actions.addWidget(button("Import sequences…", self.browse_files, True))
         actions.addWidget(button("New project…", self.new_project))
-        actions.addWidget(button("Open data folder", self.open_data_folder))
         actions.addWidget(button("Research saved library…", self.open_library_research))
         actions.addStretch()
         words.addLayout(actions)
@@ -98,12 +108,23 @@ class WorkbenchMixin:
         row.addWidget(self.helix, 1)
         content.addLayout(row)
         layout.addWidget(hero)
+        from wmlstudio.journey_widgets import InvestigationMap
+
+        self.overview_tabs = QTabWidget()
+        self.investigation_map = InvestigationMap()
+        self.investigation_map.actionRequested.connect(self.journey_action)
+        self.overview_tabs.addTab(self.investigation_map, "Investigation map")
+        library_page = QWidget()
+        library_layout = QVBoxLayout(library_page)
+        library_layout.setContentsMargins(0, 14, 0, 0)
+        self.overview_tabs.addTab(library_page, "Stored library")
+        layout.addWidget(self.overview_tabs, 1)
         metrics = QHBoxLayout()
         self.metrics = [Metric("Isolates", "in the active library"), Metric("Analysed", "saved evidence"),
                         Metric("Exact MLST", "registered profiles"), Metric("Review", "incomplete or failed")]
         for metric in self.metrics:
             metrics.addWidget(metric)
-        layout.addLayout(metrics)
+        library_layout.addLayout(metrics)
         splitter = QSplitter(Qt.Orientation.Horizontal)
         explorer, content = card()
         content.addWidget(label("Library navigator", "cardTitle"))
@@ -125,14 +146,14 @@ class WorkbenchMixin:
         content.addWidget(self.drop_zone)
         splitter.addWidget(recent)
         splitter.setSizes([320, 650])
-        layout.addWidget(splitter, 1)
+        library_layout.addWidget(splitter, 1)
         self.practice_notice = label("Practice project · synthetic sequences, not biological isolates.", "small")
         self.practice_notice.hide()
         layout.addWidget(self.practice_notice)
 
     def build_samples(self):
         _, layout = self.page()
-        self.heading(layout, "Sample library", "Select isolates, assign their workflow, and inspect the connected evidence. Ctrl/Shift selects a cohort.")
+        self.heading(layout, "Isolate library", "Browse your stored isolates. Double-click a record for complete evidence; each analysis chooses its own cohort.")
         row = QHBoxLayout()
         self.search = QLineEdit()
         self.search.setPlaceholderText("Search names, organisms, STs, AMR genes, collections or metadata…")
@@ -141,7 +162,7 @@ class WorkbenchMixin:
         row.addWidget(self.search, 1)
         row.addWidget(button("Import…", self.browse_files, True))
         row.addWidget(button("Assign organism…", self.assign_selected))
-        row.addWidget(button("Metadata…", self.edit_metadata))
+        row.addWidget(button("Epidemiology grid…", self.open_metadata_grid))
         layout.addLayout(row)
         filters = FlowLayout()
         self.genus_filter = QComboBox()
@@ -153,21 +174,18 @@ class WorkbenchMixin:
             combo.currentIndexChanged.connect(self.refresh_tables)
             filters.addWidget(combo, 1)
         filters.addWidget(button("Clear filters", self.clear_filters))
-        filters.addWidget(button("Select visible", self.select_visible_samples))
-        filters.addWidget(button("Clear selection", self.clear_sample_selection))
         layout.addLayout(filters)
         run, content = card()
         strip = FlowLayout()
         self.scheme_combo = QComboBox()
         self.scheme_combo.setMinimumWidth(180)
         self.scheme_combo.setAccessibleName("Typing scheme override")
-        strip.addWidget(self.scheme_combo, 1)
-        self.run_button = button("Analyse pending…", lambda: self.start_analysis(confirm=True), True)
-        self.rerun_button = button("Analyse selected…", lambda: self.start_analysis(selected_only=True, confirm=True))
+        self.scheme_combo.hide()  # Per-isolate schemes are reviewed in the analysis dialog.
+        self.run_button = button("Analyse…", self.choose_and_analyse, True)
+        self.rerun_button = button("Review pending…", lambda: self.choose_and_analyse(pending_only=True))
         strip.addWidget(self.run_button)
         strip.addWidget(self.rerun_button)
-        strip.addWidget(button("Compare selected", self.compare_selected))
-        strip.addWidget(button("Report selected", self.report_selected))
+        strip.addWidget(button("Attach reads…", self.attach_reads_selected))
         content.addLayout(strip)
         self.selection_label = label("No samples selected · each sample keeps its own organism and typing workflow", "small", True)
         content.addWidget(self.selection_label)
@@ -176,6 +194,9 @@ class WorkbenchMixin:
         self.sample_table = make_table(["Sample", "Input", "Status", "ST", "Called loci", "Genus", "Species",
                                         "Evidence", "Scheme", "AMR genes", "Collection", "Storage"])
         self.sample_table.itemSelectionChanged.connect(self.sample_selection_changed)
+        self.sample_table.cellDoubleClicked.connect(lambda row, column: self.open_isolate_record(self.sample_table.item(row, 0).data(Qt.ItemDataRole.UserRole)))
+        for column in (7, 8, 10, 11):
+            self.sample_table.setColumnHidden(column, True)
         self.sample_table.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.sample_table.customContextMenuRequested.connect(self.sample_context_menu)
         splitter.addWidget(self.sample_table)
@@ -186,8 +207,8 @@ class WorkbenchMixin:
         inspector.addTab(self.detail, "Sample evidence")
         self.history_view = QTextBrowser()
         inspector.addTab(self.history_view, "History / provenance")
-        splitter.addWidget(inspector)
-        splitter.setSizes([420, 190])
+        inspector.setParent(self)
+        inspector.hide()  # Complete evidence is available in the isolate popup.
         layout.addWidget(splitter, 1)
 
     def refresh(self):
@@ -212,8 +233,53 @@ class WorkbenchMixin:
                 self.refresh_report_table()
             if hasattr(self, "feature_table"):
                 self.refresh_features()
+            self.refresh_journey()
         finally:
             self._refreshing = False
+
+    def refresh_journey(self):
+        if not hasattr(self, "investigation_map"):
+            return
+        from wmlstudio.journey import journey_summary
+        summary = journey_summary(self.current_samples, selected_ids=self.selection_ids,
+                                  comparison_ids=self.cohort_ids)
+        investigation = self.investigation_summary() if hasattr(self, "investigation_summary") else {}
+        description = None
+        if investigation.get("saved"):
+            description = (f"Investigation: {investigation.get('name')} · {investigation.get('snapshots', 0)} saved snapshots · "
+                           "New samples are included only after you review the cohort.")
+        self.investigation_map.set_summary(summary, description)
+        if hasattr(self, "scope_label"):
+            counts = summary["counts"]
+            self.scope_label.setText(f"{counts['total']} isolates in project")
+
+    def journey_action(self, action):
+        """Route problem-oriented actions without silently broadening a cohort."""
+        if action == "import":
+            self.browse_files()
+        elif action == "guide":
+            self.open_workflow_guide()
+        elif action == "samples":
+            self.navigate(1)
+        elif action == "review":
+            from wmlstudio.journey import journey_summary
+            identifiers = journey_summary(self.current_samples)["review_ids"]
+            self.clear_filters()
+            self.selection_ids = set(identifiers)
+            self.library_filter = ("ids", set(identifiers))
+            self.refresh_tables()
+            self.navigate(1)
+            self.notify(f"{len(identifiers)} flagged isolates shown. Clear filters to return to all samples.")
+        elif action == "analyse":
+            self.choose_and_analyse()
+        elif action == "characterize":
+            self.run_characterization_selected()
+        elif action == "features":
+            self.choose_feature_cohort()
+        elif action == "compare":
+            self.navigate(2)
+        elif action == "reports":
+            self.navigate(5)
 
     def refresh_library(self):
         tree = self.library_tree
@@ -292,10 +358,7 @@ class WorkbenchMixin:
     def open_recent_sample(self, row, column=0):
         item = self.recent_table.item(row, 0)
         if item:
-            self.library_filter = ("ids", [item.data(Qt.ItemDataRole.UserRole)])
-            self.selection_ids = set(self.library_filter[1])
-            self.refresh_tables()
-            self.navigate(1)
+            self.open_isolate_record(item.data(Qt.ItemDataRole.UserRole))
 
     @staticmethod
     def fill_filter(combo, values, title):
@@ -397,6 +460,8 @@ class WorkbenchMixin:
         self.selection_label.setText(f"{len(self.selection_ids)} selected · {len(visible)} visible · {len(self.current_samples)} in project")
         self.show_sample_detail()
 
+        self.refresh_journey()
+
     def select_visible_samples(self):
         self.sample_table.selectAll()
         self.sample_selection_changed()
@@ -416,8 +481,8 @@ class WorkbenchMixin:
     def selected_samples(self):
         return [s for s in self.project.samples() if s["id"] in self.selection_ids]
 
-    def show_sample_detail(self):
-        sample = self.selected_sample()
+    def show_sample_detail(self, sample_id=None):
+        sample = self.project.get_sample(sample_id) if sample_id else self.selected_sample()
         if not sample:
             self.detail.setHtml("<h3>Select an isolate to inspect its evidence</h3><p>Use Ctrl/Shift to select a cohort. Organism, typing, AMR and annotations stay linked by sample ID.</p>")
             if hasattr(self, "history_view"):
@@ -595,12 +660,26 @@ class WorkbenchMixin:
         self.progress_bar.setVisible(running)
         if running:
             self.progress_bar.setValue(0)
+            from wmlstudio.analysis_progress import AnalysisProgressDialog
+            if self._progress_dialog is None or self._progress_dialog.finished_safely:
+                self._progress_dialog = AnalysisProgressDialog(self)
+            self._progress_dialog.show()
+        elif self._progress_dialog is not None:
+            self._progress_dialog.finish()
 
-    def start_analysis(self, checked=False, all_samples=False, selected_only=False, confirm=False, assemble=False):
+    def job_progress(self, percent, message):
+        super().job_progress(percent, message)
+        if self._progress_dialog is not None and not self._progress_dialog.finished_safely:
+            self._progress_dialog.update_progress(percent, message)
+
+    def start_analysis(self, checked=False, all_samples=False, selected_only=False, confirm=False, assemble=False, sample_ids=None):
         if self.busy():
             return
-        samples = [s for s in self.project.samples() if (s["id"] in self.selection_ids if selected_only
-                   else all_samples or s["status"] in {"queued", "failed", "interrupted"})]
+        chosen_ids = set(sample_ids) if sample_ids is not None else None
+        samples = [s for s in self.project.samples() if
+                   (s["id"] in chosen_ids if chosen_ids is not None else
+                    s["id"] in self.selection_ids if selected_only else
+                    all_samples or s["status"] in {"queued", "failed", "interrupted"})]
         samples = [s for s in samples if s.get("input_path") and s.get("metadata", {}).get("workflow", {}).get("source_kind") != "read_mate"]
         if not samples:
             self.notify("No sequence inputs in the requested selection. Import files, select rows or use saved profiles in Compare.")
@@ -617,6 +696,7 @@ class WorkbenchMixin:
         self._run_ids = {sample["id"] for sample in samples}
         self._run_cancelled = False
         self._typing_override = scheme
+        pairs = None
         if plan.get("assemble"):
             from wmlstudio.pairing_dialog import PairReadsDialog
             reads = [sample for sample in samples if Path(sample["input_path"]).name.lower().removesuffix(".gz").removesuffix(".bz2").endswith((".fq", ".fastq"))]
@@ -628,18 +708,79 @@ class WorkbenchMixin:
             if pairing.exec() != QDialog.DialogCode.Accepted:
                 self._run_plan = {}
                 return
-            self.assemble_pairs(pairing.assignments, plan)
+            pairs = pairing.assignments
+        if plan.get("fastqc"):
+            self.begin_fastqc_plan(samples, scheme, pairs)
+        elif pairs:
+            self.assemble_pairs(pairs, plan)
+        else:
+            self.begin_typing(samples, scheme)
+
+    def begin_fastqc_plan(self, samples, scheme, pairs=None):
+        from wmlstudio.fastqc_dialog import reads_for_sample, run_project_fastqc
+        from wmlstudio.scheduler import resources_for_run
+        reads = [sample for sample in samples if reads_for_sample(sample)]
+        if not reads:
+            self.notify("No original reads are linked to the reviewed inputs; FastQC was not run.")
+            self._run_plan = {}
             return
+        try:
+            allocation = resources_for_run(self._run_plan, memory_gb=1)
+        except ValueError as exc:
+            self.error(str(exc))
+            self._run_plan = {}
+            return
+        self._fastqc_pending = {"ids": [sample["id"] for sample in samples], "scheme": scheme, "pairs": pairs}
+        self._fastqc_flagged = 0
+        project = self.project
+        output = self.project_path.with_suffix(".files") / "fastqc_reports"
+        def operation(cancelled, progress):
+            return run_project_fastqc(project, reads, output, allocation, cancelled=cancelled, progress=progress)
+        def completed(results):
+            self._fastqc_flagged = sum(report["qc_status"] == "FAIL" for entry in results
+                                      for report in entry["result"]["reports"])
+            self.notify(f"Original FastQC completed for {len(results)} inputs; {self._fastqc_flagged} read reports have FAIL flags. No reads were trimmed.")
+        self.launch_task(operation, "fastqc_pipeline", completed)
+
+    def continue_after_fastqc(self):
+        pending = getattr(self, "_fastqc_pending", None)
+        self._fastqc_pending = None
+        if not pending or self._run_cancelled or not self._task_succeeded:
+            self._run_plan = {}
+            return
+        if self._fastqc_flagged:
+            from PySide6.QtWidgets import QMessageBox
+            answer = QMessageBox.question(self, "Review FastQC flags before continuing",
+                f"{self._fastqc_flagged} read reports contain FastQC FAIL flags. Reports are saved with the isolates. "
+                "These flags are not an automatic instruction to trim, but may affect downstream interpretation. "
+                "Continue the reviewed analysis on the unchanged reads?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No, QMessageBox.StandardButton.No)
+            if answer != QMessageBox.StandardButton.Yes:
+                self._run_plan = {}
+                self.notify("Stopped after FastQC for review. Saved reports and original reads are retained.")
+                return
+        if pending["pairs"]:
+            self.assemble_pairs(pending["pairs"], self._run_plan)
+            return
+        samples = [self.project.get_sample(identifier) for identifier in pending["ids"]]
+        scheme = pending["scheme"]
         self.begin_typing(samples, scheme)
 
     def begin_typing(self, samples, scheme):
+        from wmlstudio.scheduler import resources_for_run
+        try:
+            allocation = resources_for_run(self._run_plan)
+        except ValueError as exc:
+            self.error(str(exc))
+            return
         if scheme:
             samples = [dict(sample, metadata={**sample.get("metadata", {}), "workflow": {
                 **sample.get("metadata", {}).get("workflow", {}), "typing_mode": "manual", "scheme_path": scheme}})
                 for sample in samples]
         self.project.set_setting("scheme_path", scheme or "")
         self.worker_role = "analysis"
-        self.worker = AnalysisWorker(samples, scheme, parent=self, installed_scheme_paths=self.scheme_paths)
+        self.worker = AnalysisWorker(samples, scheme, parent=self, installed_scheme_paths=self.scheme_paths,
+                                     resource_plan=allocation)
         self.worker.sample_started.connect(self.sample_started)
         self.worker.sample_finished.connect(self.sample_finished)
         self.worker.sample_failed.connect(self.sample_failed)
@@ -653,18 +794,29 @@ class WorkbenchMixin:
         import uuid
 
         from wmlstudio.assembly import associate_assembly, run_skesa
+        from wmlstudio.scheduler import resources_for_run, run_bounded
         project = self.project
+        try:
+            allocation = resources_for_run(plan, memory_gb=8)
+        except ValueError as exc:
+            self.error(str(exc))
+            return
+        tasks = [{"primary": project.get_sample(pair["primary_id"]),
+                  "mate": project.get_sample(pair["mate_id"])} for pair in pairs]
+        output_root = self.project_path.with_suffix(".files") / "assemblies"
         def operation(cancelled, progress):
             identifiers = []
-            for index, pair in enumerate(pairs):
-                primary = project.get_sample(pair["primary_id"])
-                mate = project.get_sample(pair["mate_id"])
-                destination = self.project_path.with_suffix(".files") / "assemblies" / primary["id"] / uuid.uuid4().hex
-                result = run_skesa(primary["input_path"], mate["input_path"], destination,
-                    threads=plan.get("threads", 4), memory_gb=plan.get("memory_gb", 8), cancelled=cancelled,
-                    progress=lambda done, total, message: progress(index * 100 + done / max(1, total) * 100, len(pairs) * 100, f"{primary['name']} · {message}"))
+            def assemble(task, resources, stopped, report):
+                primary, mate = task["primary"], task["mate"]
+                destination = output_root / primary["id"] / uuid.uuid4().hex
+                return run_skesa(primary["input_path"], mate["input_path"], destination,
+                    threads=resources.threads_per_sample, memory_gb=resources.memory_gb, cancelled=stopped,
+                    progress=lambda done, total, message: report(done, total, f"{primary['name']} · {message}"))
+            def attach(task, result):
+                primary, mate = task["primary"], task["mate"]
                 associate_assembly(project, primary["id"], mate["id"], result)
                 identifiers.append(primary["id"])
+            run_bounded(tasks, assemble, allocation, cancelled=cancelled, on_result=attach, progress=progress)
             return identifiers
         self.launch_task(operation, "assembly", lambda ids: self.notify(f"Assembled {len(ids)} read pairs. Starting the assigned typing workflow…"))
 
@@ -675,6 +827,9 @@ class WorkbenchMixin:
         self.refresh()
         if self.closing_after_cancel:
             self.close()
+            return
+        if role == "fastqc_pipeline":
+            self.continue_after_fastqc()
             return
         if role == "assembly":
             if self._task_succeeded and not self._run_cancelled:
@@ -754,6 +909,7 @@ class WorkbenchMixin:
     def run_hydra_plan(self, identifiers, plan, require_completed=True):
         from wmlstudio.hydra_runtime import run_assemblies
         from wmlstudio.sample_workflow import link_hydra
+        from wmlstudio.scheduler import resources_for_run, run_bounded
         samples = [sample for sample in self.project.samples() if sample["id"] in identifiers
                    and sample.get("input_path") and (not require_completed or sample["status"] == "completed")]
         assemblies = [sample for sample in samples if (sample.get("result") or {}).get("kind", sample.get("kind")) == "fasta"
@@ -761,26 +917,28 @@ class WorkbenchMixin:
         if not assemblies:
             self.notify("No FASTA assemblies are ready for HYDRA in this selection. Raw reads must be assembled first.")
             return
+        try:
+            allocation = resources_for_run(plan, memory_gb=3)
+        except ValueError as exc:
+            self.error(str(exc))
+            return
 
         def operation(cancelled, progress):
             import hashlib
 
-            from wmlstudio.sequence import AnalysisCancelled
             reports = []
-            for index, sample in enumerate(assemblies):
-                if cancelled():
-                    raise AnalysisCancelled("HYDRA cancelled; previously completed sample evidence is saved.")
+            def analyse(sample, resources, stopped, report_progress):
                 genus, species, _ = organism_for(sample)
                 assigned = sample.get("metadata", {}).get("organism", {})
                 # A provisional MLST lineage alone is not a verified mutation-catalog assignment.
                 organism = " ".join([genus, species]) if assigned.get("genus") and assigned.get("species") else None
-                progress(index, len(assemblies), f"HYDRA · {sample['name']}")
-                report = run_assemblies([sample["input_path"]], plan["db_root"], plan.get("databases"),
-                    sample_names=[sample["id"]], organism=organism, threads=plan.get("threads", 4),
-                    protein=plan.get("protein", True), cancelled=cancelled,
+                return run_assemblies([sample["input_path"]], plan["db_root"], plan.get("databases"),
+                    sample_names=[sample["id"]], organism=organism, threads=resources.threads_per_sample,
+                    protein=plan.get("protein", True), cancelled=stopped,
                     point_mutations=plan.get("point_mutations", True),
                     **plan.get("thresholds", {}),
-                    progress=lambda done, total, message: progress(index, len(assemblies), f"{sample['name']} · {message}"))
+                    progress=lambda done, total, message: report_progress(done, total, f"{sample['name']} · {message}"))
+            def attach(sample, report):
                 link_hydra(self.project, report, {sample["id"]: sample["id"]})
                 reports.append(report)
                 combined = dict(report, samples=[entry for result in reports for entry in result["samples"]])
@@ -789,7 +947,7 @@ class WorkbenchMixin:
                     "sha256": hashlib.sha256(json.dumps(components, sort_keys=True).encode()).hexdigest()}
                 combined["execution_provenance"] = {"sample_runs": [result.get("execution_provenance", {}) for result in reports]}
                 self.project.set_setting("hydra_report", combined)
-                progress(index + 1, len(assemblies), f"HYDRA evidence saved · {sample['name']}")
+            run_bounded(assemblies, analyse, allocation, cancelled=cancelled, on_result=attach, progress=progress)
             return len(reports)
 
         self.launch_task(operation, "hydra", lambda count: self.notify(f"HYDRA completed for {count} assemblies. AMR evidence is linked to the sample library and reports."))
@@ -817,8 +975,14 @@ class WorkbenchMixin:
             self.selection_ids.clear()
             self.report_ids.clear()
             cohort = self.project.get_setting("comparison_cohort", None)
-            self.cohort_ids = set(cohort) if cohort is not None else None
+            self.cohort_ids = set(cohort) if cohort is not None else set()
+            self.feature_ids = set()
+            for dialog in getattr(self, "isolate_dialogs", {}).values():
+                dialog.close()
+            self.isolate_dialogs = {}
             self.library_filter = None
+            if hasattr(self, "restore_investigations"):
+                self.restore_investigations()
             if hasattr(self, "tree") and hasattr(self.tree, "restore_state"):
                 self._pending_graph_state = self.project.get_setting("graph_style", {"version": 1})
             self.refresh()
@@ -949,12 +1113,15 @@ class WorkbenchMixin:
         action(samples, "Select visible", self.select_visible_samples)
         action(samples, "Clear selection", self.clear_sample_selection)
         action(samples, "Relink input (same bytes)…", self.relink_selected_input)
+        action(samples, "Attach original reads to assemblies…", self.attach_reads_selected)
         action(samples, "Remove sample…", self.remove_sample)
         analysis = bar.addMenu("&Analysis")
-        action(analysis, "Analyse selected…", lambda: self.start_analysis(selected_only=True, confirm=True), "Ctrl+R")
-        action(analysis, "Analyse pending…", lambda: self.start_analysis(confirm=True))
-        action(analysis, "Run HYDRA on selected assemblies…", self.run_hydra_selected)
-        action(analysis, "Assemble and analyse selected read pairs…", lambda: self.start_analysis(selected_only=True, confirm=True, assemble=True))
+        action(analysis, "Choose isolates and analyse…", self.choose_and_analyse, "Ctrl+R")
+        action(analysis, "Review pending isolates…", lambda: self.choose_and_analyse(pending_only=True))
+        action(analysis, "Choose assemblies for HYDRA…", self.choose_hydra_cohort)
+        action(analysis, "Characterize identity / virulence / accessory evidence…", self.run_characterization_selected)
+        action(analysis, "Assemble and analyse read pairs…", lambda: self.choose_and_analyse(assemble=True))
+        action(analysis, "Check missing loci with original reads…", self.open_read_support)
         action(analysis, "Cancel current task", self.cancel_analysis)
         analysis.addSeparator()
         action(analysis, "Build comparison from selected", self.compare_selected)
@@ -964,7 +1131,10 @@ class WorkbenchMixin:
         action(data, "Online scheme catalog…", self.open_reference_manager)
         action(data, "Research saved library…", self.open_library_research)
         action(data, "AMR databases / updates…", self.open_amr_databases)
+        action(data, "Characterization references / updates…", self.install_characterization_references)
         action(data, "Import local scheme…", self.import_scheme)
+        action(data, "Epidemiology grid / bulk import…", self.open_metadata_grid)
+        action(data, "Published cluster threshold guidance…", self.open_threshold_guidance)
         action(data, "Open data folder", self.open_data_folder)
         action(data, "Open selected input folder", self.open_sample_folder)
         view = bar.addMenu("&View")
@@ -972,16 +1142,128 @@ class WorkbenchMixin:
             action(view, title, lambda checked=False, i=index: self.navigate(i), f"Alt+{index + 1}")
         action(view, "Refresh current workspace", self.refresh, "F5")
         action(view, "Fit comparison", lambda: self.tree.fit_tree())
+        action(view, "Increase interface scale", lambda: self.set_ui_scale(self.ui_scale + 10), "Ctrl++")
+        action(view, "Decrease interface scale", lambda: self.set_ui_scale(self.ui_scale - 10), "Ctrl+-")
+        action(view, "Reset interface scale", lambda: self.set_ui_scale(100), "Ctrl+0")
         help_menu = bar.addMenu("&Help")
         action(help_menu, "Practice project", self.load_demo)
+        action(help_menu, "Problem → solution guide", self.open_workflow_guide, "F1")
         action(help_menu, "Command search…", self.command_palette, "Ctrl+K")
-        action(help_menu, "Workflow and limitations", lambda: self.navigate(6))
+        action(help_menu, "Workflow and limitations", self.open_workflow_guide)
 
     def command_palette(self):
         names = [title.replace("&", "") for title, _ in self.command_actions]
         title, accepted = QInputDialog.getItem(self, "Command search", "Choose a command (type to search):", names, 0, True)
         if accepted and title in names:
             self.command_actions[names.index(title)][1].trigger()
+
+    def open_workflow_guide(self, topic=None):
+        from wmlstudio.workflow_guide import WorkflowGuide
+        try:
+            if getattr(self, "workflow_guide", None) is None:
+                self.workflow_guide = WorkflowGuide(self)
+                self.workflow_guide.actionRequested.connect(self.journey_action)
+            if isinstance(topic, str) and topic:
+                self.workflow_guide.search.setText(topic)
+            self.workflow_guide.show()
+            self.workflow_guide.raise_()
+        except (OSError, ValueError) as error:
+            self.error(str(error))
+
+    def attach_reads_selected(self):
+        from wmlstudio.read_attachment_dialog import launch_read_attachment
+        launch_read_attachment(self)
+
+    def set_ui_scale(self, percent):
+        from wmlstudio.interface_settings import interface_preferences, scaled_style
+        percent = max(80, min(150, int(percent)))
+        self.ui_scale = percent
+        QApplication.instance().setStyleSheet(scaled_style(percent))
+        interface_preferences(self.root).setValue("scale", percent)
+        self.updateGeometry()
+
+    def open_interface_settings(self):
+        from wmlstudio.interface_settings import InterfaceSettingsDialog
+        if getattr(self, "interface_dialog", None) is None:
+            self.interface_dialog = InterfaceSettingsDialog(self)
+            self.interface_dialog.setWindowModality(Qt.WindowModality.WindowModal)
+        self.interface_dialog.show()
+        self.interface_dialog.raise_()
+
+    def show_sample_detail_for_id(self, sample_id):
+        self.show_sample_detail(sample_id)
+
+    def open_isolate_record(self, sample_id):
+        from wmlstudio.isolate_dialog import IsolateRecordDialog
+        if not isinstance(sample_id, str):
+            return
+        try:
+            self.project.get_sample(sample_id)
+        except KeyError:
+            self.notify("That isolate is no longer in this project.")
+            return
+        if not hasattr(self, "isolate_dialogs"):
+            self.isolate_dialogs = {}
+        if sample_id not in self.isolate_dialogs:
+            self.isolate_dialogs[sample_id] = IsolateRecordDialog(self, sample_id)
+        dialog = self.isolate_dialogs[sample_id]
+        dialog.refresh_record()
+        dialog.show()
+        dialog.raise_()
+
+    def open_metadata_grid(self, checked=False):
+        from wmlstudio.metadata_grid import launch_metadata_grid
+        launch_metadata_grid(self)
+
+    def open_read_support(self, sample_id=None):
+        from wmlstudio.read_support_dialog import launch_read_support
+        launch_read_support(self, sample_id=sample_id if isinstance(sample_id, str) else None)
+
+    def open_threshold_guidance(self):
+        from wmlstudio.threshold_dialog import ThresholdGuideDialog
+        dialog = ThresholdGuideDialog(self)
+        if dialog.exec() == QDialog.DialogCode.Accepted:
+            self.apply_threshold_guidance(dialog.evidence)
+
+    def choose_feature_cohort(self):
+        from wmlstudio.cohort_picker import CohortPickerDialog
+        dialog = CohortPickerDialog(self.project.samples(), self.project, "Which isolates should the evidence workspace show?", self.feature_ids, self)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        self.feature_ids = set(dialog.selected_ids)
+        self.refresh_features()
+        self.navigate(4)
+
+    def navigate(self, index):
+        if index == 6:
+            self.open_interface_settings()
+            return
+        super().navigate(index)
+
+    def choose_and_analyse(self, checked=False, assemble=False, pending_only=False):
+        if self.busy():
+            return
+        from wmlstudio.cohort_picker import CohortPickerDialog
+        samples = self.project.samples()
+        initial = {sample["id"] for sample in samples if sample["status"] in {"queued", "interrupted"}} if pending_only else None
+        dialog = CohortPickerDialog(samples, self.project, "Which isolates should be analysed?", initial, self)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        self.start_analysis(confirm=True, all_samples=True, sample_ids=dialog.selected_ids, assemble=assemble)
+
+    def choose_hydra_cohort(self):
+        if self.busy():
+            return
+        from wmlstudio.cohort_picker import CohortPickerDialog
+        samples = self.project.samples()
+        dialog = CohortPickerDialog(samples, self.project, "Which assemblies should HYDRA analyse?", parent=self, include_reads=False)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        chosen = [sample for sample in samples if sample["id"] in dialog.selected_ids]
+        plan = self.review_run_plan(chosen, hydra=True)
+        if plan and plan.get("hydra"):
+            self._run_cancelled = False
+            self.run_hydra_plan(dialog.selected_ids, plan, require_completed=False)
 
     def build_schemes(self):
         super().build_schemes()

@@ -46,6 +46,29 @@ def test_version_and_help_are_runnable():
     help_result = cli("--help")
     assert help_result.returncode == 0
     assert all(command in help_result.stdout for command in ("qc", "type", "check-pair", "compare"))
+    assert "fastqc" in help_result.stdout and "characterize" in help_result.stdout
+
+
+def test_characterization_cli_not_run_is_not_negative_and_protects_input(tmp_path):
+    source = tmp_path / "input.fasta"
+    source.write_text(">contig\nACGTACGT\n")
+    original = source.read_bytes()
+    result = cli("characterize", source, "--no-species", "--no-virulence")
+    assert result.returncode == 0, result.stderr
+    output = json.loads(result.stdout)
+    assert output["status"] == "not_run"
+    assert output["species_evidence"]["status"] == "not_run"
+    assert output["drug_associations"]["status"] == "not_run"
+    invalid = cli("characterize", source, "--output", source)
+    assert invalid.returncode == 1 and "Traceback" not in invalid.stderr
+    assert source.read_bytes() == original
+
+
+def test_fastqc_cli_rejects_invalid_resources_without_traceback(tmp_path):
+    result = cli("fastqc", tmp_path / "absent.fastq", "--output", tmp_path / "reports", "--threads", "0")
+    assert result.returncode == 1
+    assert "thread allocation" in result.stderr and "Traceback" not in result.stderr
+    assert not (tmp_path / "reports").exists()
 
 
 def test_type_produces_expected_sts_and_provenance(typing_inputs):

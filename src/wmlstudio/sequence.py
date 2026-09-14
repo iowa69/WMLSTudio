@@ -18,6 +18,7 @@ from typing import Callable, Iterator, TextIO
 
 CancelCallback = Callable[[], bool] | None
 DNA = frozenset("ACGTRYSWKMBDHVN")
+_INVALID_QUALITY = re.compile(r"[^\x21-\x7e]")
 
 
 class SequenceError(ValueError):
@@ -193,7 +194,7 @@ class SequenceReader:
                 if not line:
                     raise self._error(f"truncated FASTQ quality for {identifier!r}")
                 quality = line.rstrip("\r\n")
-                if not quality or any(ord(char) < 33 or ord(char) > 126 for char in quality):
+                if not quality or _INVALID_QUALITY.search(quality):
                     raise self._error("FASTQ quality must use ASCII characters 33 through 126")
                 quality_length += len(quality)
                 if quality_length > len(sequence):

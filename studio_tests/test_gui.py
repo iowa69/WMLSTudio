@@ -12,6 +12,7 @@ from PySide6.QtGui import QImage
 from wmlstudio import jobs
 from wmlstudio.app import MainWindow
 from wmlstudio.project import Project
+from wmlstudio.scheduler import GIB, HardwareSnapshot, plan_resources
 from wmlstudio.sequence import AnalysisCancelled
 
 
@@ -85,7 +86,9 @@ def test_demo_runs_real_typing_and_builds_conservative_interactive_forest(window
     assert results["Practice_A03"]["st"] == "2"
     assert results["Practice_partial"]["status"] == "incomplete"
     assert len({result["scheme_digest"] for result in results.values()}) == 1
+    window.cohort_ids = {sample['id'] for sample in samples}
     window.navigate(2)
+    window.refresh_comparison()
     assert len(window.distance_rows) == 21
     assert sum(not row["comparable"] for row in window.distance_rows) == 6
     assert len(window.tree.nodes) == 7
@@ -170,6 +173,7 @@ def test_failed_reanalysis_does_not_enter_comparison(window, tmp_path):
         "sample_name": "isolate", "status": "complete", "scheme": "test",
         "scheme_digest": "abc", "alleles": {"locus": "1"},
     })
+    window.cohort_ids = {sample_id}
     assert len(window.comparison_results()) == 1
     window.sample_failed(sample_id, "Input changed")
     assert window.comparison_results() == []
@@ -209,6 +213,9 @@ def test_cancellation_keeps_unstarted_samples_and_defers_close(
         raise AnalysisCancelled("Cancelled safely")
 
     monkeypatch.setattr(jobs, "inspect_sequence", cancellable_inspection)
+    allocation = plan_resources(threads_per_sample=1, memory_gb=1, max_parallel=1,
+                                hardware=HardwareSnapshot(4, 8 * GIB))
+    monkeypatch.setattr("wmlstudio.scheduler.resources_for_run", lambda *args, **kwargs: allocation)
     window.import_paths([fasta(tmp_path, "one.fasta"), fasta(tmp_path, "two.fasta")])
     path = window.project_path
     window.start_analysis()
@@ -231,6 +238,48 @@ def test_cancellation_keeps_unstarted_samples_and_defers_close(
     assert [sample["status"] for sample in samples] == ["interrupted", "queued"]
     assert samples[0]["result"] is None
     assert window.test_errors == []
+
+
+def test_parallel_cancellation_interrupts_only_admitted_samples(window, qtbot, tmp_path, monkeypatch):
+    entered = set()
+    lock = threading.Lock()
+
+    def inspection(path, max_reads, cancelled):
+        with lock:
+            entered.add(str(path))
+        deadline = time.monotonic() + 10
+        while not cancelled():
+            if time.monotonic() > deadline:
+                raise RuntimeError("Test cancellation timed out")
+            threading.Event().wait(0.005)
+        raise AnalysisCancelled("Cancelled safely")
+
+    allocation = plan_resources(threads_per_sample=1, memory_gb=1, max_parallel=2,
+                                hardware=HardwareSnapshot(4, 8 * GIB))
+    monkeypatch.setattr("wmlstudio.scheduler.resources_for_run", lambda *args, **kwargs: allocation)
+    monkeypatch.setattr(jobs, "inspect_sequence", inspection)
+    window.import_paths([fasta(tmp_path, name) for name in ("one.fasta", "two.fasta", "three.fasta")])
+    window.start_analysis()
+    qtbot.waitUntil(lambda: len(entered) == 2, timeout=5000)
+    qtbot.waitUntil(lambda: sum(s["status"] == "running" for s in window.project.samples()) == 2,
+                    timeout=5000)
+    window.cancel_analysis()
+    finish_queue(qtbot, window)
+    assert len(entered) == 2
+    assert [sample["status"] for sample in window.project.samples()] == ["interrupted", "interrupted", "queued"]
+    assert all(sample["result"] is None for sample in window.project.samples())
+    assert window.test_errors == []
+
+
+def test_explicit_analysis_cohort_does_not_inherit_global_selection(window, qtbot, tmp_path):
+    window.import_paths([fasta(tmp_path, "first.fasta"), fasta(tmp_path, "second.fasta")])
+    first, second = window.project.samples()
+    window.selection_ids = {first["id"]}
+    window.start_analysis(sample_ids={second["id"]})
+    finish_queue(qtbot, window)
+    assert window.project.get_sample(first["id"])["status"] == "queued"
+    assert window.project.get_sample(second["id"])["status"] == "completed"
+    assert window.selection_ids == {first["id"]}
 
 
 def test_hydra_import_is_persisted_and_does_not_leak_across_projects(window, tmp_path, monkeypatch):

@@ -109,11 +109,13 @@ def main() -> int:
     preserve_installed_notices(destination, manifest)
     if platform.system() == "Windows":
         preserve_windows_python_notices(destination, manifest)
-    # Pyrodigal is GPL-3.0-or-later, including its Prodigal implementation.
-    # Ship the exact corresponding upstream source archive, not just a URL.
-    if "pyrodigal" in manifest["packages"]:
-        package_version = manifest["packages"]["pyrodigal"]
-        listing = json.loads(fetch(f"https://pypi.org/pypi/pyrodigal/{package_version}/json"))
+    # Pyrodigal requires corresponding source; Pyskani's source archive also
+    # preserves embedded skani and vendored Rust dependency license texts.
+    for source_package in ("pyrodigal", "pyskani"):
+        if source_package not in manifest["packages"]:
+            continue
+        package_version = manifest["packages"][source_package]
+        listing = json.loads(fetch(f"https://pypi.org/pypi/{source_package}/{package_version}/json"))
         source_entry = next(item for item in listing["urls"] if item["packagetype"] == "sdist")
         target = destination / "sources" / source_entry["filename"]
         target.parent.mkdir(parents=True, exist_ok=True)
@@ -122,7 +124,7 @@ def main() -> int:
             content = response.read(64 * 1024 * 1024)
         actual = hashlib.sha256(content).hexdigest()
         if actual != source_entry["digests"]["sha256"]:
-            raise ValueError("Pyrodigal corresponding-source archive hash does not match the provider record")
+            raise ValueError(f"{source_package} source archive hash does not match the provider record")
         target.write_bytes(content)
         manifest["files"].append({"path": target.relative_to(destination).as_posix(),
                                   "source": source_entry["url"], "sha256": actual})

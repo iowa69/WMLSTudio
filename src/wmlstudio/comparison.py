@@ -58,6 +58,7 @@ def _known_calls(result: Mapping[str, Any]) -> dict[str, str]:
 
 def pairwise_distances(
     results: Iterable[Mapping[str, Any]], min_overlap: float = 0.95, *, cancelled=None,
+    pair_keys=None,
 ) -> list[dict[str, Any]]:
     """Return every unordered pair, including explicit non-comparable pairs.
 
@@ -86,6 +87,8 @@ def pairwise_distances(
     for index, ((left_id, left, left_calls), (right_id, right, right_calls)) in enumerate(combinations(prepared, 2)):
         if index % 32 == 0:
             check_cancelled(cancelled)
+        if pair_keys is not None and (left_id, right_id) not in pair_keys:
+            continue
         loci = set(map(str, left.get("alleles", {}))) | set(map(str, right.get("alleles", {})))
         shared = sorted(left_calls.keys() & right_calls.keys())
         overlap = len(shared) / len(loci) if loci else 0.0

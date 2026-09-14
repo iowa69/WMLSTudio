@@ -21,7 +21,8 @@ def current_input_sha256(record):
     workflow = metadata.get('workflow') or {}
     return (_sha256(result.get('input_sha256'))
             or _sha256((assembly.get('provenance') or {}).get('assembly_sha256'))
-            or _sha256(workflow.get('managed_sha256')))
+            or _sha256(workflow.get('managed_sha256'))
+            or _sha256((metadata.get('input_identity') or {}).get('sha256')))
 
 
 def _execution_input_sha256(execution, source_name, *, single_sample=False):
@@ -160,6 +161,7 @@ def link_hydra(project, report, mapping: dict[str, str]) -> list[str]:
                 "mlst": source.get("mlst", {}), "species": source.get("species", {}),
                 "provenance": copy.deepcopy(provenance), "upstream": source,
                 "execution_provenance": copy.deepcopy(report.get("execution_provenance", {})),
+                "databases": copy.deepcopy(report.get("databases", [])),
                 'evidence_input_sha256': source_hash,
                 'linked_input_sha256': baseline,
                 'link_identity_basis': 'report assembly SHA-256' if source_hash else 'explicit user mapping; report input hash unavailable',

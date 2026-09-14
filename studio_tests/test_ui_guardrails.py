@@ -56,7 +56,8 @@ def test_native_pdf_and_atomic_project_copy(qtbot, tmp_path, monkeypatch):
     source.write_text(">c\nACGT\n")
     window.import_paths([source])
     pdf = tmp_path / "report.pdf"
-    window.write_pdf_report(pdf)
+    # The report cohort is explicit by design; nothing is silently included.
+    window.write_pdf_report(pdf, selected_ids={s["id"] for s in window.project.samples()})
     assert pdf.read_bytes().startswith(b"%PDF-")
     copied = tmp_path / "copy.wmlstudio"
     monkeypatch.setattr("wmlstudio.app.QFileDialog.getSaveFileName", lambda *a: (str(copied), ""))

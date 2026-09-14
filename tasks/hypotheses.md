@@ -1,5 +1,22 @@
 # Validation hypotheses
 
+## Investigation revision: active scientific and usability alternatives
+
+| Explanation | Status | Discriminating check |
+| --- | --- | --- |
+| A presumptive K. pneumoniae collection includes other species-complex members | Unresolved | Independent genome-reference evidence, runner-up margin and panel coverage; MLST is not independent taxonomy |
+| Apparent proximity is a missing-locus, reference-version or mixed-sample artifact | Unresolved | Shared-locus denominators, quality gates, identical scheme snapshots and ambiguous-call exclusions |
+| A threshold cluster is a single-link chain rather than uniformly close isolates | Unresolved | All comparable pair edges, cluster diameter, nearest neighbours and explicit chaining warnings |
+| Shared resistance/plasmid markers reflect common mobile elements rather than recent isolate transmission | Unresolved | Keep core relatedness, accessory content and contig co-location separate; require epidemiology/long-read confirmation for stronger claims |
+| Genotype-to-drug association is overinterpreted as a measured susceptible/resistant phenotype | Unresolved | Versioned determinant annotations; AST metadata kept separate; unknown/not-tested are never susceptible |
+| New sampling or database updates alter apparent cluster membership without biological change | Unresolved | Immutable investigation snapshots, stable sample/profile keys and merge/split/addition audit |
+| File stems pair the wrong reads or duplicate lanes | Unresolved | Conservative candidate matching, withheld ambiguity, explicit confirmation, full pair validation and input hashes |
+| Parallel jobs oversubscribe RAM/threads or stall the interface | Unresolved | Resource-admission controls, actual child thread budgets, cancellation, GUI heartbeat and representative workload benchmarks |
+
+Profile: computational validation and exploratory comparative genomics, not a
+clinical intervention trial. Results must not establish clinical validity from
+regression agreement alone. Revisit these alternatives after each real-data gate.
+
 ## Workbench revision hypotheses
 
 | Explanation | Evidence needed | Status |

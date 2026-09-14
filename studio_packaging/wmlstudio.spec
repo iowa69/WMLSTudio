@@ -10,6 +10,8 @@ from PyInstaller.utils.hooks import collect_data_files, collect_submodules, copy
 root = Path(SPECPATH).parent
 sys.path.insert(0, str(root / "studio_packaging"))
 from stage_bio_tools import filter_windows_qt_tls, stage_hydra_database, verify_skesa_bundle
+from stage_fastqc import verify as verify_fastqc
+from stage_ska import verify as verify_ska
 schemes = root / "src/wmlstudio/resources/schemes"
 manifest = schemes / "manifest.json"
 if not manifest.is_file() or json.loads(manifest.read_text(encoding="utf-8"))["scheme_count"] == 0:
@@ -28,12 +30,13 @@ datas = [
     (str(root / "docs/HYDRA_INTEGRATION.md"), "docs"),
     (str(root / "docs/MICROBIOLOGY_WORKFLOWS.md"), "docs"),
     (str(root / "docs/WORKBENCH_DESIGN.md"), "docs"),
+    (str(root / "docs/WORKFLOW_GUIDE.md"), "docs"),
 ]
 if (root / "LICENSE").is_file():
     datas.append((str(root / "LICENSE"), "notices"))
 for package in ("wmlstudio", "PySide6-Essentials", "shiboken6", "pyahocorasick"):
     datas += copy_metadata(package)
-for package in ("hydra-amr", "numpy", "pandas", "python-dateutil", "six", "pyrodigal", "archspec"):
+for package in ("hydra-amr", "numpy", "pandas", "python-dateutil", "six", "pyrodigal", "archspec", "pyskani"):
     datas += copy_metadata(package)
 datas += collect_data_files("hydra_amr")
 datas += collect_data_files("archspec")
@@ -41,6 +44,12 @@ tools = Path(os.environ.get("WMLSTUDIO_BLAST_ROOT", root / "src/wmlstudio/resour
 if not (tools / "manifest.json").is_file():
     raise SystemExit("Stage native BLAST+ with studio_packaging/stage_bio_tools.py before packaging")
 platform = "windows-x64" if sys.platform == "win32" else "linux-x64"
+fastqc = Path(os.environ.get("WMLSTUDIO_FASTQC_ROOT", root / "src/wmlstudio/resources/tools/fastqc"))
+verify_fastqc(fastqc, platform)
+datas.append((str(fastqc), "Tools/fastqc"))
+ska = root / "src/wmlstudio/resources/tools/ska2" / platform
+verify_ska(ska, platform)
+datas.append((str(ska), "Tools/ska2"))
 if json.loads((tools / "manifest.json").read_text())["platform"] != platform:
     raise SystemExit("Staged BLAST+ archive does not match the target build platform")
 datas.append((str(tools), "Tools/blast"))
@@ -49,6 +58,10 @@ if not (hydra_database / "manifest.json").is_file():
     raise SystemExit("The all-in-one build requires the verified NCBI HYDRA starter snapshot")
 stage_hydra_database(hydra_database, hydra_database)
 datas.append((str(hydra_database), "wmlstudio/resources/hydra/starter"))
+characterization_database = root / "src/wmlstudio/resources/characterization/starter"
+if not (characterization_database / "manifest.json").is_file():
+    raise SystemExit("Stage the independent species/virulence starter with studio_scripts/stage_characterization.py before packaging")
+datas.append((str(characterization_database), "wmlstudio/resources/characterization/starter"))
 if sys.platform == "win32":
     skesa = root / "src/wmlstudio/resources/tools/skesa"
     verify_skesa_bundle(skesa)
@@ -67,7 +80,7 @@ common = dict(
     binaries=[],
     datas=datas,
     # impl is a namespace package: collecting only 'pyrodigal' skips it.
-    hiddenimports=["ahocorasick", *collect_submodules("pyrodigal.impl")],
+    hiddenimports=["ahocorasick", *collect_submodules("pyrodigal.impl"), *collect_submodules("pyskani")],
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
