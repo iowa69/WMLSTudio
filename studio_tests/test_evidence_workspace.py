@@ -57,6 +57,28 @@ def test_evidence_cohort_is_independent_and_exports_only_visible_columns(window,
     assert 'blaA' not in path.read_text()
 
 
+def test_right_click_in_the_evidence_tables_routes_isolates_without_moving_that_cohort(window):
+    from wmlstudio.context_menus import SEPARATOR, Selection
+    first, second = sample(window, 'A', 'blaA'), sample(window, 'B', 'vanB')
+    window.feature_ids = {first, second}
+    window.refresh_features()
+    assert {'evidence.features', 'evidence.amr'} <= set(window._context_adapters)
+
+    for view, model in (('evidence.features', window.feature_model), ('evidence.amr', window.amr_model)):
+        adapter = window._context_adapters[view]
+        # The ids come from the model row, never from the visual row number.
+        assert [adapter.id_at(row) for row in range(len(model.rows))] == [row['_sample_id'] for row in model.rows]
+        selection = Selection(view, (first,))
+        titles = [entry.format_title(selection) for entry in window.context_menu_plan(selection)
+                  if entry is not SEPARATOR]
+        assert 'Add to report' in titles and 'Copy sample ID' in titles
+
+    window.context_add_to_report(Selection('evidence.features', (first,)))
+    assert window.report_ids == {first}
+    assert window.feature_ids == {first, second}, 'routing one isolate must not edit the evidence cohort'
+    assert {s['id'] for s in window.project.samples()} == {first, second}
+
+
 def test_advanced_source_controls_are_not_in_main_cohort_view(window):
     tabs = window.evidence_tabs
     assert any('Advanced' in tabs.tabText(index) for index in range(tabs.count()))

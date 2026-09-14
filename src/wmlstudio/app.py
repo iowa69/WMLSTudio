@@ -8,7 +8,7 @@ import sys
 import tempfile
 from pathlib import Path
 
-from PySide6.QtCore import QLockFile, Qt, QTimer
+from PySide6.QtCore import QCoreApplication, QLockFile, Qt, QTimer
 from PySide6.QtGui import QAction, QColor, QKeySequence, QPageSize, QPdfWriter, QTextDocument
 from PySide6.QtWidgets import (
     QApplication,
@@ -27,9 +27,9 @@ from PySide6.QtWidgets import (
     QScrollArea,
     QSpinBox,
     QSplitter,
-    QStackedWidget,
     QTableWidget,
     QTableWidgetItem,
+    QTabWidget,
     QTextBrowser,
     QVBoxLayout,
     QWidget,
@@ -37,14 +37,19 @@ from PySide6.QtWidgets import (
 
 from wmlstudio import __version__
 from wmlstudio.comparison import minimum_spanning_forest, pairwise_distances
+from wmlstudio.context_menus import ContextMenuMixin
 from wmlstudio.demo import create_demo
+from wmlstudio.display import SCALE_CHOICES, apply_display_settings
 from wmlstudio.export import ensure_separate_destination, export_results
 from wmlstudio.jobs import AnalysisWorker, SchemeImportWorker
 from wmlstudio.paths import data_root, scheme_locations
 from wmlstudio.project import Project
 from wmlstudio.theme import STYLE
 from wmlstudio.ui_characterization import CharacterizationWorkspaceMixin
+from wmlstudio.ui_common import workspace_header
+from wmlstudio.ui_tabs import PAGE_PURPOSE, WorkspaceTabs
 from wmlstudio.widgets import DropZone, Helix, Metric, TreeView, button, card, label
+from wmlstudio.workspace_focus import CohortLedger, FocusBar, FocusBus
 
 FILE_FILTER = "Sequence files (*.fasta *.fa *.fna *.fastq *.fq *.gz *.bz2);;All files (*)"
 STATUS_TEXT = {
@@ -81,6 +86,12 @@ class BaseWindow(QMainWindow):
         self.closing_after_cancel = False
         self.scheme_paths = []
         self.current_samples = []
+        # Focus is the shared, temporary highlight; the ledger records where each
+        # tab's own cohort came from. A mixin may already have created them.
+        self.focus = getattr(self, "focus", None) or FocusBus(self)
+        self.cohort_origins = getattr(self, "cohort_origins", None) or CohortLedger(self)
+        self._navigating = False
+        self.page_shown = {}
         self.setWindowTitle("WMLSTudio · Microbial genomics workspace")
         self.resize(1380, 940)
         self.setMinimumSize(1000, 680)
@@ -96,21 +107,28 @@ class BaseWindow(QMainWindow):
         outer.setSpacing(0)
         self.build_sidebar(outer)
         body = QVBoxLayout()
-        body.setContentsMargins(33, 25, 33, 18)
-        body.setSpacing(18)
+        # The tab bar and the per-tab orientation strip both cost vertical space;
+        # the margins pay for them so the comparison graph keeps its usable height.
+        body.setContentsMargins(24, 12, 24, 10)
+        body.setSpacing(12)
         outer.addLayout(body, 1)
         top = QHBoxLayout()
         self.breadcrumb = label("WORKSPACE  /  OVERVIEW", "eyebrow")
         top.addWidget(self.breadcrumb)
         top.addStretch()
-        self.scope_label = label("0 isolates in project", "small")
-        self.scope_label.setToolTip("Each analysis, comparison and report reviews its own isolate cohort.")
-        top.addWidget(self.scope_label)
+        self.focus_bar = FocusBar(self.focus)
+        self.focus_bar.showRequested.connect(self.show_focus_in_library)
+        self.focus_bar.clearRequested.connect(self.focus.clear)
+        # Kept under its original name: refresh_journey still writes the project
+        # count here, and the bar shows it whenever nothing is focused.
+        self.scope_label = self.focus_bar
+        top.addWidget(self.focus_bar)
         top.addWidget(label("●  Local & private", "badge"))
         top.addWidget(button("Open project", self.open_project_dialog))
-        top.addWidget(button("Settings", self.open_interface_settings))
+        top.addWidget(button("Settings", lambda: self.navigate(self.page_index.get("settings", 6))))
         body.addLayout(top)
-        self.pages = QStackedWidget()
+        self.page_index = {}
+        self.pages = WorkspaceTabs()
         body.addWidget(self.pages, 1)
         self.build_overview()
         self.build_samples()
@@ -119,6 +137,11 @@ class BaseWindow(QMainWindow):
         self.build_hydra()
         self.build_reports()
         self.build_settings()
+        self.install_workspace_headers()
+        self.page_shown = {key: hook for key, hook in
+                           (("compare", getattr(self, "refresh_comparison", None)),)
+                           if callable(hook)}
+        self.pages.currentChanged.connect(self.navigate)
         bottom = QHBoxLayout()
         self.progress_text = label("Ready when you are. Your files stay on this computer.", "small")
         bottom.addWidget(self.progress_text, 1)
@@ -144,9 +167,10 @@ class BaseWindow(QMainWindow):
     def build_sidebar(self, outer):
         sidebar = QWidget()
         sidebar.setObjectName("sidebar")
-        sidebar.setFixedWidth(218)
+        sidebar.setFixedWidth(205)
+        self.sidebar = sidebar
         layout = QVBoxLayout(sidebar)
-        layout.setContentsMargins(18, 28, 18, 18)
+        layout.setContentsMargins(14, 28, 14, 18)
         layout.setSpacing(6)
         brand = QHBoxLayout()
         monogram = label("W")
@@ -162,16 +186,12 @@ class BaseWindow(QMainWindow):
         self.project_label = label(self.project_path.stem, "cardTitle", True)
         layout.addWidget(self.project_label)
         layout.addSpacing(18)
+        # The tab bar is the navigation now. nav_buttons stays as an empty list so
+        # navigate's checked-state loop and nav_names (breadcrumb, Alt+1…7 menu)
+        # keep working untouched.
         self.nav_buttons = []
         self.nav_names = ["Overview", "Isolate library", "Compare", "Scheme library", "Characterization", "Reports", "Settings"]
-        symbols = ["◫", "▤", "⌘", "▥", "◈", "↗", "⚙"]
-        for index, (name, symbol) in enumerate(zip(self.nav_names, symbols, strict=True)):
-            item = button(f"{symbol}   {name}", lambda checked=False, i=index: self.navigate(i))
-            item.setObjectName("nav")
-            item.setCheckable(True)
-            item.setAccessibleName(name)
-            layout.addWidget(item)
-            self.nav_buttons.append(item)
+        layout.addWidget(label("Your isolates, your evidence and your report each keep their own cohort. Nothing is included automatically.", "small", True))
         layout.addStretch()
         tip, content = card()
         self.sidebar_tip = tip
@@ -190,18 +210,42 @@ class BaseWindow(QMainWindow):
         super().resizeEvent(event)
         if hasattr(self, "sidebar_tip"):
             self.sidebar_tip.setVisible(self.height() >= 810)
+        if hasattr(self, "sidebar"):
+            # Below this width the seven tabs need every pixel, and the tab bar
+            # already provides the navigation the sidebar used to carry.
+            self.sidebar.setVisible(self.width() >= 1180)
 
     def page(self):
         widget = QWidget()
         widget.setObjectName("page")
         layout = QVBoxLayout(widget)
         layout.setContentsMargins(0, 0, 0, 0)
-        layout.setSpacing(18)
+        layout.setSpacing(14)
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
         scroll.setWidget(widget)
-        self.pages.addWidget(scroll)
+        index = self.pages.add_page(scroll)
+        key = self.pages.key_at(index)
+        if key:
+            self.pages.setTabToolTip(index, f"{self.nav_names[index]} — {PAGE_PURPOSE.get(key, '')}")
+            self.page_index[key] = index
         return widget, layout
+
+    def install_workspace_headers(self):
+        """Give every tab the same orientation line once all seven pages exist.
+
+        This runs after `build_*` on purpose: the evidence and scheme pages move
+        their own layout items by position, and inserting the strip beforehand
+        would silently rearrange somebody else's page.
+        """
+        self.page_headers = {}
+        for key, index in self.page_index.items():
+            page = self.pages.widget(index)
+            content = page.widget() if isinstance(page, QScrollArea) else page
+            layout = content.layout() if content is not None else None
+            if layout is None:
+                continue
+            self.page_headers[key] = workspace_header(self, layout, key, index=0)
 
     def heading(self, layout, title, subtitle):
         layout.addWidget(label(title, "title"))
@@ -339,6 +383,7 @@ class BaseWindow(QMainWindow):
         row.addWidget(label("No automatic database updates", "badge"))
         layout.addLayout(row)
         self.scheme_table = table(["SCHEME", "SOURCE", "LOCATION"])
+        self.install_view_menu("schemes", self.scheme_table)
         layout.addWidget(self.scheme_table, 1)
         note, content = card()
         content.addWidget(label("What belongs in a scheme folder?", "cardTitle"))
@@ -360,6 +405,7 @@ class BaseWindow(QMainWindow):
         splitter = QSplitter(Qt.Orientation.Vertical)
         self.hydra_table = table(["SAMPLE", "SPECIES", "SEQUENCE TYPE", "AMR GENES", "VIRULENCE", "PLASMIDS"])
         self.hydra_table.itemSelectionChanged.connect(self.show_hydra_sample)
+        self.install_view_menu("evidence.hydra", self.hydra_table)
         splitter.addWidget(self.hydra_table)
         self.hydra_view = QTextBrowser()
         self.hydra_view.setHtml("<h2>More context for each genome</h2><p>Import a HYDRA JSON report to inspect its elements, sample summaries and provenance in this native application.</p><p>HYDRA analysis execution is not bundled in this preview. Its Windows dependencies need a separate port and validation.</p>")
@@ -393,15 +439,36 @@ class BaseWindow(QMainWindow):
     def build_settings(self):
         _, layout = self.page()
         self.heading(layout, "Make yourself at home", "A few settings, and a straightforward guide to what this version can do.")
-        frame, content = card()
+        # Page 6 used to be unreachable: the workbench intercepted it and opened a
+        # modal dialog instead. It is a real tab now, so the dialog's controls and
+        # this page share one implementation (InterfaceSettingsPanel).
+        from wmlstudio.interface_settings import InterfaceSettingsPanel
+        self.settings_tabs = QTabWidget()
+        self.settings_tabs.setObjectName("settingsTabs")
+        # "&&" because QTabBar reads a single "&" as a keyboard mnemonic.
+        self.interface_panel = InterfaceSettingsPanel(self, references=False)
+        self.settings_tabs.addTab(self.interface_panel, "Display && text size")
+        data_page = QWidget()
+        content = QVBoxLayout(data_page)
         self.motion = QCheckBox("Gentle interface animations")
         self.motion.setChecked(bool(self.project.get_setting("motion", True)))
         self.motion.toggled.connect(self.set_motion)
         content.addWidget(self.motion)
         content.addWidget(label("Data location: " + str(self.root), "small", True))
-        content.addWidget(button("Create a new project…", self.new_project))
+        content.addWidget(label(f"Active project: {self.project_path}", "small", True))
+        for text, method in (("Scheme references…", "open_reference_manager"),
+                             ("AMR / plasmid reference databases…", "open_amr_databases"),
+                             ("Characterization reference panel…", "install_characterization_references"),
+                             ("Open application data folder", "open_data_folder"),
+                             ("Save project backup copy…", "save_project_copy"),
+                             ("Create a new project…", "new_project")):
+            handler = getattr(self, method, None)
+            if callable(handler):
+                content.addWidget(button(text, handler))
+        content.addWidget(label("Updates create immutable reference snapshots; results you already have keep their original provenance.", "small", True))
         content.addWidget(button("Problem → solution guide", self.open_workflow_guide, True))
-        layout.addWidget(frame)
+        content.addStretch()
+        self.settings_tabs.addTab(data_page, "Data && references")
         guide = QTextBrowser()
         guide.setHtml("""<h2>From files to a comparison</h2>
         <p><b>1. Import and assign</b> FASTA or FASTQ files. Choose automatic MLST evidence, a manual organism/scheme, or unknown for QC/AMR-only work. Managed storage and ST filename suffixes affect copies only.</p>
@@ -414,7 +481,9 @@ class BaseWindow(QMainWindow):
         <p>Use Data to inspect/install versioned schemes and AMR reference snapshots. Downloads never send sequences. Provider rights and authentication can limit availability; a public snapshot is not necessarily the complete current database.</p>
         <h3>Current boundaries</h3><p>This is research software, not a validated diagnostic device or established SeqSphere+ equivalent. It does not predict measured susceptibility or prove transmission. Independent species confirmation, contamination quantification, direct-read AMR/pileup, long-read assembly and the full Kleborate/AMRFinderPlus/staphylococcal module stack are not validated here. Review biological quality, thresholds and database versions before interpreting a cluster.</p>
         <p>Keyboard: Ctrl+O import · Ctrl+Shift+O open project · Ctrl+S save project copy · Ctrl+R analyse selected · Ctrl+K commands · Alt+1…7 workspace pages.</p>""")
-        layout.addWidget(guide, 1)
+        self.settings_guide = guide
+        self.settings_tabs.addTab(guide, "What this version can and cannot do")
+        layout.addWidget(self.settings_tabs, 1)
 
     def add_shortcuts(self):
         for shortcut, callback in [("Ctrl+O", self.browse_files), ("Ctrl+Shift+O", self.open_project_dialog), ("Ctrl+S", self.save_project_copy)]:
@@ -424,18 +493,50 @@ class BaseWindow(QMainWindow):
             self.addAction(action)
 
     def navigate(self, index):
-        self.pages.setCurrentIndex(index)
-        self.breadcrumb.setText("WORKSPACE  /  " + self.nav_names[index].upper())
-        for i, item in enumerate(self.nav_buttons):
-            item.setChecked(i == index)
-        page = self.pages.currentWidget()
-        if page:
-            page.update()
-            if isinstance(page, QScrollArea):
-                page.viewport().update()
-                page.widget().update()
-        if index == 2:
-            self.refresh_comparison()
+        """The single guarded choke point for changing workspace page.
+
+        Both a tab click and a `navigate(<int>)` call arrive here, so the guard
+        stops the tab widget's own currentChanged from re-entering, and the page's
+        show hook runs exactly once, outside the guard, as it did before.
+        """
+        if self._navigating:
+            return
+        self._navigating = True
+        try:
+            if not self.pages.show_page(index):
+                return
+            index = self.pages.currentIndex()
+            self.breadcrumb.setText("WORKSPACE  /  " + self.nav_names[index].upper())
+            for i, item in enumerate(self.nav_buttons):
+                item.setChecked(i == index)
+            page = self.pages.currentWidget()
+            if page:
+                page.update()
+                if isinstance(page, QScrollArea):
+                    page.viewport().update()
+                    page.widget().update()
+        finally:
+            self._navigating = False
+        hook = self.page_shown.get(self.pages.key_at(index))
+        if callable(hook):
+            hook()
+
+    def show_focus_in_library(self):
+        """Take the user to the isolates the shared focus names. Changes no cohort."""
+        self.navigate(self.page_index.get("isolates", 1))
+        select = getattr(self, "select_samples_in_table", None)
+        if callable(select):
+            select(sorted(self.focus.ids))
+
+    def preview_interface_scale(self):
+        """Show the Display & text size controls, where the sample strip previews the size."""
+        self.navigate(self.page_index.get("settings", 6))
+        tabs = getattr(self, "settings_tabs", None)
+        if tabs is not None:
+            tabs.setCurrentIndex(0)
+        panel = getattr(self, "interface_panel", None)
+        if panel is not None and hasattr(panel, "refresh_preview"):
+            panel.refresh_preview()
 
     def set_motion(self, enabled):
         self.motion_enabled = enabled
@@ -1068,7 +1169,7 @@ from wmlstudio.ui_reports import ReportWorkspaceMixin  # noqa: E402
 from wmlstudio.ui_workbench import WorkbenchMixin  # noqa: E402
 
 
-class MainWindow(WorkbenchMixin, ComparisonWorkspaceMixin, CharacterizationWorkspaceMixin, ReportWorkspaceMixin, BaseWindow):
+class MainWindow(ContextMenuMixin, WorkbenchMixin, ComparisonWorkspaceMixin, CharacterizationWorkspaceMixin, ReportWorkspaceMixin, BaseWindow):
     """Native workbench composed from focused workflow controllers."""
 
 
@@ -1081,6 +1182,9 @@ def main(argv=None):
     parser.add_argument("--screenshot-page", type=int, choices=range(7), default=0,
                         help="Workspace page index for reproducible screenshots (0–6)")
     parser.add_argument("--window-size", help="Override screen-aware desktop size with WIDTHxHEIGHT")
+    parser.add_argument("--display-scale", type=int, choices=SCALE_CHOICES,
+                        help="Magnify the whole interface by this percentage for this run. "
+                             "Start once with --display-scale 100 if a saved size made the window unusable.")
     parser.add_argument("--native-screenshot", action="store_true", help="Capture the native window surface, not an offscreen render")
     args = parser.parse_args(argv)
     if args.window_size:
@@ -1090,6 +1194,12 @@ def main(argv=None):
                 raise ValueError
         except ValueError:
             parser.error("--window-size must be WIDTHxHEIGHT, at least 1000x680 and at most 7680x4320")
+    # Both names must be set before the display preferences are read: data_root()
+    # resolves the per-user application directory from them, and Qt reads its
+    # scaling policy when the QApplication is constructed, not later.
+    QCoreApplication.setOrganizationName("IOWA-BioTech")
+    QCoreApplication.setApplicationName("WMLSTudio")
+    apply_display_settings(args.display_scale)
     app = QApplication.instance() or QApplication(sys.argv[:1])
     app.setApplicationName("WMLSTudio")
     app.setOrganizationName("IOWA-BioTech")

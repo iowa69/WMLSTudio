@@ -7,7 +7,7 @@ from xml.etree import ElementTree
 
 import pytest
 from PySide6.QtCore import Qt
-from PySide6.QtGui import QColor, QImage, QPalette
+from PySide6.QtGui import QAction, QColor, QContextMenuEvent, QImage, QPalette
 from PySide6.QtWidgets import (
     QComboBox,
     QDialog,
@@ -21,8 +21,9 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+import wmlstudio.widgets
 from wmlstudio.theme import BACKGROUND, INK, STYLE, apply_dark_palette
-from wmlstudio.widgets import TreeView, forest_layout
+from wmlstudio.widgets import GRAPH_SUBTITLE, TreeView, forest_layout, render_side_by_side
 
 
 def records():
@@ -315,3 +316,181 @@ def test_dark_palette_covers_native_controls_dialogs_and_navigation(qapp, qtbot)
         qapp.setPalette(original_palette)
         qapp.setStyleSheet(original_style)
         qapp.setAttribute(Qt.ApplicationAttribute.AA_DontUseNativeDialogs, original_native)
+
+
+@pytest.fixture
+def quiet_graph(qtbot):
+    """A laid-out but never shown forest: repainting one after many torn-down
+    offscreen widgets crashes inside the graph label painter."""
+    widget = TreeView()
+    qtbot.addWidget(widget)
+    widget.resize(900, 600)
+    widget.draw_results(records(), edges())
+    return widget
+
+
+def test_an_export_can_name_which_tree_it_is_without_changing_the_default(quiet_graph, tmp_path):
+    default_path, titled_path = tmp_path / "default.png", tmp_path / "titled.png"
+    quiet_graph.save_image(default_path)
+    quiet_graph.save_image(titled_path, title="Baseline forest",
+                           subtitle="Frozen 2026-01-01 · not a phylogeny or transmission tree")
+    assert default_path.stat().st_size > 0 and titled_path.stat().st_size > 0
+    assert default_path.read_bytes() != titled_path.read_bytes()
+    quiet_graph.save_svg(tmp_path / "titled.svg", title="Baseline forest")
+    assert "Baseline forest" in (tmp_path / "titled.svg").read_text()
+    quiet_graph.save_svg(tmp_path / "default.svg")
+    assert "Allele-distance minimum spanning forest" in (tmp_path / "default.svg").read_text()
+    assert GRAPH_SUBTITLE in (tmp_path / "default.svg").read_text()
+
+
+def test_two_forests_can_be_shown_side_by_side_with_the_limit_in_the_picture(quiet_graph, qtbot, tmp_path):
+    other = TreeView()
+    qtbot.addWidget(other)
+    other.resize(900, 600)
+    other.draw_results(records()[:2], edges()[:1])
+    image = render_side_by_side(quiet_graph, other, left_title="Baseline · 4 isolates",
+                                right_title="Current · 2 isolates",
+                                headline="Same reference, same link threshold", width=900, height=600)
+    assert (image.width(), image.height()) == (1800, 676)
+    for suffix in ("png", "jpg"):
+        path = tmp_path / f"pair.{suffix}"
+        assert image.save(str(path))
+        assert path.stat().st_size > 0
+    assert QImage(str(tmp_path / "pair.png")).width() == 1800
+
+
+def test_a_pinned_colour_is_shared_and_pinning_the_same_key_twice_is_quiet(quiet_graph):
+    quiet_graph.set_color_by("st")
+    categories = quiet_graph.color_categories()
+    assert set(categories) == {"ST 184", "ST unassigned"}
+    emissions = []
+    quiet_graph.legendChanged.connect(lambda values: emissions.append(dict(values)))
+    assert quiet_graph.set_pinned_legend({"ST 184": "#123456"}) is True
+    assert quiet_graph.legend()["ST 184"] == "#123456"
+    assert len(emissions) == 1
+    assert quiet_graph.set_pinned_legend({"ST 184": "#123456"}) is False
+    assert len(emissions) == 1
+    # A category this view does not show is ignored rather than invented.
+    quiet_graph.set_pinned_legend({"ST 999": "#abcdef"})
+    assert "ST 999" not in quiet_graph.legend()
+
+
+def test_a_redraw_reuses_known_positions_and_only_a_new_isolate_is_laid_out_again(quiet_graph, monkeypatch):
+    calls = []
+    original = wmlstudio.widgets.forest_layout
+
+    def counted(keys, links):
+        calls.append(sorted(keys))
+        return original(keys, links)
+
+    monkeypatch.setattr(wmlstudio.widgets, "forest_layout", counted)
+    quiet_graph.nodes["a"].setPos(40, 50)
+    quiet_graph.update_edges()
+    quiet_graph._redraw()
+    assert calls == []
+    assert quiet_graph.nodes["a"].pos().x() == 40 and quiet_graph.nodes["a"].pos().y() == 50
+    quiet_graph.reset_layout()
+    assert len(calls) == 1
+    fresh = records() + [{"sample_id": "e", "sample_name": "Isolate e", "scheme_digest": "same-version",
+                          "alleles": {"locus1": "1", "locus2": "9"}, "calls": [], "metadata": {}}]
+    quiet_graph.draw_results(fresh, edges())
+    assert len(calls) == 2 and "e" in calls[-1]
+
+
+class RecordingMenu:
+    """Stands in for the modal popup: records its entries and chooses one.
+
+    The real QMenu.exec blocks on a native event loop, which an offscreen test
+    can never dismiss, so the menu class the view constructs is replaced instead.
+    """
+
+    picked = ""
+
+    def __init__(self, parent=None):
+        self.entries = []
+
+    def addAction(self, text):
+        action = QAction(str(text))
+        self.entries.append(action)
+        return action
+
+    def addSeparator(self):
+        self.entries.append(None)
+
+    def titles(self):
+        return [action.text() for action in self.entries if action is not None]
+
+    def exec(self, position):
+        return next((action for action in self.entries
+                     if action is not None and self.picked in action.text()), None)
+
+    def deleteLater(self):
+        pass
+
+
+def test_the_graph_menu_can_be_extended_without_losing_its_own_entries(quiet_graph, monkeypatch):
+    seen, chosen, menus = {}, [], []
+
+    def extension(view, menu, node_key):
+        seen["node_key"] = node_key
+        menu.addSeparator()
+        action = menu.addAction("Archive this isolate (keeps all evidence)…")
+        return {action: lambda: chosen.append(node_key)}
+
+    class Chooser(RecordingMenu):
+        picked = "Archive"
+
+        def __init__(self, parent=None):
+            super().__init__(parent)
+            menus.append(self)
+
+    quiet_graph.context_extension = extension
+    monkeypatch.setattr(wmlstudio.widgets, "QMenu", Chooser)
+    quiet_graph.contextMenuEvent(_context_event(quiet_graph, quiet_graph.nodes["a"]))
+    assert seen["node_key"] == "a"
+    titles = menus[0].titles()
+    assert "Select this threshold group" in titles and "Fit graph" in titles
+    assert titles[-1] == "Archive this isolate (keeps all evidence)…"
+    assert chosen == ["a"]
+
+
+def test_an_extension_entry_never_shadows_the_views_own_actions(quiet_graph, monkeypatch):
+    ran = []
+    quiet_graph.context_extension = lambda view, menu, key: {menu.addAction("Archive…"): ran.append}
+
+    class Chooser(RecordingMenu):
+        picked = "Fit graph"
+
+    monkeypatch.setattr(wmlstudio.widgets, "QMenu", Chooser)
+    quiet_graph.contextMenuEvent(_context_event(quiet_graph, quiet_graph.nodes["a"]))
+    assert ran == []
+
+
+def _context_event(view, node):
+    point = view.mapFromScene(node.sceneBoundingRect().center())
+    return QContextMenuEvent(QContextMenuEvent.Reason.Mouse, point, view.mapToGlobal(point))
+
+
+def test_graph_text_scale_resizes_lettering_without_moving_the_tree():
+    """A bigger label must not become a different distance.
+
+    Rescaling text for a high-resolution screen is a readability change. If it
+    also moved nodes or changed an edge, the same data would draw as a different
+    tree, so only the point size may follow the setting.
+    """
+    from wmlstudio.widgets import _graph_font, graph_text_scale, set_graph_text_scale
+    previous = graph_text_scale()
+    try:
+        assert set_graph_text_scale(100) == 100
+        base = _graph_font(14).pointSize()
+        assert set_graph_text_scale(150) == 150
+        assert _graph_font(14).pointSize() > base
+        assert set_graph_text_scale(80) == 80
+        assert _graph_font(14).pointSize() < base
+        # Out-of-range requests are clamped, never applied and never raised at the user.
+        assert set_graph_text_scale(500) == 150
+        assert set_graph_text_scale(10) == 80
+        # Even at the smallest scale a label stays legible rather than collapsing.
+        assert _graph_font(6).pointSize() >= 6
+    finally:
+        set_graph_text_scale(previous)

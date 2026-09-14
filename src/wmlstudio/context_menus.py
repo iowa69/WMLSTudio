@@ -39,9 +39,13 @@ from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path
 
-from PySide6.QtCore import QModelIndex, QPoint, Qt
+from PySide6.QtCore import QModelIndex, QPoint, Qt, QUrl
+from PySide6.QtGui import QDesktopServices
 from PySide6.QtWidgets import (
+    QApplication,
+    QFileDialog,
     QGraphicsView,
+    QMenu,
     QTableView,
     QTableWidget,
     QTreeWidget,
@@ -618,6 +622,187 @@ def default_adapter(view_id, widget, **kwargs) -> SelectionAdapter:
     if isinstance(widget, QTableView):
         return MatrixViewAdapter(view_id, widget, **kwargs)
     raise TypeError(f"No context-menu adapter for {type(widget).__name__} ({view_id}).")
+
+
+def tidy_plan(entries) -> list:
+    """Drop leading, doubled and trailing separators left by unavailable entries."""
+    tidy: list = []
+    for entry in entries:
+        if entry is SEPARATOR:
+            if tidy and tidy[-1] is not SEPARATOR:
+                tidy.append(entry)
+            continue
+        tidy.append(entry)
+    while tidy and tidy[-1] is SEPARATOR:
+        tidy.pop()
+    return tidy
+
+
+class ContextMenuMixin:
+    """Window half of the right-click system: build one menu, run one handler.
+
+    Only the generic, window-level handlers live here (copy the identifier, open
+    the containing folder, export the selection). Anything that needs to know a
+    particular view — assigning an organism, archiving, editing a cohort — belongs
+    on the workspace mixin that owns that view.
+
+    An action whose handler this window does not implement is left out of the menu
+    rather than offered and then failing. That keeps a partially wired window
+    honest: the user is never shown a command that cannot run.
+    """
+
+    def __init__(self, *args, **kwargs):
+        self._context_adapters = {}
+        super().__init__(*args, **kwargs)
+
+    # --- wiring -------------------------------------------------------------
+    def install_view_menu(self, view_id, widget, **kwargs):
+        """Route one view's right-click, menu key and Shift+F10 into this window."""
+        adapters = getattr(self, "_context_adapters", None)
+        if adapters is None:
+            adapters = self._context_adapters = {}
+        adapter = install_context_menu(widget, view_id, self.show_context_menu, **kwargs)
+        adapters[str(view_id)] = adapter
+        return adapter
+
+    def context_menu_report(self):
+        """Which registry handlers this window still lacks. Never raises; for tests."""
+        return missing_handlers(self)
+
+    # --- building and running the menu --------------------------------------
+    def context_samples(self, selection):
+        """The project records the selection names, for the state checks."""
+        wanted = set(getattr(selection, "sample_ids", ()) or ())
+        if not wanted:
+            return []
+        return [record for record in (getattr(self, "current_samples", None) or ())
+                if record.get("id") in wanted]
+
+    def context_menu_plan(self, selection):
+        """The view's plan, reduced to the entries this window can actually run."""
+        plan = [entry for entry in plan_for(selection.view_id, selection)
+                if entry is SEPARATOR or callable(getattr(self, entry.handler, None))]
+        return tidy_plan(plan)
+
+    def show_context_menu(self, selection, position):
+        entries = self.context_menu_plan(selection)
+        if not entries:
+            return None
+        busy = getattr(self, "busy", None)
+        busy = bool(busy()) if callable(busy) else False
+        samples = self.context_samples(selection)
+        menu = QMenu(self)
+        menu.setToolTipsVisible(True)
+        for entry in entries:
+            if entry is SEPARATOR:
+                menu.addSeparator()
+                continue
+            enabled, reason = action_state(entry, selection, window=self, busy=busy,
+                                           samples=samples)
+            if entry.submenu:
+                options = submenu_entries(entry.submenu, self, selection)
+                if not options:
+                    continue
+                sub = menu.addMenu(entry.format_title(selection))
+                sub.setEnabled(enabled)
+                for title, value in options:
+                    sub.addAction(title).setData((entry.handler, value))
+                continue
+            action = menu.addAction(entry.format_title(selection))
+            action.setEnabled(enabled)
+            if reason:
+                action.setToolTip(reason)
+            action.setData((entry.handler, None))
+        chosen = menu.exec(position)
+        data = chosen.data() if chosen is not None else None
+        menu.deleteLater()
+        return self.run_context_action(data, selection)
+
+    def run_context_action(self, data, selection):
+        if not data:
+            return None
+        name, value = data
+        handler = getattr(self, name, None)
+        if not callable(handler):
+            return None
+        return handler(selection) if value is None else handler(selection, value)
+
+    # --- the generic handlers -----------------------------------------------
+    def context_copy_id(self, selection):
+        ids = list(selection.sample_ids)
+        if not ids:
+            return
+        QApplication.clipboard().setText("\n".join(ids))
+        self.notify(f"Copied {len(ids)} sample identifier{'s' if len(ids) != 1 else ''}.")
+
+    def context_copy_path(self, selection):
+        paths = [str(path) for path in selection.paths]
+        if not paths:
+            paths = [str(record.get("input_path")) for record in self.context_samples(selection)
+                     if record.get("input_path")]
+        if not paths:
+            self.notify("That selection has no file path to copy.")
+            return
+        QApplication.clipboard().setText("\n".join(paths))
+        self.notify(f"Copied {len(paths)} file path{'s' if len(paths) != 1 else ''}.")
+
+    def context_open_folder(self, selection):
+        """Open the folder holding the isolate's own input file, never a copy of it."""
+        records = self.context_samples(selection)
+        path = records[0].get("input_path") if records else None
+        if not path:
+            self.notify("That isolate has no attached sequence file.")
+            return
+        folder = Path(path).parent
+        if not folder.is_dir():
+            self.notify(f"That folder is not available on this computer: {folder}")
+            return
+        QDesktopServices.openUrl(QUrl.fromLocalFile(str(folder)))
+
+    def context_export_selection(self, selection, fmt):
+        """Export exactly the isolates in the selection, and say how many that was."""
+        ids = list(selection.sample_ids)
+        if not ids:
+            self.notify("Select isolates first. Nothing is included automatically.")
+            return
+        suffix = {"profiles": "tsv", "bundle": "json"}.get(fmt, fmt)
+        name = f"{self.project_path.stem}-selection.{suffix}"
+        path, _ = QFileDialog.getSaveFileName(self, f"Export {len(ids)} selected isolates",
+                                              name, f"{suffix.upper()} (*.{suffix})")
+        if not path:
+            return
+        try:
+            self.check_output(path)
+            self._write_context_export(path, fmt, ids)
+        except Exception as exc:                       # noqa: BLE001 - shown to the user
+            self.error(exc)
+            return
+        self.notify(f"Exported {len(ids)} explicitly selected isolate"
+                    f"{'s' if len(ids) != 1 else ''}. Nothing else was included.")
+
+    def _write_context_export(self, path, fmt, ids):
+        selected = set(ids)
+        records = self.report_records() if callable(getattr(self, "report_records", None)) \
+            else self.project.samples()
+        if fmt == "pdf":
+            self.write_pdf_report(path, selected_ids=selected)
+            return
+        if fmt == "bundle":
+            from wmlstudio.library import export_bundle
+            export_bundle(self.project, path, sorted(selected))
+            return
+        if fmt == "profiles":
+            from wmlstudio.library import export_profile_table
+            results = [row for row in (self.comparison_results() or ())
+                       if row["sample_id"] in selected]
+            if not results:
+                raise ValueError("Build a comparison over these isolates with one scheme "
+                                 "snapshot before exporting their profile table.")
+            export_profile_table(self.project, path, [row["sample_id"] for row in results],
+                                 results[0]["scheme_digest"])
+            return
+        from wmlstudio.export import export_results
+        export_results(records, path, fmt, selected_ids=selected)
 
 
 def install_context_menu(widget, adapter, callback, **kwargs):

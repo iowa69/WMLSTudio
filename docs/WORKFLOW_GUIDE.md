@@ -9,6 +9,74 @@ The application supports non-commercial research. It is not a validated
 diagnostic device. Genetic proximity does not establish a transmission event;
 genomic resistance determinants are not measured antimicrobial susceptibility.
 
+You do not need to be a bioinformatician to use it. You do need to read what each
+result says about itself. Where something described here is not yet fully wired in
+this build, the text says so in italics at that point. The reach of every
+capability in this revision is listed in the
+[capability audit](STUDIO_CAPABILITIES.md).
+
+## Finding your way around
+
+Seven tabs run across the top of the window. Each one answers a different
+question, and each says so in a plain sentence directly under the tab bar, with a
+button for the usual next step and a **?** that opens this guide at the right
+place.
+
+| Tab | The question it answers |
+| --- | --- |
+| **Overview** | What is in this project, and what should I do next? |
+| **Isolates** | Which isolates do I have, and is each one trustworthy? |
+| **Compare** | How close are these isolates to each other? |
+| **Schemes** | Which reference definitions do I have installed? |
+| **Evidence** | What genes and markers were found, by which assay? |
+| **Reports** | What can I hand to a colleague? |
+| **Settings** | Text size, screen size, reference data, and what this version cannot do |
+
+The tabs are connected but they do not silently drag each other around. Selecting
+isolates anywhere sets a **focus**: the strip at the top says how many isolates
+are focused and where they came from — "Focus · 7 isolates · from Graph selection
+at 14:32". Focus alone changes nothing. A tab starts reviewing those isolates
+only when you press **Use current focus (N)** on that tab, and the tab then states
+what it is reviewing and where that cohort came from: "Reviewing 7 · from Graph
+selection". That cohort belongs to that tab only. Two tabs can be looking at two
+different sets on purpose, and each will tell you which.
+
+The Compare strip says *similarity is not proof of transmission*; the Evidence
+strip says *genotype is not measured susceptibility*. Those limits are on the
+screen, not buried in a tooltip.
+
+## I have never done this before: can I practise on real data first?
+
+Yes, and you should. Two practice cohorts of published complete genomes are
+pinned by accession and checksum. WMLSTudio ships none of the sequences — it
+downloads them from NCBI when you ask, and verifies every byte against the pinned
+size, MD5 and SHA-256 as well as against the checksums NCBI publishes today.
+
+- **`kpneumoniae-10`** — ten *K. pneumoniae* genomes, about 16 MB. A single-species
+  cohort, so you can see clustering, thresholds and a report end to end.
+- **`mixed-genus-20`** — twenty genomes across fifteen genera, about 21 MB. Its
+  job is to show automatic identification and filing working, *and failing
+  honestly*: a *K. variicola* that is a genuinely hard call inside the *K.
+  pneumoniae* complex, *E. coli* which cannot be separated from *Shigella* by
+  whole-genome identity alone, and *Enterobacter* and *Serratia* which have no
+  species reference in the bundled panel and must come out genus-only or
+  unresolved.
+
+The files arrive flat, in one folder, with no organism structure — creating the
+folders is the demonstration, so the download must not do it for you. No expected
+ST, cluster, threshold or "correct answer" ships with either cohort: agreement
+with any published investigation would not validate this software.
+
+Per-accession tables, the true organism quoted from each NCBI assembly report and
+the full provenance are in [practice cohorts](TEST_DATASETS.md).
+
+Use **Data → Download practice data…**, read the caveats the dialog shows you,
+and choose a cohort. The same cohorts are available without the interface:
+`python studio_scripts/fetch_practice_cohort.py --list`, then
+`--cohort mixed-genus-20 --destination <folder>`. `--verify-pins` re-reads NCBI's
+published checksums without downloading a single genome, so a stale pin is
+detected cheaply.
+
 ## I have 100 presumptive Klebsiella pneumoniae isolates
 
 Your investigation has six connected stages:
@@ -46,6 +114,101 @@ organism is never silently overwritten by a weaker computational result.
 
 Background: [skani methods](https://doi.org/10.1038/s41592-023-02018-3),
 [Kleborate's organism-specific analyses](https://github.com/klebgenomics/Kleborate).
+
+## Where did my files go? Automatic folders for inputs and references
+
+When you import a batch, each file is identified *before* anything is copied, and
+the proposal is shown to you with its evidence: the nearest reference, the margin
+over the runner-up, and a confidence word you can hover for the reason. You accept,
+change, or defer each row. Only then are the managed copies written.
+
+Accepted isolates are filed under `Genus/species`. Anything that was not resolved
+goes to a **`_Unresolved`** folder split by *why*, not by guesswork:
+
+| Folder | What it means |
+| --- | --- |
+| `Awaiting_identification` | Proposed, not yet reviewed by you |
+| `Low_confidence` | The evidence did not reach the confidence your policy requires |
+| `Conflicting_evidence` | Two references were too close together to separate |
+| `Reads_not_assembled` | A FASTQ file; identification needs an assembly first |
+| `Not_in_reference_panel` | Nothing in the installed panel matched — a statement about the panel, not about the organism |
+| `User_deferred` | You chose to decide later |
+
+**A folder is a filing decision, not a laboratory identification.** It records
+where a copy is stored. Confirm the organism before any clinical interpretation.
+Your original files are never moved, renamed or deleted; only the managed copies
+are organised, and the original hash is kept so a copy can always be traced back.
+
+Nothing is auto-confirmed below genus level however you set the policy, and the
+default is that nothing is auto-confirmed at all: the proposal waits for you.
+
+Installed reference schemes are indexed by genus and species from their own
+metadata, with a plainly named "Organism not recorded in this reference" group for
+the few whose metadata carries no taxon. That index is a pointer view: it does not
+re-read alleles and it changes no scheme.
+
+If you get it wrong, fix it: assign the correct genus and species and the managed
+copy moves, the old folder is pruned if it is now empty, and the change is
+recorded in the project history with what it was before. During import review you
+can also work in a spreadsheet: export a template, fill in the genus and species
+per file, and load it back.
+
+Identification beyond *Klebsiella* and *E. coli* needs the broader panel:
+**Data → Install broader species panel…** downloads 17 pinned RefSeq references
+(about 15.7 MB) and verifies every byte. It is not in the ZIP, and until it is
+installed the honest verdicts for most genera are genus-only or
+`Not_in_reference_panel`.
+
+## What can I do with the right mouse button?
+
+Right-click is the same everywhere: on an isolate table, a folder tree, the
+graph, a scheme list or an evidence row. The menu is built from the selection you
+actually have, and it tells you the truth about it:
+
+- The count is always shown — "Export 7 isolates", not "Export".
+- Right-clicking outside your selection replaces the selection first, so the
+  action cannot quietly apply to rows you cannot see.
+- Right-clicking blank space offers only the actions that need no selection.
+- An action that needs exactly one isolate is **disabled with the reason**, never
+  silently narrowed to the first row.
+- Destructive actions sit last, after a separator.
+- While an analysis is running, everything that would write to the project or the
+  disk is disabled.
+
+The generic actions are add, open, rename, assign genus/species, re-file, archive,
+remove, copy identifiers, copy file path, open the containing folder, and export
+the selection. **Delete is not the default.** Archiving hides an isolate from the
+working views while keeping the row, its results, its analyses, its history and
+your file exactly as they were; a removal writes the whole record — including
+every stored analysis — into the project history first, so it can be restored from
+**Samples → Recently removed**. Removing a record never deletes your input file.
+
+An archived isolate disappears from the working tables, comparisons, evidence and
+report cohorts, while its row, results, analyses and history stay exactly as they
+were. A project-level export still contains it, on purpose: archiving is a view
+decision, not a redaction.
+
+## The text is too small, or my screen is very high resolution
+
+**Settings → Display & text size** has three separate controls, because they are
+three different problems:
+
+- **Interface text size** (80–150%) changes immediately, while you watch.
+- **Whole interface size** scales everything, including icons and spacing. Only
+  the sizes your screen can actually show the whole window at are offered; larger
+  ones are hidden with the reason. This one takes effect the next time you open
+  the application, and says so in a banner that stays put: *"Close and reopen
+  WMLSTudio to use this size. Your project and results are not affected."*
+- **Graph text size** is saved with your interface preferences and is intended for
+  the labels drawn in the tree only, never for exported images. *It is stored but
+  not yet applied to the drawn graph in this build;* the setting is recorded and
+  the redraw hook is still to land.
+
+A preview row shows a realistic line of text at the chosen size so you can judge
+it before committing. An advanced section shows the rounding policy, the resolved
+state ("Active display scale: 150% (from your saved preference) · rounding:
+exact") and the recovery command — start with `--display-scale 100` if a saved
+size ever leaves the window unusable.
 
 ## What are the ST and cgMLST profiles?
 
@@ -85,6 +248,47 @@ and capsule-related questions need their appropriate reference definitions and
 QC; generic gene detection does not reproduce all Kleborate/Kaptive outputs.
 
 Source: [NCBI interpretation guidance](https://github.com/ncbi/amr/wiki/Interpreting-results).
+
+## Is there a tool specific to my organism?
+
+Three, in this revision. Some questions only make sense for one genus, so they
+are offered only when the isolate's organism matches — and they still run, with a
+recorded reason, if you ask for them anyway.
+
+- **SCCmec typing**, offered for *Staphylococcus*. It reports which ccr complex
+  and mec class were detected and which SCCmec type definitions they satisfy. It
+  reports a single type only when exactly one definition is satisfied, nothing is
+  unresolved, both complexes resolve, and the required targets sit on one contig.
+  Otherwise you get candidates and the reason the call was withheld.
+- ***Klebsiella* virulence locus STs** — ybt, clb, iuc, iro, rmp — from exact
+  allele vectors, with the published lineage label reported verbatim.
+- ***Klebsiella* capsule markers** — a *wzi* and a *wzc* allele number, and
+  nothing else.
+
+The plan dialog shows, per module, how many of your selected isolates it is
+recommended for, how many are *possible* (right genus, species outside the curated
+set — coagulase-negative staphylococci, for instance) and how many are off-panel.
+Modules recommended for at least one isolate are pre-selected. The stored evidence
+is stamped with which of those it was for that isolate, so a result produced
+outside its validation taxa carries that fact into the report and the export.
+
+Three limits matter more than the rest. **mecC is not in the SCCmec panel and is
+never assayed** — a mecC-carrying element is not detected by mecA, and the AMR
+path's separate mecC result is deliberately not joined into a type call. **No K
+locus, capsule type or serotype is inferred** from a *wzi* allele; the published
+wzi-to-K-type associations are neither shipped nor applied. And **none of these is
+equivalent to Kleborate, Kaptive, staphopia-sccmec or SCCmecFinder**; no
+methicillin susceptibility, MRSA/MSSA designation or hypervirulence phenotype is
+implied by any of them.
+
+Full detail, every limitation verbatim and the pinned reference revisions:
+[organism modules](ORGANISM_MODULES.md). A reference snapshot staged before these
+panels existed reports `not_run` naming the missing section — a diagnosable
+reference state, never a negative result.
+
+Outside the desktop, the same assays run from the command line:
+`WMLSTudio-CLI characterize --list-modules`, then
+`characterize <assembly> --module sccmec --organism "Staphylococcus aureus"`.
 
 ## Which drugs could these determinants affect?
 
@@ -136,6 +340,18 @@ Select the intended cohort and set a threshold appropriate to the organism,
 scheme, missing-data policy and study protocol. There is no universal outbreak
 threshold. Include background isolates when their sampling is meaningful.
 
+WMLSTudio carries a dated catalogue of published cutoffs with their citations. It
+never applies one for you. Eight organisms have a cutoff bound to a named scheme
+and target count, nine more have a published number this catalogue will show you
+but refuses to adopt because no scheme is bound, and twelve listed organisms have
+no curated cutoff at all. Before the software accepts a number it requires the
+exact scheme, the full target set, the reference fingerprint, the caller, the
+missing-data policy and your own written justification — and it then records the
+result as a local adaptation requiring validation, never as validated. Read
+[which organisms are actually covered](THRESHOLDS.md) before assuming yours is
+one of them; a seven-locus MLST distance is not the quantity any of those papers
+measured.
+
 Threshold groups must use **all comparable pairwise edges**, not the positions
 of drawn nodes. Single-linkage allows chains: A may be close to B and B to C,
 while A and C are not close. Review the cluster's maximum observed distance and
@@ -145,6 +361,44 @@ adequately profiled singleton.
 Select a graph node or cluster to inspect its members. Give a reviewed group a
 name, color and note; automatic threshold membership and the group's reviewed
 membership are distinct. Halos are presentation, not additional genetic evidence.
+
+## What has changed since this investigation started?
+
+The Compare tab can show two trees side by side: the **baseline** — the first
+snapshot of this investigation, or any earlier snapshot you pin — and the
+**current** state. The baseline is a pointer into the investigation's existing
+append-only snapshot list, so it costs no extra storage, re-analysis cannot
+rewrite it, and pinning a different one does not disturb a comparison already
+running.
+
+The baseline tree is a replay of exactly what that snapshot displayed. Distances
+are never recomputed for it; you are looking at the stored evidence, not at old
+isolates re-measured with today's rules.
+
+Beside the two trees is a change summary, and its honesty rules are the point of
+the feature:
+
+- If the two snapshots used a different scheme fingerprint or a different distance
+  method, they are **not comparable**, and the distance, edge and cluster sections
+  read "not assessed" rather than "no change". Not assessed is never zero.
+- A pair whose distance number is unchanged but whose **shared-locus denominator
+  moved** is a different measurement, and it is listed as such.
+- A pair touching an isolate that was added or removed is counted as not assessed,
+  never as unchanged.
+- Merges and splits are computed over the isolates present in both snapshots, so a
+  deleted isolate can never read as a split.
+- If you changed the threshold, the cluster changes are attributed to that. If you
+  changed the minimum overlap, the distance changes are attributed to that.
+
+Five statements travel with every comparison and appear in every export of it: an
+MST is not a phylogeny or a transmission chain; changing the cohort alone
+re-routes edges; the choice between equal-distance edges is arbitrary; a changed
+denominator is a different measurement; and a cluster change is not transmission.
+
+Turn the second tree on from the Compare tab. For a large cohort the baseline is
+drawn only when you ask for it, so switching investigations stays responsive, and
+you can pin any earlier snapshot as the baseline from the snapshot list. Pinning a
+baseline does not disturb a comparison that is already running.
 
 ## Can the graph show ST, genes and sample names clearly?
 
@@ -184,6 +438,37 @@ and total loci, and a clear “not comparable” state. Add the selected identit
 AMR, virulence, plasmid-hypothesis and metadata sections relevant to the audience.
 Record limitations and reviewer notes. Do not present genomic associations as
 phenotypic AST or confirmed transmission links.
+
+## I just need something short a colleague can read
+
+Choose the **simple summary** layout. It is one short document in plain language
+with five parts: who is in it; how close these isolates are, with the tree as an
+embedded picture and the threshold together with where that threshold came from;
+which resistance genes were found; the closest matches; and what the report does
+not tell you.
+
+Every heading says in one sentence what it shows *and* what it does not show. The
+susceptibility caveat — genes found are not a measured susceptibility result — is
+printed twice, at the top and welded onto the end of the resistance table, so no
+option can detach it; it is printed even when the resistance section is switched
+off. A distance that cannot be computed prints **"Not comparable"**, and an
+isolate with no profile in the comparison gets its own "Not in this comparison"
+row: a pair that cannot be compared has no distance, and that is not a distance
+of zero. The word cgMLST is never printed unless the scheme's own name contains
+it.
+
+Where the threshold came from is stated explicitly: which paper, which scheme it
+was measured on, and whether it has actually been bound to this comparison. If
+nothing is bound, the report lists the candidate published cutoffs for that
+organism and labels them "None of them is applied to this report".
+
+It is not one page. Measured through the real export pipeline on A4: two pages for
+two to five isolates, three for ten, four for twenty. No caveat was shortened to
+make it fit.
+
+Press **Make a simple summary (PDF)…** on the Reports tab. If no comparison has
+been built yet, it offers to build one first rather than printing a document with
+an empty proximity section.
 
 ## How are CPU and memory managed?
 

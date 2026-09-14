@@ -271,6 +271,10 @@ LOCUS_ST_MODULE = register(OrganismModule(
     column_title='Locus STs', match=KLEBSIELLA_MATCH, runner=type_virulence_loci,
     option_keys=('threads',), manifest_sections=('locus_profiles',),
     summary=summarize_locus_sts, detail_html=locus_st_html, report_default=True,
+    purpose='Matches the ybt, clb, iuc, iro and rmp virulence loci against published Kleborate profile tables '
+            'and reports a locus sequence type only when every allele matches exactly. It does not establish '
+            'hypervirulence, plasmid identity or a Kleborate virulence score, and the lineage shown is a table '
+            'lookup rather than an inference.',
     locus_st_provider=locus_st_assignments, limitations=tuple(LOCUS_ST_LIMITATIONS)))
 
 CAPSULE_MODULE = register(OrganismModule(
@@ -278,4 +282,7 @@ CAPSULE_MODULE = register(OrganismModule(
     column_title='Capsule markers', match=KLEBSIELLA_MATCH, runner=type_capsule_markers,
     option_keys=('threads',), manifest_sections=('capsule.loci',),
     summary=summarize_capsule, detail_html=capsule_html, report_default=True,
+    purpose='Matches the wzi and wzc capsule marker genes against the public Kaptive marker database and '
+            'reports the exact allele number of each. It does not establish a K locus, a capsule type or a '
+            'serotype: no wzi-allele to K-type mapping is shipped or applied.',
     limitations=tuple(CAPSULE_LIMITATIONS)))

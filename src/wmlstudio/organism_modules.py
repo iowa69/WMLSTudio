@@ -19,6 +19,15 @@ from typing import Callable
 # Reserved by characterize_assembly itself; a module may never shadow one.
 CORE_SECTIONS = frozenset({'species_evidence', 'virulence', 'drug_associations', 'plasmid_hypotheses'})
 APPLICABILITY_ORDER = ('recommended', 'possible', 'unknown_organism', 'off_panel')
+# Said wherever a user chooses or reads these assays, not only in a docstring.
+BOUNDARY = ('Each organism-specific tool is a WMLSTudio BLAST or exact-allele screen over pinned public '
+            'reference data, with the source repository, revision and licence recorded in the snapshot. '
+            'None of them is Kleborate, Kaptive, AMRFinderPlus or SCCmecFinder, and none is equivalent to '
+            'those tools: no susceptibility, phenotype, serotype or transmission conclusion is produced.')
+APPLICABILITY_TITLES = {'recommended': 'within the curated taxa',
+                        'possible': 'same genus, other species',
+                        'unknown_organism': 'no organism assigned yet',
+                        'off_panel': 'outside these taxa'}
 _ASSAY_MODULES = ('sccmec_evidence', 'klebsiella_evidence')
 _LOCK = threading.Lock()
 _LOADED = False
@@ -62,6 +71,9 @@ class OrganismModule:
     summary: Callable
     detail_html: Callable
     report_default: bool = True
+    # One plain sentence, for someone who is not a bioinformatician: what a result
+    # from this assay establishes, and what it explicitly does not.
+    purpose: str = ''
     locus_st_provider: Callable | None = None
     limitations: tuple = field(default_factory=tuple)
 
@@ -130,6 +142,65 @@ def cohort_applicability(module, records):
         genus, species, _ = organism_of(record)
         states[module.match.evaluate(genus, species)[0]] += 1
     return states
+
+
+def _isolates(count):
+    return f'{count} isolate' if count == 1 else f'{count} isolates'
+
+
+def cohort_sentence(module, counts, *, off_panel_included=False):
+    """Name, in plain words, exactly which selected isolates this assay will and will not run on.
+
+    A mixed-genus cohort is the normal case in an outbreak workspace, so the
+    dialog states the split rather than leaving the user to infer it from a
+    badge. Skipping an off-panel isolate records nothing for it, and saying so
+    is what keeps the blank from reading as a negative result.
+    """
+    total = sum(counts.values())
+    off_panel = counts.get('off_panel', 0)
+    running = total if off_panel_included else total - off_panel
+    detail = [f'{counts[state]} {APPLICABILITY_TITLES[state]}' for state in APPLICABILITY_ORDER
+              if counts.get(state) and (state != 'off_panel' or off_panel_included)]
+    sentence = f'Will run on {_isolates(running)} of {total} selected'
+    if detail:
+        sentence += ' (' + '; '.join(detail) + ')'
+    if not off_panel:
+        return sentence + '.'
+    if off_panel_included:
+        return (sentence + f'. The {_isolates(off_panel)} outside these taxa are included at your request and '
+                'their results are labelled off-panel, which is weak evidence in either direction.')
+    return (sentence + f'. Will not run on the {_isolates(off_panel)} outside these taxa; nothing is recorded '
+            'for them, which is not a negative result.')
+
+
+def selection_for_record(record, selected, *, include_off_panel=False):
+    """Split one isolate's chosen assays into those that run and those skipped, with the reason.
+
+    The registry never gates on the match rule; this is the caller's choice, made
+    once here so the plan dialog and the command line make it the same way.
+    """
+    genus, species, _ = organism_of(record)
+    running, skipped = {}, {}
+    for key, module in _load().items():
+        if not (selected or {}).get(key):
+            continue
+        state, reason = module.match.evaluate(genus, species)
+        if state == 'off_panel' and not include_off_panel:
+            skipped[key] = reason
+        else:
+            running[key] = True
+    return running, skipped
+
+
+def record_skipped(result, skipped):
+    """Replace 'Assay not selected.' with why this isolate in particular was skipped."""
+    for key, reason in (skipped or {}).items():
+        block = result.get(key)
+        if isinstance(block, dict) and block.get('status') == 'not_run':
+            block['reason'] = ('Not run for this isolate. ' + reason + ' Nothing was screened, so this is not '
+                               'a negative result; include isolates outside a tool\'s reference taxa to run it '
+                               'anyway.')
+    return result
 
 
 def _manifest(reference_root):

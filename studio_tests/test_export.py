@@ -6,13 +6,21 @@ from unittest.mock import patch
 import pytest
 
 from wmlstudio.export import (
+    REPORT_PRESETS,
     export_results,
+    review_report_html,
     write_csv,
     write_distances,
     write_html,
     write_json,
     write_tsv,
 )
+from wmlstudio.simple_report import SIMPLE_REPORT_PRESET
+
+# Every key the "Customize sections…" dialog renders with options[key]; a preset
+# missing one of them raises KeyError the moment a user opens that dialog.
+DIALOG_KEYS = ("title", "investigation", "qc", "amr", "virulence", "plasmid_hypotheses",
+               "drug_associations", "graph", "graph_jpeg", "provenance")
 
 
 @pytest.fixture
@@ -107,6 +115,41 @@ def test_unknown_format_is_rejected_without_creating_file(tmp_path):
     with pytest.raises(ValueError, match="export format"):
         export_results([], destination)
     assert not Path(destination).exists()
+
+
+def test_every_report_preset_carries_every_option_the_section_dialog_renders():
+    for key, preset in REPORT_PRESETS.items():
+        assert [name for name in DIALOG_KEYS if name in preset] == list(DIALOG_KEYS), key
+    # The simple preset is defined once, and appended last so no saved template
+    # and no stored combo position can be repointed by adding a preset.
+    assert REPORT_PRESETS["simple"] == SIMPLE_REPORT_PRESET
+    assert list(REPORT_PRESETS)[-1] == "simple"
+    assert not any(preset.get("layout") for key, preset in REPORT_PRESETS.items() if key != "simple")
+
+
+def test_the_one_page_layout_is_reached_through_the_ordinary_report_writer(records):
+    simple = review_report_html(records, selected_ids={"stable-id"}, options=REPORT_PRESETS["simple"])
+    assert "<title>Simple outbreak summary</title>" in simple
+    assert "What this report does not tell you" in simple
+    assert "No comparison has been built for these isolates" in simple
+    # The detailed shape is untouched: it still loops one section per isolate.
+    detailed = review_report_html(records, selected_ids={"stable-id"}, options=REPORT_PRESETS["cohort"])
+    assert "At a glance" in detailed and "What this report does not tell you" not in detailed
+
+
+def test_the_report_writer_threads_the_image_type_and_the_scope_sentence(records):
+    picture = b"\xff\xd8\xff\xe0 pretend image bytes"
+    note = "No isolates were chosen for this report, so it covers all 2 isolates in the project."
+    threaded = review_report_html(records, selected_ids={"stable-id"}, graph_png=picture,
+                                  graph_mime="image/jpeg", scope_note=note, scope_implicit=True)
+    assert "data:image/jpeg;base64," in threaded
+    assert note in threaded
+    assert "This scope was not chosen for this report." in threaded
+    # Every existing caller keeps PNG, the counted scope line, and no extra notice.
+    default = review_report_html(records, selected_ids={"stable-id"}, graph_png=picture)
+    assert "data:image/png;base64," in default
+    assert "1 explicitly selected isolate(s)" in default
+    assert "This scope was not chosen" not in default
 
 
 def test_distance_export_identifies_pairs_and_preserves_denominators(tmp_path):

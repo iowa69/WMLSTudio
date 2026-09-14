@@ -212,9 +212,20 @@ def feature_fields(record, highlight=None) -> dict:
     cluster = highlight if highlight is not None else metadata.get("cluster", {})
     cluster = cluster if isinstance(cluster, dict) else {"label": str(cluster), "highlight": True}
     workflow = metadata.get("workflow", {})
+    # The decision record says which engine produced a label and how strong it is.
+    # It is reported beside organism_source rather than inside it, because the three
+    # existing organism_source values are consumed verbatim by report wording.
+    # Named apart from the HYDRA evidence bound above: rebinding that name here
+    # silently emptied the hydra_* fields in every export.
+    decision = metadata.get("organism_evidence")
+    decision = decision if isinstance(decision, dict) else {}
     return {
         "genus": genus, "species": species, "organism": organism,
         "organism_source": "assigned" if assigned.get("genus") else "local_scheme_detection" if organism else "unknown",
+        "organism_basis": str(decision.get("basis") or ""),
+        "organism_confidence": str(decision.get("confidence") or ""),
+        "organism_status": str(decision.get("status") or ""),
+        "organism_quarantine": str(decision.get("quarantine_reason") or ""),
         "typing_mode": workflow.get("typing_mode", metadata.get("typing_mode", "")),
         "amr_genes": genes("AMR"), "virulence_genes": genes("VIRULENCE"),
         "plasmid_replicons": genes("PLASMID"), "stress_genes": genes("STRESS"),

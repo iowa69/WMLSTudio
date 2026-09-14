@@ -107,6 +107,20 @@ def test_simple_report_reports_uncompared_isolates_instead_of_zero_distance():
     assert re.search(r"<td>1</td>", report), "the comparable pair still reports its real distance"
 
 
+def test_simple_report_gives_every_equally_close_isolate_its_own_denominator():
+    """Two isolates can be equally close and still have been compared over different loci."""
+    focal = record("ward-A-001", "1111111")
+    complete = record("ward-A-002", "2111111")                       # 7 shared loci, 1 difference
+    partial = record("ward-A-003", [None, None, "1", "1", "1", "1", "2"])  # 5 shared, 1 difference
+    records = [focal, complete, partial]
+    report = render(records, snapshot_for(records, min_overlap=0.5))
+
+    assert "7/7 · 5/7" in report
+    assert "they were not all compared over the same loci" in report
+    # Where both closest isolates share the same loci, one denominator is enough.
+    assert '<td>5/7<br><span class="muted">71% of loci shared</span></td>' in report
+
+
 def test_simple_report_states_the_threshold_and_its_citation_or_that_none_is_bound():
     records = [record("a", "1111111"), record("b", "2111111")]
     unbound = render(records, snapshot_for(records))
@@ -235,6 +249,192 @@ def test_simple_report_marks_single_linkage_chains_in_the_group_column(chained, 
     report = render(records, snapshot_for(records))
     assert expected in report
     assert "two members of one group can differ by more than the threshold" in report
+
+
+# ---------------------------------------------------------------------------
+# The one-click route from the Reports tab, driven through a real window.
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def window(qtbot, tmp_path, monkeypatch):
+    from wmlstudio.app import MainWindow
+    widget = MainWindow(storage_root=tmp_path / "workspace")
+    errors = []
+    monkeypatch.setattr(widget, "error", lambda message: errors.append(str(message)))
+    widget.test_errors = errors
+    qtbot.addWidget(widget)
+    widget.show()
+    qtbot.wait(40)
+    yield widget
+    widget.cancel_comparison_for_close()
+    qtbot.waitUntil(lambda: widget.comparison_worker is None, timeout=5000)
+    widget.close()
+
+
+def add_isolate(window, name, vector="1111"):
+    return window.project.add_profile(name, {
+        "sample_name": name, "scheme": "Ward panel", "scheme_digest": "ward-reference",
+        "status": "profile_imported", "alleles": dict(zip("abcd", vector)), "calls": [],
+        "st": "20", "input_sha256": "a" * 64,
+    }, {"organism": {"genus": "Klebsiella", "species": "pneumoniae"}})
+
+
+def build_comparison(window, ids):
+    """Take the proven investigation route to a snapshot the graph can draw."""
+    from wmlstudio.investigation import InvestigationStore
+    window.refresh_cohort_table()
+    plan = InvestigationStore(window.project).save(
+        "Ward review", ids, scheme="Ward panel", scheme_digest="ward-reference", threshold=1,
+        include_new=True, protocol="Synthetic test protocol; not a clinical cutoff")
+    window.select_investigation(plan["id"])
+    assert window._current_snapshot, window.tree_status.text()
+    return plan["id"]
+
+
+def test_simple_report_on_a_fresh_project_covers_every_isolate_and_prints_that_choice(window, tmp_path):
+    for name in ("ward-A-001", "ward-A-002"):
+        add_isolate(window, name)
+    window.refresh()
+    assert window.report_sample_ids() == set(), "nothing is chosen for a report on a fresh project"
+
+    pdf = tmp_path / "summary.pdf"
+    window.simple_report(pdf, build_comparison=False)
+    assert pdf.read_bytes().startswith(b"%PDF")
+
+    page = tmp_path / "summary.html"
+    window.simple_report(page, build_comparison=False)
+    report = page.read_text()
+    assert ('<p class="notice">No isolates were chosen for this report, so it covers all 2 '
+            "isolates in the project.") in report
+    assert "ward-A-001" in report and "ward-A-002" in report
+    assert SUSCEPTIBILITY_CAVEAT in report
+    assert window.test_errors == []
+
+
+def test_declining_to_build_a_comparison_still_writes_the_summary_and_moves_no_cohort(window, tmp_path):
+    for name in ("ward-A-001", "ward-A-002"):
+        add_isolate(window, name)
+    window.refresh()
+    before = set(window.cohort_ids)
+    page = tmp_path / "no-comparison.html"
+    window.simple_report(page, build_comparison=False)
+    report = page.read_text()
+
+    assert "No comparison has been built for these isolates" in report
+    assert "This is not a statement that the isolates are unrelated." in report
+    assert "<img" not in report
+    assert SUSCEPTIBILITY_CAVEAT in report
+    assert set(window.cohort_ids) == before
+    assert window.project.get_setting("comparison_cohort", None) is None
+    assert window.test_errors == []
+
+
+def test_agreeing_to_build_a_comparison_makes_it_cover_exactly_the_reported_isolates(window, tmp_path):
+    ids = [add_isolate(window, name, vector) for name, vector in
+           [("ward-A-001", "1111"), ("ward-A-002", "2111")]]
+    window.refresh()
+    page = tmp_path / "built.html"
+    window.simple_report(page, build_comparison=True)
+
+    assert set(window.cohort_ids) == set(ids), "the picture must describe the reported isolates"
+    assert window.project.get_setting("comparison_cohort", None) == sorted(ids)
+    assert window.cohort_origins.entry("compare")["origin"] == "Simple summary report"
+    report = page.read_text()
+    assert "ward-A-001" in report and SUSCEPTIBILITY_CAVEAT in report
+    assert window.test_errors == []
+
+
+def test_the_simple_summary_embeds_a_jpeg_while_the_detailed_presets_still_embed_png(window, tmp_path, monkeypatch):
+    ids = [add_isolate(window, name, vector) for name, vector in
+           [("ward-A-001", "1111"), ("ward-A-002", "2111")]]
+    build_comparison(window, ids)
+    window.report_ids = set(ids)
+    window._report_investigation_snapshot = window._current_snapshot
+    window.refresh_report_table()
+
+    page = tmp_path / "simple.html"
+    window.simple_report(page, build_comparison=False)
+    simple = page.read_text()
+    assert 'src="data:image/jpeg;base64,' in simple
+    assert "Allele-distance minimum spanning forest" in simple
+    assert "not a phylogeny and not a transmission tree" in simple
+    assert "Reference used:" in simple and "Ward panel" in simple
+
+    # End to end: the JPEG reaches the printed PDF as a JPEG stream, not as a
+    # dropped picture or a re-encoded one.
+    pdf = tmp_path / "simple.pdf"
+    window.simple_report(pdf, build_comparison=False)
+    printed = pdf.read_bytes()
+    assert printed.startswith(b"%PDF") and b"DCTDecode" in printed
+
+    detailed = tmp_path / "detailed.html"
+    monkeypatch.setattr("wmlstudio.ui_reports.QFileDialog.getSaveFileName",
+                        lambda *args: (str(detailed), ""))
+    window.report_preset.setCurrentIndex(window.report_preset.findData("proximity"))
+    window.export_report("html")
+    assert "data:image/png;base64," in detailed.read_text()
+    assert window.test_errors == []
+
+
+def test_a_cohort_too_large_to_compare_in_line_still_finishes_the_summary(window, qtbot, tmp_path):
+    """Above 30 profiles the comparison moves to a worker; the click must still land."""
+    for index in range(35):
+        vector = ["1", "1", "1", "1"]
+        vector[index % 4] = str(1 + index % 7)
+        add_isolate(window, f"iso-{index:03d}", vector)
+    window.refresh()
+    page = tmp_path / "large.html"
+    window.simple_report(page, build_comparison=True)
+    qtbot.waitUntil(page.exists, timeout=60000)
+
+    report = page.read_text()
+    assert 'src="data:image/jpeg;base64,' in report
+    assert "No comparison has been built" not in report
+    assert len(window.cohort_ids) == 35
+    assert window.test_errors == []
+
+
+def test_the_summary_falls_back_to_the_focused_isolates_and_names_where_they_came_from(window, tmp_path):
+    focused = add_isolate(window, "ward-A-001")
+    add_isolate(window, "ward-B-002")
+    window.refresh()
+    window.focus.set_focus([focused], "Graph selection")
+
+    scope = window.resolve_report_scope()
+    assert scope["ids"] == {focused} and scope["implicit"]
+    page = tmp_path / "focused.html"
+    window.simple_report(page, build_comparison=False)
+    report = page.read_text()
+
+    assert ('<p class="notice">No isolates were chosen for this report, so it covers the 1 '
+            "isolate(s) you had selected — from Graph selection.") in report
+    assert "ward-A-001" in report
+    assert "ward-B-002" not in report
+    assert window.test_errors == []
+
+
+def test_right_click_on_the_report_table_changes_only_this_reports_scope(window, qtbot):
+    from wmlstudio.context_menus import SEPARATOR, Selection
+    first = add_isolate(window, "ward-A-001")
+    second = add_isolate(window, "ward-B-002")
+    window.report_ids = {first, second}
+    window.refresh()
+    window.navigate(5)
+    qtbot.waitUntil(window.report_table.isVisible, timeout=3000)
+
+    selection = Selection("reports", (second,))
+    titles = [entry.format_title(selection) for entry in window.context_menu_plan(selection)
+              if entry is not SEPARATOR]
+    assert "Remove from report" in titles and "Add to report" in titles
+    assert "context_remove_from_report" not in window.context_menu_report()
+
+    window.context_remove_from_report(selection)
+    assert window.report_ids == {first}
+    assert {s["id"] for s in window.project.samples()} == {first, second}, "no record was deleted"
+    window.context_add_to_report(selection)
+    assert window.report_ids == {first, second}
+    assert window.test_errors == []
 
 
 def test_simple_report_picture_is_never_wider_than_the_printed_page(qapp, tmp_path):

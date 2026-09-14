@@ -74,18 +74,19 @@ class IsolateRecordDialog(QDialog):
     def edit_organism(self):
         if self.window.busy():
             return
-        from wmlstudio.storage import assign_organism
         from wmlstudio.workflow_dialogs import BatchAssignmentDialog
         sample = self.window.project.get_sample(self.sample_id)
         dialog = BatchAssignmentDialog([sample], self.window.scheme_entries(), self)
         if dialog.exec() != QDialog.DialogCode.Accepted:
             return
-        for assignment in dialog.assignments:
-            assign_organism(self.window.project, [self.sample_id], assignment["genus"], assignment["species"],
-                            scheme_path=assignment.get("scheme_path"), typing_mode=assignment["typing_mode"])
-        self.window.refresh()
+        # A corrected label moves the managed copy with it; a label alone would
+        # leave the file in a folder that contradicts it.
+        self.window.apply_organism_assignments(
+            [dict(assignment, sample_id=self.sample_id) for assignment in dialog.assignments])
         self.refresh_record()
-        self.window.notify("Organism assignment saved across the project. Previous results are archived; review analysis to produce evidence for the changed workflow.")
+        self.window.notify("Organism assignment saved across the project, and the managed copy is "
+                           "being filed to match it. Previous results are archived; review analysis "
+                           "to produce evidence for the changed workflow.")
 
     def edit_metadata(self):
         previous = self.window.selection_ids

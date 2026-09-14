@@ -10,15 +10,29 @@ from PySide6.QtWidgets import (
     QDialogButtonBox,
     QHBoxLayout,
     QLineEdit,
+    QMenu,
     QSplitter,
     QTreeWidget,
     QTreeWidgetItem,
     QVBoxLayout,
 )
 
+from wmlstudio.archive import active_samples
+from wmlstudio.context_menus import (
+    SEPARATOR,
+    action_state,
+    install_context_menu,
+    plan_for,
+    tidy_plan,
+)
 from wmlstudio.journey import isolate_records
 from wmlstudio.ui_common import cell, make_table, organism_for
 from wmlstudio.widgets import button, label
+
+# A chooser must not become a second place to edit the project. It offers the two
+# actions a user genuinely needs while choosing — correct an organism folder, copy
+# the identifiers — and leaves everything else to the workspace that owns it.
+PICKER_HANDLERS = frozenset({"context_assign_organism", "context_copy_id"})
 
 
 class CohortPickerDialog(QDialog):
@@ -30,7 +44,10 @@ class CohortPickerDialog(QDialog):
         self.setWindowTitle(title)
         self.resize(1060, 690)
         self.setMinimumSize(780, 480)
-        self.samples = isolate_records(samples)
+        # Archived isolates stay in the project with all their evidence; they are
+        # simply not offered as a choice until the user restores them.
+        self.samples = isolate_records(active_samples(samples))
+        self._host = parent
         if not include_reads:
             self.samples = [sample for sample in self.samples
                             if (sample.get("result") or {}).get("kind") != "fastq"
@@ -77,11 +94,14 @@ class CohortPickerDialog(QDialog):
                 parent_item.addChild(item)
         self.folders.expandAll()
         self.folders.itemClicked.connect(self.choose_folder)
+        install_context_menu(self.folders, "picker.folders", self.show_context_menu,
+                             dialect="folders", folder_ids=self.folder_members)
         splitter.addWidget(self.folders)
         self.table = make_table(["Include", "Isolate", "Collection date", "Organism", "ST", "Additional saved profiles", "Quality / state"])
         self.table.setColumnWidth(0, 60)
         self.table.itemChanged.connect(self.item_changed)
         self.table.cellDoubleClicked.connect(self.toggle_row)
+        install_context_menu(self.table, "picker.table", self.show_context_menu, id_column=0)
         splitter.addWidget(self.table)
         splitter.setSizes([225, 810])
         layout.addWidget(splitter, 1)
@@ -104,6 +124,58 @@ class CohortPickerDialog(QDialog):
     def choose_folder(self, item, column=0):
         self._folder = item.data(0, Qt.ItemDataRole.UserRole)
         self.refresh_rows()
+
+    def folder_members(self, genus, species=""):
+        """The isolates an organism folder node stands for; folder nodes carry no ids."""
+        wanted = (genus, species) if species else (genus,)
+        members = []
+        for sample in self.samples:
+            found, child, _ = organism_for(sample)
+            taxon = (found or "Unknown", child or "Unspecified")
+            if taxon[:len(wanted)] == wanted:
+                members.append(sample["id"])
+        return members
+
+    def show_context_menu(self, selection, position):
+        """Offer the owning window's own handlers, from a menu this dialog owns.
+
+        The menu is parented to the dialog so it works while the chooser is modal,
+        and the actions are the window's, so there is one implementation of each.
+        """
+        host = self._host
+        if host is None:
+            return None
+        entries = tidy_plan([entry for entry in plan_for(selection.view_id, selection)
+                             if entry is SEPARATOR or (entry.handler in PICKER_HANDLERS
+                                                       and callable(getattr(host, entry.handler, None)))])
+        if not entries:
+            return None
+        worker = getattr(host, "worker", None)
+        busy = bool(worker is not None and worker.isRunning())
+        chosen_ids = set(selection.sample_ids)
+        samples = [sample for sample in self.samples if sample["id"] in chosen_ids]
+        menu = QMenu(self)
+        menu.setToolTipsVisible(True)
+        for entry in entries:
+            if entry is SEPARATOR:
+                menu.addSeparator()
+                continue
+            enabled, reason = action_state(entry, selection, window=host, busy=busy, samples=samples)
+            action = menu.addAction(entry.format_title(selection))
+            action.setEnabled(enabled)
+            if reason:
+                action.setToolTip(reason)
+            action.setData((entry.handler, None))
+        chosen = menu.exec(position)
+        data = chosen.data() if chosen is not None else None
+        menu.deleteLater()
+        if not data:
+            return None
+        result = host.run_context_action(data, selection)
+        if data[0] != "context_copy_id":
+            self.feedback.setText("Organism changes are saved to the project and the managed copies "
+                                  "move with them. Reopen this chooser to see the new folders.")
+        return result
 
     def refresh_rows(self):
         self._filling = True

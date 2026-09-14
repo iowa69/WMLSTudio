@@ -14,6 +14,7 @@ import uuid
 from copy import deepcopy
 from datetime import datetime, timezone
 from functools import wraps
+from html import escape
 from itertools import combinations
 
 from .comparison import _known_calls, _sample_key, forest_from_distances, pairwise_distances
@@ -501,6 +502,249 @@ def snapshot_diff(baseline, current):
     return {"format_version": 1, "baseline": baseline_facts, "current": current_facts, "policy": policy,
             "isolates": isolates, "pairs": pairs, "mst_edges": edges, "groups": groups,
             "summary": summary, "caveats": caveats}
+
+
+DIFF_ROW_FIELDS = ("change_type", "sample_id", "sample_name", "partner_id", "partner_name",
+                   "baseline_value", "current_value", "baseline_shared_total",
+                   "current_shared_total", "note")
+
+
+def _shared_total(shared, total):
+    """'2480/2500', or an explicit blank when the snapshot recorded no denominator."""
+    if shared is None and total is None:
+        return ""
+    return f"{'?' if shared is None else shared}/{'?' if total is None else total}"
+
+
+def snapshot_diff_caption(diff):
+    """A short status line: what moved, and what could not be assessed at all.
+
+    Counts that are zero are left out to keep the line readable, but a section
+    that was *not assessed* is always named, because silence there would read as
+    "nothing changed".
+    """
+    summary = diff.get("summary", {})
+    parts = []
+    for key, singular, plural in (("isolates_added", "+{n} isolate", "+{n} isolates"),
+                                  ("isolates_removed", "−{n} isolate", "−{n} isolates"),
+                                  ("evidence_changed", "{n} re-typed", "{n} re-typed"),
+                                  ("distance_changed", "{n} distance changed", "{n} distances changed"),
+                                  ("groups_split", "{n} group split", "{n} groups split"),
+                                  ("groups_merged", "{n} group merged", "{n} groups merged")):
+        count = summary.get(key)
+        if count:
+            parts.append((singular if count == 1 else plural).format(n=count))
+    if not diff.get("policy", {}).get("comparable", True):
+        return " · ".join([*parts, "distances, lines and groups not comparable"])
+    if summary.get("evidence_changed") is None:
+        parts.append("typing evidence not assessed")
+    return " · ".join(parts) if parts else "no change since the baseline"
+
+
+def snapshot_diff_rows(diff):
+    """Flatten a snapshot comparison to one row per change, for a spreadsheet.
+
+    The first rows state the comparison policy and how many pairs were *not*
+    assessed, so a reader who opens only this table cannot mistake it for a
+    complete account of what changed. A section that was not assessed produces
+    no change rows at all, never rows reading zero.
+    """
+    rows = [{"change_type": "comparison_policy", "note": diff["policy"]["reason"],
+             "baseline_value": diff["baseline"].get("snapshot_id", ""),
+             "current_value": diff["current"].get("snapshot_id", "")}]
+    for item in diff["policy"]["differences"]:
+        rows.append({"change_type": "policy_changed", "sample_name": item["field"],
+                     "baseline_value": item["baseline"], "current_value": item["current"],
+                     "note": "A policy change moves groups and pair comparability by itself."})
+    isolates = diff["isolates"]
+    for row in isolates["added"]:
+        rows.append({"change_type": "isolate_added", "sample_id": row["sample_id"],
+                     "sample_name": row["sample_name"], "current_value": "in the current comparison",
+                     "note": "Pairs touching this isolate existed in one snapshot only."})
+    for row in isolates["removed"]:
+        rows.append({"change_type": "isolate_removed", "sample_id": row["sample_id"],
+                     "sample_name": row["sample_name"], "baseline_value": "in the baseline",
+                     "note": "Absent from the current comparison; its pairs were not assessed."})
+    for row in isolates.get("evidence_changed") or ():
+        rows.append({"change_type": "evidence_changed", "sample_id": row["sample_id"],
+                     "sample_name": row["sample_name"],
+                     "baseline_shared_total": _shared_total(row["baseline_callable"], row["baseline_total"]),
+                     "current_shared_total": _shared_total(row["current_callable"], row["current_total"]),
+                     "note": "The stored typing evidence for this isolate changed between snapshots."})
+    pairs = diff.get("pairs")
+    if pairs is not None:
+        rows.append({"change_type": "pairs_not_assessed", "current_value": pairs["not_assessed_count"],
+                     "note": "Pairs touching an added or removed isolate. Not assessed is not 'unchanged'."})
+        for row in pairs["distance_changed"]:
+            note = ("The shared-locus denominator also changed: this is a measurement over a different "
+                    "locus set, not observed allele change." if row["denominator_changed"]
+                    else "Measured over the same shared-locus denominator.")
+            rows.append({"change_type": "distance_changed" if row["distance_changed"] else "denominator_changed",
+                         "sample_id": row["source"], "sample_name": row["source_name"],
+                         "partner_id": row["target"], "partner_name": row["target_name"],
+                         "baseline_value": row["baseline_distance"], "current_value": row["current_distance"],
+                         "baseline_shared_total": _shared_total(row["baseline_shared"], row["baseline_total"]),
+                         "current_shared_total": _shared_total(row["current_shared"], row["current_total"]),
+                         "note": note})
+        for row in pairs["became_comparable"]:
+            rows.append({"change_type": "became_comparable", "sample_id": row["source"],
+                         "sample_name": row["source_name"], "partner_id": row["target"],
+                         "partner_name": row["target_name"], "baseline_value": "not comparable",
+                         "current_value": row["current_distance"],
+                         "current_shared_total": _shared_total(row["current_shared"], row["current_total"]),
+                         "note": "Baseline reason: " + str(row["baseline_reason"] or "not recorded")})
+        for row in pairs["became_excluded"]:
+            rows.append({"change_type": "became_excluded", "sample_id": row["source"],
+                         "sample_name": row["source_name"], "partner_id": row["target"],
+                         "partner_name": row["target_name"], "baseline_value": row["baseline_distance"],
+                         "current_value": "not comparable",
+                         "baseline_shared_total": _shared_total(row["baseline_shared"], row["baseline_total"]),
+                         "note": "Current reason: " + str(row["current_reason"] or "not recorded")
+                                 + ". A pair that cannot be compared has no distance; it is not a distance of zero."})
+    groups = diff.get("groups")
+    if groups is not None:
+        for row in groups["crosswalk"]:
+            if row["current_group_id"] in groups["merged"]:
+                change = "group_merged"
+            elif row["added_members"]:
+                change = "group_grown"
+            elif not row["from_baseline_groups"]:
+                change = "group_new"
+            else:
+                change = "group_carried"
+            rows.append({"change_type": change, "sample_id": row["current_group_id"],
+                         "sample_name": row["current_group_name"],
+                         "baseline_value": "; ".join(origin["name"] for origin in row["from_baseline_groups"]),
+                         "current_value": len(row["current_members"]),
+                         "note": "Added since the baseline: " + (", ".join(row["added_members"]) or "none")
+                                 + ". Group membership is allele similarity under a local threshold."})
+        for group_id in groups["split"]:
+            rows.append({"change_type": "group_split", "sample_id": group_id,
+                         "note": "Isolates present in both snapshots landed in more than one current group."})
+        for row in groups["dissolved"]:
+            rows.append({"change_type": "group_dissolved", "sample_id": row["baseline_group_id"],
+                         "sample_name": row["name"], "baseline_value": len(row["members"]),
+                         "current_value": "; ".join(heir["name"] for heir in row["went_to"]) or "no current group",
+                         "note": ("The same isolates are still together under a new group identity."
+                                  if row["members_intact"] else groups["note"])})
+    return [{field: row.get(field, "") for field in DIFF_ROW_FIELDS} for row in rows]
+
+
+def _diff_table(headers, rows):
+    head = "".join(f"<th align='left'>{escape(str(name))}</th>" for name in headers)
+    body = "".join("<tr>" + "".join(f"<td>{escape('—' if value is None else str(value))}</td>"
+                                    for value in row) + "</tr>" for row in rows)
+    return f"<table border='1' cellpadding='5' cellspacing='0'><tr>{head}</tr>{body}</table>"
+
+
+def snapshot_diff_html(diff):
+    """Render a snapshot comparison for the screen and for export; pure, no Qt.
+
+    What was not assessed is printed as such rather than omitted, because an
+    absent row reads as "nothing changed". When the two snapshots were not
+    measured on one scale no distance, edge or cluster table is produced at all.
+    """
+    facts = []
+    for role, title in (("baseline", "Baseline"), ("current", "Current")):
+        item = diff[role]
+        facts.append([title, item.get("investigation_name") or "Unsaved investigation",
+                      item.get("created_at") or "not recorded", item.get("cohort_size"),
+                      item.get("threshold"), item.get("min_overlap"),
+                      item.get("scheme") or "not recorded",
+                      str(item.get("scheme_digest") or "not recorded")[:12]])
+    policy = diff["policy"]
+    banner = "notice" if not policy["identical"] else "plain"
+    parts = ["<h2>What changed since the baseline</h2>",
+             f"<p class='{banner}'>{escape(policy['reason'])}</p>",
+             _diff_table(["Panel", "Investigation", "Built", "Isolates", "Link ≤", "Shared ≥",
+                          "Reference", "Fingerprint"], facts),
+             "<h3>Isolates</h3>",
+             "<p>Cohort membership first: an isolate that is present in only one snapshot never reads "
+             "as an unchanged distance.</p>"]
+    isolates = diff["isolates"]
+    membership = [["Added", len(isolates["added"]),
+                   ", ".join(row["sample_name"] for row in isolates["added"]) or "none"],
+                  ["Removed", len(isolates["removed"]),
+                   ", ".join(row["sample_name"] for row in isolates["removed"]) or "none"],
+                  ["In both", len(isolates["retained"]), ""]]
+    if isolates["evidence_changed"] is None:
+        membership.append(["Typing evidence changed", "not assessed",
+                           "Evidence cannot be compared across different references."])
+    else:
+        membership.append(["Typing evidence changed", len(isolates["evidence_changed"]),
+                           ", ".join(f"{row['sample_name']} "
+                                     f"({row['baseline_callable']}/{row['baseline_total']} → "
+                                     f"{row['current_callable']}/{row['current_total']} loci called)"
+                                     for row in isolates["evidence_changed"]) or "none"])
+    parts.append(_diff_table(["Isolates", "Count", "Which"], membership))
+    pairs = diff["pairs"]
+    parts.append("<h3>Pairwise distances</h3>")
+    if pairs is None:
+        parts.append("<p class='notice'>Not assessed. " + escape(policy["reason"]) + "</p>")
+    else:
+        parts.append(f"<p>{pairs['unchanged_count']} pair(s) unchanged · "
+                     f"{pairs['still_excluded_count']} still not comparable · "
+                     f"{pairs['not_assessed_count']} not assessed because an isolate was added or removed. "
+                     "Every row carries both shared-locus denominators; a changed denominator means a "
+                     "different locus set was measured, not observed allele change.</p>")
+        rows = [[f"{row['source_name']} ↔ {row['target_name']}", row["baseline_distance"],
+                 row["current_distance"], _shared_total(row["baseline_shared"], row["baseline_total"]),
+                 _shared_total(row["current_shared"], row["current_total"]),
+                 "⚠ denominator changed" if row["denominator_changed"] else ""]
+                for row in pairs["distance_changed"]]
+        parts.append(_diff_table(["Pair", "Baseline", "Current", "Baseline shared/total",
+                                  "Current shared/total", "Note"], rows) if rows
+                     else "<p>No pair changed its distance or its denominator.</p>")
+        for key, title, value_key, note in (
+                ("became_comparable", "Pairs that became comparable", "current_distance",
+                 "A pair with too little shared evidence has no distance; it was never a distance of zero."),
+                ("became_excluded", "Pairs that stopped being comparable", "baseline_distance",
+                 "The earlier number is kept for the record; it is not the current measurement.")):
+            if pairs[key]:
+                parts.append(f"<h4>{title}</h4><p>{note}</p>")
+                parts.append(_diff_table(["Pair", "Distance", "Reason"],
+                                         [[f"{row['source_name']} ↔ {row['target_name']}",
+                                           row[value_key],
+                                           row.get("baseline_reason") or row.get("current_reason") or ""]
+                                          for row in pairs[key]]))
+    groups = diff["groups"]
+    parts.append("<h3>Threshold groups</h3>")
+    if groups is None:
+        parts.append("<p class='notice'>Not assessed. " + escape(policy["reason"]) + "</p>")
+    else:
+        if policy["grouping_attributable"]:
+            parts.append("<p class='notice'>The link threshold changed between these two snapshots, so "
+                         "group differences are at least partly a consequence of that cutoff.</p>")
+        parts.append(_diff_table(["Current group", "Isolates", "Came from", "Added since the baseline"],
+                                 [[row["current_group_name"], len(row["current_members"]),
+                                   "; ".join(origin["name"] for origin in row["from_baseline_groups"])
+                                   or "no baseline group",
+                                   ", ".join(row["added_members"]) or "none"]
+                                  for row in groups["crosswalk"]] or [["No current groups", 0, "", ""]]))
+        if groups["dissolved"]:
+            parts.append("<h4>Baseline groups with no current counterpart</h4>"
+                         f"<p>{escape(groups['note'])}</p>")
+            parts.append(_diff_table(["Baseline group", "Isolates", "Its isolates are now in",
+                                      "Same isolates, new identity"],
+                                     [[row["name"], len(row["members"]),
+                                       "; ".join(heir["name"] for heir in row["went_to"]) or "no current group",
+                                       "yes" if row["members_intact"] else "no"]
+                                      for row in groups["dissolved"]]))
+    edges = diff["mst_edges"]
+    parts.append("<h3>Lines drawn between isolates (presentation only)</h3>")
+    if edges is None:
+        parts.append("<p class='notice'>Not assessed. " + escape(policy["reason"]) + "</p>")
+    else:
+        parts.append(f"<p>{escape(edges['note'])}</p>")
+        parts.append(_diff_table(["Only in the baseline", "Only in the current", "In both"],
+                                 [["; ".join(f"{row['source_name']} ↔ {row['target_name']} "
+                                             f"({row['distance']})" for row in edges["only_in_baseline"]) or "none",
+                                   "; ".join(f"{row['source_name']} ↔ {row['target_name']} "
+                                             f"({row['distance']})" for row in edges["only_in_current"]) or "none",
+                                   edges["shared"]]]))
+    parts.append("<h3>How to read this</h3><ul class='notice'>"
+                 + "".join(f"<li>{escape(str(caveat))}</li>" for caveat in diff["caveats"]) + "</ul>")
+    return "".join(parts)
 
 
 def threshold_guidance_status(snapshot):

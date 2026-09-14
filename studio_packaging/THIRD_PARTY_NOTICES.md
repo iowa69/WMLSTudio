@@ -131,6 +131,102 @@ silently included by the HYDRA starter-staging command. Its reference files,
 mutation companions, manifest and observed provider release are hashed in
 `wmlstudio/resources/hydra/starter/snapshot_provenance.json`.
 
+## Bundled organism-module reference panels
+
+The independent species/virulence starter and the organism-specific typing
+panels are staged by `studio_scripts/stage_characterization.py` from three
+public repositories, each pinned to one commit and each fetched together with
+its own `LICENSE`. The staged snapshot records every upstream URL, byte count
+and SHA-256, and its `sources` block repeats the repository, revision and
+licence identifier for each source. Deriving a panel (splitting a multi-record
+FASTA, rewriting headers, parsing a rules table) happens at staging time only;
+the upstream files are retained verbatim beside the derived artefacts so the
+derivation is auditable against the bytes that were actually downloaded.
+
+[Kleborate](https://github.com/klebgenomics/Kleborate) is **GPL-3.0-or-later**.
+Its species-reference accession set, virulence-locus allele FASTAs and
+`profiles.tsv` locus-ST tables are pinned to commit
+`550ce22a2c01c76064f4dabf403704ee2293356e`. The fetched `LICENSE` (35,141 bytes,
+SHA-256 `589ed823e9a84c56feb95ac58e7cf384626b9cbf4fda2a907bc36e103de1bad2`)
+travels in the snapshot as `source-LICENSE` (`source-LICENSE-kleborate` in a
+format 2 snapshot). WMLSTudio does not incorporate Kleborate source code, does
+not run Kleborate, and does not compute Kleborate's aggregate virulence or
+resistance scores. A locus ST reported here is an exact-allele lookup against
+that pinned profile table, and a lineage string is that table's own value,
+reported verbatim.
+
+[rpetit3/sccmec](https://github.com/rpetit3/sccmec) v1.2.0 is **MIT**,
+"Copyright (c) 2024 Robert A. Petit III", pinned to commit
+`b901cc618be8eb17284ccb0cf6ef9ee428d909c3`. Its `LICENSE` is 1,076 bytes,
+SHA-256 `5545cae984ae5abd56b68d66ddf1811be5219ec3804c237da14a9eee067d0e82`,
+staged as `source-LICENSE-sccmec`. The staged panel derives from
+`data/sccmec-targets.fasta` (107,660 bytes, SHA-256
+`4b18b4f97651345b389f26dd8e91c95b792d32841dd2aee64bc7842884aa6c4d`),
+`data/sccmec-targets.yaml` (3,638 bytes, SHA-256
+`feec4363b42076c4c6187b7abeae33860ea91f9e34393024db67e899e2bba03d`),
+`data/sccmec-regions.fasta` (1,121,499 bytes, SHA-256
+`8bce1de540374f487d3f2144292b5f32872cdd839acb86bad2dc84eb0cee789f`) and the two
+companion TSV tables, all retained verbatim. The IWG ccr/mec type definitions
+live in the staged manifest, not in WMLSTudio source, so the rules in force are
+provable from the recorded `reference_digest`. The cassette references are
+public GenBank records whose accessions remain in their FASTA headers. This is a
+BLAST+ marker screen against that pinned panel: it is not staphopia-sccmec or
+SCCmecFinder output, is not equivalent to them, and assigns no MRSA/MSSA
+designation or methicillin susceptibility. `mecC` is absent from the upstream
+20-target set and is recorded as `not_assayed`, never as absent.
+
+[Kaptive](https://github.com/klebgenomics/Kaptive) v2.0.9 is
+**GPL-3.0-or-later** (GNU GPL v3), pinned to commit
+`b3856eac6e76b3017aa993319da2a8ea967a1ba0`. Only
+`reference_database/wzi_wzc_db.fasta` (246,938 bytes, SHA-256
+`5349423a9cbeedbce35ea499b441a23f1a965d64d265bdc29c96713e775e820d`) is staged;
+the K and O locus GenBank databases are not. The fetched `LICENSE` is staged as
+`source-LICENSE-kaptive` with its byte count and SHA-256 recorded in the
+snapshot manifest's `files` list. WMLSTudio reports a `wzi` or `wzc` allele
+number only. No wzi-allele-to-K-type mapping is shipped or applied, no K or O
+locus is assigned, and Kaptive's match-confidence grading and O-locus logic are
+not implemented. This is not Kaptive output and is not equivalent to it.
+
+A snapshot staged before these panels existed is format version 1. It keeps
+validating unchanged, and the organism-specific assays then report `not_run`
+naming the missing manifest section. That is a diagnosable reference state, not
+a negative result.
+
+## Public genome references downloaded on request
+
+Neither the practice cohorts nor the broad species panel is included in the
+portable ZIP. Both are fetched from NCBI to the user's own adjacent `Data`
+directory after an explicit request, verified against pinned checksums, and the
+build refuses to package a copy that was staged into the source tree. Only
+accession and checksum tables are held in WMLSTudio; no sequence bytes are
+redistributed by this project.
+
+> Assemblies are public NCBI RefSeq records retrieved from
+> https://ftp.ncbi.nlm.nih.gov/genomes/all/. NCBI places no restrictions on the
+> use or distribution of the data it hosts, but it does not hold their copyright
+> and cannot grant rights on behalf of the depositing submitters; individual
+> submitters may assert terms. Cite the assembly accession and the originating
+> submitters, not WMLSTudio, when reusing these sequences.
+
+The broad species panel is pinned as revision
+`ncbi-refseq-species-panel-2026-09-14`: 17 RefSeq assemblies, one per taxon,
+about 15.7 MiB, each row pinning the accession, assembly directory, compressed
+byte count, compressed SHA-256 and decompressed-FASTA SHA-256. It is a triage
+panel, not a representation of within-species diversity, and it does not
+distinguish *Escherichia coli* from *Shigella*.
+
+The practice cohorts are pinned as content digests over their accession tables:
+`kpneumoniae-10` (10 assemblies, 16,746,561 bytes, digest
+`238aae60e7f48449aec656cf4e4a500c6ad0136d6e9dc71ecf4fee3c545e6dbc`) and
+`mixed-genus-20` (20 assemblies, 21,703,421 bytes, digest
+`459071d13922ec70677618e35c5ddab0b1629cf46a8fec6b53424e3b8a5b5b97`). Each
+download re-checks the pinned size, MD5 and SHA-256 against the checksums NCBI
+publishes today and aborts on any disagreement. Organism and strain labels are
+the ones NCBI records for those assemblies; they were not independently
+verified here, and no expected ST, cluster or threshold is shipped with either
+cohort. Full provenance and per-accession tables are in
+[docs/TEST_DATASETS.md](../docs/TEST_DATASETS.md).
+
 Database downloads/updates occur only after explicit user action and publish
 a new versioned snapshot. Existing reference snapshots are retained. Database
 access and software licensing must not be confused with clinical validation:

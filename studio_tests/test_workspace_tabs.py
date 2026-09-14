@@ -164,3 +164,144 @@ def test_purpose_lines_state_their_limits_where_a_claim_could_be_read_in(tabs):
         assert purpose.endswith("."), key
     for key, (text, method) in NEXT_STEP.items():
         assert text and method.isidentifier(), key
+
+
+# ---------------------------------------------------------------------------
+# The real window: the pages it builds, the tabs it shows and the guarded
+# navigation every existing call site still goes through.
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def window(qtbot, tmp_path):
+    from wmlstudio.app import MainWindow
+    widget = MainWindow(storage_root=tmp_path / "workspace")
+    qtbot.addWidget(widget)
+    widget.show()
+    yield widget
+    widget.close()
+
+
+def page_content(window, key):
+    """The page's own widget, behind the scroll area every page is wrapped in."""
+    from PySide6.QtWidgets import QScrollArea
+    page = window.pages.widget(window.page_index[key])
+    return page.widget() if isinstance(page, QScrollArea) else page
+
+
+def test_the_window_builds_seven_keyed_tabs_and_the_old_indices_still_address_them(window):
+    assert isinstance(window.pages, WorkspaceTabs)
+    assert window.pages.count() == 7
+    assert window.page_index == {key: index for index, key in enumerate(PAGE_KEYS)}
+    assert window.pages.keys() == PAGE_KEYS
+    for index, key in enumerate(PAGE_KEYS):
+        assert window.pages.tabBar().tabData(index) == key
+        assert TAB_LABELS[key] in window.pages.tabText(index)
+        assert NAV_SYMBOLS[index] in window.pages.tabText(index)
+        # The tooltip keeps the long workspace name the breadcrumb and Alt+1…7 use.
+        assert window.nav_names[index] in window.pages.tabToolTip(index)
+        assert PAGE_PURPOSE[key] in window.pages.tabToolTip(index)
+
+
+def test_clicking_a_tab_updates_the_breadcrumb_without_navigating_twice(window):
+    calls = []
+    original = type(window).navigate
+    type(window).navigate = lambda self, index: (calls.append(index), original(self, index))[1]
+    try:
+        for index, key in enumerate(PAGE_KEYS):
+            calls.clear()
+            window.pages.setCurrentIndex(index)
+            assert window.pages.currentIndex() == index
+            assert window.breadcrumb.text() == "WORKSPACE  /  " + window.nav_names[index].upper()
+            # currentChanged dispatches navigate, which must not re-enter itself.
+            assert len(calls) <= 2, (key, calls)
+    finally:
+        type(window).navigate = original
+
+
+def test_an_index_outside_the_workspace_is_refused_rather_than_guessed(window):
+    window.navigate(2)
+    before = window.breadcrumb.text()
+    window.navigate(-1)
+    window.navigate(99)
+    assert window.pages.currentIndex() == 2
+    assert window.breadcrumb.text() == before
+
+
+def test_page_six_is_a_real_settings_tab_and_no_longer_opens_a_dialog(window, monkeypatch):
+    opened = []
+    monkeypatch.setattr(type(window), "open_interface_settings",
+                        lambda self: opened.append(True))
+    window.navigate(window.page_index["settings"])
+    assert window.pages.currentIndex() == window.page_index["settings"]
+    assert opened == []
+    assert window.settings_tabs.count() == 3
+    # QTabBar reads a single "&" as a mnemonic, so the titles escape it.
+    shown = [window.settings_tabs.tabText(i).replace("&&", "&") for i in range(3)]
+    assert shown == ["Display & text size", "Data & references",
+                     "What this version can and cannot do"]
+
+
+def test_the_settings_tab_keeps_the_boundaries_paragraph_word_for_word(window):
+    guide = window.settings_guide.toHtml()
+    assert "not a validated diagnostic device" in guide
+    assert "does not predict measured susceptibility or prove transmission" in guide
+
+
+def test_the_compare_page_refreshes_itself_when_its_tab_becomes_current(window):
+    refreshes = []
+    window.page_shown["compare"] = lambda: refreshes.append(True)
+    window.navigate(window.page_index["overview"])
+    window.navigate(window.page_index["compare"])
+    assert refreshes == [True]
+
+
+def test_every_tab_explains_itself_and_offers_one_obvious_next_step(window):
+    from PySide6.QtWidgets import QLabel, QPushButton
+    for key in PAGE_KEYS:
+        content = page_content(window, key)
+        purposes = [child for child in content.findChildren(QLabel)
+                    if child.text() == PAGE_PURPOSE[key]]
+        assert purposes, key
+        text, method = NEXT_STEP[key]
+        buttons = [child for child in content.findChildren(QPushButton)
+                   if child.text() == text]
+        # A next step whose method does not exist yet must not be offered at all.
+        assert bool(buttons) is callable(getattr(window, method, None)), key
+
+
+def test_the_orientation_strip_repeats_the_limits_a_novice_could_read_past(window):
+    from PySide6.QtWidgets import QLabel
+    compare = page_content(window, "compare")
+    lines = [child.text() for child in compare.findChildren(QLabel)]
+    assert any("not proof of transmission" in line for line in lines)
+    evidence = page_content(window, "evidence")
+    lines = [child.text() for child in evidence.findChildren(QLabel)]
+    assert any("not measured susceptibility" in line for line in lines)
+
+
+def test_the_pages_other_controllers_rearrange_are_left_exactly_as_they_were(window):
+    """The evidence and scheme pages move their own layout items by position."""
+    # ui_reports.build_hydra re-homed the imported-source controls into their own tab.
+    titles = [window.evidence_tabs.tabText(i) for i in range(window.evidence_tabs.count())]
+    assert "Advanced · imported source" in titles
+    assert window.hydra_table.parent() is not None
+    # ui_workbench.build_schemes inserted its own action row.
+    assert window.scheme_table.columnCount() == 3
+    # The evidence scope label stayed on the evidence page, not inside the strip.
+    from PySide6.QtWidgets import QLabel
+    evidence = page_content(window, "evidence")
+    assert window.feature_scope_label in evidence.findChildren(QLabel)
+
+
+def test_the_tab_bar_reaches_every_page_on_the_narrowest_supported_window(window, qtbot):
+    """Seven tabs must be clickable without scroll arrows at the minimum window size."""
+    window.resize(1000, 680)
+    # Hiding the sidebar happens in resizeEvent; the layout that gives its width
+    # to the tabs runs on the next pass, so wait for the settled geometry.
+    qtbot.waitUntil(lambda: not window.sidebar.isVisible()
+                    and window.pages.width() >= 940, timeout=5000)
+    assert window.pages.tabBar().sizeHint().width() <= window.pages.width()
+    window.resize(1380, 940)
+    qtbot.waitUntil(lambda: window.sidebar.isVisible(), timeout=5000)
+    assert window.pages.tabBar().sizeHint().width() <= window.pages.width()

@@ -18,15 +18,13 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from wmlstudio import __version__
-from wmlstudio.export import _escape, _snapshot, investigation_document
+from wmlstudio.export import REPORT_PRESETS, _escape, _snapshot, investigation_document
 
 # A different document shape, not a different set of facts: the same snapshot
-# rows feed the existing presets. Only the layout and the wording change.
-SIMPLE_REPORT_PRESET = {
-    'title': 'Simple outbreak summary', 'investigation': True, 'qc': False, 'amr': True,
-    'virulence': False, 'plasmid_hypotheses': False, 'drug_associations': False,
-    'graph': True, 'provenance': False, 'layout': 'one_page', 'graph_jpeg': True,
-}
+# rows feed the existing presets. Only the layout and the wording change. The
+# registry in export.py is the one definition; this is the name the renderer and
+# its tests reach for, copied so a caller cannot edit the registry through it.
+SIMPLE_REPORT_PRESET = dict(REPORT_PRESETS['simple'])
 
 # Escape-stable: typographic quotes keep the constant identical in the document,
 # so no option flag and no escaping pass can quietly reword it.
@@ -282,17 +280,26 @@ def _proximity_cells(focal, threshold) -> list[str]:
     closest = (_escape(', '.join(names[:3])) + (_escape(f' +{len(names) - 3} more') if len(names) > 3 else '')
                if names else _escape('No comparable isolate in this comparison'))
     if nearest:
-        pair = nearest[0]
-        shared = _escape(f"{pair['shared_loci']}/{pair['total_loci']}") + _muted(f"{pair['overlap']:.0%} of loci shared")
+        shown = nearest[:3]
+        denominators = [f"{pair['shared_loci']}/{pair['total_loci']}" for pair in shown]
+        if len(set(denominators)) == 1:
+            shared = _escape(denominators[0]) + _muted(f"{shown[0]['overlap']:.0%} of loci shared")
+        else:
+            # Equally close isolates can have been compared over different locus
+            # sets. One figure for all of them would hide that difference.
+            shared = _escape(' · '.join(denominators)) + _muted(
+                'One denominator per closest isolate, in the order listed: they were not all compared '
+                'over the same loci.')
     else:
         shared = '—'
     group = _escape(focal.get('group_name') or 'Not grouped')
     group += _muted(_GROUP_WORDS.get(focal.get('group_status'), 'no group recorded'))
     if focal.get('chained'):
         group += _muted('Joined through intermediate isolates.')
+    comparable = distance is not None and isinstance(threshold, (int, float)) and not isinstance(threshold, bool)
     return [_escape(focal.get('sample_name') or focal.get('sample_id')),
             _escape('Not comparable') if distance is None else _escape(distance), closest, shared,
-            '—' if distance is None else _escape('Yes' if distance <= threshold else 'No'), group]
+            _escape('Yes' if distance <= threshold else 'No') if comparable else '—', group]
 
 
 def _proximity_section(snapshot, rows, names) -> list[str]:

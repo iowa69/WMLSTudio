@@ -27,6 +27,13 @@ from PySide6.QtWidgets import (
 
 from wmlstudio.theme import BACKGROUND, INK, MUTED, PALETTE
 
+# Printed under every exported forest, including each half of a side-by-side pair.
+GRAPH_SUBTITLE = ("Not a phylogeny or transmission tree · positions are editable "
+                  "· edge labels are allele differences")
+SIDE_BY_SIDE_NOTE = ("Both panels are layouts of allele differences between profiles. Neither is a "
+                     "phylogeny, a time line or a transmission chain, and a line between two isolates "
+                     "is similarity, not a proven link.")
+
 
 def label(text: str, style: str = "", wrap: bool = False) -> QLabel:
     item = QLabel(text)
@@ -234,10 +241,29 @@ def forest_layout(keys, edges):
     return positions
 
 
+_GRAPH_TEXT_SCALE = 100
+
+
+def set_graph_text_scale(percent):
+    """Resize graph labels for a high-resolution screen. Positions never move.
+
+    Only the lettering changes; node coordinates, edge lengths and the distances
+    they carry are untouched, so a rescaled tree is the same tree. Exported
+    images use the same size as the screen, so a picture matches what was read.
+    """
+    global _GRAPH_TEXT_SCALE
+    _GRAPH_TEXT_SCALE = max(80, min(150, int(percent)))
+    return _GRAPH_TEXT_SCALE
+
+
+def graph_text_scale():
+    return _GRAPH_TEXT_SCALE
+
+
 def _graph_font(size, weight=QFont.Weight.DemiBold):
     font = QFont()
     font.setFamilies(["Segoe UI", "Inter", "DejaVu Sans"])
-    font.setPointSize(size)
+    font.setPointSize(max(6, round(size * _GRAPH_TEXT_SCALE / 100)))
     font.setWeight(weight)
     return font
 
@@ -358,6 +384,12 @@ class TreeView(QGraphicsView):
         self.label_fields = ["sample_name", "primary_st"]
         self._label_guides = {}
         self._legend, self._positions = {}, {}
+        # A colour agreed with another view, so two forests shown side by side do
+        # not give one category two colours. Empty means "decide my own colours".
+        self._pinned_legend = {}
+        # Optional window hook: context_extension(view, menu, node_key) may append
+        # shared workspace actions and returns {QAction: callable} for dispatch.
+        self.context_extension = None
         self._palette = [QColor(color).name() for color in PALETTE]
         self.color_by = "cluster"
         self.show_labels = self.show_st = self.show_edge_labels = True
@@ -471,9 +503,15 @@ class TreeView(QGraphicsView):
         menu.addSeparator()
         arrange = menu.addAction("Reset automatic layout")
         fit = menu.addAction("Fit graph")
+        extension = {}
+        if callable(self.context_extension):
+            key = node.key if isinstance(node, TreeNode) else None
+            extension = dict(self.context_extension(self, menu, key) or {})
         action = menu.exec(event.globalPos())
         menu.deleteLater()
-        if action == cluster:
+        if action in extension:
+            extension[action]()
+        elif action == cluster:
             self.select_cluster(self._members[node.key][0])
         elif action == report:
             self.reportRequested.emit(self.selected_ids())
@@ -560,7 +598,12 @@ class TreeView(QGraphicsView):
                                        "members": [member for key in group for member in self._members[key]],
                                        "status": "cluster" if len(group) > 1 else "singleton"}
                                       for index, group in enumerate(self._cluster_groups)]
-        fresh_positions = forest_layout(self._members, self._display_edges)
+        # Laying out a 500-node forest costs seconds. When every node already has
+        # a position (a redraw after a threshold, merge or label change) reuse it;
+        # "Reset automatic layout" still calls forest_layout explicitly.
+        fresh_positions = (dict(self._positions)
+                           if all(key in self._positions for key in self._members)
+                           else forest_layout(self._members, self._display_edges))
         for key, members in self._members.items():
             result = self._results[key]
             names = "\n".join(self._results[member]["sample_name"] for member in members)
@@ -714,6 +757,27 @@ class TreeView(QGraphicsView):
         return "Not recorded" if value is None or value == "" else (
             json.dumps(value, ensure_ascii=False, sort_keys=True) if isinstance(value, (dict, list)) else str(value))
 
+    def color_categories(self):
+        """The colour categories this view currently shows, for a shared legend."""
+        clusters = {member: group["name"] for group in self._group_definitions for member in group["members"]}
+        return sorted({self._category(key, clusters) for key in self._results})
+
+    def set_pinned_legend(self, mapping):
+        """Force given categories to given colours so two views agree.
+
+        Only categories this view actually shows are affected; an unknown
+        category is ignored rather than invented. Recolouring happens only when
+        the mapping really changed, which is what keeps a shared legend from
+        looping through ``legendChanged``.
+        """
+        pinned = {str(key): QColor(str(value)).name() for key, value in dict(mapping or {}).items()
+                  if QColor(str(value)).isValid()}
+        if pinned == self._pinned_legend:
+            return False
+        self._pinned_legend = pinned
+        self._apply_colors()
+        return True
+
     def _apply_colors(self):
         clusters = {member: group["name"] for group in self._group_definitions for member in group["members"]}
         categories = {key: self._category(key, clusters) for key in self._results}
@@ -723,6 +787,9 @@ class TreeView(QGraphicsView):
             self._legend = {g["name"]: (self._palette[((g.get("number") or 1) - 1) % len(self._palette)]
                                        if g.get("status") == "cluster" else "#73869A")
                             for g in self._group_definitions}
+        if self._pinned_legend:
+            self._legend = {category: self._pinned_legend.get(category, color)
+                            for category, color in self._legend.items()}
         for key, members in self._members.items():
             colors = Counter(self._manual_colors.get(member, self._legend[categories[member]]) for member in members)
             self.nodes[key].slices = sorted(colors.items())
@@ -969,16 +1036,16 @@ class TreeView(QGraphicsView):
         self._drawing = False
         self._redraw()
 
-    def _render(self, painter, width, height):
+    def _render(self, painter, width, height, *, title=None, subtitle=None):
         bounds = self.canvas.itemsBoundingRect().adjusted(-35, -35, 35, 35)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
         painter.fillRect(QRectF(0, 0, width, height), QColor(BACKGROUND))
         painter.setPen(QColor(INK))
         painter.setFont(_graph_font(16))
-        painter.drawText(QPointF(35, 38), "Allele-distance minimum spanning forest")
+        painter.drawText(QPointF(35, 38), title or "Allele-distance minimum spanning forest")
         painter.setPen(QColor(MUTED))
         painter.setFont(_graph_font(10, QFont.Weight.Normal))
-        painter.drawText(QPointF(35, 63), "Not a phylogeny or transmission tree · positions are editable · edge labels are allele differences")
+        painter.drawText(QPointF(35, 63), subtitle or GRAPH_SUBTITLE)
         self.canvas.render(painter, QRectF(0, 90, width, height - 205), bounds)
         painter.setFont(_graph_font(10))
         painter.setPen(QColor(MUTED))
@@ -1005,16 +1072,16 @@ class TreeView(QGraphicsView):
     def save_png(self, path):
         return self.save_image(path)
 
-    def save_image(self, path, *, format=None):
+    def save_image(self, path, *, format=None, title=None, subtitle=None):
         image = QImage(1800, 1200, QImage.Format.Format_ARGB32)
         image.fill(QColor(BACKGROUND))
         painter = QPainter(image)
-        self._render(painter, 1800, 1200)
+        self._render(painter, 1800, 1200, title=title, subtitle=subtitle)
         painter.end()
         if not image.save(str(path), format):
             raise OSError(f"Could not save image: {path}")
 
-    def save_svg(self, path):
+    def save_svg(self, path, *, title=None, subtitle=None):
         from PySide6.QtSvg import QSvgGenerator
         generator = QSvgGenerator()
         generator.setFileName(str(path))
@@ -1025,7 +1092,7 @@ class TreeView(QGraphicsView):
         painter = QPainter(generator)
         if not painter.isActive():
             raise OSError(f"Could not save SVG: {path}")
-        self._render(painter, 1800, 1200)
+        self._render(painter, 1800, 1200, title=title, subtitle=subtitle)
         painter.end()
 
     def save_graphml(self, path):
@@ -1091,3 +1158,38 @@ class TreeView(QGraphicsView):
             if key not in visited:
                 trees.append(subtree(key) + ";")
         Path(path).write_text("\n".join(trees) + "\n", encoding="utf-8")
+
+
+def render_side_by_side(left, right, *, left_title, right_title, left_subtitle=None,
+                        right_subtitle=None, headline, note=None, width=1800, height=1200,
+                        header=76):
+    """Draw two forests into one image, each keeping its own title and legend.
+
+    The two panels are separate measurements, so neither borrows the other's
+    caption: the headline states whether they share a reference, a link threshold
+    and a minimum shared-locus fraction, and ``note`` carries the interpretation
+    limit into the picture itself, where it cannot be cropped away from the trees
+    the way a surrounding caption can.
+    """
+    image = QImage(int(width) * 2, int(height) + int(header), QImage.Format.Format_ARGB32)
+    image.fill(QColor(BACKGROUND))
+    painter = QPainter(image)
+    try:
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        painter.setPen(QColor(INK))
+        painter.setFont(_graph_font(18))
+        painter.drawText(QPointF(35, 34), str(headline))
+        painter.setPen(QColor(MUTED))
+        painter.setFont(_graph_font(10, QFont.Weight.Normal))
+        painter.drawText(QPointF(35, 58), str(note or SIDE_BY_SIDE_NOTE))
+        for index, (view, title, subtitle) in enumerate(
+                ((left, left_title, left_subtitle), (right, right_title, right_subtitle))):
+            painter.save()
+            painter.translate(index * width, header)
+            view._render(painter, width, height, title=title, subtitle=subtitle)
+            painter.restore()
+        painter.setPen(QPen(QColor(MUTED), 2))
+        painter.drawLine(int(width), int(header), int(width), int(header) + int(height))
+    finally:
+        painter.end()
+    return image

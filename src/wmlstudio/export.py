@@ -353,20 +353,43 @@ def characterization_html(record, sections=None):
 
 REPORT_PRESETS = {
     'isolate': {'title': 'Isolate evidence review', 'investigation': False, 'qc': True, 'amr': True,
-                'virulence': True, 'plasmid_hypotheses': True, 'drug_associations': True, 'graph': False, 'provenance': False},
+                'virulence': True, 'plasmid_hypotheses': True, 'drug_associations': True, 'graph': False,
+                'provenance': False, 'graph_jpeg': False},
     'cohort': {'title': 'Selected cohort review', 'investigation': True, 'qc': True, 'amr': True,
-               'virulence': True, 'plasmid_hypotheses': True, 'drug_associations': True, 'graph': True, 'provenance': False},
+               'virulence': True, 'plasmid_hypotheses': True, 'drug_associations': True, 'graph': True,
+               'provenance': False, 'graph_jpeg': False},
     'ipc': {'title': 'IPC cluster review', 'investigation': True, 'qc': True, 'amr': True,
-            'virulence': True, 'plasmid_hypotheses': True, 'drug_associations': True, 'graph': True, 'provenance': False},
+            'virulence': True, 'plasmid_hypotheses': True, 'drug_associations': True, 'graph': True,
+            'provenance': False, 'graph_jpeg': False},
     'proximity': {'title': 'Isolate proximity review', 'investigation': True, 'qc': True, 'amr': True,
-                  'virulence': False, 'plasmid_hypotheses': False, 'drug_associations': False, 'graph': True, 'provenance': False},
+                  'virulence': False, 'plasmid_hypotheses': False, 'drug_associations': False, 'graph': True,
+                  'provenance': False, 'graph_jpeg': False},
+    # A different document shape, not a different set of facts: one short page in
+    # plain words for a reader who is not a bioinformatician. Kept last so no
+    # preset that a saved template or a combo index already names can move.
+    'simple': {'title': 'Simple outbreak summary', 'investigation': True, 'qc': False, 'amr': True,
+               'virulence': False, 'plasmid_hypotheses': False, 'drug_associations': False, 'graph': True,
+               'provenance': False, 'layout': 'one_page', 'graph_jpeg': True},
 }
 
 
-def review_report_html(records, *, selected_ids, investigation=None, options=None, graph_png=None):
-    """Readable research/IPC report with explicit scope and opt-in raw appendix."""
+def review_report_html(records, *, selected_ids, investigation=None, options=None, graph_png=None,
+                       graph_mime='image/png', scope_note=None, scope_implicit=False):
+    """Readable research/IPC report with explicit scope and opt-in raw appendix.
+
+    ``graph_png`` is raw image bytes whose type ``graph_mime`` states, so a
+    caller may embed JPEG or PNG without changing this signature. ``scope_note``
+    replaces the default header scope sentence, and ``scope_implicit`` marks a
+    scope the user did not choose so the document says so itself.
+    """
     import base64
     settings = {**REPORT_PRESETS['cohort'], **(options or {})}
+    if settings.get('layout') == 'one_page':
+        # Lazy on purpose: simple_report imports this module at module level.
+        from wmlstudio.simple_report import simple_report_html
+        return simple_report_html(records, selected_ids=selected_ids, investigation=investigation,
+                                  settings=settings, graph_png=graph_png, graph_mime=graph_mime,
+                                  scope_note=scope_note, scope_implicit=scope_implicit)
     rows = _snapshot(records, selected_ids, investigation=investigation)
     parts = ['<!doctype html><html><head><meta charset="utf-8">',
              '<meta http-equiv="Content-Security-Policy" content="default-src \'none\'; style-src \'unsafe-inline\'; img-src data:">',
@@ -378,9 +401,15 @@ def review_report_html(records, *, selected_ids, investigation=None, options=Non
              '.muted{color:#5c6f76}section{margin:24px 0}pre{white-space:pre-wrap;overflow-wrap:anywhere;font-size:10px}'
              'img{max-width:100%;height:auto}@media print{body{padding:0}tr{break-inside:avoid}h2,h3{break-after:avoid}}</style></head><body>',
              '<h1>' + _escape(settings['title']) + '</h1>',
-             f'<p>WMLSTudio {_escape(__version__)} · {_escape(datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC"))} · {len(rows)} explicitly selected isolate(s)</p>',
+             f'<p>WMLSTudio {_escape(__version__)} · {_escape(datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC"))} · '
+             + _escape(scope_note or f'{len(rows)} explicitly selected isolate(s)') + '</p>',
              '<p class="notice"><b>Research / review evidence, not a clinical diagnosis.</b> Genomic similarity does not prove transmission. '
              'Resistance determinants are not measured susceptibility; use validated laboratory testing and epidemiological review.</p>']
+    if scope_implicit:
+        # A scope the user did not choose is stated in the document itself, not
+        # only in a message that disappears once the file has been saved.
+        parts.append('<p class="notice"><b>This scope was not chosen for this report.</b> ' +
+                     _escape(scope_note or '') + '</p>')
     parts.append('<h2>At a glance</h2><table cellpadding="6" cellspacing="0" border="1"><tr><th>Isolate</th><th>Organism</th><th>Primary ST</th><th>Typing / QC state</th>' +
                  ('<th>AMR evidence</th>' if settings['amr'] else '') + '</tr>')
     for row in rows:
@@ -394,7 +423,7 @@ def review_report_html(records, *, selected_ids, investigation=None, options=Non
         if graph_png:
             encoded = base64.b64encode(graph_png).decode('ascii')
             parts.append('<h2>Comparison-cohort context</h2><p>Selected focal isolates are highlighted. Other nodes are context only, not additional reported sample records. Layout is not a transmission tree.</p>'
-                         '<img width="920" src="data:image/png;base64,' + encoded + '" alt="Allele-distance graph with focal isolates highlighted">')
+                         '<img width="920" src="data:' + _escape(graph_mime or 'image/png') + ';base64,' + encoded + '" alt="Allele-distance graph with focal isolates highlighted">')
         else:
             parts.append('<p class="muted">Graph omitted: no matching comparison snapshot is currently available.</p>')
     if settings['investigation']:
@@ -435,10 +464,13 @@ def review_report_html(records, *, selected_ids, investigation=None, options=Non
     return ''.join(parts)
 
 
-def write_review_report(records, path, *, selected_ids, investigation=None, options=None, graph_png=None):
+def write_review_report(records, path, *, selected_ids, investigation=None, options=None, graph_png=None,
+                        graph_mime='image/png', scope_note=None, scope_implicit=False):
     records = list(records)
     ensure_separate_destination(path, _protected_paths(records))
-    markup = review_report_html(records, selected_ids=selected_ids, investigation=investigation, options=options, graph_png=graph_png)
+    markup = review_report_html(records, selected_ids=selected_ids, investigation=investigation, options=options,
+                                graph_png=graph_png, graph_mime=graph_mime, scope_note=scope_note,
+                                scope_implicit=scope_implicit)
     with _atomic_text(path) as handle:
         handle.write(markup)
     return Path(path).expanduser().resolve()

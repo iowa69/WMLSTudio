@@ -83,12 +83,14 @@ def test_map_connected_to_native_navigation(qtbot, tmp_path):
     window = MainWindow(storage_root=tmp_path)
     qtbot.addWidget(window)
     assert window.overview_tabs.tabText(0) == "Investigation map"
-    window.journey_action("samples")
-    assert window.pages.currentIndex() == 1
-    window.journey_action("compare")
-    assert window.pages.currentIndex() == 2
-    window.journey_action("reports")
-    assert window.pages.currentIndex() == 5
+    # The map routes by index; the workspace now also names each page, so a
+    # renumbering would be caught here instead of silently landing elsewhere.
+    for action, index, key in [("samples", 1, "isolates"), ("compare", 2, "compare"),
+                               ("reports", 5, "reports")]:
+        window.journey_action(action)
+        assert window.pages.currentIndex() == index
+        assert window.pages.current_key() == key
+        assert window.page_index[key] == index
     window.open_workflow_guide("plasmid")
     assert window.workflow_guide.isVisible()
     window.workflow_guide.close()

@@ -18,6 +18,51 @@ This revision starts from `2135c3e` on `investigation-v0.3`. Raw local sequence
 data remain private and unchanged; only source, tests and sequence-free validation
 summaries may be versioned. The existing 0.2 release remains available unchanged.
 
+## Acceptance revision: the twelve requests, with honest status
+
+Status words mean exactly this: **interface** — a user can do it in the running
+application; **engine** — implemented and tested as a module, with no interface
+surface; **open** — not started. An engine-only capability is not a delivered one.
+
+| # | Request | Status | Where |
+| --- | --- | --- | --- |
+| 1 | Dedicated, interconnected tabs | interface | Seven keyed tabs, orientation strips, shared focus with visible provenance, per-tab cohorts |
+| 2 | Auto-organised folders for inputs and databases | interface | Identify before copy, reviewed proposals, `Genus/species` folders, a six-bucket `_Unresolved` tree, re-filing |
+| 3 | Right-click menu in every tab | interface | 29 handlers across all 15 registered views |
+| 4 | Dual MST — original beside current | interface | Baseline pointer, snapshot replay beside the current tree, change summary with not-assessed states |
+| 5 | Highlight / delete / add samples inline | interface | Archive as the default, restorable removals, Recently removed, focus accent distinct from saved highlights |
+| 6 | High-resolution screen support the user can adjust | interface, one gap | Settings scales and `--display-scale`; the graph text size is saved but not yet redrawn |
+| 7 | Simple report: MST picture, resistance, proximity | interface | Reports tab action plus the `one_page` preset in the export path |
+| 8 | Thresholds pre-set for common pathogens with references | interface | Catalogue and dialog; coverage audited honestly in `docs/THRESHOLDS.md` |
+| 9 | Practice datasets, 10 single-species and 20 mixed-genus | interface | Data menu download with caveats, plus `studio_scripts/fetch_practice_cohort.py` |
+| 10 | Manual genus/species override | interface | Assign from the context menu, re-file on change, CSV assignment import |
+| 11 | Organism-specific tools (SCCmec, Kleborate-style) | interface | Plan-dialog selection, results column, drill-down, report section, CLI flags |
+| 12 | Friendly to non-bioinformaticians | interface | Orientation strips, plain-language guide, evidence wording, the simple summary |
+
+### Carried into the next batch
+
+- [ ] Re-stage the bundled characterization starter to manifest format 2 so the
+      organism modules stop reporting `not_run` on the shipped snapshot. CI stages
+      it fresh, so this is a developer-tree gap; check `frozen-check.json` to see
+      which state a given build actually shipped.
+- [ ] Regenerate `uv.lock` for the new `pyyaml` development dependency. Until then
+      CI fails at `uv sync --locked`, and the characterization staging step fails
+      closed because the SCCmec rule document cannot be parsed.
+- [ ] `WorkbenchMixin.set_graph_text_scale` and the `widgets.py` graph text scale
+      it calls: the Settings control persists the value and nothing consumes it.
+- [ ] `organism_typing` as a flat export field in `export._FIELDS` and
+      `sample_workflow.feature_fields`.
+- [ ] Delete the dead `navigate` override in `ui_workbench.py` and the temporary
+      shim in `app.py` that neutralises it.
+- [ ] Widen the threshold catalogue, or record why each remaining organism cannot
+      be curated. Twelve listed organisms still have no cutoff at all, including
+      *S. pneumoniae*, *S. enterica* and *S. capitis*.
+- [ ] Guard the per-window `setStyleSheet` re-polish that makes repeated window
+      construction grow superlinearly in one process.
+- [ ] Run the frozen SCCmec self-comparison for real: it needs a format 2 bundled
+      panel, which only a fresh CI build currently produces.
+- [ ] Clean Windows 11 acceptance, now including high-DPI and per-monitor scaling.
+
 ## Workbench revision requested after user acceptance feedback
 
 - [x] Replace page-opacity rendering and implement a consistent dark native theme.
