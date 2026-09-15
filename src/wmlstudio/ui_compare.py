@@ -1442,7 +1442,14 @@ class ComparisonWorkspaceMixin:
             self.cohort_ids = set(sample_ids)
             self.project.set_setting('comparison_cohort', sorted(self.cohort_ids))
             self.refresh_cohort_table()
-        self.show_typing_view('cgmlst')
+        # The tree lives on its own tab, and the workspace is wherever it was last
+        # shown. Switching the view without going there would leave the person on
+        # the table of calls, looking at nothing happening.
+        navigate = getattr(self, 'navigate', None)
+        if callable(navigate) and (self.stations.get('cgmlst_tree') or {}).get('adopted'):
+            navigate('cgmlst_tree')
+        else:
+            self.show_typing_view('cgmlst')
         index = self.graph_tabs.indexOf(self.graph_split)
         if index >= 0:
             self.graph_tabs.setCurrentIndex(index)
