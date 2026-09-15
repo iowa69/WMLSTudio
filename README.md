@@ -11,25 +11,25 @@ installation for the portable package.
 
 ## Download and retest
 
-### [⬇ Download WMLSTudio — Windows portable ZIP](https://github.com/iowa69/WMLSTudio/releases/download/v0.3.0/WMLSTudio-0.3.0-Windows-x64.zip)
+### [⬇ Download WMLSTudio — Windows portable ZIP](https://github.com/iowa69/WMLSTudio/releases/download/v0.3.1/WMLSTudio-0.3.1-Windows-x64.zip)
 
-**v0.3.0 · Windows x64 · 372 MB ZIP · Non-commercial research**
+**v0.3.1 · Windows x64 · 372 MB ZIP · Non-commercial research**
 
 Unzip and run `WMLSTudio.exe`. No installer, no Python, no WSL, no Docker.
-SHA-256 `9b0569d19d42c71603be1973fc47ba9c0e05332345edafe29db92389a9df6b6b`.
+SHA-256 `f246240e5fd0ee16478db8d1a09897b8da774ecb3484e2bc0704af0520418270`.
 
-[Release notes](https://github.com/iowa69/WMLSTudio/releases/tag/v0.3.0)
-· [SHA-256 checksum](https://github.com/iowa69/WMLSTudio/releases/download/v0.3.0/WMLSTudio-0.3.0-Windows-x64.zip.sha256)
+[Release notes](https://github.com/iowa69/WMLSTudio/releases/tag/v0.3.1)
+· [SHA-256 checksum](https://github.com/iowa69/WMLSTudio/releases/download/v0.3.1/WMLSTudio-0.3.1-Windows-x64.zip.sha256)
 · [Previous 0.2 release](https://github.com/iowa69/WMLSTudio/releases/tag/v0.2.0-workbench.1)
 · [Build/test results](https://github.com/iowa69/WMLSTudio/actions/workflows/studio.yml)
 · [Previous 0.1 release](https://github.com/iowa69/WMLSTudio/releases/tag/v0.1.0-preview.1)
 
 The release notes distinguish observed Linux, native Windows CI and Wine checks
 from the still-required clean Windows 11 desktop acceptance test.
-The published binary was built from `9e46f2e`: **1,382 tests passed on each
+The published binary was built from `c31b5b1`: **1,536 tests passed on each
 hosted platform**, followed by the frozen-build, app-local Windows dependency
 and bundled-reference checks in
-[this successful build](https://github.com/iowa69/WMLSTudio/actions/runs/34929169286).
+[this successful build](https://github.com/iowa69/WMLSTudio/actions/runs/34948774268).
 Clean Windows 11 desktop acceptance has still not been done.
 
 > Research software, not a validated diagnostic device or an established
