@@ -8,7 +8,7 @@ import sys
 import tempfile
 from pathlib import Path
 
-from PySide6.QtCore import QCoreApplication, QLockFile, Qt, QTimer
+from PySide6.QtCore import QCoreApplication, QEvent, QLockFile, Qt, QTimer
 from PySide6.QtGui import QAction, QColor, QKeySequence, QPageSize, QPdfWriter, QTextDocument
 from PySide6.QtWidgets import (
     QApplication,
@@ -48,7 +48,16 @@ from wmlstudio.project import Project
 from wmlstudio.theme import STYLE
 from wmlstudio.ui_characterization import CharacterizationWorkspaceMixin
 from wmlstudio.ui_common import workspace_header
-from wmlstudio.ui_tabs import PAGE_PURPOSE, WorkspaceTabs
+from wmlstudio.ui_tabs import (
+    PAGE_KEYS,
+    PAGE_PURPOSE,
+    PLANNED,
+    STATION_KEYS,
+    STATION_PAGES,
+    WorkspaceTabs,
+    clear_promise,
+    page_name,
+)
 from wmlstudio.widgets import DropZone, Helix, Metric, TreeView, button, card, label
 from wmlstudio.workspace_focus import CohortLedger, FocusBar, FocusBus
 
@@ -131,11 +140,16 @@ class BaseWindow(QMainWindow):
         top.addWidget(self.focus_bar)
         top.addWidget(label("●  Local & private", "badge"))
         top.addWidget(button("Open project", self.open_project_dialog))
-        top.addWidget(button("Settings", lambda: self.navigate(self.page_index.get("settings", 6))))
+        top.addWidget(button("Settings", lambda: self.navigate("settings")))
         body.addLayout(top)
         self.page_index = {}
+        self.stations = {}
+        self.clear_buttons = {}
         self.pages = WorkspaceTabs()
         body.addWidget(self.pages, 1)
+        # Built in the order these seven pages have always been built, because an
+        # integer anywhere in this application means "the Nth page built". The tab
+        # bar shows them in the pipeline order instead (ui_tabs.PIPELINE).
         self.build_overview()
         self.build_samples()
         self.build_compare()
@@ -143,12 +157,15 @@ class BaseWindow(QMainWindow):
         self.build_hydra()
         self.build_reports()
         self.build_settings()
+        self.build_stations()
         self.install_workspace_headers()
         self.fold_duplicate_pages()
         self.page_shown = {key: hook for key, hook in
                            (("compare", getattr(self, "refresh_comparison", None)),)
                            if callable(hook)}
-        self.pages.currentChanged.connect(self.navigate)
+        # The tab widget reports a tab position; navigate speaks keys and
+        # build-order numbers, so the bar hands it the key it just showed.
+        self.pages.pageShown.connect(self.navigate)
         bottom = QHBoxLayout()
         self.progress_text = label("Ready when you are. Your files stay on this computer.", "small")
         bottom.addWidget(self.progress_text, 1)
@@ -195,12 +212,11 @@ class BaseWindow(QMainWindow):
         layout.addWidget(self.project_label)
         layout.addSpacing(18)
         # The tab bar is the navigation now. nav_buttons stays as an empty list so
-        # navigate's checked-state loop and nav_names (breadcrumb, Alt+1…7 menu)
-        # keep working untouched.
+        # navigate's checked-state loop keeps working untouched.
         self.nav_buttons = []
-        # "Samples" is the hub the rest of the workspace hangs off, and it is the
-        # word the people using this say; "Isolate library" was ours, not theirs.
-        self.nav_names = ["Overview", "Samples", "Compare", "Scheme library", "Characterization", "Reports", "Settings"]
+        # One name per page, in build order, because the View menu binds Alt+N to
+        # the Nth page built. The tab bar shows the same pages in pipeline order.
+        self.nav_names = [page_name(key) for key in PAGE_KEYS]
         layout.addWidget(label("Your isolates, your evidence and your report each keep their own cohort. Nothing is included automatically.", "small", True))
         layout.addStretch()
         tip, content = card()
@@ -220,10 +236,33 @@ class BaseWindow(QMainWindow):
         super().resizeEvent(event)
         if hasattr(self, "sidebar_tip"):
             self.sidebar_tip.setVisible(self.height() >= 810)
-        if hasattr(self, "sidebar"):
-            # Below this width the seven tabs need every pixel, and the tab bar
-            # already provides the navigation the sidebar used to carry.
-            self.sidebar.setVisible(self.width() >= 1180)
+        self.update_workspace_room()
+
+    def changeEvent(self, event):
+        super().changeEvent(event)
+        # A larger text size costs the tab bar room without changing the window,
+        # so the sidebar decision is made again once the new metrics are polished.
+        if event.type() in (QEvent.Type.StyleChange, QEvent.Type.FontChange,
+                            QEvent.Type.ApplicationFontChange):
+            QTimer.singleShot(0, self.update_workspace_room)
+
+    def update_workspace_room(self):
+        """Decide whether this window can afford the sidebar beside the tab bar.
+
+        The tab bar is the navigation, and a tab hidden behind a scroll arrow is a
+        tab nobody finds. The sidebar is only afforded when every label can still be
+        drawn whole beside it; below that it stands down, as it always did below
+        1180 px. Nothing here changes a page, a cohort or a preference.
+        """
+        try:
+            if not hasattr(self, "sidebar") or not hasattr(self, "pages"):
+                return None
+            room = self.width() - 48 - self.sidebar.width()
+            afford = self.width() >= 1180 and room >= self.pages.minimum_bar_width()
+            self.sidebar.setVisible(afford)
+            return afford
+        except RuntimeError:  # The window was closed before the queued call ran.
+            return None
 
     def page(self):
         widget = QWidget()
@@ -234,36 +273,62 @@ class BaseWindow(QMainWindow):
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
         scroll.setWidget(widget)
-        index = self.pages.add_page(scroll)
-        key = self.pages.key_at(index)
+        slot = self.pages.add_page(scroll)
+        key = self.pages.key_at(slot)
         if key:
-            self.pages.setTabToolTip(index, f"{self.nav_names[index]} — {PAGE_PURPOSE.get(key, '')}")
-            self.page_index[key] = index
+            position = self.pages.position_of(key)
+            self.pages.setTabToolTip(position, f"{page_name(key)} — {PAGE_PURPOSE.get(key, '')}")
+            self.page_index[key] = slot
         return widget, layout
 
     def install_workspace_headers(self):
-        """Give every tab the same orientation line once all seven pages exist.
+        """Give every tab the same orientation line once all the pages exist.
 
         This runs after `build_*` on purpose: the evidence and scheme pages move
         their own layout items by position, and inserting the strip beforehand
         would silently rearrange somebody else's page.
         """
         self.page_headers = {}
-        for key, index in self.page_index.items():
-            page = self.pages.widget(index)
+        for key, slot in self.page_index.items():
+            page = self.pages.widget(slot)
             content = page.widget() if isinstance(page, QScrollArea) else page
             layout = content.layout() if content is not None else None
             if layout is None:
                 continue
-            self.page_headers[key] = workspace_header(self, layout, key, index=0)
+            strip = workspace_header(self, layout, key, index=0)
+            self.page_headers[key] = strip
+            self.install_clear_action(key, strip)
+
+    def install_clear_action(self, key, strip):
+        """Every tab gets the same Clear, in the same place, saying the same thing.
+
+        A person works with new samples, past samples or a mixture of both, so each
+        tab has to be restartable on its own. Clear resets that tab's view, its
+        selection and its cohort; it never removes a sample, a result, a scheme or
+        an imported report, and the confirmation says which is which.
+        """
+        row = strip.layout() if strip is not None else None
+        if row is None:
+            return None
+        promise = clear_promise(key)
+        action = button("Clear", lambda checked=False, k=key: self.clear_page(k))
+        action.setObjectName("nextStep")
+        action.setToolTip(f"Start this tab again. Clears {promise['clears']}; "
+                          f"keeps {promise['keeps']}.")
+        action.setAccessibleName(f"Clear the {page_name(key)} tab")
+        # Before the "?" guide button, which is always last on the strip.
+        row.insertWidget(max(0, row.count() - 1), action)
+        self.clear_buttons[key] = action
+        return action
 
     def fold_duplicate_pages(self):
-        """Stop offering a top-level tab whose content is already a Samples sub-tab.
+        """Stop offering a top-level tab whose content is already a sub-tab elsewhere.
 
-        Samples is the hub, so anything that also lives there must not be a second
-        place to look. Nothing is folded unless the sub-tab really exists, and the
-        page itself is kept: every `navigate(<int>)` call site keeps its meaning and
-        still lands on the same content (ui_tabs.WorkspaceTabs.fold_page).
+        Nothing folds today: each task has its own tab now, which is the point of
+        this layout. The mechanism stays because a page that later grows a second
+        home must have one place to look, not two. Nothing is folded unless the
+        sub-tab really exists, and the page itself is kept: every `navigate(<int>)`
+        call site keeps its meaning (ui_tabs.WorkspaceTabs.fold_page).
         """
         from wmlstudio.ui_tabs import FOLDABLE
         folded = []
@@ -405,13 +470,21 @@ class BaseWindow(QMainWindow):
 
     def build_schemes(self):
         _, layout = self.page()
-        self.heading(layout, "Your scheme library", "Local, versioned allele collections for MLST and cgMLST. Each analysis records the database fingerprint.")
+        self.heading(layout, "Update: schemes and reference databases",
+                     "Local, versioned allele collections for MLST and cgMLST, and the reference "
+                     "snapshots this workspace types and screens against. Each analysis records "
+                     "the database fingerprint it used.")
         row = QHBoxLayout()
         row.addWidget(button("Import a scheme folder", self.import_scheme, True))
+        row.addWidget(button("What is installed, and what can be updated…",
+                             self.open_update_center))
         row.addStretch()
         row.addWidget(label("No automatic database updates", "badge"))
         layout.addLayout(row)
-        self.scheme_table = table(["SCHEME", "SOURCE", "LOCATION"])
+        # TYPE is its own column because a classical seven-locus scheme and a
+        # cgMLST scheme are different quantities: selecting one where the other is
+        # expected is wrong, and the two must never read as one alphabetical list.
+        self.scheme_table = table(["SCHEME", "TYPE", "SOURCE", "LOCATION"])
         self.install_view_menu("schemes", self.scheme_table)
         layout.addWidget(self.scheme_table, 1)
         note, content = card()
@@ -524,6 +597,274 @@ class BaseWindow(QMainWindow):
         self.settings_tabs.addTab(guide, "What this version can and cannot do")
         layout.addWidget(self.settings_tabs, 1)
 
+    # --- the pipeline stations this layout owns ------------------------------
+    def build_stations(self):
+        """One tab per remaining step of the workflow, in the order it is worked.
+
+        These are the pages no controller has claimed: the two typing steps, the
+        cgMLST tree, and the three stations a later round fills. Each one is a real
+        page with a purpose, a live summary, its own actions and a Clear; a station
+        that cannot do its work yet says so instead of looking finished.
+        """
+        self.station_status = {}
+        for key in STATION_KEYS:
+            definition = STATION_PAGES.get(key)
+            if definition is None:
+                continue
+            self.build_station(key, definition)
+        for key in PLANNED:
+            self.pages.mark_planned(key)
+        return list(self.stations)
+
+    def build_station(self, key, definition):
+        _, layout = self.page()
+        self.heading(layout, definition["title"], definition["subtitle"])
+        if key in PLANNED:
+            # Said in the bar's tooltip and here, where a reader who opened the tab
+            # expecting to work cannot miss it. The stretch keeps the badge the width
+            # of its own words rather than the width of the page.
+            banner = QHBoxLayout()
+            banner.addWidget(label("Planned — nothing on this tab runs yet", "badge"))
+            banner.addStretch()
+            layout.addLayout(banner)
+        status = label("", "muted", True)
+        status.setObjectName(f"stationStatus.{key}")
+        self.station_status[key] = status
+        layout.addWidget(status)
+        strip = QHBoxLayout()
+        for entry in definition.get("actions", ()):
+            text, method = entry[0], entry[1]
+            needs = entry[2] if len(entry) > 2 else ""
+            handler = getattr(self, method, None)
+            # An action this build cannot perform is not offered at all: a button
+            # that leads nowhere costs more trust than a missing one.
+            if callable(handler) and (not needs or getattr(self, needs, None) is not None):
+                strip.addWidget(button(text, handler, text.endswith("…")))
+        strip.addStretch()
+        layout.addLayout(strip)
+        card_frame, content = card()
+        for paragraph in definition.get("body", ()):
+            content.addWidget(label(paragraph, "muted", True))
+        layout.addWidget(card_frame)
+        # Where a finished page for this station is dropped in, without moving a
+        # tab or changing a single page number (see adopt_station).
+        holder = QWidget()
+        holder_layout = QVBoxLayout(holder)
+        holder_layout.setContentsMargins(0, 0, 0, 0)
+        holder.hide()
+        layout.addWidget(holder, 1)
+        layout.addStretch()
+        self.stations[key] = {"holder": holder, "layout": holder_layout,
+                              "placeholder": card_frame, "status": status}
+        return holder
+
+    def adopt_station(self, key, widget, *, title=None):
+        """Give a pipeline station its real page, built elsewhere.
+
+        The station's own explanation is hidden, the widget takes the page, and the
+        tab stops being marked as planned. Nothing about the tab bar, the page
+        numbering or any navigation call site changes.
+        """
+        station = self.stations.get(str(key))
+        if station is None or widget is None:
+            return False
+        station["layout"].addWidget(widget)
+        station["holder"].show()
+        station["placeholder"].hide()
+        station["status"].hide()
+        if title:
+            position = self.pages.position_of(key)
+            if position >= 0:
+                self.pages.setTabText(position, str(title))
+        self.pages.mark_planned(key, False)
+        station["adopted"] = widget
+        return True
+
+    def refresh_stations(self):
+        """One honest line per station: what this project actually has, counted."""
+        status = getattr(self, "station_status", None)
+        if not status:
+            return {}
+        samples = self.current_samples or []
+        try:
+            index = self.project.typing_kind_index()
+        except (sqlite3.Error, ValueError):
+            index = {}
+        counted = {}
+        for kind in ("mlst", "cgmlst"):
+            counted[kind] = sum(1 for sample in samples
+                                if index.get(sample["id"], {}).get(kind))
+        total = len(samples)
+        lines = {
+            "reads": "Nothing runs on this tab yet. Read statistics for each sample are shown "
+                     "in Samples.",
+            "assembly": "Nothing runs on this tab yet. Assembling works today in Samples → "
+                        "Assembly.",
+            "mlst": f"{counted['mlst']} of {total} samples have a stored seven-locus result · "
+                    f"{total - counted['mlst']} have none.",
+            "cgmlst": f"{counted['cgmlst']} of {total} samples have a stored cgMLST result · "
+                      f"{total - counted['cgmlst']} have none.",
+            "cgmlst_tree": f"{counted['cgmlst']} samples carry a cgMLST profile. A tree needs at "
+                           "least two profiles from the same scheme.",
+            "snp": "Nothing runs on this tab yet.",
+        }
+        for key, widget in status.items():
+            widget.setText(lines.get(key, ""))
+        return counted
+
+    # --- where each station's work happens today -----------------------------
+    def goto_samples(self):
+        """The hub, without changing any cohort."""
+        self.navigate("isolates")
+
+    def goto_step(self, title, step=""):
+        """Samples, with one of its steps selected. Falls back to Samples itself."""
+        self.navigate("isolates")
+        show = getattr(self, "show_step", None)
+        if step and callable(show):
+            return bool(show(step))
+        return self.pages.show_subtab("isolates", title)
+
+    def goto_assembly_step(self):
+        return self.goto_step("Assembly", "assembly")
+
+    def goto_mlst_step(self):
+        return self.goto_step("ST", "st")
+
+    def goto_cgmlst_step(self):
+        return self.goto_step("cgMLST", "cgmlst")
+
+    def goto_cgmlst_station(self):
+        self.navigate("cgmlst")
+
+    def goto_mlst_tree(self):
+        self.navigate("compare")
+
+    def goto_cgmlst_calls(self):
+        """The cgMLST table of calls, wherever this build keeps it.
+
+        Once the calls page is adopted onto the cgMLST tab this is simply that tab;
+        until then it is a sub-tab of the tree page, and the button says so.
+        """
+        if (self.stations.get("cgmlst") or {}).get("adopted") is not None:
+            return self.navigate("cgmlst")
+        if getattr(self, "cgmlst_calls", None) is None:
+            self.notify("This build has no table of calls yet.")
+            return False
+        self.navigate("compare")
+        return self.pages.show_subtab("compare", "cgMLST calls")
+
+    def goto_cgmlst_tree_view(self):
+        """Draw the cgMLST tree on the tree page, with its own reference and threshold.
+
+        The tree page labels every graph with the scheme and the target count it was
+        built from, so a cgMLST graph is never presented on a seven-locus scale. When
+        this station is given a drawing of its own, it draws here instead.
+        """
+        if (self.stations.get("cgmlst_tree") or {}).get("adopted") is not None:
+            return self.navigate("cgmlst_tree")
+        draw = getattr(self, "show_cgmlst_tree", None)
+        if not callable(draw):
+            self.notify("This build draws cgMLST trees from the tree page.")
+            return False
+        self.navigate("compare")
+        return draw()
+
+    def run_station_step(self, step, what):
+        """Run one typing step on the isolates already selected in Samples."""
+        runner = getattr(self, "run_step", None)
+        if not callable(runner):
+            self.notify(f"{what} runs from Samples in this build.")
+            return self.goto_samples()
+        return runner(step)
+
+    def run_mlst_station(self):
+        return self.run_station_step("st", "Seven-locus MLST")
+
+    def run_cgmlst_station(self):
+        return self.run_station_step("cgmlst", "cgMLST")
+
+    # --- restarting one tab without losing any evidence ----------------------
+    def clear_page(self, key=None, *, confirm=True):
+        """Start one tab again: its view, its selection and its cohort, nothing else.
+
+        The user asked for this on every tab so they can work with new samples, past
+        samples or a mixture whenever they want. Clearing a view must never delete
+        evidence, so the confirmation names what goes and what stays, and this
+        method only ever touches interface state.
+        """
+        key = self.pages.current_key() if key is None else str(key)
+        if not key:
+            return False
+        promise = clear_promise(key)
+        question = (f"Start the {page_name(key)} tab again?\n\n"
+                    f"This clears {promise['clears']}.\n"
+                    f"This keeps {promise['keeps']}.\n\n"
+                    "Nothing you have imported or analysed is deleted.")
+        if confirm and QMessageBox.question(self, f"Clear {page_name(key)}?", question) \
+                != QMessageBox.StandardButton.Yes:
+            return False
+        self.clear_page_state(key)
+        self.notify(f"{page_name(key)} cleared: {promise['clears']}. "
+                    f"Kept: {promise['keeps']}.")
+        return True
+
+    def clear_page_state(self, key):
+        """The interface state one tab owns. Never project data."""
+        from wmlstudio.workspace_focus import COHORT_ATTRIBUTES, REFRESH_METHODS
+        focus = getattr(self, "focus", None)
+        if key in {"overview", "isolates"} and focus is not None and hasattr(focus, "clear"):
+            focus.clear()
+        if key == "isolates":
+            search = getattr(self, "search", None)
+            if search is not None:
+                search.clear()
+            for table_name in ("sample_table", "recent_table"):
+                widget = getattr(self, table_name, None)
+                if widget is not None:
+                    widget.clearSelection()
+            for widget in (getattr(self, "step_tables", None) or {}).values():
+                widget.clearSelection()
+        attribute = COHORT_ATTRIBUTES.get(key)
+        if attribute is not None and hasattr(self, attribute):
+            setattr(self, attribute, set())
+            ledger = getattr(self, "cohort_origins", None)
+            if ledger is not None and hasattr(ledger, "forget"):
+                ledger.forget(key)
+        if key == "compare":
+            self.distance_rows = []
+            tree = getattr(self, "tree", None)
+            if tree is not None:
+                tree.draw_results([], [])
+            status = getattr(self, "tree_status", None)
+            if status is not None:
+                status.setText("Cleared. Choose a cohort to build a comparison; every stored "
+                               "profile is still in this project.")
+        if key == "evidence":
+            table_widget = getattr(self, "hydra_table", None)
+            if table_widget is not None:
+                table_widget.clearSelection()
+        if key == "schemes":
+            self.populate_schemes()
+        if key == "settings":
+            tabs = getattr(self, "settings_tabs", None)
+            if tabs is not None:
+                tabs.setCurrentIndex(0)
+        # A station that has been given a real page clears that page its own way.
+        adopted = (self.stations.get(key) or {}).get("adopted")
+        if adopted is not None and callable(getattr(adopted, "clear", None)):
+            adopted.clear()
+        # A typing station's selection is the step table it runs on, nothing wider.
+        step = {"mlst": "st", "cgmlst": "cgmlst"}.get(key)
+        table_widget = (getattr(self, "step_tables", None) or {}).get(step)
+        if table_widget is not None:
+            table_widget.clearSelection()
+        refresh = getattr(self, REFRESH_METHODS.get(key, ""), None)
+        if callable(refresh):
+            refresh()
+        self.refresh_stations()
+        return True
+
     # --- menus this window owns ----------------------------------------------
     def menu_named(self, title):
         """The menu bar action carrying a menu with this title, or None."""
@@ -605,23 +946,28 @@ class BaseWindow(QMainWindow):
             action.triggered.connect(callback)
             self.addAction(action)
 
-    def navigate(self, index):
+    def navigate(self, target):
         """The single guarded choke point for changing workspace page.
 
-        Both a tab click and a `navigate(<int>)` call arrive here, so the guard
-        stops the tab widget's own currentChanged from re-entering, and the page's
-        show hook runs exactly once, outside the guard, as it did before.
+        Both a tab click and a `navigate(<int>)` call arrive here. An integer is a
+        build-order page number, the address this application has always used, so
+        `navigate(2)` still means the tree page wherever its tab now sits; a string
+        is the page key. The guard stops the tab widget's own currentChanged from
+        re-entering, and the page's show hook runs exactly once, outside the guard.
         """
         if self._navigating:
             return
         self._navigating = True
+        key = ""
         try:
-            if not self.pages.show_page(index):
+            key = self.pages.key_for(target)
+            if not key or not self.pages.show_page(key):
                 return
-            index = self.pages.currentIndex()
-            self.breadcrumb.setText("WORKSPACE  /  " + self.nav_names[index].upper())
+            key = self.pages.current_key() or key
+            self.breadcrumb.setText("WORKSPACE  /  " + page_name(key).upper())
+            current = self.pages.slot_of(key)
             for i, item in enumerate(self.nav_buttons):
-                item.setChecked(i == index)
+                item.setChecked(i == current)
             page = self.pages.currentWidget()
             if page:
                 page.update()
@@ -630,13 +976,13 @@ class BaseWindow(QMainWindow):
                     page.widget().update()
         finally:
             self._navigating = False
-        hook = self.page_shown.get(self.pages.key_at(index))
+        hook = self.page_shown.get(key)
         if callable(hook):
             hook()
 
     def show_focus_in_library(self):
         """Take the user to the isolates the shared focus names. Changes no cohort."""
-        self.navigate(self.page_index.get("isolates", 1))
+        self.navigate("isolates")
         select = getattr(self, "select_samples_in_table", None)
         if callable(select):
             select(sorted(self.focus.ids))
@@ -647,7 +993,7 @@ class BaseWindow(QMainWindow):
 
     def open_display_settings(self):
         """Window size, text size and screen resolution, in one obvious place."""
-        self.navigate(self.page_index.get("settings", 6))
+        self.navigate("settings")
         tabs = getattr(self, "settings_tabs", None)
         if tabs is not None:
             tabs.setCurrentIndex(0)
@@ -771,26 +1117,48 @@ class BaseWindow(QMainWindow):
         event.acceptProposedAction()
 
     def populate_schemes(self):
+        """Every installed scheme, under a name a person can read, labelled by kind.
+
+        A downloaded cgMLST scheme used to appear as its folder name with the
+        underscores turned into spaces, sorted in among 162 classical schemes: the
+        user could install one and then not find it. The row title now comes from
+        the scheme's own metadata, and TYPE says which library it belongs to.
+        """
         selected = self.project.get_setting("scheme_path", "")
-        # The cgMLST library exists before anything is downloaded, so a user never
-        # has to make a folder and can see which schemes this build can ship.
         try:
             from wmlstudio import cgmlst_schemes
             cgmlst_schemes.prepare_library(self.root)
+            # A scheme moved into the cgMLST library keeps working for a project
+            # that stored where it used to be.
+            if selected:
+                moved = str(cgmlst_schemes.resolve_migrated_path(self.root, selected))
+                if moved != selected:
+                    self.project.set_setting("scheme_path", moved)
+                    selected = moved
         except (OSError, ValueError):
             pass  # A read-only or full data folder must not stop the workspace opening.
         self.scheme_paths = scheme_locations(self.root)
+        from wmlstudio.reference_index import scheme_entries as installed_rows
+        try:
+            titles = {row["path"]: row for row in installed_rows(self.scheme_paths)}
+        except (OSError, ValueError):
+            titles = {}
         self.scheme_combo.clear()
         self.scheme_combo.addItem("Quality checks only", None)
         self.scheme_table.setRowCount(len(self.scheme_paths))
         for index, path in enumerate(self.scheme_paths):
-            name = "Practice scheme · 7 loci (synthetic)" if path.name == "practice_7" else path.name.replace("_", " ")
+            row = titles.get(str(path), {})
+            name = ("Practice scheme · 7 loci (synthetic)" if path.name == "practice_7"
+                    else row.get("title") or path.name)
+            kind = {"mlst": "MLST", "cgmlst": "cgMLST"}.get(row.get("kind"), "Not classified")
             self.scheme_combo.addItem(name, str(path))
             if str(path) == selected:
                 self.scheme_combo.setCurrentIndex(index + 1)
-            for col, text in enumerate([name, "Local import" if self.root in path.parents else "Bundled snapshot", str(path)]):
+            for col, text in enumerate([name, kind,
+                                        "Local import" if self.root in path.parents else "Bundled snapshot",
+                                        str(path)]):
                 item = QTableWidgetItem(text)
-                item.setToolTip(text)
+                item.setToolTip(row.get("kind_conflict") or row.get("kind_basis") or text)
                 self.scheme_table.setItem(index, col, item)
 
     def import_scheme(self):
@@ -826,6 +1194,7 @@ class BaseWindow(QMainWindow):
             metric.value.setText(str(value))
         self.practice_notice.setVisible(bool(self.project.get_setting("practice", False)))
         self.refresh_tables()
+        self.refresh_stations()
         self.restore_hydra()
 
     def refresh_tables(self):
@@ -927,6 +1296,13 @@ class BaseWindow(QMainWindow):
 
     def sample_finished(self, sample_id, result):
         self.project.set_result(sample_id, result)
+        # The organism this run established becomes the sample's own, so it fills
+        # in on every other tab without anybody retyping it.
+        from wmlstudio.storage import adopt_analysis_organism
+        try:
+            adopt_analysis_organism(self.project, sample_id, result)
+        except (KeyError, ValueError):
+            pass  # Recording a label must never lose the result that produced it.
         self.refresh()
 
     def sample_failed(self, sample_id, message):
@@ -1389,8 +1765,9 @@ def main(argv=None):
     parser.add_argument("--demo", action="store_true")
     parser.add_argument("--smoke-test", action="store_true")
     parser.add_argument("--screenshot", type=Path)
-    parser.add_argument("--screenshot-page", type=int, choices=range(7), default=0,
-                        help="Workspace page index for reproducible screenshots (0–6)")
+    parser.add_argument("--screenshot-page", type=int, choices=range(len(PAGE_KEYS)), default=0,
+                        help="Workspace page, by the build-order number navigate() uses "
+                             f"(0–{len(PAGE_KEYS) - 1}: {', '.join(PAGE_KEYS)})")
     parser.add_argument("--window-size", help="Override screen-aware desktop size with WIDTHxHEIGHT")
     parser.add_argument("--display-scale", type=int, choices=SCALE_CHOICES,
                         help="Magnify the whole interface by this percentage for this run. "

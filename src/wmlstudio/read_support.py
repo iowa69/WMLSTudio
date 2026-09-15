@@ -30,6 +30,11 @@ from .sequence import (
 )
 from .typing import Scheme, reverse_complement
 
+# The explicit panel bound this assay enforces. Named here so a caller that has to
+# split a long list of loci into runs uses the assay's own number instead of
+# repeating a literal that could drift away from it.
+MAX_PANEL_LOCI = 20
+
 LIMITATIONS = [
     'Read support is separate investigative evidence: no assembly allele, ST or cgMLST distance is overwritten.',
     'Depth counts independently aligned reads, including overlapping mates and PCR duplicates; it is not molecule depth.',
@@ -45,7 +50,7 @@ def _integer(value, name, low, high):
         raise ValueError(f'{name} must be an integer between {low:,} and {high:,}.')
 
 
-def preflight_read_support(scheme, loci, *, max_loci=20, max_alleles=5000, max_reference_bases=10_000_000):
+def preflight_read_support(scheme, loci, *, max_loci=MAX_PANEL_LOCI, max_alleles=5000, max_reference_bases=10_000_000):
     """Inspect an already-loaded scheme without reading FASTQ or spawning tools."""
     if not isinstance(scheme, Scheme):
         raise ValueError('Load and validate a local scheme before read-support preflight.')
@@ -293,7 +298,7 @@ def _summarize_loci(candidates, loci):
 
 def investigate_read_support(read1, read2, scheme, loci, cancelled=None, progress=None, *,
                              assembly_path=None, expected_read_sha256=None, max_pairs=100_000,
-                             max_loci=20, max_alleles=5000, max_reference_bases=10_000_000,
+                             max_loci=MAX_PANEL_LOCI, max_alleles=5000, max_reference_bases=10_000_000,
                              max_query_bases=60_000_000, max_output_bytes=128 * 1024 * 1024,
                              min_read_length=50, max_read_length=1000, min_base_quality=20,
                              min_identity=90.0, min_read_coverage=.8, min_depth=3, min_breadth=.95,

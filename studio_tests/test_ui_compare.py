@@ -314,3 +314,196 @@ def test_turning_the_baseline_off_restores_the_single_tree_layout(window, qtbot)
     assert not window.export_tree_choice.isVisible()
     assert window.baseline_tree._results == {}
     assert_comparison_geometry(window, qtbot, '1080x720-dual-off')
+
+
+# ---------------------------------------------------------------------------
+# One tree in a window of its own, and starting the tab again
+# ---------------------------------------------------------------------------
+
+CG_TARGETS = [f'target{index:03d}' for index in range(1, 41)]
+
+
+def cg_profile(window, index):
+    """One core-genome profile: forty targets, so its typing kind is its own evidence."""
+    alleles = {locus: '1' for locus in CG_TARGETS}
+    alleles['target001'] = str(1 + index % 2)
+    sid = window.project.add_profile(f'core-{index}', {
+        'sample_name': f'core-{index}', 'scheme': 'Demo cgMLST', 'scheme_digest': 'core-reference',
+        'status': 'profile_imported', 'alleles': alleles, 'calls': [], 'input_sha256': 'a' * 64,
+        'analysis_kind': 'cgmlst'}, {'organism': {'genus': 'Klebsiella', 'species': 'pneumoniae'}})
+    window.cohort_ids = set(window.cohort_ids or ()) | {sid}
+    return sid
+
+
+def built(window, kind='cgmlst'):
+    window.refresh_cohort_table()
+    window.show_typing_view(kind)
+    window.refresh_comparison()
+    assert window.tree.nodes, window.tree_status.text()
+    return window.tree
+
+
+def test_the_drawn_tree_opens_in_its_own_window_and_leaves_the_page_untouched(window, qtbot):
+    cg_profile(window, 0)
+    cg_profile(window, 1)
+    built(window)
+    detached = window.open_graph_window()
+    qtbot.addWidget(detached)
+    try:
+        assert window._graph_windows == [detached]
+        assert detached.view is not window.tree
+        assert sorted(detached.view.nodes) == sorted(window.tree.nodes)
+        positions = {key: (node.pos().x(), node.pos().y())
+                     for key, node in window.tree.nodes.items()}
+        moved = sorted(detached.view.nodes)[0]
+        detached.view.nodes[moved].setPos(321, 123)
+        detached.view.update_edges()
+        detached.view.set_node_colors({moved: '#ff0055'})
+        assert {key: (node.pos().x(), node.pos().y())
+                for key, node in window.tree.nodes.items()} == positions
+        assert window.tree.nodes[moved].slices != [('#ff0055', 1)]
+    finally:
+        detached.close()
+    assert window._graph_windows == []
+    assert sorted(window.tree.nodes) == sorted(positions)
+
+
+def test_a_window_states_the_typing_kind_reference_and_target_count_it_is_showing(window, qtbot):
+    cg_profile(window, 0)
+    cg_profile(window, 1)
+    built(window)
+    window.cluster_threshold.setValue(5)
+    detached = window.open_graph_window()
+    qtbot.addWidget(detached)
+    try:
+        assert detached.identity.kind == 'cgmlst'
+        assert detached.identity.targets == len(CG_TARGETS)
+        assert detached.identity.caption() == 'cgMLST · Demo cgMLST · 40 targets'
+        assert detached.identity.threshold_words() == 'link ≤ 5 of 40 targets'
+        assert '2 isolates' in detached.identity.cohort_words()
+        title = detached.windowTitle()
+        assert title.startswith('cgMLST forest · link ≤ 5 of 40 targets · 2 isolates · Demo cgMLST')
+        assert detached.headline.text() == 'cgMLST · Demo cgMLST · 40 targets'
+    finally:
+        detached.close()
+
+
+def test_a_classical_window_and_a_core_genome_window_never_share_a_scale(window, qtbot):
+    cg_profile(window, 0)
+    cg_profile(window, 1)
+    profile(window, 0)
+    profile(window, 1)
+    built(window, 'cgmlst')
+    core = window.open_graph_window()
+    qtbot.addWidget(core)
+    built(window, 'mlst')
+    classical = window.open_graph_window()
+    qtbot.addWidget(classical)
+    try:
+        assert (core.identity.kind, classical.identity.kind) == ('cgmlst', 'mlst')
+        assert core.identity.targets == 40 and classical.identity.targets == 2
+        assert core.identity.target_word == 'targets' and classical.identity.target_word == 'loci'
+        assert core.windowTitle() != classical.windowTitle()
+        assert sorted(core.view.nodes) != sorted(classical.view.nodes)
+        assert core.identity.separation == classical.identity.separation
+        assert 'never share a scale' in core.identity.separation
+    finally:
+        core.close()
+        classical.close()
+
+
+def test_opening_a_window_before_anything_is_drawn_opens_nothing_and_says_so(window):
+    assert window.open_graph_window() is None
+    assert window._graph_windows == []
+    assert 'nothing drawn' in window.progress_text.text()
+
+
+def test_a_tree_that_is_not_on_screen_is_not_offered_as_a_second_opinion(window):
+    cg_profile(window, 0)
+    cg_profile(window, 1)
+    built(window)
+    assert window.open_graph_window('baseline') is None
+    assert window._graph_windows == []
+    assert 'not on screen' in window.progress_text.text()
+
+
+def test_a_window_opened_from_the_baseline_tree_names_the_stored_snapshot(window, qtbot):
+    profile(window, 0)
+    profile(window, 1)
+    pinned_baseline(window)
+    window.dual_toggle.setChecked(True)
+    qtbot.waitUntil(lambda: bool(window.baseline_tree.nodes), timeout=5000)
+    detached = window.open_graph_window('baseline')
+    qtbot.addWidget(detached)
+    try:
+        assert detached.identity.cohort == 'Geometry check'
+        assert detached.identity.scheme == 'Example cgMLST'
+        assert 'stored baseline snapshot' in detached.identity.note
+        assert sorted(detached.view.nodes) == sorted(window.baseline_tree.nodes)
+        assert detached.view is not window.baseline_tree
+    finally:
+        detached.close()
+
+
+def test_clearing_the_compare_tab_empties_it_and_keeps_every_stored_profile(window, qtbot):
+    first = cg_profile(window, 0)
+    cg_profile(window, 1)
+    built(window)
+    window.cohort_search.setText('core')
+    window.graph_search.setText('core-0')
+    detached = window.open_graph_window()
+    qtbot.addWidget(detached)
+    window.clear_compare_tab()
+    assert window.cohort_ids == set()
+    assert window.project.get_setting('comparison_cohort') == []
+    assert window._last_comparison == [] and window.tree.nodes == {}
+    assert window._pending_graph_state is None
+    assert window.cohort_search.text() == '' and window.graph_search.text() == ''
+    assert window.active_investigation_id is None
+    assert window._graph_windows == []
+    assert window.cgmlst_calls.calls is None
+    assert 'Nothing stored was changed' in window.tree_status.text()
+    # Everything that was cleared was on screen. The evidence is untouched.
+    assert len(window.project.samples()) == 2
+    assert window.project.get_sample(first)['result']['alleles']['target001'] == '1'
+    window.cohort_ids = {first}
+    window.refresh_comparison()
+    assert len(window.tree.nodes) == 1
+
+
+def dual_typed(window, index):
+    """One isolate carrying both a classical profile and a core-genome profile."""
+    sid = cg_profile(window, index)
+    window.project.set_analysis(sid, {
+        'sample_name': f'core-{index}', 'scheme': 'Study MLST', 'scheme_digest': 'study-reference',
+        'status': 'complete', 'alleles': dict(zip('abcdefg', '111111' + str(1 + index % 2))),
+        'calls': [], 'st': '20', 'input_sha256': 'a' * 64, 'analysis_kind': 'mlst'})
+    return sid
+
+
+def test_both_typing_trees_open_in_their_own_windows_on_their_own_scales(window, qtbot):
+    dual_typed(window, 0)
+    dual_typed(window, 1)
+    built(window, 'cgmlst')
+    window.counterpart_toggle.setChecked(True)
+    qtbot.waitUntil(lambda: bool(window.counterpart_tree.nodes), timeout=5000)
+    core = window.open_graph_window('current')
+    qtbot.addWidget(core)
+    classical = window.open_graph_window('counterpart')
+    qtbot.addWidget(classical)
+    try:
+        assert (core.identity.kind, classical.identity.kind) == ('cgmlst', 'mlst')
+        assert (core.identity.targets, classical.identity.targets) == (40, 7)
+        assert core.identity.scheme == 'Demo cgMLST' and classical.identity.scheme == 'Study MLST'
+        assert 'of 40 targets' in core.identity.threshold_words()
+        assert 'of 7 loci' in classical.identity.threshold_words()
+        assert 'the other typing view' in classical.identity.note
+        assert len(window._graph_windows) == 2
+        # Two windows on the same isolates, and neither one can borrow the other's
+        # arrangement or the other's numbers.
+        assert core.view is not classical.view
+        assert sorted(core.view.nodes) == sorted(classical.view.nodes)
+    finally:
+        core.close()
+        classical.close()
+    assert window._graph_windows == []

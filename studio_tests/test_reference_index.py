@@ -7,6 +7,7 @@ import pytest
 from wmlstudio import identification
 from wmlstudio.paths import scheme_locations
 from wmlstudio.reference_index import (
+    CGMLST_LOCUS_THRESHOLD,
     INDEX_DIRNAME,
     UNRESOLVED_NODE,
     clear_index_cache,
@@ -15,6 +16,7 @@ from wmlstudio.reference_index import (
     organism_tree,
     panel_entries,
     scheme_entries,
+    scheme_library,
     write_organism_index,
 )
 from wmlstudio.sequence import file_signature
@@ -179,3 +181,104 @@ def test_indexing_the_bundled_snapshot_stays_cheap_and_complete(tmp_path):
     unresolved = list((index / UNRESOLVED_NODE).glob("*.json"))
     assert 0 < len(unresolved) < 10
     assert (index / "Klebsiella").is_dir() and (index / "Escherichia" / "coli").is_dir()
+
+
+def test_the_kind_of_a_scheme_is_reported_with_the_evidence_it_rests_on(tmp_path):
+    classical = scheme(tmp_path, "classical", metadata={"name": "c", "type": "MLST"})
+    counted = scheme(tmp_path, "counted", loci=40, metadata={"name": "b"})
+    partial = scheme(tmp_path, "partial", loci=5, metadata={"name": "p", "type": "cgMLST"})
+    rows = {entry["id"]: entry for entry in scheme_entries([classical, counted, partial])}
+    assert rows["classical"]["kind"] == "mlst"
+    assert rows["classical"]["kind_basis"] == "scheme metadata declares type 'mlst'"
+    assert rows["counted"]["kind"] == "cgmlst"
+    assert "40 targets" in rows["counted"]["kind_basis"]
+    assert f"{CGMLST_LOCUS_THRESHOLD}-locus" in rows["counted"]["kind_basis"]
+    assert rows["partial"]["kind"] == "cgmlst"
+    assert "declares type 'cgmlst'" in rows["partial"]["kind_basis"]
+    assert "partial snapshot" in rows["partial"]["kind_conflict"]
+
+
+def test_a_folder_whose_kind_cannot_be_read_is_unknown_and_belongs_to_neither_tab(tmp_path):
+    empty = tmp_path / "empty"
+    empty.mkdir()
+    (empty / "README.txt").write_text("this slot is not filled yet")
+    row = scheme_entries([empty])[0]
+    assert row["kind"] == "unknown"
+    assert row["kind_basis"] == "the folder holds no allele FASTA files"
+    library = scheme_library([empty])
+    assert library["mlst"] == [] and library["cgmlst"] == []
+    assert [entry["id"] for entry in library["unknown"]] == ["empty"]
+
+
+def test_a_contradiction_between_size_and_declared_type_is_shown_not_resolved_silently(tmp_path):
+    # A two-thousand-target scheme that calls itself MLST is not offered where a
+    # seven-locus scheme is expected: the measured target count decides, and the
+    # contradiction is reported so the metadata can be fixed.
+    mislabelled = scheme(tmp_path, "mislabelled", loci=45, metadata={"name": "m", "type": "MLST"})
+    row = scheme_entries([mislabelled])[0]
+    assert row["kind"] == "cgmlst"
+    assert "declares type 'MLST'" in row["kind_conflict"]
+    assert "the installed target count decides" in row["kind_conflict"]
+
+
+def test_each_library_can_be_asked_for_on_its_own(tmp_path):
+    small = scheme(tmp_path, "small", metadata={"organism": "Klebsiella pneumoniae"})
+    big = scheme(tmp_path, "big", loci=35, metadata={"organism": "Listeria monocytogenes"})
+    paths = [small, big]
+    assert [row["id"] for row in scheme_entries(paths, kind="mlst")] == ["small"]
+    assert [row["id"] for row in scheme_entries(paths, kind="cgmlst")] == ["big"]
+    assert set(scheme_library(paths)) == {"mlst", "cgmlst", "unknown"}
+    with pytest.raises(ValueError, match="scheme kind"):
+        scheme_entries(paths, kind="cgmlst_maybe")
+
+
+def test_a_row_carries_a_readable_title_instead_of_a_folder_name(tmp_path):
+    # The reported bug rendered a downloaded scheme as "cgmlst org kpneumoniae
+    # abcdef0123456789". A row now says what a microbiologist would say.
+    folder = scheme(tmp_path, "cgmlst_org_Kpneumoniae_complex_abcdef0123456789", loci=40,
+                    metadata={"name": "Klebsiella pneumoniae sensu lato cgMLST",
+                              "organism": "Klebsiella pneumoniae sensu lato", "type": "cgMLST",
+                              "source": "cgMLST.org", "last_updated": "2026-09-14",
+                              "API": "https://www.cgmlst.org/ncs/schema/Kpneumoniae_complex/"})
+    row = scheme_entries([folder])[0]
+    assert row["title"] == ("Klebsiella pneumoniae sensu lato · cgMLST · 40 targets · "
+                            "cgMLST.org · updated 2026-09-14")
+    assert row["organism_label"] == "Klebsiella pneumoniae sensu lato"
+    assert row["provider"] == "cgMLST.org"
+    assert row["version"] == "2026-09-14"
+    assert "abcdef0123456789" not in row["title"]
+    # The unit is named, because 40 targets and 7 loci are different quantities.
+    classical = scheme(tmp_path, "kp_mlst", metadata={"organism": "Klebsiella pneumoniae",
+                                                      "description": "MLST", "source": "pubmlst"})
+    assert scheme_entries([classical])[0]["title"] == \
+        "Klebsiella pneumoniae · MLST · 7 loci · PubMLST"
+
+
+def test_a_scheme_that_records_nothing_still_gets_a_title_a_person_can_read(tmp_path):
+    bare = scheme(tmp_path, "practice_7")
+    row = scheme_entries([bare])[0]
+    assert row["title"] == "practice_7 · 7 loci"
+    assert row["kind"] == "mlst"
+    assert row["provider"] == ""
+
+
+def test_a_scheme_says_whether_its_target_set_is_core_or_accessory(tmp_path):
+    core = scheme(tmp_path, "core", loci=40, metadata={"name": "c", "type": "cgMLST"})
+    accessory = scheme(tmp_path, "accessory", loci=60, metadata={"name": "a", "type": "wgMLST"})
+    unstated = scheme(tmp_path, "unstated", loci=40, metadata={"name": "u"})
+    classical = scheme(tmp_path, "classical", metadata={"name": "m", "type": "MLST"})
+    rows = {entry["id"]: entry["target_set"]
+            for entry in scheme_entries([core, accessory, unstated, classical])}
+    assert rows == {"core": "core", "accessory": "accessory", "unstated": "", "classical": ""}
+
+
+def test_the_derived_index_pointer_records_the_kind_and_the_basis_for_it(tmp_path):
+    root = tmp_path / "schemes"
+    path = scheme(root, "kp", loci=40, metadata={"organism": "Klebsiella pneumoniae",
+                                                 "type": "cgMLST", "name": "kp"})
+    index = write_organism_index(root, scheme_entries([path]))
+    pointer = json.loads((index / "Klebsiella" / "pneumoniae" / "kp.json").read_text())
+    assert pointer["kind"] == "cgmlst"
+    assert "40 targets" in pointer["kind_basis"]
+    assert pointer["target_set"] == "core"
+    assert "Klebsiella pneumoniae" in pointer["title"]

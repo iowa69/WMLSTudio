@@ -87,6 +87,12 @@ class ReportWorkspaceMixin:
         layout.addLayout(controls)
         self.report_count = label("Report scope: all project samples", "cardTitle")
         layout.addWidget(self.report_count)
+        # Which typing this report is about, on the page and in the document, from
+        # the one call the document itself prints: a cgMLST report and an MLST
+        # report must never be mistakable for one another, and the page is where a
+        # reader finds out before they export.
+        self.report_typing_label = label("", "small", True)
+        layout.addWidget(self.report_typing_label)
         self.report_table = make_table(["Include", "Highlight", "Sample", "Organism", "ST", "AMR genes", "Group"])
         self.report_table.setColumnWidth(0, 65)
         self.report_table.setColumnWidth(1, 75)
@@ -189,6 +195,42 @@ class ReportWorkspaceMixin:
             context = current
         return context
 
+    def report_typing(self):
+        """What this report will say it measured, or None when it measures nothing.
+
+        Built by export.threshold_provenance — the same call the document itself
+        prints — so the page and the PDF can never state two different schemes,
+        two different target counts or two different thresholds.
+        """
+        context = self.report_context()
+        if not context:
+            return None
+        from wmlstudio.export import threshold_provenance
+        return threshold_provenance(context)
+
+    def report_typing_line(self):
+        """One sentence naming the typing, the reference, its size and the threshold."""
+        provenance = self.report_typing()
+        if provenance is None:
+            return ("No comparison is attached to this report, so it will state no typing scale, no "
+                    "reference and no threshold. That is not a statement that the isolates are "
+                    "unrelated.")
+        typing = provenance["typing"]
+        return (f"This report is {typing['label']}: {provenance['scheme']} · "
+                f"{provenance['total_loci']} targets in the reference. {provenance['statement']} "
+                f"{typing['note']}")
+
+    def report_typing_kind(self):
+        """'mlst', 'cgmlst' or '' — the word that keeps two reports apart on a desk."""
+        provenance = self.report_typing()
+        kind = ((provenance or {}).get("typing") or {}).get("kind", "")
+        return kind if kind in {"mlst", "cgmlst"} else ""
+
+    def report_filename(self, stem, suffix):
+        """A default filename that names the typing, so the two cannot be swapped."""
+        kind = self.report_typing_kind()
+        return f"wmlstudio-{kind}-{stem}.{suffix}" if kind else f"wmlstudio-{stem}.{suffix}"
+
     def report_graph_available(self):
         """Whether a picture would describe the same snapshot as the numbers."""
         context = self.report_context()
@@ -230,7 +272,8 @@ class ReportWorkspaceMixin:
         if not self.report_graph_available():
             self.notify('Choose a comparison-aware report with a matching current graph first.')
             return
-        path, _ = QFileDialog.getSaveFileName(self, 'Export focal-isolate graph', 'investigation.png',
+        path, _ = QFileDialog.getSaveFileName(self, 'Export focal-isolate graph',
+                                              self.report_filename('graph', 'png'),
                                               'PNG (*.png);;JPEG (*.jpg *.jpeg)')
         if not path:
             return
@@ -244,7 +287,10 @@ class ReportWorkspaceMixin:
                 temporary = Path(directory) / Path(path).name
                 temporary.write_bytes(data)
                 os.replace(temporary, path)
-            self.notify(f'Exported the graph as {fmt} with this report’s focal isolates highlighted.')
+            # A picture carries no scale once it leaves the application, so the
+            # typing it was drawn on is named here and in its filename.
+            self.notify(f'Exported the graph as {fmt} with this report’s focal isolates highlighted. '
+                        + self.report_typing_line())
         except Exception as error:
             self.error(error)
 
@@ -321,6 +367,7 @@ class ReportWorkspaceMixin:
             self.report_table.blockSignals(False)
             highlights = sum(s["id"] in chosen and s.get("metadata", {}).get("cluster", {}).get("highlight", False) for s in samples)
             self.report_count.setText(f"{len(chosen)} included · {highlights} highlighted · {len(samples)} in project")
+            self.report_typing_label.setText(self.report_typing_line())
             if hasattr(self, 'report_preview'):
                 if chosen:
                     options = self.report_options()
@@ -415,7 +462,9 @@ class ReportWorkspaceMixin:
             self.notify(str(error))
             return
         ids = scope['ids']
-        path, _ = QFileDialog.getSaveFileName(self, f"Export {len(ids)} samples", f"wmlstudio-report.{fmt}", f"{fmt.upper()} (*.{fmt})")
+        path, _ = QFileDialog.getSaveFileName(self, f"Export {len(ids)} samples",
+                                              self.report_filename("report", fmt),
+                                              f"{fmt.upper()} (*.{fmt})")
         if not path:
             return
         try:
@@ -466,7 +515,9 @@ class ReportWorkspaceMixin:
         with tempfile.TemporaryDirectory(prefix='.wmlstudio-pdf-', dir=Path(path).resolve().parent) as directory:
             output = Path(directory) / 'report.pdf'
             writer = QPdfWriter(str(output))
-            writer.setTitle(settings['title'])
+            # The document's own title carries the typing too: a PDF filed away
+            # for a week must still say which quantity it measured.
+            writer.setTitle(settings['title'] + self.pdf_title_suffix(full_project))
             writer.setPageSize(QPageSize(QPageSize.PageSizeId.A4))
             writer.setResolution(144)
             document.print_(writer)
@@ -474,6 +525,15 @@ class ReportWorkspaceMixin:
             if not output.is_file() or output.stat().st_size < 100:
                 raise OSError('PDF generation failed; the previous destination was preserved.')
             os.replace(output, path)
+
+    def pdf_title_suffix(self, full_project=False):
+        """' — cgMLST, 2358 targets' for the PDF's own title, or '' when unknown."""
+        provenance = None if full_project else self.report_typing()
+        typing = (provenance or {}).get('typing') or {}
+        if typing.get('kind') not in {'mlst', 'cgmlst'}:
+            return ''
+        word = 'cgMLST' if typing['kind'] == 'cgmlst' else 'classical MLST'
+        return f" — {word}, {provenance['total_loci']} targets"
 
     def report_records(self):
         return [dict(sample, analyses=self.available_profiles(sample)) for sample in self.project.samples()]
@@ -546,18 +606,21 @@ class ReportWorkspaceMixin:
         self._write_simple_report(path, scope)
 
     def _write_simple_report(self, path, scope):
-        if path is None:
-            path, _ = QFileDialog.getSaveFileName(self, 'Save simple summary', 'outbreak-summary.pdf',
-                                                  'PDF (*.pdf);;HTML (*.html)')
-            if not path:
-                return
         options = {**REPORT_PRESETS['simple']}
         # One click must produce the same document whatever preset the combo was
         # left on, and report_context()/report_graph_image() both read
-        # report_options(). Evaluate the whole write against the simple preset.
+        # report_options(). Evaluate the whole write — the offered filename
+        # included, since that is where the typing is named — against the simple
+        # preset.
         previous = self._report_options_override
         self._report_options_override = options
         try:
+            if path is None:
+                path, _ = QFileDialog.getSaveFileName(self, 'Save simple summary',
+                                                      self.report_filename('summary', 'pdf'),
+                                                      'PDF (*.pdf);;HTML (*.html)')
+                if not path:
+                    return
             self.check_output(path)
             investigation = self.report_context()
             image = self.report_graph_image(scope['ids'], fmt='JPEG')

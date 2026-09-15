@@ -8,6 +8,31 @@ from pathlib import Path
 
 from wmlstudio.sequence import file_sha256, sample_name
 
+CONFIGURATION_VERSION = 1
+# One sample configuration, under these names and no other. A menu that keeps its
+# own copy of "which scheme" or "which organism" is how two menus come to disagree
+# about one isolate; every surface reads sample_configuration and writes through
+# storage.set_sample_configuration.
+ORGANISM_FIELDS = ("genus", "species")
+WORKFLOW_FIELDS = ("typing_mode", "scheme_path", "calling_mode", "genetic_code",
+                   "cgmlst_scheme_key", "cgmlst_scheme_path", "run_hydra", "run_cgmlst")
+CONFIGURATION_FIELDS = (*ORGANISM_FIELDS, *WORKFLOW_FIELDS)
+TYPING_MODES = ("auto", "manual", "unknown")
+CALLING_MODES = ("auto", "exact", "full_cds")
+
+# An MLST panel match is compatibility with an installed panel. The caveat travels
+# with the value it produced, so no later surface can read it as taxonomy.
+MLST_ORGANISM_CAVEAT = (
+    "An MLST scheme match is evidence for a lineage compatible with an installed panel, "
+    "not an independent species determination.")
+
+# The four things an allele call is made against. Nothing else can change the call,
+# and a rerun is asked for only when one of them differs from what was stored.
+RERUN_FIELDS = ("input_sha256", "scheme_digest", "scheme", "scheme_version")
+_RERUN_LABELS = {"input_sha256": "the sequence input", "scheme_digest": "the scheme's contents",
+                 "scheme": "the scheme", "scheme_version": "the scheme version"}
+_SCHEME_VERSION_KEYS = ("revision", "version", "last_updated", "scheme_version")
+
 
 def _sha256(value):
     return value.lower() if isinstance(value, str) and re.fullmatch(r'[0-9a-fA-F]{64}', value) else None
@@ -216,6 +241,307 @@ def typing_profiles(record) -> dict:
     return profiles
 
 
+def _metadata(record) -> dict:
+    metadata = record.get("metadata") if isinstance(record, dict) else None
+    return metadata if isinstance(metadata, dict) else {}
+
+
+def assigned_organism(record) -> dict:
+    """The organism stored on the sample, tolerating the old free-text spelling of it.
+
+    Only what was written down: unlike sample_organism this never falls back to what
+    an analysis detected, so a write can tell a stored assignment from a detection
+    that is merely being read through.
+    """
+    assigned = _metadata(record).get("organism") or {}
+    if isinstance(assigned, str):
+        parts = assigned.split(maxsplit=1)
+        assigned = {"genus": parts[0] if parts else "", "species": parts[1] if len(parts) > 1 else ""}
+    return assigned if isinstance(assigned, dict) else {}
+
+
+def sample_organism(record) -> dict:
+    """Genus and species for one sample, with where the value came from and how strong it is.
+
+    The single read every surface uses, so nothing asks again for what the first
+    analysis already established. An assignment somebody made outranks a detection,
+    a detection is reported as a detection, and the basis travels with the value:
+    an MLST scheme match names a lineage compatible with an installed panel, never a
+    species. Genus and species always come from one source, never one from each.
+    """
+    metadata = _metadata(record)
+    assigned = assigned_organism(record)
+    evidence = metadata.get("organism_evidence")
+    evidence = evidence if isinstance(evidence, dict) else {}
+    result = record.get("result") or (record if "result" not in record else {})
+    result = result if isinstance(result, dict) else {}
+    detected = result.get("identification") or {}
+    detected = detected if isinstance(detected, dict) else {}
+    named = detected.get("organism") if isinstance(detected.get("organism"), dict) else {}
+    genus, species = str(assigned.get("genus") or ""), str(assigned.get("species") or "")
+    if genus:
+        source = "assigned"
+        basis = str(evidence.get("basis") or "")
+        confidence = str(evidence.get("confidence") or "")
+    else:
+        genus = str(named.get("genus") or detected.get("genus") or "")
+        species = str(named.get("species") or detected.get("species") or "")
+        # The basis describes the value, so a detection never borrows the basis of a
+        # decision record about some other proposal. The only engine that writes an
+        # identification into a typing result is identification.identify_assembly.
+        source = "scheme_match" if genus else "unknown"
+        basis = str(detected.get("basis") or "mlst_panel") if genus else ""
+        confidence = str(detected.get("confidence") or "panel_compatibility") if genus else ""
+    authored = _authorship_record(metadata).get("genus") or {}
+    return {"genus": genus, "species": species,
+            "organism": " ".join(part for part in (genus, species) if part),
+            "source": source, "basis": basis, "confidence": confidence,
+            "status": str(evidence.get("status") or ""),
+            "note": MLST_ORGANISM_CAVEAT if basis == "mlst_panel" else "",
+            "set_by": str(authored.get("by") or evidence.get("confirmed_by") or ""),
+            "set_utc": str(authored.get("utc") or evidence.get("confirmed_utc") or ""),
+            "surface": str(authored.get("surface") or ""),
+            "automatic": bool(authored["automatic"]) if "automatic" in authored
+            else evidence.get("confirmed_by") in {None, "", "auto_policy"}}
+
+
+def _authorship_record(metadata) -> dict:
+    record = metadata.get("configuration") if isinstance(metadata, dict) else None
+    fields = record.get("fields") if isinstance(record, dict) else None
+    if not isinstance(fields, dict):
+        return {}
+    return {field: dict(entry) for field, entry in fields.items()
+            if field in CONFIGURATION_FIELDS and isinstance(entry, dict)}
+
+
+def configuration_authorship(record) -> dict:
+    """Who set each configuration field and when, as far as the sample records it.
+
+    A field nobody has touched is simply absent. The organism falls back to its own
+    decision record, so a label a person accepted before this bookkeeping existed is
+    still recognised as theirs and is not quietly replaced by an automatic proposal.
+    """
+    metadata = _metadata(record)
+    authorship = _authorship_record(metadata)
+    organism = sample_organism(record)
+    if organism["source"] == "assigned" and organism["set_by"]:
+        for field in ORGANISM_FIELDS:
+            authorship.setdefault(field, {"by": organism["set_by"], "utc": organism["set_utc"],
+                                          "surface": organism["surface"],
+                                          "automatic": organism["automatic"]})
+    return authorship
+
+
+def sample_configuration(record) -> dict:
+    """The one configuration a sample has: organism, scheme choice, typing mode, run flags.
+
+    Every menu and submenu reads this and writes through
+    storage.set_sample_configuration, so a change made anywhere is what every other
+    surface shows next. Older top-level metadata keys are still read as a fallback
+    so a project made before the single home keeps working; they are never written
+    back to. The organism is reported with its source, and is not promoted to an
+    assignment by being read here.
+    """
+    metadata = _metadata(record)
+    workflow = metadata.get("workflow") if isinstance(metadata.get("workflow"), dict) else {}
+    organism = sample_organism(record)
+
+    def choice(field, default=None):
+        return workflow[field] if field in workflow else metadata.get(field, default)
+
+    def text(field):
+        value = choice(field)
+        return str(value).strip() or None if value not in (None, "") else None
+
+    code = choice("genetic_code")
+    return {"genus": organism["genus"], "species": organism["species"],
+            "organism": organism["organism"], "organism_source": organism["source"],
+            "organism_basis": organism["basis"], "organism_confidence": organism["confidence"],
+            "organism_status": organism["status"], "organism_note": organism["note"],
+            "typing_mode": str(choice("typing_mode", "") or ""),
+            "scheme_path": text("scheme_path"),
+            "calling_mode": str(choice("calling_mode", "auto") or "auto"),
+            "genetic_code": int(code) if (isinstance(code, int) and not isinstance(code, bool))
+            or (isinstance(code, str) and code.strip().isdigit()) else None,
+            "cgmlst_scheme_key": text("cgmlst_scheme_key"),
+            "cgmlst_scheme_path": text("cgmlst_scheme_path"),
+            "run_hydra": bool(choice("run_hydra", False)),
+            "run_cgmlst": bool(choice("run_cgmlst", False)),
+            "set_by": configuration_authorship(record)}
+
+
+def _scheme_version(state) -> str | None:
+    if state.get("scheme_version"):
+        return str(state["scheme_version"])
+    metadata = state.get("scheme_metadata")
+    if isinstance(metadata, dict):
+        for key in _SCHEME_VERSION_KEYS:
+            if metadata.get(key):
+                return str(metadata[key])
+    return None
+
+
+def typing_state(value) -> dict:
+    """What one typing run was made against, read out of a stored result or a request.
+
+    The caller settings are whatever the caller recorded for itself; a request
+    should state only the settings that change the answer, because every setting it
+    states is one the stored result has to be able to answer for.
+    """
+    value = value if isinstance(value, dict) else {}
+    caller = value.get("caller")
+    if not isinstance(caller, dict):
+        caller = value.get("parameters") if isinstance(value.get("parameters"), dict) else {}
+    return {"input_sha256": _sha256(value.get("input_sha256")),
+            "scheme_digest": str(value.get("scheme_digest") or "") or None,
+            "scheme": str(value.get("scheme") or "") or None,
+            "scheme_version": _scheme_version(value), "caller": dict(caller)}
+
+
+def _rerun_compare(field, label, before, now, decision) -> None:
+    if before is None or now is None:
+        missing = "the request does not state it" if now is None else "the stored result does not record it"
+        decision["unverified"].append({"field": field, "reason": f"{label} cannot be compared: {missing}."})
+        return
+    decision["compared"].append(field)
+    if before != now:
+        decision["changes"].append({"field": field, "was": before, "now": now,
+                                    "reason": f"{label} changed."})
+
+
+def rerun_decision(stored, requested) -> dict:
+    """Whether typing has to run again, and exactly what changed since it last ran.
+
+    Pure: it reads two mappings, touches no database and no file, so a Run button
+    can call it to enable or explain itself. Typing is repeated only when something
+    it was run against changed -- the input bytes, the scheme's identity, the
+    scheme's version, or a caller setting. When nothing changed, the stored result
+    stands and may be said to stand.
+
+    "Cannot be compared" is a third answer, kept apart from both: a result whose
+    input hash nobody recorded is not shown to be current, so a rerun is still asked
+    for and the reason names what is missing rather than implying staleness.
+    """
+    before, now = typing_state(stored), typing_state(requested)
+    decision = {"rerun": True, "status": "never_run", "changes": [], "unverified": [],
+                "compared": [], "summary": ""}
+    if not before["scheme_digest"]:
+        decision["summary"] = ("Nothing is stored for this sample against a scheme, so typing has "
+                               "not been run yet.")
+        return decision
+    for field in ("input_sha256", "scheme_digest"):
+        _rerun_compare(field, _RERUN_LABELS[field], before[field], now[field], decision)
+    for field in ("scheme", "scheme_version"):
+        # Optional: a request that does not name the scheme version is not asking
+        # about it, and is not told that it could not be checked.
+        if now[field] is not None:
+            _rerun_compare(field, _RERUN_LABELS[field], before[field], now[field], decision)
+    for key in sorted(now["caller"]):
+        _rerun_compare(f"caller.{key}", f"the caller setting {key!r}",
+                       before["caller"].get(key), now["caller"][key], decision)
+    if decision["changes"]:
+        decision["status"] = "changed"
+        decision["summary"] = ("Typing has to run again: "
+                               + " ".join(change["reason"] for change in decision["changes"]))
+    elif decision["unverified"]:
+        decision["status"] = "unverifiable"
+        decision["summary"] = ("The stored result cannot be shown to be current. "
+                               + " ".join(entry["reason"] for entry in decision["unverified"]))
+    else:
+        decision.update(rerun=False, status="current")
+        decision["summary"] = ("Nothing typing was run against has changed, so the stored result "
+                               "stands. Checked: " + ", ".join(decision["compared"]) + ".")
+    return decision
+
+
+def _cohort_label(record) -> str:
+    result = record.get("result") if isinstance(record.get("result"), dict) else {}
+    return str(record.get("name") or result.get("sample_name") or record.get("sample_name")
+               or record.get("id") or record.get("sample_id") or "this sample")
+
+
+def _name_list(entries, limit=5) -> str:
+    names = [f"{entry['name']} ({entry['organism']})" if entry["organism"] else entry["name"]
+             for entry in entries[:limit]]
+    remaining = len(entries) - len(names)
+    return ", ".join(names) + (f", and {remaining} more" if remaining > 0 else "")
+
+
+def cgmlst_scheme_applies(records, scheme) -> dict:
+    """Whether one cgMLST scheme applies to the organisms in a cohort, and why it does not.
+
+    A cgMLST target set is defined for one organism or one species complex. Calling
+    a genome of another genus against it does not produce a larger distance, it
+    produces absent targets, and absent targets are not differences. So a scheme is
+    refused for a cohort that contradicts it, and refused for a cohort in which no
+    sample's organism is known yet -- an unidentified isolate is not a match.
+
+    A sample of the same genus but another species is allowed and named in
+    ``warnings``: several catalogued schemes are complex-level on purpose, and which
+    species a target set was defined on is something the person launching the run
+    has to be told rather than have decided for them.
+    """
+    from wmlstudio.project import CGMLST_LOCUS_FLOOR
+    scheme = scheme if isinstance(scheme, dict) else {}
+    genus = str(scheme.get("genus") or "").strip()
+    species = str(scheme.get("species") or "").strip()
+    label = (str(scheme.get("organism") or "").strip()
+             or " ".join(part for part in (genus, species) if part) or "no organism")
+    name = str(scheme.get("scheme_name") or scheme.get("key") or "the chosen cgMLST scheme")
+    verdict = {"applies": False, "status": "", "scheme_key": scheme.get("key"), "scheme_name": name,
+               "scheme_organism": label, "matched": [], "mismatched": [], "unknown": [],
+               "warnings": [], "message": ""}
+    count = scheme.get("locus_count")
+    if isinstance(count, int) and count <= CGMLST_LOCUS_FLOOR:
+        verdict["status"] = "not_a_cgmlst_scheme"
+        verdict["message"] = (f"{name} declares {count} targets, at or below the "
+                              f"{CGMLST_LOCUS_FLOOR}-locus floor that separates classical MLST "
+                              "from gene-by-gene typing. It cannot be run as a cgMLST scheme.")
+        return verdict
+    if not genus:
+        verdict["status"] = "scheme_organism_unknown"
+        verdict["message"] = (f"{name} records no organism, so nothing confirms it applies to "
+                              "these samples. Choose a catalogued cgMLST scheme.")
+        return verdict
+    for record in records:
+        organism = sample_organism(record)
+        entry = {"sample_id": str(record.get("id") or record.get("sample_id") or ""),
+                 "name": _cohort_label(record), "organism": organism["organism"]}
+        if not organism["genus"]:
+            verdict["unknown"].append(entry)
+        elif organism["genus"].casefold() != genus.casefold():
+            verdict["mismatched"].append(entry)
+        else:
+            verdict["matched"].append(entry)
+            if species and organism["species"] and organism["species"].casefold() != species.casefold():
+                verdict["warnings"].append(
+                    f"{entry['name']} is {organism['organism']}; {name} was defined on {label}. "
+                    "Check the scheme's scope before comparing these profiles.")
+    if verdict["mismatched"]:
+        verdict["status"] = "organism_mismatch"
+        verdict["message"] = (f"{name} is defined for {label}. "
+                              f"{len(verdict['mismatched'])} selected sample(s) are a different "
+                              f"organism: {_name_list(verdict['mismatched'])}. A cgMLST distance "
+                              "never crosses organisms; choose that organism's scheme or deselect "
+                              "those samples.")
+        return verdict
+    if not verdict["matched"]:
+        verdict["status"] = "organism_unknown"
+        verdict["message"] = (f"No selected sample has an organism yet, so nothing confirms that "
+                              f"{name} ({label}) applies to it. Identify or assign the organism "
+                              "first, then run cgMLST.")
+        return verdict
+    verdict["applies"] = True
+    verdict["status"] = "applies"
+    verdict["message"] = (f"{name} applies to {len(verdict['matched'])} of {len(verdict['matched']) + len(verdict['unknown'])} "
+                          f"selected sample(s) as {label}.")
+    if verdict["unknown"]:
+        verdict["warnings"].append(
+            f"{len(verdict['unknown'])} selected sample(s) have no organism yet and were not "
+            f"checked against {label}: {_name_list(verdict['unknown'])}.")
+    return verdict
+
+
 def _organism_typing(record):
     """Organism-specific calls as one line, or empty when none are current.
 
@@ -228,20 +554,11 @@ def _organism_typing(record):
 
 
 def feature_fields(record, highlight=None) -> dict:
-    result = record.get("result") or (record if "result" not in record else {})
     metadata = record.get("metadata", {})
     metadata = metadata if isinstance(metadata, dict) else {}
-    assigned = metadata.get("organism", {})
-    if isinstance(assigned, str):
-        parts = assigned.split(maxsplit=1)
-        assigned = {"genus": parts[0] if parts else "", "species": parts[1] if len(parts) > 1 else ""}
-    assigned = assigned if isinstance(assigned, dict) else {}
-    detected = result.get("identification", {}) or {}
-    detected_organism = detected.get("organism") or {}
-    detected_organism = detected_organism if isinstance(detected_organism, dict) else {}
-    genus = assigned.get("genus") or detected_organism.get("genus") or detected.get("genus") or ""
-    species = assigned.get("species") or detected_organism.get("species") or detected.get("species") or ""
-    organism = " ".join(filter(None, [genus, species]))
+    # One reader for the organism, so this row and every menu show the same answer.
+    identity = sample_organism(record)
+    genus, species, organism = identity["genus"], identity["species"], identity["organism"]
     evidence = current_hydra_evidence(record)
     evidence_state = hydra_evidence_status(record)
     primary = [hit for hit in evidence.get("hits", []) if hit.get("primary") is True]
@@ -265,7 +582,8 @@ def feature_fields(record, highlight=None) -> dict:
     cg_alleles = cgmlst.get("alleles") if isinstance(cgmlst.get("alleles"), dict) else {}
     return {
         "genus": genus, "species": species, "organism": organism,
-        "organism_source": "assigned" if assigned.get("genus") else "local_scheme_detection" if organism else "unknown",
+        "organism_source": "assigned" if identity["source"] == "assigned"
+        else "local_scheme_detection" if organism else "unknown",
         "organism_basis": str(decision.get("basis") or ""),
         "organism_confidence": str(decision.get("confidence") or ""),
         "organism_status": str(decision.get("status") or ""),

@@ -26,7 +26,7 @@ from datetime import UTC, datetime
 from html.parser import HTMLParser
 from pathlib import Path
 
-from . import __version__
+from . import __version__, cgmlst_schemes
 from .sequence import DNA, SequenceError, check_cancelled
 from .typing import SchemeError, load_scheme
 
@@ -141,6 +141,25 @@ def _safe_name(name: str) -> str:
 def _file_digest(path) -> str:
     with Path(path).open("rb") as handle:
         return hashlib.file_digest(handle, "sha256").hexdigest()
+
+
+def install_destination(library_root, entry, digest="") -> Path:
+    """Where a validated snapshot of this scheme is published, by kind.
+
+    A classical seven-locus scheme keeps its content-addressed folder in the
+    library the caller named: existing projects store those exact paths. A
+    gene-by-gene scheme goes to the ONE cgMLST library instead, into a folder named
+    for its organism, provider and target count -- because a 2,358-target scheme
+    filed alphabetically among 162 seven-locus schemes under a digest-shaped name
+    is a scheme the person who downloaded it cannot find.
+    """
+    library_root = Path(library_root)
+    if cgmlst_schemes.is_gene_by_gene(entry):
+        base = cgmlst_schemes.install_root(library_root)
+        return cgmlst_schemes.install_folder(base, entry, digest=digest)
+    base = _safe_name(f"{entry['database']}_{entry['scheme_id']}") if entry.get("database") \
+        else _safe_name(str(entry.get("scheme_id") or "scheme"))
+    return library_root / f"{base}_{digest[:16]}"
 
 
 def _exclusion_notes(excluded) -> list[str]:
@@ -552,22 +571,22 @@ class PubMLSTCatalog:
                 "snapshot_note": "Sources were downloaded separately; the server does not provide a transactional multi-file snapshot.",
             }
             (staging / "reference_manifest.json").write_text(json.dumps(manifest, indent=2), encoding="utf-8")
-            base = _safe_name(current["database"] + "_" + current["scheme_id"])
-            destination = library_root / f"{base}_{checked.digest[:16]}"
+            destination = install_destination(library_root, current, checked.digest)
             check_cancelled(cancelled)
-            created = not destination.exists()
-            if destination.exists():
+            # A pre-created, labelled cgMLST slot is the destination, not an
+            # existing snapshot: only allele files mean a scheme is already there.
+            occupied = destination.is_dir() and cgmlst_schemes.has_alleles(destination)
+            created = not occupied
+            if occupied:
                 if _validated_scheme(destination, cancelled=cancelled).digest != checked.digest:
                     raise CatalogError("Existing reference snapshot was modified; it will not be overwritten.")
                 shutil.rmtree(staging)
             else:
                 (staging / RESUME_LEDGER).unlink(missing_ok=True)
-                try:
-                    staging.rename(destination)
-                except OSError:
-                    # The partial folder sits beside the library, so a library root
-                    # that is itself a mount point needs a copying move.
-                    shutil.move(str(staging), str(destination))
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                # The partial folder sits beside the library, so a library root
+                # that is itself a mount point needs a copying move.
+                cgmlst_schemes.install_into(staging, destination)
             staging = None
             notes = list(checked.notes) + _exclusion_notes(excluded_alleles)
             if current["access_notice"] and current["access_notice"] not in notes:
@@ -769,7 +788,10 @@ class CGMLSTOrgCatalog(PubMLSTCatalog):
             raise CatalogError('Review the cgMLST.org server policy and explicitly acknowledge that your intended use is permitted before downloading: ' + self.TERMS_URL)
         slug = _safe_name(str(entry.get("slug") or ""))
         base = f"https://www.cgmlst.org/ncs/schema/{slug}/"
-        library_root = Path(library_root).resolve()
+        # Every cgMLST.org scheme is gene-by-gene, so it installs into the cgMLST
+        # library whichever library the caller named. Staging inside it keeps the
+        # final publication a rename on the same filesystem.
+        library_root = cgmlst_schemes.install_root(Path(library_root)).resolve()
         library_root.mkdir(parents=True, exist_ok=True)
         staging = Path(tempfile.mkdtemp(prefix=".cgmlst-download-", dir=library_root))
         excluded_alleles = []
@@ -871,14 +893,18 @@ class CGMLSTOrgCatalog(PubMLSTCatalog):
                         "excluded_alleles": excluded_alleles,
                         "downloaded_bytes": archive_source["bytes"] + table_source["bytes"]}
             (staging / "reference_manifest.json").write_text(json.dumps(manifest, indent=2), encoding="utf-8")
-            destination = library_root / f"cgmlst_org_{slug}_{checked.digest[:16]}"
+            destination = cgmlst_schemes.install_folder(
+                library_root, {**entry, "type": "cgMLST", "slug": slug}, digest=checked.digest)
             check_cancelled(cancelled)
-            created = not destination.exists()
-            if destination.exists():
+            # An empty labelled slot is where this scheme belongs; only allele files
+            # mean a snapshot is already installed there.
+            occupied = destination.is_dir() and cgmlst_schemes.has_alleles(destination)
+            created = not occupied
+            if occupied:
                 if _validated_scheme(destination, cancelled=cancelled).digest != checked.digest:
                     raise CatalogError("The existing reference snapshot was modified and will not be overwritten.")
             else:
-                staging.rename(destination)
+                cgmlst_schemes.install_into(staging, destination)
                 staging = None
             return {"path": str(destination), "scheme_digest": checked.digest,
                     "source_digest": source_digest, "created": created,

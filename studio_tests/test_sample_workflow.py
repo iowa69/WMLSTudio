@@ -267,6 +267,235 @@ def test_a_core_genome_run_never_empties_the_classical_st_column(tmp_path):
         assert fields["cgmlst_loci"] == 400 and fields["cgmlst_called"] == 200
 
 
+MLST_RESULT = {"scheme": "Klebsiella MLST", "scheme_digest": "mlst-v1", "st": "258",
+               "status": "complete", "input_sha256": "a" * 64,
+               "alleles": {f"gene{index}": "1" for index in range(7)},
+               "scheme_metadata": {"type": "MLST", "last_updated": "2026-01-05"},
+               "parameters": {"method": "exact-nucleotide", "strands": "both"}}
+CG_RESULT = {"scheme": "Klebsiella cgMLST", "scheme_digest": "cg-v1", "st": None,
+             "status": "complete", "input_sha256": "a" * 64,
+             "alleles": {f"locus{index:04d}": "3" for index in range(400)},
+             "parameters": {"method": "full-cds-cgmlst-v2", "genetic_code": 11}}
+
+
+def test_the_whole_sample_configuration_is_read_from_one_place(tmp_path):
+    """Every menu reads these names, so no surface has to keep a second copy.
+
+    A project written before the single home stored some of the same choices at the
+    top of metadata; those are still read, and the workflow record wins when both
+    are present, so an old project keeps working without being rewritten.
+    """
+    from wmlstudio.sample_workflow import sample_configuration
+    with Project(tmp_path / "study.wmlstudio") as project:
+        sid = add(project, tmp_path / "a.fasta", "a")
+        project.set_metadata(sid, {
+            "organism": {"genus": "Klebsiella", "species": "pneumoniae"},
+            "typing_mode": "auto", "scheme_path": "/legacy/scheme",
+            "workflow": {"typing_mode": "manual", "scheme_path": "/schemes/kpneumoniae",
+                         "calling_mode": "full_cds", "genetic_code": 11,
+                         "cgmlst_scheme_key": "cgmlst.org:kpneumoniae-2358",
+                         "cgmlst_scheme_path": "/cgmlst/Klebsiella", "run_cgmlst": True}})
+        configuration = sample_configuration(project.get_sample(sid))
+        assert configuration["genus"] == "Klebsiella" and configuration["species"] == "pneumoniae"
+        assert configuration["typing_mode"] == "manual"
+        assert configuration["scheme_path"] == "/schemes/kpneumoniae"
+        assert configuration["calling_mode"] == "full_cds" and configuration["genetic_code"] == 11
+        assert configuration["cgmlst_scheme_key"] == "cgmlst.org:kpneumoniae-2358"
+        assert configuration["run_cgmlst"] is True and configuration["run_hydra"] is False
+
+    # A sample nothing has configured reports the absence rather than a guess.
+    blank = sample_configuration({"id": "x", "name": "x"})
+    assert blank["typing_mode"] == "" and blank["scheme_path"] is None
+    assert blank["cgmlst_scheme_key"] is None and blank["run_cgmlst"] is False
+    assert blank["organism_source"] == "unknown" and blank["set_by"] == {}
+
+
+def test_an_mlst_scheme_match_fills_the_organism_in_but_never_as_taxonomy(tmp_path):
+    """The lineage a panel matched is corroborating evidence, and says so wherever it goes."""
+    from wmlstudio.sample_workflow import MLST_ORGANISM_CAVEAT, sample_organism
+    with Project(tmp_path / "study.wmlstudio") as project:
+        sid = add(project, tmp_path / "a.fasta", "a")
+        project.set_result(sid, {**MLST_RESULT, "identification": {
+            "identification_status": "assigned",
+            "organism": {"genus": "Klebsiella", "species": "pneumoniae"}}})
+        identity = sample_organism(project.get_sample(sid))
+        assert identity["organism"] == "Klebsiella pneumoniae"
+        assert identity["source"] == "scheme_match" and identity["basis"] == "mlst_panel"
+        assert identity["confidence"] == "panel_compatibility"
+        assert identity["note"] == MLST_ORGANISM_CAVEAT
+        # The flat row calls it a detection, never an assignment somebody made.
+        assert feature_fields(project.get_sample(sid))["organism_source"] == "local_scheme_detection"
+
+        project.update_metadata(sid, {"organism": {"genus": "Klebsiella", "species": "variicola"}})
+        assigned = sample_organism(project.get_sample(sid))
+        assert assigned["species"] == "variicola" and assigned["source"] == "assigned"
+        assert feature_fields(project.get_sample(sid))["organism_source"] == "assigned"
+
+
+def test_typing_is_not_repeated_when_nothing_it_was_run_against_changed():
+    from wmlstudio.sample_workflow import rerun_decision
+    request = {"input_sha256": "a" * 64, "scheme_digest": "mlst-v1", "scheme": "Klebsiella MLST",
+               "scheme_version": "2026-01-05", "caller": {"method": "exact-nucleotide"}}
+    decision = rerun_decision(MLST_RESULT, request)
+    assert decision["rerun"] is False and decision["status"] == "current"
+    assert decision["changes"] == [] and decision["unverified"] == []
+    assert set(decision["compared"]) == {"input_sha256", "scheme_digest", "scheme",
+                                         "scheme_version", "caller.method"}
+    assert "stands" in decision["summary"]
+
+
+def test_a_rerun_names_which_of_the_four_things_changed():
+    from wmlstudio.sample_workflow import rerun_decision
+    request = {"input_sha256": "a" * 64, "scheme_digest": "mlst-v1", "scheme": "Klebsiella MLST",
+               "scheme_version": "2026-01-05", "caller": {"method": "exact-nucleotide"}}
+    for field, value, expected in [("input_sha256", "b" * 64, "the sequence input"),
+                                   ("scheme_digest", "mlst-v2", "the scheme's contents"),
+                                   ("scheme", "Other MLST", "the scheme"),
+                                   ("scheme_version", "2026-06-01", "the scheme version")]:
+        decision = rerun_decision(MLST_RESULT, {**request, field: value})
+        assert decision["rerun"] is True and decision["status"] == "changed"
+        assert [change["field"] for change in decision["changes"]] == [field]
+        assert expected in decision["summary"]
+    caller = rerun_decision(MLST_RESULT, {**request, "caller": {"method": "full-cds-cgmlst-v2"}})
+    assert [change["field"] for change in caller["changes"]] == ["caller.method"]
+    assert caller["changes"][0]["was"] == "exact-nucleotide"
+    # Nothing stored at all is its own answer, not a change.
+    assert rerun_decision(None, request)["status"] == "never_run"
+    assert rerun_decision({"status": "qc_only", "scheme_digest": None}, request)["rerun"] is True
+
+
+def test_a_result_that_cannot_be_shown_to_be_current_is_never_called_current():
+    """Unverifiable is a third answer. It is not currency and it is not staleness."""
+    from wmlstudio.sample_workflow import rerun_decision
+    request = {"input_sha256": "a" * 64, "scheme_digest": "mlst-v1"}
+    hashless = rerun_decision({**MLST_RESULT, "input_sha256": None}, request)
+    assert hashless["rerun"] is True and hashless["status"] == "unverifiable"
+    assert hashless["changes"] == []
+    assert hashless["unverified"][0]["field"] == "input_sha256"
+    assert "the stored result does not record it" in hashless["unverified"][0]["reason"]
+    # A setting the request asks about that the stored result never recorded is the
+    # same kind of gap: it is reported, not assumed to have matched.
+    asked = rerun_decision(MLST_RESULT, {**request, "caller": {"min_identity": 0.9}})
+    assert asked["status"] == "unverifiable"
+    assert [entry["field"] for entry in asked["unverified"]] == ["caller.min_identity"]
+    # A request that does not state the scheme version is not asking about it.
+    assert rerun_decision(MLST_RESULT, request)["status"] == "current"
+
+
+def test_each_typing_kind_answers_its_own_rerun_question(tmp_path):
+    """A current cgMLST profile never excuses an MLST rerun, or the other way round."""
+    from wmlstudio.sample_workflow import rerun_decision
+    with Project(tmp_path / "study.wmlstudio") as project:
+        sid = add(project, tmp_path / "a.fasta", "a")
+        project.set_result(sid, MLST_RESULT)
+        project.set_result(sid, CG_RESULT)
+        classical = rerun_decision(project.latest_analysis(sid, "mlst"),
+                                   {"input_sha256": "a" * 64, "scheme_digest": "mlst-v1"})
+        core = rerun_decision(project.latest_analysis(sid, "cgmlst"),
+                              {"input_sha256": "b" * 64, "scheme_digest": "cg-v1"})
+        assert classical["status"] == "current" and core["status"] == "changed"
+        assert core["changes"][0]["field"] == "input_sha256"
+
+
+KPNEUMONIAE = {"key": "cgmlst.org:kpneumoniae-2358", "genus": "Klebsiella",
+               "species": "pneumoniae", "organism": "Klebsiella pneumoniae",
+               "scheme_name": "Klebsiella pneumoniae cgMLST", "locus_count": 2358,
+               "path": "/cgmlst/Klebsiella_pneumoniae__cgmlst_org_2358"}
+
+
+def named(name, genus="", species=""):
+    organism = {"genus": genus, "species": species}
+    return {"id": name, "name": name, "metadata": {"organism": organism}, "result": None}
+
+
+def test_a_cgmlst_scheme_is_refused_for_a_cohort_of_another_organism():
+    from wmlstudio.sample_workflow import cgmlst_scheme_applies
+    cohort = [named("kp1", "Klebsiella", "pneumoniae"), named("ec1", "Escherichia", "coli")]
+    verdict = cgmlst_scheme_applies(cohort, KPNEUMONIAE)
+    assert verdict["applies"] is False and verdict["status"] == "organism_mismatch"
+    assert [entry["name"] for entry in verdict["mismatched"]] == ["ec1"]
+    assert "Klebsiella pneumoniae" in verdict["message"]
+    assert "ec1 (Escherichia coli)" in verdict["message"]
+    assert "never crosses organisms" in verdict["message"]
+
+
+def test_a_cgmlst_scheme_is_not_confirmed_for_samples_whose_organism_is_unknown():
+    from wmlstudio.sample_workflow import cgmlst_scheme_applies
+    verdict = cgmlst_scheme_applies([named("unknown1"), named("unknown2")], KPNEUMONIAE)
+    assert verdict["applies"] is False and verdict["status"] == "organism_unknown"
+    assert [entry["name"] for entry in verdict["unknown"]] == ["unknown1", "unknown2"]
+    assert "Identify or assign the organism first" in verdict["message"]
+    # One identified sample is enough to run, and the unidentified one is named.
+    mixed = cgmlst_scheme_applies([named("kp1", "Klebsiella", "pneumoniae"), named("u")],
+                                  KPNEUMONIAE)
+    assert mixed["applies"] is True
+    assert any("were not checked" in warning for warning in mixed["warnings"])
+
+
+def test_a_complex_member_may_run_the_scheme_and_is_told_what_it_was_defined_on():
+    from wmlstudio.sample_workflow import cgmlst_scheme_applies
+    verdict = cgmlst_scheme_applies([named("kv1", "Klebsiella", "variicola")], KPNEUMONIAE)
+    assert verdict["applies"] is True and verdict["status"] == "applies"
+    assert "Klebsiella variicola" in verdict["warnings"][0]
+    assert "defined on Klebsiella pneumoniae" in verdict["warnings"][0]
+
+
+def test_a_seven_locus_scheme_is_never_offered_as_a_core_genome_run():
+    from wmlstudio.sample_workflow import cgmlst_scheme_applies
+    classical = {"key": "kp-mlst", "genus": "Klebsiella", "species": "pneumoniae",
+                 "scheme_name": "Klebsiella MLST", "locus_count": 7, "path": "/schemes/kp"}
+    verdict = cgmlst_scheme_applies([named("kp1", "Klebsiella", "pneumoniae")], classical)
+    assert verdict["applies"] is False and verdict["status"] == "not_a_cgmlst_scheme"
+    assert "cannot be run as a cgMLST scheme" in verdict["message"]
+    # A scheme that names no organism cannot be shown to apply to anything.
+    unnamed = cgmlst_scheme_applies([named("kp1", "Klebsiella", "pneumoniae")],
+                                    {"key": "x", "locus_count": 2000, "path": "/x"})
+    assert unnamed["applies"] is False and unnamed["status"] == "scheme_organism_unknown"
+
+
+# The launch dialog is the surface cgmlst_scheme_applies exists for, so the refusal
+# and the plan it produces are checked here beside the rule they come from.
+def test_the_run_plan_asks_for_cgmlst_beside_mlst_and_names_the_target_set(qtbot):
+    from wmlstudio.analysis_plan import RunPlanDialog
+    dialog = RunPlanDialog([named("kp1", "Klebsiella", "pneumoniae")],
+                           cgmlst_schemes=[{**KPNEUMONIAE, "ready": True}])
+    qtbot.addWidget(dialog)
+    dialog.hydra.setChecked(False)
+    dialog.cgmlst.setChecked(True)
+    dialog.accept()
+    assert dialog.plan["cgmlst"] is True and dialog.plan["hydra"] is False
+    assert dialog.plan["cgmlst_scheme"]["key"] == "cgmlst.org:kpneumoniae-2358"
+    assert dialog.plan["cgmlst_scheme"]["path"] == KPNEUMONIAE["path"]
+    assert dialog.plan["cgmlst_scheme"]["locus_count"] == 2358
+
+
+def test_the_run_plan_refuses_a_cgmlst_scheme_the_cohort_is_not(qtbot):
+    from PySide6.QtWidgets import QDialog
+
+    from wmlstudio.analysis_plan import RunPlanDialog
+    dialog = RunPlanDialog([named("ec1", "Escherichia", "coli")],
+                           cgmlst_schemes=[{**KPNEUMONIAE, "ready": True}])
+    qtbot.addWidget(dialog)
+    dialog.cgmlst.setChecked(True)
+    dialog.accept()
+    assert dialog.result() != QDialog.DialogCode.Accepted
+    assert "never crosses organisms" in dialog.feedback.text()
+    assert "Nothing was run" in dialog.feedback.text()
+    dialog.cgmlst.setChecked(False)
+    dialog.accept()
+    assert dialog.plan["cgmlst"] is False and dialog.plan["cgmlst_scheme"] is None
+
+
+def test_the_run_plan_offers_nothing_when_no_cgmlst_scheme_is_installed(qtbot):
+    from wmlstudio.analysis_plan import RunPlanDialog
+    dialog = RunPlanDialog([named("kp1", "Klebsiella", "pneumoniae")],
+                           cgmlst_schemes=[{**KPNEUMONIAE, "path": "", "ready": False}])
+    qtbot.addWidget(dialog)
+    assert dialog.cgmlst_choices == []
+    assert dialog.cgmlst.isEnabled() is False
+    assert "cgMLST schemes tab" in dialog.cgmlst.toolTip()
+
+
 def test_a_sample_with_only_an_st_reports_no_core_genome_profile(tmp_path):
     with Project(tmp_path / "study.wmlstudio") as project:
         sid = add(project, tmp_path / "a.fasta", "a")

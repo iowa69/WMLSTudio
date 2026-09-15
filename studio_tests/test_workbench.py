@@ -961,3 +961,348 @@ def test_running_the_st_step_types_against_a_seven_locus_scheme_and_records_it_a
         "a step run chooses a scheme for that run; it does not repin the isolate"
     assert source.is_file()
     assert workbench.test_errors == []
+
+
+# --- drag and drop, sticky configuration, and starting a tab again -----------
+
+
+def test_a_dropped_scheme_folder_is_installed_instead_of_imported_as_isolates(workbench, qtbot, tmp_path):
+    """A folder of allele FASTA is a scheme wherever it is dropped, never 40 isolates."""
+    folder = tmp_path / "kp_seven_incoming"
+    make_scheme(folder)
+    (folder / "scheme.json").write_text(json.dumps(
+        {"name": "kp_seven", "organism": {"genus": "Klebsiella", "species": "pneumoniae"}}))
+
+    assert workbench.handle_drop([str(folder)]) == "scheme"
+    idle(qtbot, workbench)
+
+    assert workbench.project.samples() == [], "allele files are never imported as isolates"
+    installed = {Path(path).name for path in workbench.scheme_paths}
+    assert any(name.startswith("kp_seven_incoming_") for name in installed)
+    assert "Installed" in workbench.progress_text.text()
+    assert "into the classical MLST library" in workbench.progress_text.text()
+    assert workbench.project.get_setting("scheme_path", "") == "", \
+        "installing a scheme never chooses it for the whole workspace"
+    assert (folder / "arcA.tfa").is_file(), "the user's own folder is not moved"
+    assert workbench.test_errors == []
+
+
+def test_a_plain_folder_of_assemblies_dropped_on_samples_is_still_a_cohort(workbench, tmp_path, monkeypatch):
+    """Only a scheme's own markers make a folder a scheme; .fasta files are isolates."""
+    folder = tmp_path / "cohort"
+    assembly(folder / "one.fasta", "AAAA")
+    assembly(folder / "two.fasta", "GGGG")
+    started = []
+    monkeypatch.setattr(MainWindow, "intake_paths", lambda self, paths: started.append(list(paths)))
+
+    assert workbench.handle_drop([str(folder)], {"page": "isolates", "step": "st"}) == "import"
+    assert started == [[str(folder)]]
+    assert workbench._drop_step == "st"
+
+
+def test_a_drop_on_a_step_tab_lands_the_new_isolates_on_that_step(workbench, qtbot, tmp_path, monkeypatch):
+    # Pinned to no installed reference in either direction: this is about where the
+    # drop lands, and identification against whatever is staged here is not the point.
+    monkeypatch.setattr(MainWindow, "installed_species_panel", lambda self: None)
+    monkeypatch.setattr("wmlstudio.characterization_refs.bundled_reference_root", lambda: None)
+    workbench.scheme_paths = []
+    source = assembly(tmp_path / "inbox" / "dropped.fasta", "AAAA")
+
+    workbench.handle_drop([str(source)], {"page": "isolates", "step": "cgmlst"})
+    idle(qtbot, workbench)
+
+    assert [sample["name"] for sample in workbench.project.samples()] == ["dropped"]
+    tabs = workbench.sample_tabs
+    assert tabs.tabText(tabs.currentIndex()) == "cgMLST", "the drop landed on the cgMLST step"
+    identifier = workbench.project.samples()[0]["id"]
+    assert workbench.selection_ids == {identifier}
+    cg_table = workbench.step_tables["cgmlst"]
+    assert cg_table.item(row_of(cg_table, "dropped"), 0).isSelected()
+    assert source.is_file()
+    assert workbench.test_errors == []
+
+
+def test_dropped_reads_on_one_assembly_offer_to_attach_rather_than_import(workbench, tmp_path, monkeypatch):
+    from wmlstudio.read_attachment_dialog import AttachReadsDialog
+    source = assembly(tmp_path / "inbox" / "kp.fasta", "AAAA")
+    sid = workbench.project.add_sample(source, "kp")
+    reads = []
+    for mate in (1, 2):
+        path = tmp_path / f"kp_R{mate}.fastq"
+        path.write_text(f"@read1/{mate}\nACGT\n+\nIIII\n")
+        reads.append(str(path))
+    offered = {}
+
+    def accept(dialog):
+        offered["pairs"] = [[combo.currentData() for combo in row] for row in dialog.rows]
+        dialog.accept()
+        return QDialog.DialogCode.Accepted
+
+    monkeypatch.setattr(AttachReadsDialog, "exec", accept)
+    validated = []
+    monkeypatch.setattr(MainWindow, "launch_read_validation",
+                        lambda self, assignments, snapshots: validated.append(assignments) or True)
+
+    assert workbench.handle_drop(reads, {"sample_id": sid}) == "attach_reads"
+
+    assert [entry["path"] for entry in offered["pairs"][0]] == reads
+    assert validated == [[{"sample_id": sid, "read1": reads[0], "read2": reads[1],
+                           "read_sample_ids": [None, None]}]]
+    assert len(workbench.project.samples()) == 1, "reads attached to an isolate are not new isolates"
+    assert workbench.test_errors == []
+
+
+def test_dropping_reads_on_a_read_record_says_why_it_cannot_attach_them(workbench, tmp_path):
+    reads = tmp_path / "solo_R1.fastq"
+    reads.write_text("@read1/1\nACGT\n+\nIIII\n")
+    sid = workbench.project.add_sample(reads, "solo")
+
+    assert workbench.handle_drop([str(reads)], {"sample_id": sid}) == ""
+    assert "is not an assembly" in workbench.progress_text.text()
+    assert len(workbench.project.samples()) == 1
+
+
+def test_a_dropped_spreadsheet_is_previewed_before_any_metadata_is_saved(workbench, tmp_path, monkeypatch):
+    from wmlstudio.metadata_grid import MetadataPreviewDialog
+    source = assembly(tmp_path / "inbox" / "kp.fasta", "AAAA")
+    sid = workbench.project.add_sample(source, "kp")
+    table = tmp_path / "epi.csv"
+    table.write_text(f"sample_id,ward\n{sid},ICU 5\n", encoding="utf-8")
+    monkeypatch.setattr(MetadataPreviewDialog, "exec",
+                        lambda self: self.apply_changes() or QDialog.DialogCode.Accepted)
+
+    assert workbench.handle_drop([str(table)]) == "metadata"
+
+    annotations = workbench.project.get_sample(sid)["metadata"]["annotations"]
+    assert annotations["ward"] == "ICU 5"
+    assert "not genomic evidence" in workbench.progress_text.text()
+    assert workbench.test_errors == []
+
+
+def test_clear_restarts_a_tab_without_removing_anything(workbench, tmp_path):
+    first = workbench.project.add_sample(assembly(tmp_path / "inbox" / "one.fasta", "AAAA"), "one")
+    identified(workbench, first, "Klebsiella", "pneumoniae")
+    workbench.project.set_result(first, {"sample_name": "one", "kind": "fasta", "status": "complete",
+                                         "scheme": "kp_seven", "scheme_digest": "d", "st": "17",
+                                         "alleles": {"arcA": "1"}, "calls": []}, kind="mlst")
+    workbench.refresh()
+    workbench.selection_ids = {first}
+    workbench.search.setText("one")
+    workbench.library_filter = ("genus", "Klebsiella")
+    workbench.step_toggles["st"].setChecked(True)
+    workbench.refresh_tables()
+
+    report = workbench.clear_step()
+
+    assert report["selected"] == 0 and report["removed"] == 0
+    assert workbench.selection_ids == set()
+    assert workbench.search.text() == ""
+    assert workbench.library_filter is None
+    assert not workbench.step_toggles["st"].isChecked()
+    assert "Nothing was removed" in workbench.progress_text.text()
+    assert len(workbench.project.samples()) == 1
+    assert workbench.project.latest_analysis(first, "mlst")["st"] == "17"
+
+    # One step's Clear drops what that step is working on and leaves the hub's
+    # search alone, exactly as its own promise says.
+    workbench.selection_ids = {first}
+    workbench.search.setText("one")
+    workbench.step_toggles["cgmlst"].setChecked(True)
+    workbench.clear_step("cgmlst")
+    assert workbench.selection_ids == set()
+    assert workbench.search.text() == "one"
+    assert not workbench.step_toggles["cgmlst"].isChecked()
+    assert workbench.test_errors == []
+
+
+def test_scheme_pickers_read_as_organisms_and_never_offer_cgmlst_for_seven_locus_typing(workbench):
+    from wmlstudio.ui_workbench import CLASSICAL_KINDS
+    local_scheme(workbench, "kp_seven", "Klebsiella", "pneumoniae", loci=7, name="MLST")
+    local_scheme(workbench, "cgmlst_org_kpneumoniae_abcdef0123456789", "Klebsiella",
+                 "pneumoniae", loci=40, name="cgMLST")
+
+    # Asserted by membership, never by equality: this machine may have any number
+    # of bundled reference snapshots staged beside the two this test installs.
+    seven = "Klebsiella pneumoniae · MLST · 7 loci"
+    core_genome = "Klebsiella pneumoniae · cgMLST · 40 targets"
+    every = dict(workbench.scheme_entries())
+    classical = dict(workbench.scheme_entries(CLASSICAL_KINDS))
+    core = dict(workbench.scheme_entries("cgmlst"))
+
+    assert Path(every[seven]).is_dir() and Path(every[core_genome]).is_dir()
+    assert "cgmlst org kpneumoniae abcdef0123456789" not in every, \
+        "a downloaded scheme is never shown as its mangled folder name"
+    assert seven in classical and core_genome not in classical, \
+        "a 40-target scheme is never offered for seven-locus typing"
+    assert core_genome in core and seven not in core
+    assert not any(title.startswith("cgmlst org ") for title in classical)
+
+
+def test_an_organism_set_in_one_menu_is_what_every_other_menu_reads(workbench, qtbot, tmp_path):
+    from wmlstudio.sample_workflow import sample_configuration
+    scheme = local_scheme(workbench, "kp_seven", "Klebsiella", "pneumoniae", loci=7, name="MLST")
+    source = assembly(tmp_path / "inbox" / "kp.fasta", "AAAA")
+    sid = workbench.project.add_sample(source, "kp")
+
+    workbench.apply_organism_assignments(
+        [{"sample_id": sid, "genus": "Klebsiella", "species": "pneumoniae",
+          "typing_mode": "manual", "scheme_path": str(scheme)}], surface="Assign organism")
+    idle(qtbot, workbench)
+
+    configuration = sample_configuration(workbench.project.get_sample(sid))
+    assert configuration["organism"] == "Klebsiella pneumoniae"
+    assert configuration["scheme_path"] == str(scheme)
+    assert configuration["set_by"]["genus"]["surface"] == "Assign organism"
+    assert configuration["set_by"]["genus"]["automatic"] is False
+    # Every surface reads the one configuration, so the roster, the step views and
+    # the launch dialog all show what was set in the assignment menu.
+    roster = workbench.sample_table
+    assert roster.item(row_of(roster, "kp"), column_of(roster, "Genus")).text() == "Klebsiella"
+    st_table = workbench.step_tables["st"]
+    assert st_table.item(row_of(st_table, "kp"),
+                         column_of(st_table, "Organism")).text() == "Klebsiella pneumoniae"
+    assert workbench.test_errors == []
+
+
+def test_typing_that_nothing_has_invalidated_is_not_repeated_and_says_why(workbench, qtbot, tmp_path, monkeypatch):
+    scheme = make_scheme(workbench.root / "schemes" / "kp_seven")
+    (scheme / "scheme.json").write_text(json.dumps(
+        {"name": "kp_seven", "organism": {"genus": "Klebsiella", "species": "pneumoniae"}}))
+    workbench.populate_schemes()
+    source = assembly(tmp_path / "inbox" / "kp.fasta")
+    sid = workbench.project.add_sample(source, "kp")
+    identified(workbench, sid, "Klebsiella", "pneumoniae")
+    monkeypatch.setattr(MainWindow, "review_run_plan", lambda self, *args, **kwargs: {})
+    select_only(workbench, sid)
+
+    workbench.run_step("st")
+    idle(qtbot, workbench)
+    first = workbench.project.latest_analysis(sid, "mlst")
+    assert first["st"] == "17"
+
+    select_only(workbench, sid)
+    assert "left alone" in workbench.step_notes["st"].text()
+    workbench.run_step("st")
+    idle(qtbot, workbench)
+
+    assert "Nothing was run" in workbench.last_typing_report
+    assert "same sequence input, same scheme fingerprint" in workbench.last_typing_report
+    assert "Nothing was run" in workbench.progress_text.text()
+    assert workbench.project.latest_analysis(sid, "mlst") == first
+    select_only(workbench, sid)
+    assert "already have a ST result nothing has invalidated" in workbench.step_notes["st"].text()
+
+    # Changing the scheme's contents is a change the stored result cannot answer for,
+    # and the tab names it rather than silently re-running or silently refusing.
+    (scheme / "arcA.tfa").write_text(f">arcA_1\n{ARC}\n>arcA_2\n{GYR}\n")
+    select_only(workbench, sid)
+    workbench.run_step("st")
+    idle(qtbot, workbench)
+    assert "the scheme's contents changed" in workbench.last_typing_report
+    assert workbench.project.latest_analysis(sid, "mlst")["scheme_digest"] != first["scheme_digest"]
+    assert workbench.test_errors == []
+
+
+def test_the_re_run_toggle_repeats_the_work_when_a_person_asks_for_it(workbench, qtbot, tmp_path, monkeypatch):
+    scheme = make_scheme(workbench.root / "schemes" / "kp_seven")
+    (scheme / "scheme.json").write_text(json.dumps(
+        {"name": "kp_seven", "organism": {"genus": "Klebsiella", "species": "pneumoniae"}}))
+    workbench.populate_schemes()
+    sid = workbench.project.add_sample(assembly(tmp_path / "inbox" / "kp.fasta"), "kp")
+    identified(workbench, sid, "Klebsiella", "pneumoniae")
+    monkeypatch.setattr(MainWindow, "review_run_plan", lambda self, *args, **kwargs: {})
+    select_only(workbench, sid)
+    workbench.run_step("st")
+    idle(qtbot, workbench)
+
+    workbench.step_toggles["st"].setChecked(True)
+    select_only(workbench, sid)
+    workbench.run_step("st")
+    idle(qtbot, workbench)
+
+    assert "Nothing was run" not in workbench.last_typing_report
+    assert workbench.project.latest_analysis(sid, "mlst")["st"] == "17"
+    assert workbench.test_errors == []
+
+
+def test_the_first_analysis_fills_the_organism_in_for_every_later_menu(workbench, tmp_path):
+    from wmlstudio.sample_workflow import sample_configuration
+    sid = workbench.project.add_sample(assembly(tmp_path / "inbox" / "kp.fasta"), "kp")
+
+    workbench.sample_finished(sid, {
+        "sample_name": "kp", "kind": "fasta", "status": "complete", "scheme": "kp_seven",
+        "scheme_digest": "d", "st": "17", "alleles": {"arcA": "1"}, "calls": [],
+        "identification": {"identification_status": "assigned", "basis": "mlst_panel",
+                           "confidence": "panel_compatibility",
+                           "organism": {"genus": "Klebsiella", "species": "pneumoniae"}}})
+
+    configuration = sample_configuration(workbench.project.get_sample(sid))
+    assert configuration["organism"] == "Klebsiella pneumoniae"
+    assert configuration["organism_source"] == "assigned"
+    assert configuration["organism_basis"] == "mlst_panel"
+    assert "not an independent species determination" in configuration["organism_note"]
+    # A panel match is recorded so it autofills, and it is still not accepted for
+    # filing: the isolate keeps waiting in the review tree under its own reason.
+    review = organism_review(workbench.project.get_sample(sid), {})
+    assert review["needs_review"] is True
+    assert workbench.test_errors == []
+
+
+def test_an_analysis_organism_never_overrules_the_one_a_person_set(workbench, tmp_path):
+    from wmlstudio.sample_workflow import sample_configuration
+    sid = workbench.project.add_sample(assembly(tmp_path / "inbox" / "kp.fasta"), "kp")
+    confirm_organism(workbench.project, [sid], "Enterobacter", "cloacae")
+
+    workbench.sample_finished(sid, {
+        "sample_name": "kp", "kind": "fasta", "status": "complete", "st": None, "alleles": {},
+        "calls": [], "identification": {"identification_status": "assigned",
+                                        "organism": {"genus": "Klebsiella", "species": "pneumoniae"}}})
+
+    assert sample_configuration(workbench.project.get_sample(sid))["organism"] == "Enterobacter cloacae"
+    held = [entry for entry in workbench.project.history(sid)
+            if entry["action"] == "configuration_proposal_held"]
+    assert held and held[0]["details"]["fields"]["genus"]["proposed"] == "Klebsiella"
+
+
+def test_a_cgmlst_scheme_folder_dropped_on_the_schemes_tab_joins_the_cgmlst_library(workbench, qtbot, tmp_path):
+    """The bug the user reported, from the other end: an installed cgMLST scheme is
+    findable, labelled cgMLST, and never offered where a seven-locus ST is expected."""
+    from wmlstudio.ui_workbench import CLASSICAL_KINDS
+    folder = tmp_path / "kpneumoniae_core"
+    folder.mkdir()
+    for index in range(40):
+        (folder / f"core{index:04d}.tfa").write_text(f">core{index:04d}_1\n{ARC}\n")
+    (folder / "scheme.json").write_text(json.dumps(
+        {"name": "kp cgMLST", "type": "cgMLST",
+         "organism": {"genus": "Klebsiella", "species": "pneumoniae"}}))
+
+    assert workbench.handle_drop([str(folder)], {"page": "schemes"}) == "scheme"
+    idle(qtbot, workbench)
+
+    assert "into the cgMLST library" in workbench.progress_text.text()
+    core = dict(workbench.scheme_entries("cgmlst"))
+    title = next(name for name in core if "kp cgMLST" in name)
+    assert title.startswith("Klebsiella pneumoniae · ") and "40 targets" in title
+    assert Path(core[title]).is_dir()
+    assert title not in dict(workbench.scheme_entries(CLASSICAL_KINDS)), \
+        "a 2,000-target scheme and a seven-locus scheme are never in one picker"
+    assert workbench.project.samples() == []
+    assert workbench.test_errors == []
+
+
+def test_a_drop_over_a_row_is_about_that_isolate_and_anywhere_else_about_the_tab(workbench, tmp_path):
+    sid = workbench.project.add_sample(assembly(tmp_path / "inbox" / "kp.fasta", "AAAA"), "kp")
+    identified(workbench, sid, "Klebsiella", "pneumoniae")
+    workbench.navigate(1)
+    assert workbench.show_step("st")
+    workbench.refresh()
+
+    table = workbench.step_tables["st"]
+    item = table.item(row_of(table, "kp"), 0)
+    over_row = table.viewport().mapTo(workbench, table.visualItemRect(item).center())
+
+    assert workbench.drop_target(over_row) == {"page": "isolates", "step": "st", "sample_id": sid}
+    # Away from any row of isolates, the drop is about the tab being looked at.
+    assert workbench.drop_target() == {"page": "isolates", "step": "st", "sample_id": ""}
+    assert workbench.show_step("cgmlst")
+    assert workbench.drop_target()["step"] == "cgmlst"

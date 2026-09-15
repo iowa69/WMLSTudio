@@ -27,6 +27,8 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+import shutil
+import urllib.parse
 from copy import deepcopy
 from datetime import UTC, datetime
 from pathlib import Path
@@ -37,14 +39,33 @@ from .threshold_guidance import catalog_entries as _threshold_guidance_entries
 CATALOG_VERSION = "2026-09-14.1"
 LICENCE_REVIEWED_ON = "2026-09-14"
 LIBRARY_DIRNAME = "cgmlst"
+SCHEME_DIRNAME = "schemes"
 SLOT_FILENAME = "scheme_slot.json"
 TARGETS_FILENAME = "targets.txt"
 README_FILENAME = "README.txt"
+MIGRATIONS_FILENAME = "migrations.json"
 SLOT_FORMAT_VERSION = 1
 # The same floor project.classify_typing and reference_index use to separate a
 # classical seven-locus scheme from a gene-by-gene one. Repeated, not imported,
 # to keep this module free of the storage/typing import chain.
 CGMLST_TARGET_FLOOR = 30
+# A cgMLST scheme is a CORE target set: every target is expected in every isolate
+# of the organism. Some providers publish an accessory or whole-genome set beside
+# it. The two are different quantities, never share a cutoff and never share an
+# axis, so which one a scheme is is recorded on the row rather than inferred.
+TARGET_SET_CORE = "core"
+TARGET_SET_ACCESSORY = "accessory"
+TARGET_SETS = (TARGET_SET_CORE, TARGET_SET_ACCESSORY)
+_ALLELE_SUFFIXES = {".tfa", ".fasta", ".fa", ".fna"}
+# Provider spellings differ between the pinned catalogue ("pasteur") and the
+# download clients ("BIGSdb-Pasteur"); both name one provider and must resolve to
+# one library folder.
+_PROVIDER_TOKENS = {"bigsdb_pasteur": "pasteur", "bigsdb": "pasteur", "ridom": "cgmlst_org",
+                    "cgmlst_org_nomenclature_server": "cgmlst_org"}
+_PROVIDER_HOSTS = {"rest.pubmlst.org": "pubmlst", "pubmlst.org": "pubmlst",
+                   "bigsdb.pasteur.fr": "pasteur", "www.cgmlst.org": "cgmlst_org",
+                   "cgmlst.org": "cgmlst_org"}
+_KNOWN_PROVIDERS = frozenset({"pubmlst", "pasteur", "cgmlst_org", "enterobase", "chewie_ns"})
 
 INTERPRETATION = (
     "An installed cgMLST scheme is a target set and an allele nomenclature. Two profiles are "
@@ -393,6 +414,12 @@ def _organism(entry: dict) -> str:
     return " ".join(part for part in (entry.get("genus"), entry.get("species")) if part)
 
 
+def _version_of(entry: dict) -> str:
+    """A short revision date pulled out of the pinned revision sentence, or ''."""
+    match = re.search(r"\d{4}-\d{2}-\d{2}", str(entry.get("revision") or ""))
+    return match.group(0) if match else ""
+
+
 def catalog_entries() -> list[dict]:
     """Every pinned scheme, with its provider licence verdict resolved onto the row."""
     rows = []
@@ -409,11 +436,44 @@ def catalog_entries() -> list[dict]:
         entry["licence_restriction"] = provider["restriction"]
         entry["licence_reviewed_on"] = provider["reviewed_on"]
         entry["kind"] = "cgmlst"
+        # Every pinned row is a core target set. A curator who pins a provider's
+        # accessory or whole-genome set sets this to "accessory" on that row; the
+        # two then appear as an explicit choice instead of one silently standing
+        # in for the other.
+        entry.setdefault("target_set", TARGET_SET_CORE)
+        entry["scheme_group"] = scheme_group(entry)
         entry["slot"] = slot_name(entry)
         entry["source_url"] = source_url(entry)
+        entry["version"] = _version_of(entry)
+        entry["title"] = scheme_title(entry)
         entry["notes"] = list(entry.get("notes", ()))
         rows.append(entry)
     return rows
+
+
+def scheme_title(entry: dict) -> str:
+    """One readable row title for a catalogued scheme, never a folder name.
+
+    The unit is spelled out because it is the point: 'targets' here and 'loci' on a
+    classical scheme are different quantities that must never share a scale.
+    """
+    parts = [_organism(entry), str(entry.get("scheme_name") or ""),
+             f"{entry['locus_count']} targets",
+             PROVIDERS[entry["provider"]]["name"] if entry.get("provider") in PROVIDERS else "",
+             f"updated {_version_of(entry)}" if _version_of(entry) else ""]
+    return " · ".join(part for part in parts if part)
+
+
+def provider_token(value) -> str:
+    """One canonical token per provider, whatever spelling a caller arrived with."""
+    token = re.sub(r"[^A-Za-z0-9]+", "_", str(value or "")).strip("_").casefold()
+    return _PROVIDER_TOKENS.get(token, token)
+
+
+def scheme_group(entry: dict) -> str:
+    """The provider-and-organism family whose core and accessory sets belong together."""
+    organism = re.sub(r"[^A-Za-z0-9]+", "_", _organism(entry) or "unknown_organism").strip("_")
+    return f"{provider_token(entry.get('provider') or entry.get('source'))}:{organism.casefold()}"
 
 
 def entry_for(key) -> dict:
@@ -442,11 +502,124 @@ def source_url(entry: dict) -> str:
     return f"{provider['api_root']}/db/{entry['database']}/schemes/{entry['scheme_id']}"
 
 
+def _provider_of(descriptor) -> str:
+    """One canonical provider token, preferring the service the URL actually names.
+
+    A scheme records its provider as anything from "pubmlst" to "cgMLST.org
+    Nomenclature Server (Ridom GmbH)". A free-text name that resolves to nothing
+    this catalogue knows is not allowed to become a folder name: the host of the
+    scheme's own API answers the same question and answers it the same way twice.
+    """
+    token = provider_token(descriptor.get("provider") or descriptor.get("source"))
+    if token in _KNOWN_PROVIDERS:
+        return token
+    url = str(descriptor.get("url") or descriptor.get("API") or descriptor.get("source_url") or "")
+    host = (urllib.parse.urlsplit(url).hostname or "").casefold()
+    return _PROVIDER_HOSTS.get(host, token)
+
+
 def slot_name(entry: dict) -> str:
-    """The library folder for one scheme: organism first, then provider and target count."""
-    organism = re.sub(r"[^A-Za-z0-9]+", "_", _organism(entry) or "Unknown_organism").strip("_")
-    provider = re.sub(r"[^A-Za-z0-9]+", "_", entry["provider"]).strip("_")
-    return f"{organism}__{provider}_{entry['locus_count']}"
+    """The library folder for one scheme: organism first, then provider and target count.
+
+    Named for what a microbiologist recognises. A folder called
+    ``cgmlst_org_Kpneumoniae_abcdef0123456789`` tells a person nothing and sorts
+    between two unrelated schemes; ``Klebsiella_pneumoniae__cgmlst_org_2358`` says
+    the organism, who defined the targets and how many there are.
+    """
+    organism = re.sub(r"[^A-Za-z0-9]+", "_",
+                      _organism(entry) or "Unknown_organism").strip("_") or "Unknown_organism"
+    count = entry.get("locus_count") or 0
+    return f"{organism}__{_provider_of(entry) or 'unknown_provider'}_{count}"
+
+
+def _source_identity(descriptor) -> tuple[str, str, str]:
+    """(provider token, database, scheme id) as the provider itself names them.
+
+    Read from an online catalogue entry, a downloaded scheme.json or a snapshot
+    manifest alike, because those are the three shapes an installed scheme's
+    identity arrives in.
+    """
+    if not isinstance(descriptor, dict):
+        return ("", "", "")
+    url = str(descriptor.get("url") or descriptor.get("API") or descriptor.get("source_url") or "")
+    path = urllib.parse.unquote(urllib.parse.urlsplit(url).path)
+    provider = _provider_of(descriptor)
+    database = str(descriptor.get("database") or "")
+    scheme_id = str(descriptor.get("slug") or descriptor.get("scheme_id") or "")
+    schema = re.search(r"/schema/([^/]+)/?$", path)
+    bigsdb = re.search(r"/db/([^/]+)/schemes/([^/]+)/?$", path)
+    if schema:
+        provider = provider or "cgmlst_org"
+        scheme_id = scheme_id or schema.group(1)
+    elif bigsdb:
+        database = database or bigsdb.group(1)
+        scheme_id = scheme_id or bigsdb.group(2)
+    return (provider, database, scheme_id)
+
+
+def entry_for_source(descriptor) -> dict | None:
+    """The pinned catalogue row a descriptor names, or None when it names none.
+
+    Matched on the provider and on the provider's OWN scheme identifier -- never on
+    the organism name and never on the target count. PubMLST and cgMLST.org both
+    publish a 2,692-target Serratia marcescens scheme that shares no target name
+    at all, so equal counts are a coincidence and must not resolve an identity.
+    """
+    provider, database, scheme_id = _source_identity(descriptor)
+    if not provider or not scheme_id:
+        return None
+    for entry in catalog_entries():
+        if provider_token(entry["provider"]) != provider or entry["scheme_id"] != scheme_id:
+            continue
+        if entry["database"] and database and entry["database"] != database:
+            continue
+        return entry
+    return None
+
+
+def slot_for(descriptor) -> str:
+    """The library folder a scheme belongs in, catalogued or not.
+
+    A scheme this catalogue pins lands in the slot the library already describes,
+    so a download fills the labelled, licence-annotated folder a user has been
+    looking at instead of creating a second one beside it.
+    """
+    pinned = entry_for_source(descriptor)
+    return pinned["slot"] if pinned else slot_name(descriptor)
+
+
+def scheme_variants(organism=None, *, group=None) -> dict:
+    """The core and accessory target sets catalogued for one organism.
+
+    A cgMLST scheme is a core set. Where a provider also publishes an accessory or
+    whole-genome set, both are returned so the choice can be offered explicitly.
+    Where only the core set is catalogued this says so in words, because an empty
+    "accessory" list on its own reads as a broken menu rather than as an answer.
+    """
+    wanted = str(organism or "").strip().casefold()
+    rows = [entry for entry in catalog_entries()
+            if (group is None or entry["scheme_group"] == group)
+            and (not wanted or entry["organism"].casefold() == wanted
+                 or entry["genus"].casefold() == wanted)]
+    core = [entry for entry in rows if entry["target_set"] == TARGET_SET_CORE]
+    accessory = [entry for entry in rows if entry["target_set"] == TARGET_SET_ACCESSORY]
+    if not rows:
+        message = (f"No cgMLST scheme is catalogued for {organism or group}. That is a gap in this "
+                   "catalogue, not proof that no scheme exists.")
+    elif not accessory:
+        message = ("Only a core target set is catalogued for this organism. No accessory or "
+                   "whole-genome set is pinned, so there is nothing to choose between: the core "
+                   "set is the scheme.")
+    elif not core:
+        message = ("Only an accessory target set is catalogued for this organism. An accessory "
+                   "set is not a core genome scheme and its distances are a different quantity.")
+    else:
+        message = (f"{len(core)} core and {len(accessory)} accessory target set(s) are catalogued. "
+                   "They are different quantities: a distance from one never shares a scale, an "
+                   "axis or a threshold with a distance from the other.")
+    return {"organism": str(organism or ""), "group": group, "core": core,
+            "accessory": accessory, "has_core": bool(core), "has_accessory": bool(accessory),
+            "message": message}
 
 
 def catalog_digest() -> str:
@@ -573,10 +746,10 @@ Terms    : {terms_url}
 
 {restriction}
 
-This folder is created by WMLSTudio so that you never have to make one. It is
-safe to delete: the app recreates it, and deleting it removes no scheme you have
-already installed. Nothing in this folder is sequence data until you install a
-scheme into it.
+This folder is created by WMLSTudio so that you never have to make one, and a
+download of this scheme installs into THIS folder rather than somewhere else.
+Deleting it removes these description files and whatever scheme you installed
+here; the app recreates the empty, labelled folder on the next run.
 
 A cgMLST distance from this scheme is a number of differing targets out of the
 targets called in BOTH isolates. It is not a seven-locus MLST distance, it is not
@@ -589,6 +762,9 @@ _DOWNLOAD_STATE = ("This scheme CANNOT be packed into WMLSTudio: its provider do
                    "redistribution. Use Reference data > Download cgMLST scheme. You will be "
                    "shown the provider's terms and asked to confirm that your use is permitted "
                    "before anything is downloaded.")
+_INSTALLED_STATE = ("This scheme IS installed in this folder. The allele files beside this README "
+                    "are the installed target set; reference_manifest.json records where every "
+                    "byte came from and which allele records, if any, were excluded.")
 
 
 def library_root(root) -> Path:
@@ -596,11 +772,101 @@ def library_root(root) -> Path:
     return Path(root).expanduser() / LIBRARY_DIRNAME
 
 
+def classical_root(root) -> Path:
+    """<data root>/schemes -- where the classical seven-locus schemes live instead."""
+    return Path(root).expanduser() / SCHEME_DIRNAME
+
+
+def install_root(library_root_path, kind: str = "cgmlst") -> Path:
+    """Where a scheme of this kind installs, given whichever library a caller named.
+
+    There is ONE cgMLST library. A caller that hands over the classical scheme
+    folder is not installing a 2,000-target scheme into it: the sibling cgMLST
+    library is returned instead, so a downloaded cgMLST scheme lands in the library
+    a user browses for cgMLST schemes rather than between two seven-locus ones.
+    """
+    base = Path(library_root_path).expanduser()
+    if kind != "cgmlst":
+        return base
+    if base.name == LIBRARY_DIRNAME:
+        return base
+    if base.name == SCHEME_DIRNAME:
+        return base.parent / LIBRARY_DIRNAME
+    return base / LIBRARY_DIRNAME
+
+
+def is_gene_by_gene(descriptor) -> bool:
+    """Whether a scheme descriptor names a gene-by-gene scheme, not a classical one.
+
+    One definition for the whole application: the declared target count decides
+    once it clears the floor, and below the floor a declared cgMLST/wgMLST type
+    decides. Nothing else is consulted, because the organism name and the provider
+    say nothing about how many targets a scheme has.
+    """
+    if not isinstance(descriptor, dict):
+        return False
+    declared = str(descriptor.get("type") or "").strip().casefold().replace(" ", "")
+    try:
+        count = int(descriptor.get("locus_count") or 0)
+    except (TypeError, ValueError):
+        count = 0
+    return count > CGMLST_TARGET_FLOOR or declared in {"cgmlst", "wgmlst", "core", "accessory"}
+
+
+def has_alleles(folder) -> bool:
+    """Whether a folder holds an installed scheme rather than a labelled empty slot."""
+    folder = Path(folder)
+    try:
+        for path in folder.iterdir():
+            if not path.is_file():
+                continue
+            name = path.with_suffix("") if path.suffix.casefold() in {".gz", ".bz2"} else path
+            if name.suffix.casefold() in _ALLELE_SUFFIXES:
+                return True
+    except OSError:
+        return False
+    return False
+
+
+def _folder_digest(folder: Path) -> str:
+    """The scheme digest a snapshot manifest records for an installed folder, or ''."""
+    path = folder / "reference_manifest.json"
+    if not path.is_file() or path.stat().st_size > 4 * 1024 * 1024:
+        return ""
+    try:
+        manifest = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, ValueError):
+        return ""
+    return str(manifest.get("scheme_digest") or "") if isinstance(manifest, dict) else ""
+
+
+def install_folder(base, descriptor, *, digest="") -> Path:
+    """The folder this scheme installs into: its readable slot, never a digest name.
+
+    An empty, pre-created slot IS the destination -- that is what the labelled
+    folder is for. A slot already holding a DIFFERENT scheme is never overwritten:
+    a second, digest-suffixed folder is returned instead, so an upstream
+    redefinition that keeps the same target count cannot silently replace the
+    target set a result was called against.
+    """
+    base = Path(base).expanduser()
+    slot = slot_for(descriptor)
+    candidate = base / slot
+    if not candidate.is_dir() or not has_alleles(candidate):
+        return candidate
+    if not digest or _folder_digest(candidate) == digest:
+        # The same scheme, or a caller with no digest to tell them apart; the
+        # caller checks whether the folder is occupied before writing to it.
+        return candidate
+    return base / f"{slot}__{digest[:12]}"
+
+
 def slot_payload(entry: dict) -> dict:
     """The machine-readable description written into an empty slot."""
     return {"format_version": SLOT_FORMAT_VERSION, "catalog_version": CATALOG_VERSION,
             "key": entry["key"], "organism": entry["organism"], "genus": entry["genus"],
-            "species": entry["species"], "kind": "cgmlst",
+            "species": entry["species"], "kind": "cgmlst", "target_set": entry["target_set"],
+            "scheme_group": entry["scheme_group"], "title": entry["title"],
             "provider": entry["provider"], "provider_name": entry["provider_name"],
             "database": entry["database"], "scheme_id": entry["scheme_id"],
             "scheme_name": entry["scheme_name"], "revision": entry["revision"],
@@ -618,33 +884,180 @@ def slot_payload(entry: dict) -> dict:
             "interpretation": INTERPRETATION}
 
 
-def prepare_library(root, *, keys=None, targets=None) -> dict:
+def _descriptor(folder: Path) -> dict:
+    """What an installed folder records about itself, from the files it carries."""
+    descriptor: dict = {}
+    for name in ("scheme.json", "reference_manifest.json", SLOT_FILENAME):
+        path = folder / name
+        if not path.is_file() or path.stat().st_size > 4 * 1024 * 1024:
+            continue
+        try:
+            value = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeDecodeError, ValueError):
+            continue
+        if not isinstance(value, dict):
+            continue
+        if name == "reference_manifest.json":
+            value = value.get("entry") if isinstance(value.get("entry"), dict) else {}
+        for key, item in (value or {}).items():
+            descriptor.setdefault(key, item)
+    return descriptor
+
+
+def _is_cgmlst_folder(folder: Path) -> bool:
+    """Whether an installed folder holds a gene-by-gene scheme, on its own evidence.
+
+    The installed target count decides once it clears the floor; below the floor a
+    declared cgMLST/wgMLST type decides, because a partial snapshot of a
+    gene-by-gene scheme is still one. A folder that records neither is left where
+    it is rather than moved on a guess.
+    """
+    count = _installed_locus_count(folder)
+    if not count:
+        return False
+    return is_gene_by_gene({**_descriptor(folder), "locus_count": count})
+
+
+def _read_migrations(base: Path) -> dict:
+    path = base / MIGRATIONS_FILENAME
+    if not path.is_file() or path.stat().st_size > 4 * 1024 * 1024:
+        return {"format_version": 1, "moved": []}
+    try:
+        stored = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, ValueError):
+        return {"format_version": 1, "moved": []}
+    if not isinstance(stored, dict) or not isinstance(stored.get("moved"), list):
+        return {"format_version": 1, "moved": []}
+    return stored
+
+
+def migrate_downloads(root, *, sources=None) -> list[dict]:
+    """Move cgMLST schemes out of <data root>/schemes and into the cgMLST library.
+
+    Earlier releases installed every downloaded scheme into <data root>/schemes,
+    where a 2,358-target cgMLST scheme sat between two seven-locus MLST schemes
+    under a digest-shaped folder name -- found by nothing a person would look for
+    and offered where a classical scheme was expected. The bytes are MOVED, never
+    copied and never deleted, into the labelled slot the library already describes.
+
+    Each move is recorded in migrations.json so a project that stored the old
+    scheme_path can still be pointed at the scheme it was actually called against.
+    A folder is left exactly where it is unless it clearly records itself as a
+    gene-by-gene scheme, and an occupied destination is never overwritten.
+    """
+    base = library_root(root)
+    bases = [Path(path).expanduser() for path in sources] if sources is not None \
+        else [classical_root(root)]
+    moved = []
+    for source in bases:
+        if not source.is_dir() or source.resolve() == base.resolve():
+            continue
+        for folder in sorted((p for p in source.iterdir() if p.is_dir()),
+                             key=lambda p: p.name.casefold()):
+            if folder.name.startswith(("_", ".")) or not _is_cgmlst_folder(folder):
+                continue
+            descriptor = _descriptor(folder)
+            descriptor.setdefault("locus_count", _installed_locus_count(folder))
+            destination = install_folder(base, descriptor, digest=_folder_digest(folder))
+            if destination.exists() and has_alleles(destination):
+                continue
+            base.mkdir(parents=True, exist_ok=True)
+            try:
+                install_into(folder, destination)
+            except OSError:
+                continue  # A locked or in-use folder stays put; nothing is lost.
+            moved.append({"from": str(folder), "to": str(destination),
+                          "locus_count": int(descriptor.get("locus_count") or 0),
+                          "moved_utc": datetime.now(UTC).isoformat()})
+    if moved:
+        ledger = _read_migrations(base)
+        ledger["moved"] = [row for row in ledger["moved"] if isinstance(row, dict)] + moved
+        ledger["format_version"] = 1
+        (base / MIGRATIONS_FILENAME).write_text(
+            json.dumps(ledger, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    return moved
+
+
+def install_into(source: Path, destination: Path) -> None:
+    """Move a scheme folder into place, filling a pre-created empty slot if there is one.
+
+    A labelled slot already carries its README and scheme_slot.json, so the slot is
+    filled file by file rather than replaced; those two descriptions are what tell
+    a person whose scheme this is and under what terms it was obtained.
+    """
+    if not destination.exists():
+        try:
+            source.rename(destination)
+        except OSError:
+            shutil.move(str(source), str(destination))
+        return
+    for child in sorted(source.iterdir()):
+        target = destination / child.name
+        if target.exists():
+            continue
+        try:
+            child.rename(target)
+        except OSError:
+            shutil.move(str(child), str(target))
+    remaining = sorted(child.name for child in source.iterdir())
+    if remaining:
+        # Nothing already in the destination is replaced. A caller that cannot
+        # complete the move keeps its staging folder and publishes nothing.
+        raise OSError(f"{destination} already holds {', '.join(remaining)}; nothing was replaced.")
+    source.rmdir()
+
+
+def resolve_migrated_path(root, path) -> Path:
+    """Where a scheme folder went, for a stored path that names its old location.
+
+    Returns the path unchanged when it was never moved, so a caller can route every
+    stored scheme_path through this without deciding first.
+    """
+    wanted = str(Path(path).expanduser())
+    for row in reversed(_read_migrations(library_root(root))["moved"]):
+        if isinstance(row, dict) and str(row.get("from") or "") == wanted:
+            return Path(str(row.get("to") or wanted))
+    return Path(path)
+
+
+def prepare_library(root, *, keys=None, targets=None, migrate=True) -> dict:
     """Create the cgMLST library layout so a first run never asks for a folder.
 
-    Every catalogued scheme gets a named, empty folder carrying a README and a
-    scheme_slot.json. Existing folders and any scheme already installed in them are
-    left untouched: only the two description files are refreshed, and only when
-    their content changed. `targets` optionally maps a key to its target-name list,
-    which is written as targets.txt beside the slot.
+    Every catalogued scheme gets a named folder carrying a README and a
+    scheme_slot.json; a download installs INTO that folder, so the layout a user
+    browses and the place a scheme actually lands are one and the same. Existing
+    folders and any scheme already installed in them are left untouched: only the
+    description files are refreshed, and only when their content changed.
+    `targets` optionally maps a key to its target-name list, written as targets.txt
+    beside the slot.
+
+    With `migrate` (the default) any cgMLST scheme still sitting in the classical
+    <data root>/schemes folder from an earlier release is moved into the library
+    first, so a scheme downloaded yesterday is where it is now looked for.
     """
     base = library_root(root)
     base.mkdir(parents=True, exist_ok=True)
     wanted = set(keys) if keys is not None else None
-    report = {"root": str(base), "created": [], "existing": [], "refreshed": [],
+    report = {"root": str(base), "created": [], "existing": [], "refreshed": [], "migrated": [],
               "catalog_version": CATALOG_VERSION, "catalog_digest": catalog_digest(),
               "generated_utc": datetime.now(UTC).isoformat()}
+    if migrate:
+        report["migrated"] = migrate_downloads(root)
     for entry in catalog_entries():
         if wanted is not None and entry["key"] not in wanted:
             continue
         folder = base / entry["slot"]
         (report["existing"] if folder.is_dir() else report["created"]).append(entry["slot"])
         folder.mkdir(parents=True, exist_ok=True)
+        if has_alleles(folder):
+            state_line = _INSTALLED_STATE
+        else:
+            state_line = _BUNDLED_STATE if entry["bundled"] else _DOWNLOAD_STATE
         readme = SLOT_README.format(
             organism=entry["organism"], scheme_name=entry["scheme_name"],
             locus_count=entry["locus_count"], provider_name=entry["provider_name"],
             source_url=entry["source_url"], terms_url=entry["terms_url"],
-            restriction=entry["licence_restriction"],
-            state_line=_BUNDLED_STATE if entry["bundled"] else _DOWNLOAD_STATE)
+            restriction=entry["licence_restriction"], state_line=state_line)
         payload = json.dumps(slot_payload(entry), indent=2, sort_keys=True) + "\n"
         for name, text in ((README_FILENAME, readme), (SLOT_FILENAME, payload)):
             path = folder / name
@@ -664,17 +1077,24 @@ def prepare_library(root, *, keys=None, targets=None) -> dict:
 
 LIBRARY_README = """WMLSTudio cgMLST scheme library
 
-One folder per catalogued cgMLST scheme. Each folder explains, in its own
-README.txt, which scheme belongs there, who publishes it, under what terms, and
-how to install it. An empty folder means that scheme is not installed yet -- it
-does not mean anything is broken.
+Every cgMLST scheme WMLSTudio installs lives here, in a folder named for its
+organism, its provider and its target count -- never a folder named after a
+digest. One folder is pre-created for each catalogued scheme and explains, in its
+own README.txt, who publishes it, under what terms, and how to install it. An
+empty folder means that scheme is not installed yet; it does not mean anything is
+broken. A scheme this catalogue does not pin gets its own folder here too, named
+the same way.
 
 These are cgMLST schemes: hundreds to thousands of targets. Classical seven-locus
 MLST schemes live in the separate schemes folder. Distances from the two are
 different quantities and are never mixed, compared or thresholded together.
 
-Deleting a folder here deletes only its description files unless you have
-installed a scheme into it. WMLSTudio recreates the empty layout on the next run.
+migrations.json, if present, records schemes moved here from the classical
+schemes folder by an earlier release, so a saved project that stored the old
+location can still be pointed at the scheme it used.
+
+Deleting a folder here deletes its description files and any scheme installed
+into it. WMLSTudio recreates the empty, labelled layout on the next run.
 """
 
 
@@ -690,41 +1110,76 @@ def _installed_locus_count(folder: Path) -> int:
     return count
 
 
-def installed_scheme(root, key, *, extra_paths=()) -> dict | None:
-    """The scheme installed for one catalogue key, or None. Counts files, parses none.
+def _folder_metadata(folder: Path) -> dict:
+    metadata = {}
+    for name in ("scheme.json", "reference_manifest.json"):
+        path = folder / name
+        if path.is_file() and path.stat().st_size <= 4 * 1024 * 1024:
+            try:
+                value = json.loads(path.read_text(encoding="utf-8"))
+            except (OSError, UnicodeDecodeError, ValueError):
+                continue
+            if isinstance(value, dict):
+                metadata[name] = value
+    return metadata
 
-    A folder is accepted as this scheme only when its recorded provider and scheme
-    identifier match the pin. A folder with the right number of allele files but a
-    different or absent identity is reported with `identity_matched` False, so a
-    caller can show it without ever binding a threshold to it.
+
+def library_index(root, *, extra_paths=()) -> list[dict]:
+    """Every folder in the cgMLST library that actually holds a scheme, read once.
+
+    Counted and identified, never parsed. Building this once and handing it to the
+    per-scheme lookups is what keeps a twenty-three row library page from walking a
+    four-thousand-file folder twenty-three times.
     """
-    entry = entry_for(key)
-    candidates = [library_root(root) / entry["slot"]]
-    candidates.extend(Path(path) for path in extra_paths)
-    for folder in candidates:
-        if not folder.is_dir():
+    base = library_root(root)
+    folders = [path for path in sorted(base.iterdir(), key=lambda p: p.name.casefold())
+               if path.is_dir()] if base.is_dir() else []
+    folders.extend(Path(path).expanduser() for path in extra_paths)
+    seen, rows = set(), []
+    for folder in folders:
+        resolved = str(folder)
+        if resolved in seen or not folder.is_dir():
             continue
+        seen.add(resolved)
         count = _installed_locus_count(folder)
         if not count:
             continue
-        metadata = {}
-        for name in ("scheme.json", "reference_manifest.json"):
-            path = folder / name
-            if path.is_file() and path.stat().st_size <= 4 * 1024 * 1024:
-                try:
-                    value = json.loads(path.read_text(encoding="utf-8"))
-                except (OSError, UnicodeDecodeError, ValueError):
-                    continue
-                if isinstance(value, dict):
-                    metadata[name] = value
-        matched = _identity_matches(entry, metadata)
-        return {"key": entry["key"], "path": str(folder), "locus_count": count,
-                "expected_locus_count": entry["locus_count"],
-                "count_matched": count == entry["locus_count"],
-                "identity_matched": matched,
-                "organism": entry["organism"], "scheme_name": entry["scheme_name"],
-                "provider_name": entry["provider_name"]}
-    return None
+        rows.append({"path": folder, "locus_count": count,
+                     "metadata": _folder_metadata(folder)})
+    return rows
+
+
+def installed_scheme(root, key, *, extra_paths=(), index=None) -> dict | None:
+    """The scheme installed for one catalogue key, or None. Counts files, parses none.
+
+    The whole library is searched, not only the folder this scheme is meant to sit
+    in: a scheme installed under any name is still that scheme, and a user who
+    cannot find what they downloaded is the bug this exists to prevent. A folder is
+    accepted as this scheme only when its recorded provider and scheme identifier
+    match the pin, so the named slot is a preference and never a proof of identity.
+    A folder with the right number of allele files but a different or absent
+    identity is reported with `identity_matched` False, so a caller can show it
+    without ever binding a threshold to it.
+    """
+    entry = entry_for(key)
+    rows = library_index(root, extra_paths=extra_paths) if index is None else index
+    slot = library_root(root) / entry["slot"]
+    matched = [row for row in rows if _identity_matches(entry, row["metadata"])]
+    if matched:
+        row = next((item for item in matched if item["path"] == slot), matched[0])
+        return _installed_row(entry, row, identity_matched=True)
+    unnamed = next((row for row in rows if row["path"] == slot), None)
+    return _installed_row(entry, unnamed, identity_matched=False) if unnamed else None
+
+
+def _installed_row(entry: dict, row: dict, *, identity_matched: bool) -> dict:
+    count = row["locus_count"]
+    return {"key": entry["key"], "path": str(row["path"]), "locus_count": count,
+            "expected_locus_count": entry["locus_count"],
+            "count_matched": count == entry["locus_count"],
+            "identity_matched": identity_matched,
+            "organism": entry["organism"], "scheme_name": entry["scheme_name"],
+            "provider_name": entry["provider_name"], "target_set": entry["target_set"]}
 
 
 def _identity_matches(entry: dict, metadata: dict) -> bool:
@@ -743,8 +1198,9 @@ def library_status(root, *, extra_paths=()) -> list[dict]:
     """One row per catalogued scheme: where it belongs, whether it is there, what is
     offerable. This is the model a "cgMLST schemes" page renders directly."""
     rows = []
+    index = library_index(root, extra_paths=extra_paths)
     for entry in catalog_entries():
-        installed = installed_scheme(root, entry["key"], extra_paths=extra_paths)
+        installed = installed_scheme(root, entry["key"], index=index)
         count = installed["locus_count"] if installed else None
         guidance = threshold_for(entry["key"], locus_count=count)
         rows.append({**entry, "folder": str(library_root(root) / entry["slot"]),
@@ -752,6 +1208,32 @@ def library_status(root, *, extra_paths=()) -> list[dict]:
                                                            and installed["identity_matched"]),
                      "threshold": guidance})
     return rows
+
+
+def installed_entries(root, *, extra_paths=(), cancelled=None) -> list[dict]:
+    """Every cgMLST scheme actually installed, catalogued or not, with a readable row.
+
+    This is what a "cgMLST schemes" tab lists: what the user HAS, titled by organism
+    and provider rather than by folder name. A scheme this catalogue does not pin is
+    listed all the same, with `catalog_key` None and no bound cutoff -- an
+    unrecognised scheme is still perfectly usable within itself.
+    """
+    from .reference_index import scheme_entries as _scheme_entries
+    index = library_index(root, extra_paths=extra_paths)
+    rows = _scheme_entries([row["path"] for row in index], cancelled=cancelled, kind="cgmlst")
+    listed = []
+    for row in rows:
+        identified = identify_installed(row["path"])
+        guidance = threshold_for_installed(row["path"])
+        listed.append({**row, "catalog_key": identified["key"] if identified else None,
+                       "catalogued": identified is not None,
+                       "target_set": row["target_set"] or (
+                           identified["target_set"] if identified else ""),
+                       "expected_locus_count": identified["locus_count"] if identified else None,
+                       "count_matched": bool(identified)
+                       and row["locus_count"] == identified["locus_count"],
+                       "threshold": guidance})
+    return listed
 
 
 def identify_installed(path) -> dict | None:
@@ -764,16 +1246,7 @@ def identify_installed(path) -> dict | None:
     folder = Path(path).expanduser()
     if not folder.is_dir():
         return None
-    metadata = {}
-    for name in ("scheme.json", "reference_manifest.json"):
-        candidate = folder / name
-        if candidate.is_file() and candidate.stat().st_size <= 4 * 1024 * 1024:
-            try:
-                value = json.loads(candidate.read_text(encoding="utf-8"))
-            except (OSError, UnicodeDecodeError, ValueError):
-                continue
-            if isinstance(value, dict):
-                metadata[name] = value
+    metadata = _folder_metadata(folder)
     for entry in catalog_entries():
         if _identity_matches(entry, metadata):
             return {**entry, "path": str(folder), "locus_count_on_disk": _installed_locus_count(folder)}
@@ -813,11 +1286,13 @@ def download_plan(key) -> dict:
                   "it can be cancelled and resumed.")
     else:
         method = "No supported download route is catalogued for this provider."
-    return {"key": entry["key"], "organism": entry["organism"],
+    return {"key": entry["key"], "organism": entry["organism"], "title": entry["title"],
             "scheme_name": entry["scheme_name"], "locus_count": entry["locus_count"],
             "provider": entry["provider"], "provider_name": entry["provider_name"],
+            "target_set": entry["target_set"], "scheme_group": entry["scheme_group"],
             "source_url": entry["source_url"], "terms_url": provider["terms_url"],
             "terms_notice": provider["restriction"], "licence_quote": provider["quote"],
             "requires_acknowledgement": bool(provider["requires_acknowledgement"]),
             "may_be_bundled": bool(provider["may_bundle"]), "method": method,
-            "destination_slot": entry["slot"], "notes": list(entry["notes"])}
+            "destination_slot": entry["slot"],
+            "destination_library": LIBRARY_DIRNAME, "notes": list(entry["notes"])}

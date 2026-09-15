@@ -218,6 +218,178 @@ def test_assignment_retains_custom_metadata_and_archives_previous_result(project
     assert event["details"]["result"]["st"] == "1"
 
 
+def test_one_write_puts_the_configuration_where_every_other_surface_reads_it(project, tmp_path):
+    """Touching a sample's configuration anywhere is what every menu then shows.
+
+    One write, one read: the organism, the typing mode, both scheme choices and the
+    run flags land in the same place, and the record says who changed them and when.
+    """
+    from wmlstudio.sample_workflow import sample_configuration
+    from wmlstudio.storage import set_sample_configuration
+    sid = project.add_sample(sequence(tmp_path / "isolate.fasta"))
+    report = set_sample_configuration(project, [sid], {
+        "genus": "Klebsiella", "species": "pneumoniae", "typing_mode": "manual",
+        "scheme_path": str(tmp_path / "schemes" / "kpneumoniae"), "calling_mode": "full_cds",
+        "genetic_code": 11, "cgmlst_scheme_key": "cgmlst.org:kpneumoniae-2358",
+        "cgmlst_scheme_path": str(tmp_path / "cgmlst" / "Klebsiella"), "run_cgmlst": True,
+        "run_hydra": True}, surface="cgMLST menu")
+    assert report["held"] == {}
+    assert report["applied"][sid]["cgmlst_scheme_key"] == "cgmlst.org:kpneumoniae-2358"
+
+    configuration = report["configuration"][sid]
+    assert configuration == sample_configuration(project.get_sample(sid))
+    assert configuration["genus"] == "Klebsiella" and configuration["species"] == "pneumoniae"
+    assert configuration["typing_mode"] == "manual" and configuration["calling_mode"] == "full_cds"
+    assert configuration["run_cgmlst"] is True and configuration["run_hydra"] is True
+    assert configuration["set_by"]["cgmlst_scheme_key"]["by"] == "user"
+    assert configuration["set_by"]["cgmlst_scheme_key"]["surface"] == "cgMLST menu"
+    assert configuration["set_by"]["cgmlst_scheme_key"]["automatic"] is False
+    assert configuration["set_by"]["genus"]["utc"]
+
+    # The same one place, whether it is read from the record or from the row.
+    from wmlstudio.sample_workflow import feature_fields
+    assert feature_fields(project.get_sample(sid))["organism"] == "Klebsiella pneumoniae"
+    event = next(e for e in project.history(sid) if e["action"] == "sample_configured")
+    assert event["details"]["changed_by"] == "user" and event["details"]["surface"] == "cgMLST menu"
+    assert event["details"]["fields"]["run_cgmlst"] is True
+
+
+def test_an_automatic_proposal_never_silently_replaces_what_a_person_set(project, tmp_path):
+    from wmlstudio.sample_workflow import sample_configuration
+    from wmlstudio.storage import set_sample_configuration
+    chosen = project.add_sample(sequence(tmp_path / "chosen.fasta"), "chosen")
+    untouched = project.add_sample(sequence(tmp_path / "untouched.fasta", "AAAA"), "untouched")
+    set_sample_configuration(project, [chosen], {"genus": "Klebsiella", "species": "pneumoniae"},
+                             surface="Samples menu")
+
+    report = set_sample_configuration(
+        project, [chosen, untouched], {"genus": "Escherichia", "species": "coli"},
+        changed_by="identification", automatic=True, basis="genomic_ani",
+        confidence="genomic_reference_supported")
+    assert chosen not in report["applied"]
+    assert report["held"][chosen]["genus"]["current"] == "Klebsiella"
+    assert report["held"][chosen]["genus"]["proposed"] == "Escherichia"
+    assert report["held"][chosen]["genus"]["set_by"] == "user"
+    assert project.get_sample(chosen)["metadata"]["organism"]["genus"] == "Klebsiella"
+    held = [e for e in project.history(chosen) if e["action"] == "configuration_proposal_held"]
+    assert held[0]["details"]["proposed_by"] == "identification"
+
+    # A field nobody has chosen is filled in, and says an engine filled it in.
+    assert report["applied"][untouched] == {"genus": "Escherichia", "species": "coli"}
+    configuration = sample_configuration(project.get_sample(untouched))
+    assert configuration["organism"] == "Escherichia coli"
+    assert configuration["set_by"]["genus"]["automatic"] is True
+    assert configuration["organism_basis"] == "genomic_ani"
+
+
+def test_the_first_analysis_to_establish_an_organism_fills_it_in_for_every_menu(project, tmp_path):
+    """The MLST panel match is adopted as evidence for a lineage, never as taxonomy.
+
+    The label is recorded so nothing asks for it again, and the file still waits for
+    a person: a panel match is below the floor at which anything is filed by itself.
+    """
+    from wmlstudio.sample_workflow import sample_configuration, sample_organism
+    from wmlstudio.storage import adopt_analysis_organism, review_bucket
+    original = sequence(tmp_path / "isolate.fasta")
+    sid = import_samples(project, [{"path": original, "typing_mode": "auto"}],
+                         tmp_path / "managed")[0]
+    digest = hashlib.sha256(original.read_bytes()).hexdigest()
+    project.set_result(sid, {"scheme": "Klebsiella MLST", "scheme_digest": "mlst-v1", "st": "258",
+                             "status": "complete", "input_sha256": digest,
+                             "alleles": {f"gene{index}": "1" for index in range(7)},
+                             "identification": {"identification_status": "assigned",
+                                                "organism": {"genus": "Klebsiella",
+                                                             "species": "pneumoniae"}}})
+    report = adopt_analysis_organism(project, sid)
+    assert report["adopted"] is True
+    sample = project.get_sample(sid)
+    assert sample["metadata"]["organism"] == {"genus": "Klebsiella", "species": "pneumoniae"}
+    assert sample_configuration(sample)["organism"] == "Klebsiella pneumoniae"
+    assert sample_organism(sample)["note"].startswith("An MLST scheme match")
+    evidence = sample["metadata"]["organism_evidence"]
+    assert evidence["basis"] == "mlst_panel" and evidence["confidence"] == "panel_compatibility"
+    assert evidence["status"] == "proposed" and review_bucket(sample["metadata"])
+    # Recording what the analysis itself found is not a change of assignment, so the
+    # result that established the organism is never destroyed by adopting it.
+    assert sample["result"]["st"] == "258" and sample["status"] == "completed"
+
+    # On a sample a person already labelled, the same proposal is held instead.
+    from wmlstudio.storage import set_sample_configuration
+    other = project.add_sample(sequence(tmp_path / "other.fasta", "AAAA"), "other")
+    set_sample_configuration(project, [other], {"genus": "Klebsiella", "species": "variicola"},
+                             surface="Samples menu")
+    project.set_result(other, {"scheme": "Klebsiella MLST", "scheme_digest": "mlst-v1",
+                               "st": "258", "status": "complete", "alleles": {"gapA": "3"},
+                               "identification": {"identification_status": "assigned",
+                                                  "organism": {"genus": "Klebsiella",
+                                                               "species": "pneumoniae"}}})
+    held = adopt_analysis_organism(project, other)
+    assert held["adopted"] is False and "held" in held["reason"]
+    assert held["held"][other]["species"]["proposed"] == "pneumoniae"
+    assert project.get_sample(other)["metadata"]["organism"]["species"] == "variicola"
+
+
+def test_an_analysis_that_established_no_organism_records_nothing(project, tmp_path):
+    from wmlstudio.storage import adopt_analysis_organism
+    sid = project.add_sample(sequence(tmp_path / "isolate.fasta"))
+    project.set_result(sid, {"status": "qc_only", "st": None, "alleles": {},
+                             "identification": {"identification_status": "ambiguous",
+                                                "organism": {"genus": "", "species": ""}}})
+    report = adopt_analysis_organism(project, sid)
+    assert report["adopted"] is False and "did not assign an organism" in report["reason"]
+    assert project.get_sample(sid)["metadata"].get("organism") is None
+
+
+def test_changing_a_run_flag_keeps_a_result_that_changing_the_scheme_re_earns(project, tmp_path):
+    from wmlstudio.storage import set_sample_configuration
+    sid = project.add_sample(sequence(tmp_path / "isolate.fasta"))
+    project.set_result(sid, {"st": "258", "status": "complete", "scheme_digest": "mlst-v1"})
+    set_sample_configuration(project, [sid], {"run_cgmlst": True, "run_hydra": True,
+                                              "cgmlst_scheme_key": "cgmlst.org:kpneumoniae-2358"})
+    assert project.get_sample(sid)["result"]["st"] == "258"
+    set_sample_configuration(project, [sid], {"typing_mode": "manual",
+                                              "scheme_path": str(tmp_path / "other")})
+    sample = project.get_sample(sid)
+    assert sample["result"] is None and sample["status"] == "queued"
+    # The flags are configuration, not results, so they survive the re-queue.
+    assert sample["metadata"]["workflow"]["run_cgmlst"] is True
+
+
+def test_the_configuration_write_refuses_a_field_or_a_value_no_surface_can_read(project, tmp_path):
+    from wmlstudio.storage import set_sample_configuration
+    sid = project.add_sample(sequence(tmp_path / "isolate.fasta"))
+    with pytest.raises(ValueError, match="Unknown sample configuration field"):
+        set_sample_configuration(project, [sid], {"organism": "Klebsiella pneumoniae"})
+    with pytest.raises(ValueError, match="Unsupported typing mode"):
+        set_sample_configuration(project, [sid], {"typing_mode": "whatever"})
+    with pytest.raises(ValueError, match="Unsupported allele calling mode"):
+        set_sample_configuration(project, [sid], {"calling_mode": "blast"})
+    with pytest.raises(ValueError, match="translation table"):
+        set_sample_configuration(project, [sid], {"genetic_code": 99})
+    with pytest.raises(ValueError, match="at least one field"):
+        set_sample_configuration(project, [sid], {})
+    assert project.get_sample(sid)["metadata"] == {}
+    project.set_status(sid, "running")
+    with pytest.raises(ValueError, match="Wait for this sample"):
+        set_sample_configuration(project, [sid], {"run_cgmlst": True})
+
+
+def test_a_configuration_survives_reopening_the_project(tmp_path):
+    from wmlstudio.sample_workflow import sample_configuration
+    from wmlstudio.storage import set_sample_configuration
+    path = tmp_path / "study.wmlstudio"
+    original = sequence(tmp_path / "isolate.fasta")
+    with Project(path) as project:
+        sid = project.add_sample(original)
+        set_sample_configuration(project, [sid], {
+            "genus": "Escherichia", "species": "coli", "run_cgmlst": True,
+            "cgmlst_scheme_key": "pubmlst:ecoli-cgmlst-2513"}, surface="cgMLST menu")
+        before = sample_configuration(project.get_sample(sid))
+    with Project(path) as project:
+        assert sample_configuration(project.get_sample(sid)) == before
+        assert before["cgmlst_scheme_key"] == "pubmlst:ecoli-cgmlst-2513"
+
+
 def typed(project, sample_id, digest):
     """One classical ST and one core-genome profile, stored the way the app stores them."""
     project.set_result(sample_id, {"scheme": "Klebsiella MLST", "scheme_digest": "mlst-v1",

@@ -21,6 +21,16 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 from wmlstudio.project import Project
+from wmlstudio.sample_workflow import (
+    CALLING_MODES,
+    CONFIGURATION_FIELDS,
+    CONFIGURATION_VERSION,
+    ORGANISM_FIELDS,
+    TYPING_MODES,
+    WORKFLOW_FIELDS,
+    assigned_organism,
+    sample_configuration,
+)
 from wmlstudio.sequence import (
     AnalysisCancelled,
     check_cancelled,
@@ -96,7 +106,7 @@ def safe_component(value: object, fallback: str = "Unknown") -> str:
 
 def _assignment(value: dict) -> tuple[dict, dict]:
     mode = value.get("typing_mode", "auto")
-    if mode not in {"auto", "manual", "unknown"}:
+    if mode not in TYPING_MODES:
         raise ValueError(f"Unsupported organism assignment mode: {mode}")
     organism = {"genus": str(value.get("genus", "")).strip(),
                 "species": str(value.get("species", "")).strip()}
@@ -161,18 +171,48 @@ def review_bucket(metadata: dict) -> str | None:
     return token if token in QUARANTINE_BUCKETS else "awaiting_identification"
 
 
-def assign_organism(
-    project: Project, sample_ids, genus: str, species: str = "", scheme_path=None,
-    typing_mode: str = "manual",
-) -> None:
-    """Record an organism assignment, invalidating only a result it can invalidate.
+def _apply_assignment(project: Project, sample: dict, organism, workflow: dict) -> bool:
+    """Write one sample's organism and scheme choice, invalidating only what they invalidate.
 
     Under typing_mode 'auto' the scheme is derived from the organism, so changing
     the organism can change which panel applies and the result must be re-earned.
     When the user pinned an explicit scheme_path in manual mode, the ST belongs to
     that scheme's digest rather than to the display label, so correcting a
-    mis-called genus must not destroy a valid, still-applicable result.
+    mis-called genus must not destroy a valid, still-applicable result. ``organism``
+    may be None, meaning this write does not touch the organism at all.
+
+    Recording exactly the organism the stored result itself reports is not a change
+    of assignment: that result was produced under that organism, so it is not
+    re-earned and the analysis that established a label never destroys itself.
     """
+    old = sample["metadata"]
+    old_workflow = old.get("workflow", {})
+    scheme_bound = (old_workflow.get("typing_mode") == "manual"
+                    and bool(old_workflow.get("scheme_path")))
+    workflow_changed = any(old_workflow.get(key) != value for key, value in workflow.items())
+    detected = (sample.get("result") or {}).get("identification") or {}
+    named = detected.get("organism") if isinstance(detected.get("organism"), dict) else {}
+    confirms_result = organism is not None and organism == {
+        "genus": str(named.get("genus") or detected.get("genus") or ""),
+        "species": str(named.get("species") or detected.get("species") or "")}
+    organism_changed = (organism is not None and old.get("organism") != organism
+                        and not confirms_result)
+    patch: dict = {"workflow": workflow} if workflow else {}
+    if organism is not None:
+        patch["organism"] = organism
+    if patch:
+        project.update_metadata(sample["id"], patch)
+    changed = workflow_changed or (organism_changed and not scheme_bound)
+    if changed and sample.get("result") is not None and not sample.get("profile_only"):
+        project.invalidate_result(sample["id"], "Organism or typing scheme assignment changed")
+    return changed
+
+
+def assign_organism(
+    project: Project, sample_ids, genus: str, species: str = "", scheme_path=None,
+    typing_mode: str = "manual",
+) -> None:
+    """Record an organism assignment, invalidating only a result it can invalidate."""
     organism, workflow = _assignment({"genus": genus, "species": species,
                                       "typing_mode": typing_mode, "scheme_path": scheme_path})
     with project.transaction():
@@ -180,16 +220,7 @@ def assign_organism(
             sample = project.get_sample(sample_id)
             if sample["status"] == "running":
                 raise ValueError("Wait for this sample's analysis before changing its assignment.")
-            old = sample["metadata"]
-            old_workflow = old.get("workflow", {})
-            scheme_bound = (old_workflow.get("typing_mode") == "manual"
-                            and bool(old_workflow.get("scheme_path")))
-            workflow_changed = any(old_workflow.get(key) != value for key, value in workflow.items())
-            organism_changed = old.get("organism") != organism
-            changed = workflow_changed or (organism_changed and not scheme_bound)
-            project.update_metadata(sample_id, {"organism": organism, "workflow": workflow})
-            if changed and sample.get("result") is not None and not sample.get("profile_only"):
-                project.invalidate_result(sample_id, "Organism or typing scheme assignment changed")
+            _apply_assignment(project, sample, organism, workflow)
 
 
 def _relink_digest(sample):
@@ -1070,6 +1101,25 @@ def _evidence_patch(evidence, **changes) -> dict:
     return organism_evidence(record)
 
 
+def _confirmation_record(current, accepted: dict, *, basis: str, confidence: str,
+                         confirmed_by: str, stamp: str, evidence=None) -> dict:
+    """The decision record for an accepted organism, with the basis that supports it.
+
+    A label the operator typed over the proposal is not supported by the evidence
+    that produced the proposal, so it loses that evidence's basis and confidence.
+    """
+    record = _evidence_patch(evidence if evidence is not None else current,
+                             status="confirmed", accepted=accepted, quarantine_reason=None,
+                             confirmed_by=confirmed_by, confirmed_utc=stamp)
+    proposed = record.get("proposed") or {}
+    record.setdefault("basis", basis)
+    record.setdefault("confidence", confidence)
+    if ((proposed.get("genus", ""), proposed.get("species", "")) != (accepted["genus"], accepted["species"])
+            or record["basis"] in {"", "none", None}):
+        record.update(basis=basis, confidence=confidence)
+    return record
+
+
 def confirm_organism(project: Project, sample_ids, genus: str, species: str = "", *,
                      evidence=None, scheme_path=None, typing_mode: str = "manual",
                      basis: str = "user_assigned", confidence: str = "unresolved",
@@ -1086,22 +1136,208 @@ def confirm_organism(project: Project, sample_ids, genus: str, species: str = ""
     with project.transaction():
         for sample_id in dict.fromkeys(sample_ids):
             current = project.get_sample(sample_id)["metadata"].get("organism_evidence")
-            record = _evidence_patch(evidence if evidence is not None else current,
-                                     status="confirmed", accepted=accepted,
-                                     quarantine_reason=None, confirmed_by=confirmed_by,
-                                     confirmed_utc=stamp)
-            proposed = record.get("proposed") or {}
-            record.setdefault("basis", basis)
-            record.setdefault("confidence", confidence)
-            # A label the operator typed over the proposal is not supported by the
-            # evidence that produced the proposal, so it loses that evidence's basis.
-            if ((proposed.get("genus", ""), proposed.get("species", "")) != (accepted["genus"], accepted["species"])
-                    or record["basis"] in {"", "none", None}):
-                record.update(basis=basis, confidence=confidence)
+            record = _confirmation_record(current, accepted, basis=basis, confidence=confidence,
+                                          confirmed_by=confirmed_by, stamp=stamp, evidence=evidence)
             project.update_metadata(sample_id, {"organism_evidence": record})
             project.record_history(sample_id, "organism_confirmed", {
                 "accepted": accepted, "basis": record.get("basis"),
                 "confidence": record.get("confidence"), "confirmed_by": confirmed_by})
+
+
+def _configuration_change(field: str, value):
+    """Validate one configuration field so no surface can store a value another cannot read."""
+    if field in ORGANISM_FIELDS:
+        return str(value or "").strip()
+    if field == "typing_mode":
+        mode = str(value or "").strip().casefold()
+        if mode not in TYPING_MODES:
+            raise ValueError(f"Unsupported typing mode {value!r}; expected one of "
+                             f"{', '.join(TYPING_MODES)}.")
+        return mode
+    if field == "calling_mode":
+        mode = str(value or "auto").strip().casefold()
+        if mode not in CALLING_MODES:
+            raise ValueError(f"Unsupported allele calling mode {value!r}; expected one of "
+                             f"{', '.join(CALLING_MODES)}.")
+        return mode
+    if field == "genetic_code":
+        if value in (None, ""):
+            return None
+        try:
+            code = int(value)
+        except (TypeError, ValueError) as error:
+            raise ValueError("A genetic code must be an NCBI translation table number.") from error
+        if not 1 <= code <= 33:
+            raise ValueError(f"Genetic code {code} is not an NCBI translation table number.")
+        return code
+    if field in {"run_hydra", "run_cgmlst"}:
+        return bool(value)
+    return str(value).strip() or None if value not in (None, "") else None
+
+
+def set_sample_configuration(project: Project, sample_ids, changes, *, changed_by: str = "user",
+                             automatic: bool = False, surface: str = "",
+                             basis: str = "user_assigned", confidence: str = "unresolved") -> dict:
+    """Write one sample configuration, the same way from every menu and submenu.
+
+    This is the single write. The organism, the typing mode, the chosen MLST and
+    cgMLST schemes, the allele-caller settings and the run flags live in one place
+    on the sample, so a change made in any surface is what every other surface reads
+    next; there is no second copy to fall out of step with it. Every field that
+    changes records who changed it and when.
+
+    An automatic proposal never silently replaces something a person set: when an
+    engine writes a field a person already chose, the proposal is held, recorded in
+    history and returned in the report, and the person's value stays. That rule
+    already governed organism assignment and now governs the whole configuration.
+
+    A change to the organism, the typing mode or the chosen scheme can invalidate a
+    stored result, exactly as assign_organism decides it. Changing a caller setting
+    or a run flag never destroys a stored result -- sample_workflow.rerun_decision
+    reports what changed and lets the person decide.
+    """
+    requested = {}
+    for field, value in dict(changes or {}).items():
+        if field not in CONFIGURATION_FIELDS:
+            raise ValueError(f"Unknown sample configuration field {field!r}; expected one of "
+                             f"{', '.join(CONFIGURATION_FIELDS)}.")
+        requested[field] = _configuration_change(field, value)
+    if not requested:
+        raise ValueError("A configuration write needs at least one field to change.")
+    author = str(changed_by or "").strip() or "user"
+    stamp = datetime.now(UTC).isoformat()
+    report: dict[str, dict] = {"applied": {}, "held": {}, "configuration": {}}
+    with project.transaction():
+        for sample_id in dict.fromkeys(sample_ids):
+            sample = project.get_sample(sample_id)
+            if sample["status"] == "running":
+                raise ValueError("Wait for this sample's analysis before changing its configuration.")
+            current = sample_configuration(sample)
+            # Compared against what is stored, never against an organism that is
+            # only being read through from an analysis: a detection everybody can
+            # already see is exactly the value this write exists to write down.
+            stored = assigned_organism(sample)
+            baseline = {**current, "genus": str(stored.get("genus") or ""),
+                        "species": str(stored.get("species") or "")}
+            authorship = current["set_by"]
+            applied, held = {}, {}
+            for field, value in requested.items():
+                if baseline.get(field) == value:
+                    continue
+                owner = authorship.get(field) or {}
+                if automatic and owner.get("by") and not owner.get("automatic", True):
+                    held[field] = {"current": baseline.get(field), "proposed": value,
+                                   "set_by": owner.get("by", ""), "set_utc": owner.get("utc", ""),
+                                   "surface": owner.get("surface", "")}
+                    continue
+                applied[field] = value
+            if held:
+                report["held"][sample_id] = held
+                project.record_history(sample_id, "configuration_proposal_held", {
+                    "proposed_by": author, "automatic": bool(automatic), "surface": str(surface),
+                    "fields": held})
+            if applied:
+                report["applied"][sample_id] = dict(applied)
+                _write_configuration(project, sample, applied, author=author, automatic=automatic,
+                                     surface=str(surface), stamp=stamp, basis=basis,
+                                     confidence=confidence, authorship=authorship)
+            report["configuration"][sample_id] = sample_configuration(project.get_sample(sample_id))
+    return report
+
+
+def _write_configuration(project: Project, sample: dict, applied: dict, *, author: str,
+                         automatic: bool, surface: str, stamp: str, basis: str, confidence: str,
+                         authorship: dict) -> None:
+    """Apply one validated configuration change set to one sample, in one transaction."""
+    sample_id = sample["id"]
+    stored = assigned_organism(sample)
+    organism = None
+    if any(field in applied for field in ORGANISM_FIELDS):
+        # Built from what is stored, never from what was merely detected: reading a
+        # detection through and writing it back would promote it to an assignment.
+        organism = {"genus": str(stored.get("genus") or ""), "species": str(stored.get("species") or "")}
+        organism.update({field: applied[field] for field in ORGANISM_FIELDS if field in applied})
+    assignment = {field: applied[field] for field in ("typing_mode", "scheme_path") if field in applied}
+    remainder = {field: applied[field] for field in WORKFLOW_FIELDS
+                 if field in applied and field not in assignment}
+    _apply_assignment(project, sample, organism, assignment)
+    if remainder:
+        project.update_metadata(sample_id, {"workflow": remainder})
+    fields = {field: dict(entry) for field, entry in authorship.items()}
+    for field in applied:
+        fields[field] = {"by": author, "automatic": bool(automatic), "utc": stamp,
+                         "surface": surface}
+    project.update_metadata(sample_id, {"configuration": {
+        "format_version": CONFIGURATION_VERSION, "fields": fields}})
+    if organism is not None and organism["genus"]:
+        from wmlstudio.organism_id import AUTO_CONFIRM_FLOOR, confidence_rank
+        current = sample["metadata"].get("organism_evidence")
+        # A label is recorded so every surface can autofill it, but accepting it for
+        # filing is a separate step: nothing weaker than the auto-confirm floor is
+        # accepted without a person, so an MLST panel match stays a proposal and its
+        # file keeps waiting in the needs-review tree under its own reason.
+        if automatic and confidence_rank(confidence) < confidence_rank(AUTO_CONFIRM_FLOOR):
+            record = _evidence_patch(current, status="proposed", proposed=dict(organism),
+                                     basis=basis, confidence=confidence)
+            project.update_metadata(sample_id, {"organism_evidence": record})
+            project.record_history(sample_id, "organism_identified", {
+                "basis": record.get("basis"), "confidence": record.get("confidence"),
+                "status": record.get("status"), "proposed": dict(organism)})
+        else:
+            record = _confirmation_record(current, organism, basis=basis, confidence=confidence,
+                                          confirmed_by=author, stamp=stamp)
+            project.update_metadata(sample_id, {"organism_evidence": record})
+            project.record_history(sample_id, "organism_confirmed", {
+                "accepted": organism, "basis": record.get("basis"),
+                "confidence": record.get("confidence"), "confirmed_by": author})
+    project.record_history(sample_id, "sample_configured", {
+        "fields": applied, "changed_by": author, "automatic": bool(automatic),
+        "surface": surface, "changed_utc": stamp})
+
+
+def adopt_analysis_organism(project: Project, sample_id: str, result=None, *,
+                            surface: str = "analysis") -> dict:
+    """Record the organism an analysis established, once, without overruling a person.
+
+    This is what "the first analysis fills the organism in everywhere" means: the
+    genus and species land on the sample the moment an analysis establishes them, and
+    every later menu reads them from there instead of asking again. The basis travels
+    with the value, so a classical MLST scheme match is adopted as corroborating
+    evidence for a lineage and can never be read afterwards as independent taxonomy.
+
+    Recording a label is not accepting it: a panel match is below the auto-confirm
+    floor, so its decision record stays a proposal and its file keeps waiting for a
+    person in the needs-review tree. A label a person set is never replaced -- the
+    proposal is held and returned -- and an analysis that established no organism
+    changes nothing at all.
+    """
+    sample = project.get_sample(sample_id)
+    result = sample.get("result") if result is None else result
+    result = result if isinstance(result, dict) else {}
+    identification = result.get("identification") if isinstance(result.get("identification"), dict) else {}
+    named = identification.get("organism") if isinstance(identification.get("organism"), dict) else {}
+    genus = str(named.get("genus") or identification.get("genus") or "").strip()
+    species = str(named.get("species") or identification.get("species") or "").strip()
+    unresolved = {"applied": {}, "held": {}, "configuration": {}, "adopted": False, "reason": ""}
+    if identification and identification.get("identification_status") not in (None, "assigned"):
+        unresolved["reason"] = ("This analysis did not assign an organism, so none was recorded "
+                                "for the sample.")
+        return unresolved
+    if not genus:
+        unresolved["reason"] = "This analysis established no organism, so nothing was recorded."
+        return unresolved
+    # identification.identify_assembly is the only engine that writes an organism
+    # into a typing result, and it reports installed-panel compatibility.
+    report = set_sample_configuration(
+        project, [sample_id], {"genus": genus, "species": species}, changed_by="analysis",
+        automatic=True, surface=surface,
+        basis=str(identification.get("basis") or "mlst_panel"),
+        confidence=str(identification.get("confidence") or "panel_compatibility"))
+    report["adopted"] = bool(report["applied"].get(sample_id))
+    report["reason"] = ("" if report["adopted"] else
+                        "A person already set this sample's organism, so the analysis proposal "
+                        "was held rather than applied.")
+    return report
 
 
 def quarantine_samples(project: Project, sample_ids, reason: str = "user_deferred", *,

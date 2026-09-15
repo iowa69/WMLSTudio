@@ -38,6 +38,7 @@ from wmlstudio.organism_modules import (
 from wmlstudio.paths import resource_root
 from wmlstudio.scheduler import plan_resources, run_bounded
 from wmlstudio.ui_common import FlowLayout, cell, make_table, organism_for
+from wmlstudio.ui_workbench import CLASSICAL_KINDS
 from wmlstudio.widgets import button, label
 
 HIT_LIMIT = 40
@@ -48,6 +49,21 @@ def organism_line(sample):
     genus, species, source = organism_for(sample)
     name = f"{genus} {species}".strip()
     return f"{name} ({source})" if name else "Unknown organism"
+
+
+def classical_st(sample):
+    """The classical ST, or a plain statement that this result is another quantity.
+
+    A core-genome profile is not a sequence type: a cgST printed under a column
+    headed 'Classical ST' is exactly the confusion this table must not create.
+    """
+    from wmlstudio.threshold_guidance import typing_scale
+    result = sample.get("result") or {}
+    count = len(result.get("alleles") or {}) or int(result.get("total_loci") or 0)
+    scale = typing_scale(count)
+    if scale["kind"] == "cgmlst":
+        return f"Not a classical ST — {scale['label']}"
+    return result.get("st") or ""
 
 
 def hits_html(evidence, limit=HIT_LIMIT):
@@ -517,7 +533,7 @@ class CharacterizationWorkspaceMixin:
             virulence = usable.get("virulence") or {}
             groups = virulence.get("loci") or virulence.get("groups") or []
             values = [sample["name"], state, " ".join(str(species.get(key) or "") for key in ("genus", "species")).strip() or "Unresolved",
-                      (species.get("nearest") or {}).get("ani"), (sample.get("result") or {}).get("st"),
+                      (species.get("nearest") or {}).get("ani"), classical_st(sample),
                       "; ".join(group["locus"] for group in groups if group.get("status") == "detected") or virulence.get("status", "not_run"),
                       "; ".join(sorted({entry.get("class") or entry.get("subclass") or "" for entry in usable.get("drug_associations", {}).get("associations", [])})) or usable.get("drug_associations", {}).get("status", "not_run"),
                       "; ".join(entry["gene"] for entry in usable.get("plasmid_hypotheses", {}).get("replicons", [])) or usable.get("plasmid_hypotheses", {}).get("status", "not_run")]
@@ -606,9 +622,14 @@ class CharacterizationWorkspaceMixin:
             self.notify("Select/import FASTA assemblies for characterization. Review paired FASTQ assembly first if you only have reads.")
             self.navigate(1)
             return
-        dialog = CharacterizationPlanDialog(assemblies, self.active_characterization_reference(), self,
-                                            project=self.project, scheme_entries=self.scheme_entries(),
-                                            database_root=self.active_amr_database())
+        # The assignment this plan can make sets the scheme a sample is TYPED
+        # against, so it offers classical schemes only: a 2,000-target cgMLST
+        # scheme chosen where a seven-locus one is expected is a different
+        # quantity under the same label.
+        dialog = CharacterizationPlanDialog(
+            assemblies, self.active_characterization_reference(), self, project=self.project,
+            scheme_entries=self.scheme_entries(CLASSICAL_KINDS),
+            database_root=self.active_amr_database())
         dialog.installRequested.connect(self.install_characterization_references)
         if dialog.exec() != QDialog.DialogCode.Accepted:
             return

@@ -357,6 +357,10 @@ class TreeView(QGraphicsView):
 
     selectionChanged = Signal(list)
     nodeActivated = Signal(str)
+    # The reader zoomed or panned this view themselves. A window that had been
+    # fitting the whole forest to its own size stops doing so when this arrives,
+    # rather than pulling the view back from where the reader put it.
+    viewAdjusted = Signal()
     colorsChanged = Signal(dict)
     layoutChanged = Signal(dict)
     legendChanged = Signal(dict)
@@ -434,7 +438,11 @@ class TreeView(QGraphicsView):
     def wheelEvent(self, event):
         factor = 1.12 if event.angleDelta().y() > 0 else 1 / 1.12
         if 0.05 <= self.transform().m11() * factor <= 8:
-            self.scale(factor, factor)
+            # `self.scale` is the typing scale this forest measures, which shadows
+            # the view's own zoom method: zooming must name the base class, or a
+            # scroll over the graph raises instead of magnifying it.
+            QGraphicsView.scale(self, factor, factor)
+            self.viewAdjusted.emit()
         event.accept()
 
     def mousePressEvent(self, event):
@@ -451,6 +459,8 @@ class TreeView(QGraphicsView):
             self._panning = event.position()
             self.horizontalScrollBar().setValue(self.horizontalScrollBar().value() - round(delta.x()))
             self.verticalScrollBar().setValue(self.verticalScrollBar().value() - round(delta.y()))
+            if round(delta.x()) or round(delta.y()):
+                self.viewAdjusted.emit()
             event.accept()
         else:
             super().mouseMoveEvent(event)
@@ -529,7 +539,7 @@ class TreeView(QGraphicsView):
         elif action == rename:
             key = self._members[node.key][0]
             value, okay = QInputDialog.getText(self, "Display label", "Presentation only; original sample name is retained:",
-                                               text=self._aliases.get(key, self._results[key]["sample_name"]))
+                                               text=self.node_label(key))
             if okay:
                 self.set_node_label(key, value)
         elif action == reset:
@@ -724,6 +734,34 @@ class TreeView(QGraphicsView):
         self.draw_results(list(self._results.values()), self._source_edges, self.cluster_threshold,
                           groups=self._group_definitions)
 
+    def graph_contents(self):
+        """Everything a second view needs to draw this same forest, as plain data.
+
+        Another view is handed the records, edges, threshold, groups and scale,
+        never these items: a detached window then arranges, recolors and relabels
+        its own copy without moving a node in the panel it was opened from. Each
+        record is a fresh mapping over the stored evidence, which no view writes
+        into: arrangement, color and label live beside the results, not in them.
+        """
+        return {"results": [dict(result) for result in self._results.values()],
+                "edges": [dict(edge) for edge in self._source_edges],
+                "cluster_threshold": self.cluster_threshold,
+                "groups": [dict(group) for group in self._group_definitions],
+                "scale": dict(self.scale)}
+
+    def show_contents(self, contents):
+        """Draw what :meth:`graph_contents` returned, scale first.
+
+        The quantity is recorded before anything is drawn, so an edge label of
+        "3" never appears before the target set it counts over is known.
+        """
+        contents = dict(contents or {})
+        self.set_scale(contents.get("scale") or {})
+        threshold = contents.get("cluster_threshold", 1)
+        self.draw_results(contents.get("results") or [], contents.get("edges") or [],
+                          int(threshold if threshold is not None else 1),
+                          groups=contents.get("groups") or None)
+
     def _select_label(self, key, modifiers):
         ids = set(self.selected_ids()) if modifiers & Qt.KeyboardModifier.ControlModifier else set()
         members = set(self._members[key])
@@ -731,8 +769,20 @@ class TreeView(QGraphicsView):
         self.select_ids(ids)
 
     def select_cluster(self, sample_id):
+        self.select_ids(self.group_members(sample_id))
+
+    def groups(self):
+        """The threshold groups as drawn, as plain data; editing a copy changes nothing."""
+        return [dict(group) for group in self._group_definitions]
+
+    def group_members(self, sample_id):
+        """Every isolate in the single-link group holding this one, else just this one.
+
+        Membership is the grouping that was drawn, not a new calculation, and a
+        group is a visual grouping rather than an outbreak assignment.
+        """
         group = next((g for g in self._group_definitions if sample_id in g["members"]), None)
-        self.select_ids(group["members"] if group else [sample_id])
+        return list(group["members"]) if group else [sample_id]
 
     def set_merge_identical(self, enabled):
         self.merge_identical = bool(enabled)
@@ -876,6 +926,13 @@ class TreeView(QGraphicsView):
                 self._manual_colors.pop(str(key), None)
         self._apply_colors()
         self.colorsChanged.emit(dict(self._manual_colors))
+
+    def node_label(self, sample_id):
+        """The display label one isolate currently carries, or its own sample name."""
+        key = str(sample_id)
+        if key not in self._results:
+            raise ValueError(f"Unknown sample ID: {key}")
+        return self._aliases.get(key, self._results[key]["sample_name"])
 
     def set_node_label(self, sample_id, text):
         key = str(sample_id)

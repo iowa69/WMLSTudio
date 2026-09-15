@@ -275,6 +275,84 @@ def test_png_svg_graphml_and_forest_newick_exports(graph, tmp_path):
     assert "Isolate a [a]" in newick and "Isolate b [b]" in newick
 
 
+def test_a_forest_can_be_handed_to_another_view_as_data_without_sharing_its_items(graph, qtbot):
+    """A second view of one comparison must be a copy, not the same nodes twice.
+
+    A detached window draws the same records, edges, threshold, groups and scale
+    in a view of its own, so arranging one picture never moves a node in the
+    other and neither can edit the evidence they were both built from.
+    """
+    graph.set_scale({"kind": "cgmlst", "title": "cgMLST", "target_word": "targets",
+                     "targets": 2358, "caption": "cgMLST · kp · 2358 targets"})
+    contents = graph.graph_contents()
+    assert sorted(row["sample_id"] for row in contents["results"]) == ["a", "b", "c", "d"]
+    assert contents["cluster_threshold"] == 1
+    assert contents["scale"]["targets"] == 2358
+    contents["results"][0]["sample_name"] = "Edited copy"
+    contents["scale"]["targets"] = 7
+    assert graph._results["a"]["sample_name"] == "Isolate a"
+    assert graph.scale["targets"] == 2358
+    other = TreeView()
+    qtbot.addWidget(other)
+    other.resize(900, 600)
+    other.show_contents(graph.graph_contents())
+    assert sorted(other.nodes) == sorted(graph.nodes)
+    assert other.cluster_threshold == graph.cluster_threshold
+    assert other.scale_caption() == graph.scale_caption()
+    other.nodes["a"].setPos(500, 400)
+    assert (graph.nodes["a"].pos().x(), graph.nodes["a"].pos().y()) != (500, 400)
+
+
+def test_groups_labels_and_membership_are_readable_without_reaching_inside_the_view(graph):
+    groups = graph.groups()
+    assert [group["status"] for group in groups] == ["cluster", "singleton"]
+    # Single linkage chains: a and c are one group through b, not by their own distance.
+    assert graph.group_members("a") == graph.group_members("c") == ["a", "b", "c"]
+    assert graph.group_members("d") == ["d"]
+    # An isolate that is in no drawn group answers for itself, never for a group.
+    assert graph.group_members("unknown") == ["unknown"]
+    groups[0]["name"] = "Renamed elsewhere"
+    assert graph.groups()[0]["name"] == "Group 1"
+    assert graph.node_label("a") == "Isolate a"
+    graph.set_node_label("a", "Ward B index case")
+    assert graph.node_label("a") == "Ward B index case"
+    assert graph.labels["a"].toolTip() == "Isolate a"
+    with pytest.raises(ValueError, match="Unknown sample ID"):
+        graph.node_label("unknown")
+
+
+def test_scrolling_over_the_graph_zooms_it_and_says_the_reader_moved_the_view(graph):
+    """The typing scale this view measures shadows the view's own zoom method.
+
+    Calling the shadowed name turned every scroll over the graph into a type
+    error instead of a zoom, so the magnification is asserted here rather than
+    only the signal that follows it.
+    """
+    from PySide6.QtCore import QPoint, QPointF
+    from PySide6.QtGui import QWheelEvent
+
+    def wheel(delta):
+        return QWheelEvent(QPointF(30, 30), QPointF(30, 30), QPoint(0, 0), QPoint(0, delta),
+                           Qt.MouseButton.NoButton, Qt.KeyboardModifier.NoModifier,
+                           Qt.ScrollPhase.NoScrollPhase, False)
+
+    adjustments = []
+    graph.viewAdjusted.connect(lambda: adjustments.append(graph.transform().m11()))
+    start = graph.transform().m11()
+    graph.wheelEvent(wheel(120))
+    assert graph.transform().m11() > start
+    graph.wheelEvent(wheel(-120))
+    assert graph.transform().m11() == pytest.approx(start)
+    assert len(adjustments) == 2
+    for _ in range(80):
+        graph.wheelEvent(wheel(-120))
+    assert 0.05 <= graph.transform().m11() <= 8
+    # Fitting the graph is not the reader moving it, so it reports no adjustment.
+    before = len(adjustments)
+    graph.fit_tree()
+    assert len(adjustments) == before
+
+
 def test_dark_palette_covers_native_controls_dialogs_and_navigation(qapp, qtbot):
     original_palette, original_style = qapp.palette(), qapp.styleSheet()
     original_native = qapp.testAttribute(Qt.ApplicationAttribute.AA_DontUseNativeDialogs)
