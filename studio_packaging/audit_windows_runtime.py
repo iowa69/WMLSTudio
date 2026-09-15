@@ -56,7 +56,9 @@ def verify_directory(directory, *, recursive=False, excluded_roots=()):
         missing = [name for name in imports if name not in available and name not in SYSTEM_DLLS
                    and not name.startswith(("api-ms-win-", "ext-ms-win-"))]
         records.append({"binary": binary.relative_to(directory).as_posix(), "imports": imports})
-        unresolved.extend(f"{binary.name}: {name}" for name in missing)
+        # Name where the binary actually is. Several copies of a runtime library can
+        # sit in one bundle, and "awt.dll: jvm.dll" does not say which one is wrong.
+        unresolved.extend(f"{binary.relative_to(directory).as_posix()}: {name}" for name in missing)
     if not binaries:
         raise ValueError(f"No native binaries found in {directory}")
     if unresolved:
