@@ -1110,3 +1110,19 @@ def test_the_cgmlst_tree_tab_really_draws_the_cgmlst_tree(window):
     assert window.typing_kind == "cgmlst"
     assert window.cluster_threshold.value() == cg_threshold
     assert window._current_snapshot["target_loci"] == CG_TARGETS
+
+
+def test_the_table_of_calls_takes_you_to_the_tree_it_offers(window):
+    """Its button switched the view without going to the tab that shows it.
+
+    The table of calls has its own tab now, so switching the typing kind while
+    the workspace sits on another tab left the person looking at the table with
+    nothing visibly happening.
+    """
+    a, b = both_typed(window, "A", "1111", "11"), both_typed(window, "B", "2111", "21")
+    window.navigate("cgmlst")
+    assert window.pages.current_key() == "cgmlst"
+    assert window.show_cgmlst_tree([a, b]) == "cgmlst"
+    assert window.pages.current_key() == "cgmlst_tree", "the button lands on the tree"
+    assert window.tree_holders()["cgmlst_tree"].widget() is window.comparison_content
+    assert set(window.tree._results) == {a, b}
