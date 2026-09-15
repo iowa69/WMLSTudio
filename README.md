@@ -11,28 +11,26 @@ installation for the portable package.
 
 ## Download and retest
 
-### [⬇ Download WMLSTudio — Windows portable ZIP](https://github.com/iowa69/WMLSTudio/releases/download/v0.2.0-workbench.1/WMLSTudio-Windows-x64.zip)
+### [⬇ Download WMLSTudio — Windows portable ZIP](https://github.com/iowa69/WMLSTudio/releases/download/v0.3.0/WMLSTudio-0.3.0-Windows-x64.zip)
 
-**v0.2.0-workbench.1 · Windows x64 · 147.6 MB ZIP · Non-commercial research**
+**v0.3.0 · Windows x64 · 372 MB ZIP · Non-commercial research**
 
-> **0.3.0 is in development and is not the download above.** The link serves the
-> last released build, 0.2. It has none of the 0.3 work: the tabbed workspace,
-> the Samples hub, separate MLST and cgMLST trees, automatic organism filing,
-> adjustable display scaling or the cgMLST scheme library. Builds of the current
-> source, named `WMLSTudio-0.3.0-Windows-x64.zip`, are attached to each run under
-> [Actions](https://github.com/iowa69/WMLSTudio/actions/workflows/studio.yml);
-> 0.3.0 has no release of its own yet.
+Unzip and run `WMLSTudio.exe`. No installer, no Python, no WSL, no Docker.
+SHA-256 `9b0569d19d42c71603be1973fc47ba9c0e05332345edafe29db92389a9df6b6b`.
 
-[Release notes](https://github.com/iowa69/WMLSTudio/releases/tag/v0.2.0-workbench.1)
-· [SHA-256 checksum](https://github.com/iowa69/WMLSTudio/releases/download/v0.2.0-workbench.1/WMLSTudio-Windows-x64.zip.sha256)
+[Release notes](https://github.com/iowa69/WMLSTudio/releases/tag/v0.3.0)
+· [SHA-256 checksum](https://github.com/iowa69/WMLSTudio/releases/download/v0.3.0/WMLSTudio-0.3.0-Windows-x64.zip.sha256)
+· [Previous 0.2 release](https://github.com/iowa69/WMLSTudio/releases/tag/v0.2.0-workbench.1)
 · [Build/test results](https://github.com/iowa69/WMLSTudio/actions/workflows/studio.yml)
 · [Previous 0.1 release](https://github.com/iowa69/WMLSTudio/releases/tag/v0.1.0-preview.1)
 
 The release notes distinguish observed Linux, native Windows CI and Wine checks
 from the still-required clean Windows 11 desktop acceptance test.
-The published binary was built from `e5d5f72`: **466 tests passed on each hosted
-platform**, followed by frozen-executable checks in
-[this successful build](https://github.com/iowa69/WMLSTudio/actions/runs/34713168070).
+The published binary was built from `9e46f2e`: **1,382 tests passed on each
+hosted platform**, followed by the frozen-build, app-local Windows dependency
+and bundled-reference checks in
+[this successful build](https://github.com/iowa69/WMLSTudio/actions/runs/34929169286).
+Clean Windows 11 desktop acceptance has still not been done.
 
 > Research software, not a validated diagnostic device or an established
 > SeqSphere+ equivalent. Review the [capability audit](docs/STUDIO_CAPABILITIES.md).
