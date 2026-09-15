@@ -3,13 +3,19 @@ import pytest
 from wmlstudio.plasmid_evidence import (
     BACKBONE_MIN_BP,
     MOB_SUITE_GAP,
+    SCREEN_STATES,
+    SCREEN_WORDS,
     SUPPORT_STATES,
+    TABLE_NOTES,
     backbone_depth,
     cohort_replicon_cooccurrence,
     contig_plasmid_evidence,
     contig_records,
+    isolate_replicon_view,
     marker_location,
     parse_contig_header,
+    plasmid_payload,
+    replicon_database_state,
 )
 from wmlstudio.sequence import AnalysisCancelled
 
@@ -237,6 +243,144 @@ def test_a_cohort_entry_without_an_identifier_is_refused_rather_than_merged():
 def test_cohort_work_is_cancellable():
     with pytest.raises(AnalysisCancelled):
         cohort_replicon_cooccurrence([cohort_entry('a')], cancelled=lambda: True)
+
+
+def payload_entry(sample_id, *, replicons=(), databases=('ncbi', 'plasmidfinder'),
+                  contigs=(), placements=(), status='completed', reason=''):
+    """One isolate in the shape the plasmid page hands the payload builder."""
+    return {'sample_id': sample_id, 'sample_name': sample_id.upper(),
+            'plasmid_hypotheses': {'status': status, 'reason': reason,
+                                   'replicons': [{'gene': gene} for gene in replicons],
+                                   'source': {'databases': list(databases)},
+                                   'contig_evidence': list(contigs),
+                                   'determinant_placement': list(placements),
+                                   'contig_associations': []}}
+
+
+def test_a_store_with_no_plasmid_set_is_stated_as_a_missing_question_not_a_finding():
+    """No plasmidfinder means no replicon can be reported for any isolate on earth."""
+    state = replicon_database_state(['ncbi', 'protein'])
+    assert state['status'] == 'not_installed' and state['known'] is True
+    assert 'plasmidfinder' in state['missing']
+    assert 'never asked' in state['reason'] and 'not evidence' in state['reason']
+    installed = replicon_database_state(['ncbi', 'plasmidfinder'])
+    assert installed['status'] == 'installed' and installed['installed'] == ['plasmidfinder']
+
+
+def test_a_reference_store_nobody_inspected_is_unknown_and_never_reported_as_absent():
+    """Only the store can say a set is missing; not asking it is a third answer."""
+    state = replicon_database_state()
+    assert state['status'] == 'unknown' and state['known'] is False
+    assert 'not a negative result' in state['reason']
+
+
+@pytest.mark.parametrize('databases,installed,expected', [
+    (['ncbi', 'plasmidfinder'], ['ncbi', 'plasmidfinder'], 'none_detected'),
+    (['ncbi'], ['ncbi', 'plasmidfinder'], 'not_searched'),
+    (['ncbi'], ['ncbi'], 'plasmid_database_not_installed'),
+    (['ncbi'], None, 'not_searched'),
+])
+def test_an_empty_replicon_list_says_which_of_four_things_actually_happened(databases, installed,
+                                                                           expected):
+    """Four different reasons for an empty list must never collapse into one blank."""
+    view = isolate_replicon_view(payload_entry('a', databases=databases),
+                                 database=replicon_database_state(installed))
+    assert view['state'] == expected and view['state'] in SCREEN_STATES
+    assert view['state_words'] == SCREEN_WORDS[expected]
+
+
+def test_a_run_that_did_read_a_plasmid_set_still_counts_as_having_looked():
+    """A set removed from the store after the run does not unmake the search."""
+    view = isolate_replicon_view(payload_entry('a', databases=['ncbi', 'plasmidfinder']),
+                                 database=replicon_database_state(['ncbi']))
+    assert view['state'] == 'none_detected'
+    assert 'not proof of absence' in view['reason']
+
+
+def test_the_replicon_grid_marks_an_unassayed_isolate_apart_from_a_negative_one():
+    payload = plasmid_payload([payload_entry('a', replicons=['IncFIB']),
+                               payload_entry('b'),
+                               payload_entry('c', status='not_run',
+                                             reason='No plasmid-reference assay was run.')],
+                              installed=['ncbi', 'plasmidfinder'])
+    grid = payload['tables']['replicon_matrix']
+    assert grid['columns'] == ['Isolate', 'Replicon screen', 'IncFIB']
+    assert [row[0] for row in grid['rows']] == ['A', 'B', 'C']
+    assert [row[2] for row in grid['rows']] == ['present', 'not detected', 'not assayed']
+
+
+def test_every_table_the_payload_builds_carries_the_limit_that_belongs_to_it():
+    """These limits are severe enough that a table without one is read too strongly."""
+    payload = plasmid_payload([payload_entry('a', replicons=['IncFIB'])],
+                              installed=['ncbi', 'plasmidfinder'])
+    assert set(payload['tables']) == set(TABLE_NOTES)
+    for key, table in payload['tables'].items():
+        assert table['note'] == TABLE_NOTES[key] and table['note']
+        assert len(table['columns']) == len({*table['columns']})
+        assert all(len(row) == len(table['columns']) for row in table['rows'])
+    assert payload['limitations'] and payload['mob_suite_gap'] == MOB_SUITE_GAP
+
+
+def test_an_empty_table_always_says_why_it_is_empty():
+    """A table with no rows and no sentence beneath it reads as a negative result."""
+    payload = plasmid_payload([payload_entry('a', databases=['ncbi'])], installed=['ncbi'])
+    for key in ('replicon_matrix', 'determinant_colocation', 'cohort_cooccurrence', 'contigs'):
+        table = payload['tables'][key]
+        assert table['rows'] == [] and table['empty_reason']
+    assert 'Install plasmidfinder' in payload['tables']['replicon_matrix']['empty_reason']
+
+
+def test_the_contig_table_quotes_the_assembler_and_measures_nothing_itself():
+    lengths, headers = small_circular_assembly()
+    evidence = contig_plasmid_evidence(lengths, [replicon(contig='Contig_2_201.434_Circ')],
+                                       [determinant(contig='Contig_2_201.434_Circ')],
+                                       contig_headers=headers)
+    payload = plasmid_payload([payload_entry('a', replicons=['IncFIB'],
+                                             contigs=evidence['contigs'])],
+                              installed=['ncbi', 'plasmidfinder'])
+    table = payload['tables']['contigs']
+    row = dict(zip(table['columns'], table['rows'][0], strict=True))
+    assert row['Contig'] == 'Contig_2_201.434_Circ' and row['Length (bp)'] == 4372
+    assert row["Closure (assembler's claim)"] == 'declared circular'
+    assert row['Coverage vs backbone'].endswith('×') and row['Header convention'] == 'skesa'
+    assert "assembler's own claims" in table['note']
+
+
+def test_the_whole_payload_produces_no_distance_and_no_threshold():
+    """A plasmid table must never acquire a scale MLST, cgMLST or SNP could share."""
+    payload = plasmid_payload([payload_entry('a', replicons=['IncFIB'])],
+                              installed=['ncbi', 'plasmidfinder'])
+    forbidden = {'distance', 'threshold', 'similarity', 'cluster', 'score', 'snp',
+                 'allele_differences'}
+    assert not forbidden & set(payload)
+    headings = {str(name).casefold() for table in payload['tables'].values()
+                for name in table['columns']}
+    assert not forbidden & headings
+
+
+def test_the_headline_counts_the_assayed_isolates_against_the_whole_cohort():
+    payload = plasmid_payload([payload_entry('a', replicons=['IncFIB']),
+                               payload_entry('b', status='not_run', reason='Not run.')],
+                              installed=['ncbi', 'plasmidfinder'])
+    assert payload['denominator'] == 1 and payload['isolate_count'] == 2
+    assert '1 of 2 isolate(s)' in payload['headline']
+    assert payload['tables']['isolates_not_assayed']['rows'][0][0] == 'B'
+
+
+def test_a_cohort_with_no_plasmid_database_says_so_before_any_table_is_read():
+    payload = plasmid_payload([payload_entry('a', databases=['ncbi'])], installed=['ncbi'])
+    assert payload['database']['status'] == 'not_installed'
+    assert 'never asked' in payload['headline']
+
+
+def test_building_the_payload_is_cancellable():
+    with pytest.raises(AnalysisCancelled):
+        plasmid_payload([payload_entry('a')], cancelled=lambda: True)
+
+
+def test_a_payload_entry_without_an_identifier_is_refused_rather_than_merged():
+    with pytest.raises(ValueError, match='sample_id'):
+        plasmid_payload([{'plasmid_hypotheses': {'status': 'completed'}}])
 
 
 def test_the_backbone_floor_is_a_stated_constant_not_a_hidden_rule():

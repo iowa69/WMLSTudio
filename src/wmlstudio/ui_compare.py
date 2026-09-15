@@ -41,7 +41,9 @@ from PySide6.QtWidgets import (
 
 from wmlstudio.comparison import forest_from_distances, pairwise_distances
 from wmlstudio.context_menus import TableWidgetAdapter
+from wmlstudio.dendrogram import DendrogramPanel
 from wmlstudio.graph_window import GraphWindow
+from wmlstudio.hierarchical import build_tree
 from wmlstudio.identification import cached_scheme, scheme_organism
 from wmlstudio.investigation import (
     DIFF_ROW_FIELDS,
@@ -65,6 +67,7 @@ from wmlstudio.project import CGMLST_LOCUS_FLOOR
 from wmlstudio.project import typing_kind as stored_typing_kind
 from wmlstudio.sample_workflow import current_input_sha256, hydra_evidence_status
 from wmlstudio.sequence import AnalysisCancelled, SequenceReader, check_cancelled, file_sha256
+from wmlstudio.threshold_guidance import operational_cutoffs, suggested_threshold
 from wmlstudio.ui_cgmlst import CgmlstCallsPanel
 from wmlstudio.ui_common import FlowLayout, cell, gene_names, make_table, organism_for
 from wmlstudio.widgets import TreeView, button, label, render_side_by_side
@@ -335,6 +338,54 @@ class ComparisonWorker(QThread):
         try:
             payload = _calculate_comparison(self.project, self.request, self.cancel_event.is_set)
             self.succeeded.emit(self.generation, payload)
+        except AnalysisCancelled:
+            pass
+        except Exception as error:
+            self.failed.emit(self.generation, str(error))
+
+
+def _build_dendrogram(rows, labels, linkage, scale_caption, typing_kind, cancelled=None):
+    """One hierarchical tree from the pairwise rows this comparison already produced.
+
+    The typing kind is stamped onto every row so the core's own guard against
+    mixing quantities has something to check: a seven-locus distance and a
+    core-genome distance must never be clustered into one tree. Nothing else is
+    added, and an uncomparable row stays uncomparable rather than becoming a zero.
+    """
+    tagged = ({'source': row['source'], 'target': row['target'],
+               'comparable': bool(row.get('comparable')), 'distance': row.get('distance'),
+               'reason': row.get('reason', ''), 'typing_kind': typing_kind} for row in rows)
+    return build_tree(tagged, linkage=linkage, labels=labels, missing='refuse',
+                      scale_caption=scale_caption, cancelled=cancelled)
+
+
+class DendrogramWorker(QThread):
+    """Cluster off the GUI thread: a 300-isolate cohort takes about three seconds.
+
+    It follows ComparisonWorker exactly — a generation number so a superseded
+    build is discarded rather than drawn, and a cancel flag the core checks — and
+    it touches no widget, only plain rows in and one plain dict out.
+    """
+
+    succeeded = Signal(int, object)
+    failed = Signal(int, str)
+
+    def __init__(self, rows, labels, *, linkage, scale_caption, typing_kind, generation,
+                 parent=None):
+        super().__init__(parent)
+        self.rows, self.labels = rows, labels
+        self.linkage, self.scale_caption, self.typing_kind = linkage, scale_caption, typing_kind
+        self.generation = generation
+        self.cancel_event = threading.Event()
+
+    def cancel(self):
+        self.cancel_event.set()
+
+    def run(self):
+        try:
+            tree = _build_dendrogram(self.rows, self.labels, self.linkage, self.scale_caption,
+                                     self.typing_kind, self.cancel_event.is_set)
+            self.succeeded.emit(self.generation, tree)
         except AnalysisCancelled:
             pass
         except Exception as error:
@@ -1263,6 +1314,7 @@ class ComparisonWorkspaceMixin:
         self.advanced_panel.hide()
         content.addWidget(self.advanced_panel)
         content.addWidget(self._build_guidance_row())
+        content.addWidget(self._build_operational_row())
         for text, method, default in [("Labels", "set_labels_visible", True), ("ST", "set_show_st", True),
                                       ("Edge distances", "set_edge_labels_visible", True),
                                       ("Merge identical", "set_merge_identical", False), ("Cluster halos", "set_halos_visible", True)]:
@@ -1317,6 +1369,21 @@ class ComparisonWorkspaceMixin:
         self.current_caption.hide()
         tabs.addTab(self.graph_split, "Graph")
         tabs.addTab(self.cluster_table, 'Groups')
+        # The same distances drawn as a dendrogram, with its own linkage and its
+        # own cut. It is built off the GUI thread and only for the tab that shows
+        # it, because a 300-isolate cohort is about three seconds of work.
+        self.dendrogram = DendrogramPanel()
+        self.dendrogram_linkage = self.dendrogram.linkage
+        self.dendrogram_worker = None
+        self._dendrogram_cache = None
+        self._dendrogram_generation = 0
+        self.dendrogram.linkageChanged.connect(self._dendrogram_linkage_chosen)
+        self.dendrogram.cutAdopted.connect(self.adopt_dendrogram_cut)
+        tabs.addTab(self.dendrogram, 'Dendrogram')
+        tabs.setTabToolTip(tabs.indexOf(self.dendrogram),
+                           'Hierarchical clustering of this comparison, on its own scale.\n'
+                           'A dendrogram is a summary of the distance rows and of nothing else.\n'
+                           + SCALE_SEPARATION)
         self.profile_table = QTableView()
         self.profile_model = EvidenceMatrixModel(self.profile_table)
         self.profile_table.setModel(self.profile_model)
@@ -1440,6 +1507,118 @@ class ComparisonWorkspaceMixin:
         tabs = getattr(self, 'graph_tabs', None)
         if tabs is not None and tabs.widget(index) is self.cgmlst_calls:
             self.cgmlst_calls.refresh_references()
+        if tabs is not None and tabs.widget(index) is getattr(self, 'dendrogram', None):
+            self.refresh_dendrogram(force=True)
+
+    # --- hierarchical clustering --------------------------------------------
+    def dendrogram_scale_caption(self):
+        """What the dendrogram's height axis measures, in the comparison's own words."""
+        snapshot = self._current_snapshot or {}
+        return snapshot.get('scale_caption') or typing_scale(
+            self._last_comparison or [], self.typing_kind)['caption']
+
+    def _dendrogram_linkage_chosen(self, linkage):
+        """Each linkage is a different tree, so the choice is stored per typing view."""
+        self.project.set_setting(self._kind_setting('linkage'), str(linkage))
+        self._dendrogram_cache = None
+        self.refresh_dendrogram(force=True)
+
+    def adopt_dendrogram_cut(self, height):
+        """Take a single-linkage cut as the page's Group ≤, so one number drives both lists.
+
+        Only the panel's single-linkage button reaches here, because Group ≤ keeps
+        every pair within that many differences in one component, which is exactly
+        a single-linkage cut and is not what a complete or average cut produces.
+        """
+        value = max(0, int(height))
+        if value == self.cluster_threshold.value():
+            return
+        self.cluster_threshold.setValue(value)
+        self.notify(f'Group ≤ is now {value}, so the Groups tab and the dendrogram cut are one '
+                    'single-linkage number again. It is a local setting, not a published cutoff.')
+
+    def refresh_dendrogram(self, force=False):
+        """Cluster the comparison on screen and draw it, off the GUI thread when large.
+
+        The tree is built only while its own tab is in front: it is seconds of work
+        on a large cohort, and nobody reading the graph should pay for it. When it
+        cannot be built the panel says so, because an empty picture must never be
+        readable as "nothing was found".
+        """
+        if not hasattr(self, 'dendrogram') or self._comparison_closing:
+            return
+        if not force and self.graph_tabs.currentWidget() is not self.dendrogram:
+            return
+        results = list(self._last_comparison or [])
+        self._dendrogram_generation += 1
+        if not results:
+            self.dendrogram.show_message(
+                f'No {self.typing_view_title()} comparison is built, so nothing was clustered. '
+                'This is an analysis that has not been run, not a finding that these isolates '
+                'are unrelated.')
+            return
+        linkage = self.dendrogram.selected_linkage()
+        labels = sorted({str(result['sample_id']) for result in results})
+        key = (str(self.project.path), self.typing_kind, linkage, tuple(labels),
+               self.overlap.value(), len(self.distance_rows))
+        if self._dendrogram_cache and self._dendrogram_cache[0] == key:
+            self._show_dendrogram(self._dendrogram_cache[1])
+            return
+        if self.dendrogram_worker and self.dendrogram_worker.isRunning():
+            self.dendrogram_worker.cancel()
+        rows, caption = list(self.distance_rows), self.dendrogram_scale_caption()
+        if len(labels) <= 30:
+            try:
+                tree = _build_dendrogram(rows, labels, linkage, caption, self.typing_kind)
+            except Exception as error:
+                self.dendrogram.show_message('This cohort could not be clustered: ' + str(error))
+                return
+            self._dendrogram_cache = (key, tree)
+            self._show_dendrogram(tree)
+            return
+        self.dendrogram.show_message(
+            f'Clustering {len(labels)} isolates by {linkage} linkage in the background… '
+            'Nothing is drawn until it finishes.')
+        worker = DendrogramWorker(rows, labels, linkage=linkage, scale_caption=caption,
+                                  typing_kind=self.typing_kind,
+                                  generation=self._dendrogram_generation, parent=self)
+        self.dendrogram_worker = worker
+        worker.succeeded.connect(lambda generation, tree: self._dendrogram_ready(generation, key, tree))
+        worker.failed.connect(self._dendrogram_failed)
+        worker.finished.connect(lambda: self._dendrogram_finished(worker))
+        worker.start()
+
+    def _show_dendrogram(self, tree):
+        """Draw the tree beside the Groups tab's own list, each named for its method."""
+        snapshot = self._current_snapshot or {}
+        names = {str(result['sample_id']): str(result.get('sample_name') or result['sample_id'])
+                 for result in (self._last_comparison or [])}
+        self.dendrogram.show_tree(
+            tree, names=names,
+            comparison={'threshold': self.cluster_threshold.value(),
+                        'groups': [list(map(str, group['members']))
+                                   for group in snapshot.get('groups', [])]},
+            # The cut opens on the page's own Group ≤ so the two lists start as one
+            # list; dragging it is then a deliberate move away from that number,
+            # and the notes under the picture say which method produced which list.
+            cut=float(self.cluster_threshold.value()))
+
+    def _dendrogram_ready(self, generation, key, tree):
+        if self._comparison_closing or generation != self._dendrogram_generation:
+            return
+        self._dendrogram_cache = (key, tree)
+        self._show_dendrogram(tree)
+
+    def _dendrogram_failed(self, generation, message):
+        if generation == self._dendrogram_generation and not self._comparison_closing:
+            self.dendrogram.show_message('This cohort could not be clustered: ' + message)
+
+    def _dendrogram_finished(self, worker):
+        if self.dendrogram_worker is worker:
+            self.dendrogram_worker = None
+        worker.deleteLater()
+        if self._comparison_closing:
+            QTimer.singleShot(0, self.close)
 
     def show_cgmlst_tree(self, sample_ids=None):
         """Show the cgMLST tree, optionally for exactly the isolates of the calls table.
@@ -1502,6 +1681,129 @@ class ComparisonWorkspaceMixin:
         row.hide()
         return row
 
+    # --- this installation's own operational cutoff -------------------------
+    def _build_operational_row(self):
+        """A locally declared cutoff, shown as a local one and never as evidence.
+
+        It is deliberately a second row rather than a second message in the
+        published-guidance banner: everything that reads that banner prints a
+        citation beside the number, and there is no citation to print here. A
+        number somebody declared for their own laboratory travels on its own line,
+        with its own words, so it can never be read as a published cutoff.
+        """
+        row = QWidget()
+        layout = QHBoxLayout(row)
+        layout.setContentsMargins(0, 0, 0, 0)
+        self.operational_banner = label('', 'small', True)
+        layout.addWidget(self.operational_banner, 1)
+        self.operational_button = button('Where this number comes from…',
+                                         self.show_operational_cutoff)
+        layout.addWidget(self.operational_button)
+        self.operational_row = row
+        self._operational_cutoff = {}
+        self._operational_notice = ''
+        self._operational_seeded = ''
+        row.hide()
+        return row
+
+    def cohort_organism(self):
+        """The one taxon this cohort states for itself, or '' when it states more than one.
+
+        A local cutoff is bound to an exact taxon, so a mixed cohort gets none
+        rather than the cutoff of whichever organism happens to be commonest.
+        """
+        names = {' '.join(str(result.get('organism') or '').split())
+                 for result in (self._last_comparison or [])}
+        names.discard('')
+        return next(iter(names)) if len(names) == 1 else ''
+
+    def refresh_operational_cutoff(self):
+        """Offer this installation's own cutoff for this exact scheme, saying whose it is."""
+        if not hasattr(self, 'operational_row'):
+            return
+        snapshot = self._current_snapshot or {}
+        organism, targets = self.cohort_organism(), snapshot.get('target_loci')
+        rows = (operational_cutoffs(organism, self.typing_kind, locus_count=targets)
+                if organism and targets else [])
+        self._operational_cutoff = rows[0] if rows else {}
+        self._operational_notice = ''
+        if not rows:
+            self.operational_row.hide()
+            self._refresh_threshold_units()
+            return
+        cutoff = rows[0]
+        self._operational_notice = self._operational_paragraph(cutoff, organism, targets)
+        seeded = self._seed_operational_threshold(cutoff)
+        value, mine = self.cluster_threshold.value(), int(cutoff['operational_threshold'])
+        headline = (f"Your own operational cutoff for {cutoff['organism']}: at most {mine} "
+                    f"{cutoff['unit']} over {cutoff['locus_count']} targets. It is this "
+                    "installation's own rule; no publication reviewed here establishes it.")
+        if seeded or (self._operational_seeded == cutoff['id'] and value == mine):
+            state = (f'Group ≤ was seeded from it and reads {mine}. It is reported everywhere as '
+                     'your own setting, never as a published cutoff.')
+        elif value == mine:
+            state = (f'Group ≤ is set to {mine}, which is this number, as your own setting and '
+                     'not as published evidence.')
+        else:
+            state = (f'Group ≤ is currently {value}, so this cutoff is offered here and is not '
+                     'applied.')
+        self.operational_banner.setText(headline + ' ' + state)
+        self.operational_banner.setToolTip('\n\n'.join(filter(None, [
+            headline, state, self._operational_notice, SCALE_SEPARATION])))
+        self.operational_row.show()
+        self._refresh_threshold_units()
+
+    def _operational_paragraph(self, cutoff, organism, targets):
+        """The catalog's own paragraph about this number, including what it departs from."""
+        try:
+            payload = suggested_threshold(organism, self.typing_kind, locus_count=targets)
+        except Exception:
+            payload = {}
+        return payload.get('operational_notice') or ' '.join(filter(None, [
+            cutoff.get('notice', ''), cutoff.get('provenance', ''), cutoff.get('trade_off', '')]))
+
+    def _seed_operational_threshold(self, cutoff):
+        """Put the number in the Group ≤ box once, and only into a box nobody has set.
+
+        The cutoff's own notice says it is not applied until somebody sets it, so a
+        threshold this view already carries is never overwritten: only the untouched
+        default is seeded, the seeding is recorded so it happens once per project,
+        and the banner beside the box says what was put there and whose number it is.
+        """
+        marker = self._kind_setting('operational_seed')
+        if self.project.get_setting(marker, '') == cutoff['id']:
+            return False
+        stored = self.project.get_setting(self._kind_setting('threshold'), None)
+        self.project.set_setting(marker, cutoff['id'])
+        if stored is not None:
+            return False
+        value = int(cutoff['operational_threshold'])
+        self._operational_seeded = cutoff['id']
+        self.cluster_threshold.blockSignals(True)
+        self.cluster_threshold.setValue(value)
+        self.cluster_threshold.blockSignals(False)
+        self.project.set_setting(self._kind_setting('threshold'), value)
+        # The groups on screen were grouped with the old number, so the page is
+        # built again rather than left showing a threshold its picture never used.
+        QTimer.singleShot(0, self.refresh_comparison)
+        return True
+
+    def show_operational_cutoff(self):
+        """Print the whole notice, because the banner has room for its first claim only."""
+        cutoff = self._operational_cutoff or {}
+        if not cutoff:
+            self.notify('No locally declared cutoff is bound to this reference and target count.')
+            return
+        QMessageBox.information(
+            self, 'Your own operational cutoff',
+            '\n\n'.join(filter(None, [
+                f"{cutoff['organism']} · at most {cutoff['operational_threshold']} "
+                f"{cutoff['unit']} on {cutoff['scheme_key']} over {cutoff['locus_count']} targets.",
+                self._operational_notice,
+                f"Declared by: {cutoff.get('declared_by', '')}",
+                f"Declared on: {cutoff.get('declared_on', '')}",
+                cutoff.get('review_note', ''), SCALE_SEPARATION])))
+
     def set_advanced_visible(self, shown):
         """Open or close the rarely-used graph controls; nothing else changes."""
         shown = bool(shown)
@@ -1528,6 +1830,9 @@ class ComparisonWorkspaceMixin:
         self.project.set_setting(self._kind_setting('overlap', kind), self.overlap.value())
         self.project.set_setting(self._kind_setting('scheme', kind), self.compare_scheme.currentData() or '')
         self.project.set_setting(self._kind_setting('investigation', kind), self.active_investigation_id)
+        if hasattr(self, 'dendrogram'):
+            self.project.set_setting(self._kind_setting('linkage', kind),
+                                     self.dendrogram.selected_linkage())
 
     def _load_kind_state(self):
         """Restore this view's own settings. Defaults are never inherited across kinds."""
@@ -1541,6 +1846,16 @@ class ComparisonWorkspaceMixin:
                 control.setValue(default)
             control.blockSignals(False)
         self.threshold_evidence = {}
+        # A linkage, like a threshold, belongs to one typing view: the two trees
+        # are different quantities and neither inherits the other's choice.
+        if hasattr(self, 'dendrogram'):
+            # Single linkage by default, because the Groups tab already groups by
+            # single linkage: the page opens with one rule, and choosing another
+            # linkage is then a deliberate move to a second method.
+            self.dendrogram.set_linkage(
+                self.project.get_setting(self._kind_setting('linkage'), 'single'))
+            self._dendrogram_cache = None
+            self._operational_seeded = ''
         self._refresh_threshold_units()
 
     def _restore_kind_scheme(self):
@@ -1567,11 +1882,19 @@ class ComparisonWorkspaceMixin:
         word = TYPING_SCALES.get(self.typing_kind, TYPING_SCALES['unclassified'])['target_word']
         self.cluster_threshold.setSuffix(f' of {targets} {word}' if targets else ' differences')
         suggestion = self._threshold_suggestion or {}
+        cutoff = getattr(self, '_operational_cutoff', {}) or {}
         self.cluster_threshold.setToolTip('\n'.join(filter(None, [
             f'Single-linkage link threshold for the {self.typing_view_title()} tree'
             + (f' ({scale}).' if scale else '.'),
+            'The Groups tab and a single-linkage dendrogram cut at this height are the same rule.',
             'A local protocol parameter, not a universal clinical cutoff.',
-            suggestion.get('headline', ''), suggestion.get('reason', ''), SCALE_SEPARATION])))
+            suggestion.get('headline', ''), suggestion.get('reason', ''),
+            # Whose number is in the box is part of what the box means, so it is
+            # said here too and never left to the banner alone.
+            (f"Your own operational cutoff for {cutoff['organism']} is "
+             f"{cutoff['operational_threshold']} {cutoff['unit']}; it is a local rule with no "
+             "publication behind it." if cutoff else ''),
+            getattr(self, '_operational_notice', ''), SCALE_SEPARATION])))
 
     def _refresh_typing_menu(self):
         if not hasattr(self, 'typing_menu'):
@@ -1898,6 +2221,13 @@ class ComparisonWorkspaceMixin:
         self.refresh_statistics([], [])
         self.refresh_cluster_table()
         self.refresh_threshold_suggestion()
+        self.refresh_operational_cutoff()
+        if hasattr(self, 'dendrogram'):
+            self._dendrogram_cache = None
+            self._dendrogram_generation += 1
+            self.dendrogram.show_message(
+                'No comparison is built, so nothing was clustered. This is an analysis that has '
+                'not been run, not a finding that these isolates are unrelated.')
 
     def clear_compare_tab(self):
         """Start this tab again: empty cohort, no filters, no drawn trees, no table.
@@ -2011,10 +2341,17 @@ class ComparisonWorkspaceMixin:
         self._comparison_generation += 1
         self._comparison_timer.stop()
         self._comparison_pending = None
+        self._dendrogram_generation += 1
+        running = False
         if self.comparison_worker and self.comparison_worker.isRunning():
             self.comparison_worker.cancel()
-            return False
-        return True
+            running = True
+        # Clustering reads the same rows and must be finished with before the
+        # project database closes underneath it, exactly like the comparison.
+        if self.dendrogram_worker and self.dendrogram_worker.isRunning():
+            self.dendrogram_worker.cancel()
+            running = True
+        return not running
 
     def _apply_comparison(self, payload):
         results, edges = payload['results'], payload['edges']
@@ -2088,6 +2425,8 @@ class ComparisonWorkspaceMixin:
             self.refresh_baseline_graph()
             self.refresh_graph_captions()
             self.refresh_threshold_suggestion()
+            self.refresh_operational_cutoff()
+            self.refresh_dendrogram()
         except Exception as exc:
             self.tree_status.setText(str(exc))
 

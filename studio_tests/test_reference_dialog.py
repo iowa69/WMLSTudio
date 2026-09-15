@@ -11,6 +11,12 @@ from wmlstudio.reference_dialog import ReferenceManagerDialog
 from wmlstudio.sequence import check_cancelled
 
 KLEBSIELLA = "cgmlst.org:kpneumoniae-2358"
+# The two organisms for which the catalogue pins more than one target set: a core
+# set with an accessory set beside it, and a family of four including a pan-genome
+# set. They are what makes "cgMLST or cgMLST plus accessory genes" a real choice.
+ANTHRACIS_CORE = "pubmlst:banthracis-cgmlst-3803"
+ANTHRACIS_ACCESSORY = "pubmlst:banthracis-accessory-1263"
+GONOCOCCUS_PANGENOME = "pubmlst:ngonorrhoeae-pgmlst-1907"
 
 
 def install_scheme(folder, *, targets=40, organism="Klebsiella pneumoniae", name="Kp cgMLST",
@@ -186,7 +192,13 @@ def test_a_cgmlst_scheme_downloaded_into_the_classical_folder_is_moved_and_named
 
 
 def test_a_core_and_an_accessory_set_are_an_explicit_choice_and_one_set_is_stated_plainly(
-        qtbot, tmp_path, monkeypatch):
+        qtbot, tmp_path):
+    """One set pinned must read as an answer, two as a choice a person can reach.
+
+    An organism with a single catalogued set said so in words. An organism with a
+    core set and an accessory set beside it must offer both, because running
+    cgMLST and running cgMLST plus accessory genes are two different runs.
+    """
     dialog = open_dialog(qtbot, tmp_path)
     page = dialog.pages["cgmlst"]
     page.query.setText("Klebsiella pneumoniae")
@@ -197,22 +209,143 @@ def test_a_core_and_an_accessory_set_are_an_explicit_choice_and_one_set_is_state
     assert page.variant.count() == 1 and not page.variant.isEnabled()
     assert "Only a core target set is catalogued" in page.variant_note.text()
 
-    core = cgmlst_schemes.entry_for(KLEBSIELLA)
-    accessory = {**core, "key": "cgmlst.org:kpneumoniae-accessory-900",
-                 "target_set": "accessory", "locus_count": 900,
-                 "scheme_name": "Klebsiella pneumoniae accessory set",
-                 "title": "Klebsiella pneumoniae · accessory set · 900 targets · cgMLST.org"}
-    monkeypatch.setattr(cgmlst_schemes, "scheme_variants", lambda *args, **kwargs: {
-        "organism": "Klebsiella pneumoniae", "group": core["scheme_group"], "core": [core],
-        "accessory": [accessory], "has_core": True, "has_accessory": True,
-        "message": "They are different quantities: a distance from one never shares a scale."})
-    page.show_entry()
+    page.query.setText("Bacillus anthracis")
+    assert page.select_row_id("key:" + ANTHRACIS_CORE)
 
     assert page.variant.isEnabled() and page.variant.count() == 2
-    assert page.variant.itemText(0).startswith("Core target set — ")
-    assert page.variant.itemText(1).startswith("Accessory / whole-genome set — ")
-    assert page.variant.currentData() == KLEBSIELLA
-    assert "different quantities" in page.variant_note.text()
+    assert page.variant.itemText(0) == ("Core target set — 3803 targets — B. anthracis cgMLST · "
+                                        "PubMLST (University of Oxford)")
+    assert page.variant.itemText(1).startswith("Accessory target set — 1263 targets — ")
+    assert page.variant.currentData() == ANTHRACIS_CORE
+    assert [page.variant.itemData(index) for index in range(2)] == \
+        [ANTHRACIS_CORE, ANTHRACIS_ACCESSORY]
+
+    note = page.variant_note.text()
+    assert "1 core and 1 accessory target set(s) are catalogued" in note
+    assert "DIFFERENT QUANTITIES" in note
+    assert "never shares a scale, an axis or a threshold" in note
+    assert "not offered for a core-plus-accessory run" in note
+    assert "not comparable at all" in note
+    assert "Type every isolate of one comparison against the set you choose here." in note
+    # And what each set is for, so the choice is made on what they measure.
+    assert "expected in every isolate" in note
+    assert "biology and not a failed call" in note
+
+
+def test_choosing_the_accessory_set_in_the_menu_selects_that_scheme_and_not_the_core_one(
+        qtbot, tmp_path):
+    """The menu was inert: it listed the sets but choosing one changed nothing."""
+    dialog = open_dialog(qtbot, tmp_path)
+    page = dialog.pages["cgmlst"]
+    page.query.setText("Bacillus anthracis")
+    assert page.select_row_id("key:" + ANTHRACIS_CORE)
+
+    page.choose_variant(page.variant.findData(ANTHRACIS_ACCESSORY))
+
+    row = page.selected_row()
+    assert row["key"] == ANTHRACIS_ACCESSORY and row["count"] == 1263
+    assert row["target_set_detail"] == "accessory"
+
+
+def test_every_catalogued_target_set_for_one_organism_is_offered_with_its_own_target_count(
+        qtbot, tmp_path):
+    """Four gonococcal sets: two cores, an accessory set and a pan-genome set.
+
+    The reported bug was that the choice could not be reached at all. A menu that
+    lists every set, each with the number of targets it holds, is the difference
+    between choosing a run and discovering afterwards which one was made.
+    """
+    dialog = open_dialog(qtbot, tmp_path)
+    page = dialog.pages["cgmlst"]
+    page.query.setText("Neisseria gonorrhoeae")
+    assert page.select_row_id("key:" + GONOCOCCUS_PANGENOME)
+
+    assert page.variant.isEnabled()
+    assert [page.variant.itemText(index) for index in range(page.variant.count())] == [
+        "Core target set — 1430 targets — N. gonorrhoeae cgMLST v2 · PubMLST (University of Oxford)",
+        "Core target set — 1649 targets — N. gonorrhoeae cgMLST v1.0 · "
+        "PubMLST (University of Oxford)",
+        "Accessory target set — 251 targets — N. gonorrhoeae agMLST v1.0 · "
+        "PubMLST (University of Oxford)",
+        "Whole-genome set (core + accessory) — 1907 targets — N. gonorrhoeae pgMLST v1.0 · "
+        "PubMLST (University of Oxford)"]
+    assert page.variant.currentData() == GONOCOCCUS_PANGENOME
+    note = page.variant_note.text()
+    assert "2 core, 1 accessory and 1 whole-genome target set(s) are catalogued" in note
+    assert "Run it instead of a core scheme, never beside one" in note
+
+
+def test_a_pan_genome_scheme_is_labelled_whole_genome_and_never_core(qtbot, tmp_path):
+    """It read 'Not recorded' beside two core sets, which invited reading it as one.
+
+    A 1,907-target pan-genome distance is not a cgMLST distance. The column that
+    names the target set must say which set each row is, in the same words the
+    catalogue uses, or the one row that must not be mistaken for a core scheme is
+    the one row that carries no label.
+    """
+    dialog = open_dialog(qtbot, tmp_path)
+    page = dialog.pages["cgmlst"]
+    page.query.setText("Neisseria gonorrhoeae")
+
+    column = page.COLUMNS["cgmlst"].index("Target set")
+    labelled = {int(page.table.item(index, 2).text()): page.table.item(index, column).text()
+                for index in range(page.table.rowCount())}
+    assert labelled == {1430: "Core", 1649: "Core", 251: "Accessory", 1907: "Whole genome"}
+
+
+def test_a_core_set_and_a_core_plus_accessory_set_stay_separate_all_the_way_down(qtbot, tmp_path):
+    """Two isolates typed against different target sets are not comparable.
+
+    So the two sets must stay distinguishable everywhere a result can be traced
+    back to a scheme: a different catalogue key, a different install folder, a
+    different pinned target list, and no cutoff carried across.
+    """
+    dialog = open_dialog(qtbot, tmp_path)
+    page = dialog.pages["cgmlst"]
+    page.query.setText("Bacillus anthracis")
+    rows = {row["key"]: row for row in page.visible}
+
+    core, accessory = rows[ANTHRACIS_CORE], rows[ANTHRACIS_ACCESSORY]
+    assert core["row_id"] != accessory["row_id"]
+    assert core["location"] != accessory["location"], "one folder could not hold both"
+    assert (core["count"], accessory["count"]) == (3803, 1263)
+
+    pins = {cgmlst_schemes.entry_for(key)["target_list_sha256"]
+            for key in (ANTHRACIS_CORE, ANTHRACIS_ACCESSORY)}
+    assert len(pins) == 2, "the two target lists are pinned apart, not by count alone"
+
+    # The published five-allele cutoff was derived on the core set. It is not
+    # offered for the accessory set, and the accessory row says why in so many words.
+    assert cgmlst_schemes.threshold_for(ANTHRACIS_ACCESSORY)["threshold"] is None
+    page.select_row_id(accessory["row_id"])
+    detail = page.notice.toPlainText()
+    assert "Target set: Accessory · 1263 targets." in detail
+    assert "the core cutoff is not offered for it" in detail
+    assert "never added together into one number" in detail
+    assert "ACCESSORY target set, not a cgMLST scheme" in detail
+
+
+def test_a_scheme_found_online_reports_its_target_set_as_unrecorded_rather_than_core(
+        qtbot, tmp_path):
+    """A search result says nothing about its target set, so neither may the column.
+
+    Rendering an unlabelled set as 'Core' would turn "we do not know" into "this is
+    the core genome", which is the one reading that lets a pan-genome scheme be
+    compared against a core cutoff.
+    """
+    found = {"id": "PubMLST:ng:81", "name": "pgMLST v1.0", "organism": "Neisseria gonorrhoeae",
+             "locus_count": 1907, "type": "cgMLST", "last_updated": "2026-09-15",
+             "url": "https://rest.pubmlst.org/db/pubmlst_neisseria_seqdef/schemes/81",
+             "access_notice": ""}
+    dialog = open_dialog(qtbot, tmp_path, Catalog(schemes=[found]))
+    dialog.query.setText("Neisseria gonorrhoeae")
+    dialog.search()
+    qtbot.waitUntil(lambda: bool(dialog.pages["cgmlst"].online), timeout=3000)
+
+    page = dialog.pages["cgmlst"]
+    online = [row for row in page.rows if row["state"] == "online"]
+    assert [row["target_set"] for row in online] == [""]
+    assert reference_dialog._target_set_words(online[0]) == "Not recorded"
 
 
 def test_another_providers_scheme_for_the_same_organism_is_named_but_never_offered_as_a_variant(
@@ -230,6 +363,73 @@ def test_another_providers_scheme_for_the_same_organism_is_named_but_never_offer
     assert "1 other cgMLST scheme(s) are catalogued for this organism" in note
     assert "2133 targets" in note and "PubMLST" in note
     assert "never share a distance, an axis or a cutoff" in note
+
+
+def test_the_library_summary_names_the_organisms_that_have_more_than_one_target_set(
+        qtbot, tmp_path):
+    """The choice was invisible until the right row happened to be selected.
+
+    A person who does not already know that B. anthracis has an accessory set has
+    no way of discovering that the greyed-out menu ever lights up.
+    """
+    dialog = open_dialog(qtbot, tmp_path)
+    summary = dialog.pages["cgmlst"].summary.text()
+
+    assert "More than one target set is catalogued for " in summary
+    assert "Bacillus anthracis" in summary and "Neisseria gonorrhoeae" in summary
+    # Two core schemes from one provider are two schemes, not two target sets.
+    assert "Salmonella enterica" not in summary
+    assert "the accessory or whole-genome set beside it" in summary
+    assert "More than one target set" not in dialog.pages["mlst"].summary.text()
+
+
+def test_an_installed_scheme_offers_its_own_providers_target_sets_and_no_one_elses(qtbot, tmp_path):
+    """An installed scheme recorded no scheme family, so the menu fell back to the
+    organism and offered a different provider's core scheme as if it were the
+    accessory half of this one. Two providers' core schemes for one organism are
+    two schemes, not two target sets of one."""
+    install_scheme(tmp_path / "cgmlst" / "Acinetobacter_baumannii__pubmlst_2133",
+                   organism="Acinetobacter baumannii", name="cgMLST v1", source="PubMLST",
+                   api="https://rest.pubmlst.org/db/pubmlst_abaumannii_seqdef/schemes/3")
+    dialog = open_dialog(qtbot, tmp_path)
+    page = dialog.pages["cgmlst"]
+    page.query.setText("Acinetobacter baumannii")
+    installed = next(row for row in page.visible if row["state"] == "installed")
+    page.select_row_id(installed["row_id"])
+
+    assert installed["key"] == "pubmlst:abaumannii-cgmlst-2133"
+    assert [page.variant.itemData(index) for index in range(page.variant.count())] == \
+        ["pubmlst:abaumannii-cgmlst-2133"]
+    assert not page.variant.isEnabled(), "there is one set, so there is nothing to choose"
+    note = page.variant_note.text()
+    assert "1 other cgMLST scheme(s) are catalogued for this organism" in note
+    assert "2390 targets · Core · cgMLST.org" in note
+    assert "never share a distance, an axis or a cutoff" in note
+
+
+def test_an_installed_scheme_that_records_no_target_set_says_so_instead_of_claiming_core(
+        qtbot, tmp_path):
+    """A folder that never said which set it holds must not be read as a core one.
+
+    "We did not look" rendering as "this is the core genome" is what would let a
+    hand-copied accessory or pan-genome folder be compared against a core cutoff.
+    """
+    folder = tmp_path / "cgmlst" / "Homebrew__unknown_40"
+    folder.mkdir(parents=True)
+    for index in range(40):
+        (folder / f"target{index:04d}.fasta").write_text(f">target{index:04d}_1\nACGT\n")
+    (folder / "scheme.json").write_text(json.dumps(
+        {"name": "homebrew", "organism": "Mystery organism", "locus_count": 40}))
+    dialog = open_dialog(qtbot, tmp_path)
+    page = dialog.pages["cgmlst"]
+    page.select_path(folder)
+    row = page.selected_row()
+
+    assert row["target_set"] == "" and row["target_set_detail"] == ""
+    column = page.COLUMNS["cgmlst"].index("Target set")
+    assert page.table.item(page.table.currentRow(), column).text() == "Not recorded"
+    assert "Target set: not recorded." in page.notice.toPlainText()
+    assert "cannot be read as a cgMLST core distance" in page.notice.toPlainText()
 
 
 def test_nothing_is_downloaded_until_the_providers_terms_are_confirmed(qtbot, tmp_path, monkeypatch):

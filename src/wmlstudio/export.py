@@ -292,6 +292,11 @@ def _count_words(value, unit='allele differences'):
     return f"{_display(value)} {singular if value == 1 else unit}"
 
 
+def _plural(count, singular, plural):
+    """A counted noun whose two forms are both written out, never guessed at."""
+    return _display(count) + ' ' + (singular if count == 1 else plural)
+
+
 def snapshot_organisms(snapshot, organisms=None):
     """The organism names this comparison actually covers, with no inference."""
     source = organisms if organisms is not None else [
@@ -357,6 +362,10 @@ def threshold_provenance(snapshot, organisms=None):
         'published_scheme': evidence.get('scheme_scope') or '',
         'published_locus_count': evidence.get('published_locus_count'),
         'scale_separation': SCALE_SEPARATION, 'suggestion': None, 'suggestion_blocked': '',
+        # A number the user declared as their laboratory's own rule is neither a
+        # publication nor an anonymous local setting, and a report must be able
+        # to say which of the three the threshold in force actually is.
+        'operational': [], 'operational_notice': '', 'operational_match': None,
     }
     if adopted:
         provenance['statement'] = (
@@ -373,7 +382,25 @@ def threshold_provenance(snapshot, organisms=None):
         # function can turn it into the threshold above. A snapshot measures
         # allele differences, so only allele-distance entries can be relevant;
         # on a classical-scale reference the catalog refuses to suggest at all.
-        provenance['suggestion'] = suggested_threshold(organism, 'cgmlst', locus_count=total_loci)
+        suggestion = suggested_threshold(organism, 'cgmlst', locus_count=total_loci)
+        if scale['kind'] == 'mlst' and suggestion['status'] != 'scale_mismatch':
+            # The catalog refuses on the target count; this refuses again on the
+            # kind the snapshot declares for itself. A core-genome number beside
+            # a comparison that calls itself classical MLST is the same mistake,
+            # whichever of the two said so first.
+            suggestion = {**suggestion, 'status': 'scale_mismatch', 'suggestion': None, 'newest': None,
+                          'alternatives': [], 'disagreement': '', 'operational': [], 'operational_notice': '',
+                          'headline': ('This comparison is recorded as ' + scale['label'] + ', so this catalog '
+                                       'suggests no cutoff for it. ' + SCALE_SEPARATION)}
+        provenance['suggestion'] = suggestion
+        provenance['operational'] = suggestion['operational']
+        provenance['operational_notice'] = suggestion['operational_notice']
+        # The threshold in force is this laboratory's declared rule only when it
+        # is that exact number on that exact target set. A near miss is a local
+        # setting like any other, and is printed as one.
+        provenance['operational_match'] = next(
+            (row for row in suggestion['operational']
+             if row.get('operational_threshold') == snapshot.get('threshold')), None)
     elif names:
         provenance['suggestion_blocked'] = (
             'These isolates are not all the same organism (' + ', '.join(names)
@@ -403,6 +430,41 @@ def _suggestion_html(suggestion):
     return parts
 
 
+def threshold_origin_html(provenance):
+    """Where the number in force came from, in the only three answers there are.
+
+    A published cutoff that was reviewed and adopted here prints its citation and
+    the authors' own caveat. A number the user declared as their laboratory's own
+    operational rule prints as theirs, with the sentence saying that no
+    publication reviewed here establishes it and with the published numbers it
+    departs from: a local rule that reads as published is the failure this block
+    exists to prevent. Anything else is a local setting with nothing behind it,
+    and says that too rather than saying nothing.
+    """
+    if provenance['source'] == 'adopted_publication':
+        parts = ['<p><b>Where this number comes from:</b> a published cutoff that was reviewed and adopted '
+                 'for this comparison — ' + _escape(provenance['citation'] or 'no citation recorded')
+                 + (' doi:' + _escape(provenance['doi']) if provenance['doi'] else '') + '.</p>']
+        if provenance['caveat']:
+            parts.append('<p class="notice"><b>The authors’ own caveat:</b> “'
+                         + _escape(provenance['caveat']) + '”</p>')
+        return ''.join(parts)
+    match = provenance.get('operational_match')
+    if not match:
+        return ('<p><b>Where this number comes from:</b> your own setting for this comparison. No published '
+                'cutoff is in force here and no declared operational rule matches it, so it carries no '
+                'citation and no validation.</p>')
+    return ('<p class="notice"><b>Where this number comes from: your own operational cutoff, never a '
+            'published one.</b> ' + _escape(provenance['operational_notice']) + '</p>'
+            + '<p class="muted">Declared on ' + _escape(match['declared_on']) + '. Who declared it: '
+            + _escape(match['declared_by']) + ' It is matched to this comparison by organism and full target '
+            'count only: it was declared for ' + _escape(match['scheme_key']) + ' over '
+            + _escape(match['locus_count']) + ' targets, and this comparison measured '
+            + _escape(provenance['total_loci']) + ' targets on “' + _escape(provenance['scheme'])
+            + '”. Check that those are the same reference before reading the groups below as the groups your '
+            'own rule produces.</p>')
+
+
 def threshold_provenance_html(snapshot, organisms=None):
     """The block that must sit beside any printed tree, cluster or distance."""
     return _provenance_html(threshold_provenance(snapshot, organisms))
@@ -419,6 +481,10 @@ def _provenance_html(provenance):
              + ' — <b>' + ('a published cutoff, reviewed and adopted here'
                            if adopted else 'your own setting, not a published cutoff') + '.</b></p>',
              '<p>' + _escape(provenance['statement']) + '</p>']
+    if not adopted:
+        # An adopted cutoff prints its citation in the block just below, so the
+        # origin block is added only where nothing else would state the origin.
+        parts.append(threshold_origin_html(provenance))
     if adopted or provenance['citation'] or provenance['doi']:
         parts.append('<p><b>Citation:</b> ' + _escape(provenance['citation'] or 'No citation recorded')
                      + (' doi:' + _escape(provenance['doi']) if provenance['doi'] else '')
@@ -681,7 +747,10 @@ def snp_section_html(payload, *, sample_ids=None):
     binding = payload.get('threshold') or {}
     parts.append('<p><b>Published SNP cutoff:</b> ' + _escape(binding.get('message') or 'none considered')
                  + '<br><b>Applied to this report:</b> none. No SNP threshold groups, colours or '
-                   'highlights anything in this document.</p>')
+                   'highlights anything in this document.'
+                 + '<br><b>The allele-difference cutoff used for the clusters elsewhere in this report is '
+                   'not applied to any number here.</b> A SNP distance is never grouped by an allele '
+                   'cutoff: the two are different quantities, measured over different denominators.</p>')
     if binding.get('link_threshold_warning'):
         parts.append('<p class="notice"><b>Grouping chosen in the SNP view:</b> '
                      + _escape(binding['link_threshold_warning']) + '</p>')
@@ -923,6 +992,179 @@ _GROUP_STATE_WORDS = {
 }
 
 
+# How close a link has to sit to the cutoff before the next step of the cutoff
+# would drop it. One allele difference is the smallest step anybody can take, so
+# a link within one of the threshold is a link that step breaks.
+_NEAR_LINK_MARGIN = 1
+
+# Clusters are highlighted in the picture, so they are highlighted in the table
+# that lists them too: the same green rule the sample overview marks a
+# user-defined group with, on the rows that are groups of two or more isolates.
+_CLUSTER_ROW_STYLE = ' style="border-left:5px solid #2F8A78;background:#f1f7ed"'
+
+
+def _near_the_cutoff(distance, threshold):
+    """A link close enough to the cutoff that one step of the cutoff would drop it."""
+    return distance >= 1 and distance >= threshold - _NEAR_LINK_MARGIN
+
+
+def _member_names(snapshot):
+    """Sample IDs to the names a reader recognises, from the snapshot's own profiles."""
+    return {str(profile.get('sample_id')): str(profile.get('sample_name') or profile.get('sample_id'))
+            for profile in snapshot.get('profiles') or ()}
+
+
+def cluster_linkage(snapshot, members):
+    """What actually holds one single-linkage group together at this threshold.
+
+    Single linkage joins two isolates that were never within the threshold of
+    each other, so a group is not a set of isolates that are all close: it is a
+    chain. This reports the chain — the largest direct distance inside the group,
+    how many member pairs carry no accepted distance at all, and whether the
+    group survives the removal of every link sitting within one allele difference
+    of the cutoff. A group that does not survive that is a group one step of the
+    threshold would dissolve, and a report that does not say so is how a document
+    accidentally asserts an outbreak.
+    """
+    threshold = snapshot.get('threshold')
+    ids = sorted({str(member) for member in members or ()})
+    empty = {'members': ids, 'accepted_pairs': 0, 'unassessed_pairs': 0, 'links': 0, 'near_links': 0,
+             'largest_link': None, 'max_direct_distance': None, 'chained': False,
+             'held_by_near_links': False}
+    if isinstance(threshold, bool) or not isinstance(threshold, int) or len(ids) < 2:
+        return empty
+    inside, accepted, links = set(ids), [], []
+    for pair in snapshot.get('pairs') or ():
+        source, target = str(pair.get('source')), str(pair.get('target'))
+        if source == target or source not in inside or target not in inside:
+            continue
+        distance = pair.get('distance')
+        if not pair.get('comparable') or isinstance(distance, bool) or not isinstance(distance, int):
+            continue
+        accepted.append(distance)
+        if distance <= threshold:
+            links.append((source, target, distance))
+    # Union-find over the links that are NOT near the cutoff: if those alone do
+    # not reach every member, the near ones are what hold the group together.
+    parent = {sid: sid for sid in ids}
+
+    def root(node):
+        while parent[node] != node:
+            parent[node] = parent[parent[node]]
+            node = parent[node]
+        return node
+
+    for source, target, distance in links:
+        if _near_the_cutoff(distance, threshold):
+            continue
+        parent[root(source)] = root(target)
+    near = [distance for _, _, distance in links if _near_the_cutoff(distance, threshold)]
+    # A member pair with no accepted distance was never measured; it is not a
+    # pair that was measured and found far apart.
+    total_pairs = len(ids) * (len(ids) - 1) // 2
+    return {'members': ids, 'accepted_pairs': len(accepted),
+            'unassessed_pairs': max(total_pairs - len(accepted), 0),
+            'links': len(links), 'near_links': len(near),
+            'largest_link': max((distance for _, _, distance in links), default=None),
+            'max_direct_distance': max(accepted, default=None),
+            'chained': bool(accepted) and max(accepted) > threshold,
+            'held_by_near_links': bool(near) and len({root(sid) for sid in ids}) > 1}
+
+
+def cluster_linkage_words(linkage, threshold):
+    """The sentences one group needs beside it, the sharpest one first."""
+    if len(linkage['members']) < 2:
+        return ('Nothing else came within the threshold of this isolate. That describes this cutoff and this '
+                'reference, not the isolate.')
+    parts = []
+    if linkage['chained']:
+        parts.append('Single linkage, and the chain shows: the two most distant members differ by '
+                     + _count_words(linkage['max_direct_distance']) + ', more than the cutoff of '
+                     + _count_words(threshold) + '. They are in one group because intermediate isolates link '
+                     'them, not because they were measured close to each other.')
+    if linkage['held_by_near_links']:
+        parts.append('Remove every link within ' + _count_words(_NEAR_LINK_MARGIN) + ' of the cutoff and this '
+                     'group falls apart: it is held together by links at the edge of the threshold, so a '
+                     'cutoff one step lower would not report it.')
+    if not parts:
+        parts.append('Every member is linked below the edge of the cutoff; the largest link inside the group '
+                     'is ' + _count_words(linkage['largest_link']) + '.')
+    if linkage['unassessed_pairs']:
+        parts.append(_plural(linkage['unassessed_pairs'], 'member pair carries', 'member pairs carry')
+                     + ' no accepted distance at all: unknown, never zero.')
+    return ' '.join(parts)
+
+
+def cluster_section_html(snapshot, *, sample_ids=None, heading='<h3>Clusters at this threshold</h3>'):
+    """Which isolates fall in which group at the threshold in force, and how many.
+
+    A highlighted picture is not a list. A reader cannot count groups off a
+    forest, cannot tell a group of three from three isolates drawn near each
+    other, and cannot see that a group is a chain. So the groups are written out
+    as well: members named, the isolates of this report counted inside them, and
+    the single-linkage chain stated for each one. Every number here is read back
+    out of the snapshot named at the end of the section and from nowhere else.
+    """
+    provenance = threshold_provenance(snapshot)
+    threshold = snapshot.get('threshold')
+    names = _member_names(snapshot)
+    focus = None if sample_ids is None else {str(value) for value in sample_ids}
+    groups = [group for group in snapshot.get('groups') or ()
+              if focus is None or focus.intersection({str(member) for member in group.get('members') or ()})]
+    parts = [heading]
+    if not groups:
+        parts.append('<p class="muted">Single linkage at this threshold put no isolate from this report in '
+                     'a group with another. That describes this threshold and this reference only; it is '
+                     'not a finding that the isolates are unrelated.</p>')
+        return ''.join(parts)
+    counts = {status: [group for group in groups if group.get('status') == status]
+              for status in ('cluster', 'singleton', 'not_comparable')}
+    parts.append('<p><b>' + _escape(_plural(len(counts['cluster']), 'group of two or more isolates',
+                                            'groups of two or more isolates'))
+                 + '</b> at a cutoff of at most ' + _escape(_count_words(threshold)) + ' on '
+                 + _escape(provenance['scheme']) + ' (' + _escape(provenance['total_loci']) + ' targets · '
+                 + _escape(provenance['typing']['label']) + '), beside '
+                 + _escape(_plural(len(counts['singleton']), 'isolate that linked to nothing else',
+                                   'isolates that linked to nothing else'))
+                 + ' and ' + _escape(_plural(len(counts['not_comparable']),
+                                             'isolate with no usable comparison',
+                                             'isolates with no usable comparison'))
+                 + '. Groups of two or more isolates are highlighted below, and where a picture is shown '
+                 'they are the groups highlighted in it.</p>')
+    parts.append('<table border="1" cellpadding="5" cellspacing="0"><tr>'
+                 + ''.join('<th>' + _escape(header) + '</th>' for header in
+                           ('Group · stable ID', 'State', 'Isolates in this group',
+                            'Isolates in this report', 'Largest direct distance',
+                            'How this group holds together')) + '</tr>')
+    for group in groups:
+        members = [str(member) for member in group.get('members') or ()]
+        linkage = cluster_linkage(snapshot, members)
+        distance = group.get('max_direct_distance')
+        listed = _escape(', '.join(names.get(member, member) for member in members))
+        listed += _muted(_plural(len(members), 'member in the comparison cohort',
+                                 'members in the comparison cohort'))
+        cells = [_escape(group.get('name')) + _muted(group.get('id')),
+                 _escape(_GROUP_STATE_WORDS.get(group.get('status'), group.get('status'))),
+                 listed,
+                 _escape(len(members) if focus is None else len(focus.intersection(members))),
+                 (_escape(_count_words(distance)) if distance is not None else _escape('Not measured'))
+                 + _muted('Single linkage: two members can differ by more than the threshold when '
+                          'an intermediate isolate links them.' if group.get('chained') else
+                          'No pair inside this group carries an accepted distance.' if distance is None else
+                          'Largest direct distance measured inside this group.'),
+                 _escape(cluster_linkage_words(linkage, threshold))]
+        style = _CLUSTER_ROW_STYLE if group.get('status') == 'cluster' else ''
+        parts.append('<tr' + style + '>' + ''.join('<td>' + cell + '</td>' for cell in cells) + '</tr>')
+    parts.append('</table>')
+    parts.append('<p class="muted">Groups counted from snapshot ' + _escape(snapshot.get('snapshot_id'))
+                 + ' · reference SHA-256 ' + _escape(str(snapshot.get('scheme_digest') or '')[:12])
+                 + ' · distance method ' + _escape(snapshot.get('metric_version'))
+                 + ' · built ' + _escape(snapshot.get('created_at'))
+                 + '. A group is a research signal for epidemiological review, not a transmission finding, '
+                 'and an isolate outside the cutoff has not been shown to be unrelated.</p>')
+    return ''.join(parts)
+
+
 def cohort_picture_html(investigation, graph_png, *, graph_mime='image/png', graph_typing=None,
                         sample_ids=None):
     """The tree for this report's typing, with the threshold in force stated beside it.
@@ -968,36 +1210,19 @@ def cohort_picture_html(investigation, graph_png, *, graph_mime='image/png', gra
            if provenance['source'] == 'adopted_publication'
            else 'your own setting, not a published cutoff') + '.</b></p>',
         '<p>' + _escape(provenance['statement']) + '</p>',
+        # Where the number came from belongs against the picture, not in an
+        # appendix: the clusters a reader is looking at are the clusters that
+        # number produced, and its authority is part of reading them.
+        threshold_origin_html(provenance),
         '<p class="muted">Selected focal isolates are highlighted. Other nodes are comparison-cohort '
         'context, not additional reported sample records. The layout is a minimum spanning forest '
         'of the distances named above: it is not a phylogeny and not a transmission tree, and the '
-        'position of a node carries no meaning.</p>'])
-    focus = None if sample_ids is None else {str(value) for value in sample_ids}
-    groups = [group for group in investigation.get('groups') or ()
-              if focus is None or focus.intersection(group.get('members') or ())]
-    if groups:
-        rows = []
-        for group in groups:
-            members = [str(member) for member in group.get('members') or ()]
-            distance = group.get('max_direct_distance')
-            rows.append([_escape(group.get('name')) + _muted(group.get('id')),
-                         _escape(_GROUP_STATE_WORDS.get(group.get('status'), group.get('status'))),
-                         _escape(len(members) if focus is None else len(focus.intersection(members))),
-                         _escape(len(members)),
-                         (_escape(_count_words(distance)) if distance is not None else
-                          _escape('Not measured')) +
-                         _muted('Single linkage: two members can differ by more than the threshold when '
-                                'an intermediate isolate links them.' if group.get('chained') else
-                                'No pair inside this group carries an accepted distance.'
-                                if distance is None else
-                                'Largest direct distance measured inside this group.')])
-        parts.append('<h3>Clusters at this threshold</h3>')
-        parts.append(_html_table(['Group · stable ID', 'State', 'Isolates in this report',
-                                  'Members in the cohort', 'Largest direct distance'], rows))
-    else:
-        parts.append('<p class="muted">Single linkage at this threshold put no isolate from this report in '
-                     'a group with another. That describes this threshold and this reference only; it is '
-                     'not a finding that the isolates are unrelated.</p>')
+        'position of a node carries no meaning.</p>',
+        # The threshold beside the picture belongs to the quantity the picture
+        # was drawn on and to no other, so the separation is stated here rather
+        # than only in an appendix a printed page may never reach.
+        '<p class="muted">' + _escape(provenance['typing']['note']) + '</p>',
+        cluster_section_html(investigation, sample_ids=sample_ids)])
     return ''.join(parts)
 
 

@@ -23,7 +23,13 @@ from PySide6.QtWidgets import (
 
 import wmlstudio.widgets
 from wmlstudio.theme import BACKGROUND, INK, STYLE, apply_dark_palette
-from wmlstudio.widgets import GRAPH_SUBTITLE, TreeView, forest_layout, render_side_by_side
+from wmlstudio.widgets import (
+    GRAPH_SUBTITLE,
+    TreeView,
+    forest_layout,
+    graph_colors,
+    render_side_by_side,
+)
 
 
 def records():
@@ -260,7 +266,9 @@ def test_png_svg_graphml_and_forest_newick_exports(graph, tmp_path):
     graph.save_newick(tmp_path / "graph.nwk")
     image = QImage(str(tmp_path / "graph.png"))
     assert (image.width(), image.height()) == (1800, 1200)
-    assert image.pixelColor(0, 0) == QColor(BACKGROUND)
+    # The ground of the picture is the ground of the theme in force, which is why
+    # it is asked for here rather than written down: see test_graph_theme.py.
+    assert image.pixelColor(0, 0) == QColor(graph_colors()["ground"])
     svg = ElementTree.parse(tmp_path / "graph.svg").getroot()
     assert svg.tag.endswith("svg")
     document = ElementTree.parse(tmp_path / "graph.graphml")
@@ -387,7 +395,7 @@ def test_dark_palette_covers_native_controls_dialogs_and_navigation(qapp, qtbot)
             assert not image.isNull()
             assert image.pixelColor(2, 2).lightness() < 50
         image = graph.viewport().grab().toImage()
-        assert image.pixelColor(0, 0) == QColor(BACKGROUND)
+        assert image.pixelColor(0, 0) == QColor(graph_colors()["ground"])
         assert graph.graphicsEffect() is None
         assert graph.viewportUpdateMode() == QGraphicsView.ViewportUpdateMode.FullViewportUpdate
     finally:
