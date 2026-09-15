@@ -60,7 +60,7 @@ PIPELINE = (
     "compare",      # the MLST minimum spanning tree
     "cgmlst",       # core-genome typing and its table of calls
     "cgmlst_tree",  # the cgMLST minimum spanning tree -- its own scale, always
-    "snp",          # planned: a SNP tree from read alignment
+    "snp",          # reference-free SNP distances (SKA2), on their own scale
     "evidence",     # HYDRA: resistance, virulence and lineage evidence
     "reports",      # the report
     "update",       # what is installed, what is published, what an update costs
@@ -69,7 +69,10 @@ PIPELINE = (
 )
 
 #: Stations a later round builds. Their pages say so; they never pretend to work.
-PLANNED = ("snp",)
+#: The SNP tree panel was finished and tested but never mounted, so its tab said
+#: nothing runs there while a working page sat unused. Nothing is planned now:
+#: every tab in the bar carries the work it names.
+PLANNED = ()
 
 TAB_LABELS = {
     "overview": "Overview",
@@ -119,8 +122,9 @@ PAGE_PURPOSE = {
               "own missing-target count.",
     "cgmlst_tree": "A minimum spanning tree of cgMLST target differences. A cgMLST distance and a "
                    "seven-locus distance are different quantities and never share a scale.",
-    "snp": "A SNP tree from read alignment. Planned for a later round; nothing runs on this "
-           "tab yet.",
+    "snp": "Reference-free SNP distances between the isolates you choose, with their own "
+           "comparable-sites denominator. SNP distances and allele differences answer "
+           "different questions and never share a scale.",
     "evidence": "Review identity, resistance and virulence evidence for isolates you choose. "
                 "Genotype is not measured susceptibility.",
     "reports": "Turn reviewed evidence into a document you can share.",
@@ -287,10 +291,10 @@ STATION_PAGES = {
         "title": "cgMLST tree",
         "subtitle": "A minimum spanning tree of cgMLST target differences, on its own scale.",
         "body": [
-            "Nothing is drawn on this tab yet. Until it draws its own graph, the button "
-            "above takes you to the tree page and switches it to cgMLST: that page states "
-            "the scheme and the target count of whatever it has drawn, so a 2,000-target "
-            "distance is never presented as a seven-locus one.",
+            "This tab draws the cgMLST tree. It is the same comparison workspace the MLST "
+            "tree tab uses, moved here and bound to the core-genome scale: the reference, "
+            "the threshold, the minimum overlap and the legend are this tab's own, so a "
+            "2,000-target distance is never presented on a seven-locus scale.",
             "A minimum spanning tree is a layout of similarity, not a phylogeny, and "
             "similarity is not proof of transmission. Distances carry their shared-target "
             "denominator: too little overlap is reported as insufficient evidence, never as "
@@ -304,8 +308,8 @@ STATION_PAGES = {
         "subtitle": "Single-nucleotide differences from read alignment, as a separate line of "
                     "evidence from allele typing.",
         "body": [
-            "Nothing runs on this tab yet. A later round puts reference-free SNP distances "
-            "here, with their own alignment fraction and their own scale.",
+            "This tab runs reference-free SNP distances (SKA2) over the isolates you choose, "
+            "with their own comparable-sites denominator rather than a shared one.",
             "SNP distances and allele differences answer different questions and are never "
             "merged, summed or plotted on one axis.",
         ],

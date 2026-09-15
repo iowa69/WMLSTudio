@@ -1071,3 +1071,42 @@ def test_each_views_threshold_survives_leaving_and_reopening_the_project(window,
     window.show_typing_view("mlst")
     assert window.cluster_threshold.value() == 2
     assert window.test_errors == []
+
+
+def test_the_cgmlst_tree_tab_really_draws_the_cgmlst_tree(window):
+    """End to end on the tab the user could not draw on, with real profiles.
+
+    "cgmlst tree i cannot draw" — because the tab was a signpost. This walks the
+    route a person takes: isolates with core-genome profiles, choose the cohort,
+    open the cgMLST tree tab, and check a graph is actually there, on the
+    core-genome scale, with the seven-locus tab left on its own.
+    """
+    a, b, c = (both_typed(window, "A", "1111", "11"), both_typed(window, "B", "2111", "21"),
+               both_typed(window, "C", "3111", "31"))
+    cohort(window, [a, b, c])
+
+    window.navigate("cgmlst_tree")
+    assert window.pages.current_key() == "cgmlst_tree"
+    assert window.typing_kind == "cgmlst"
+    # A drawn graph: these are the isolates, and there are edges between them.
+    assert set(window.tree._results) == {a, b, c}
+    assert window._current_snapshot["typing_kind"] == "cgmlst"
+    assert window._current_snapshot["target_loci"] == CG_TARGETS
+    assert len(window.tree.edges) == 2, "three isolates make a two-edge spanning tree"
+    assert "cgMLST" in window.current_caption.text()
+    assert str(CG_TARGETS) in window.current_caption.text()
+    cg_threshold = window.cluster_threshold.value()
+
+    # The seven-locus tab is the seven-locus tab, and shares nothing with it.
+    window.navigate("compare")
+    assert window.typing_kind == "mlst"
+    assert window._current_snapshot["typing_kind"] == "mlst"
+    assert window._current_snapshot["target_loci"] == 4
+    assert "Classical MLST" in window.current_caption.text()
+    window.cluster_threshold.setValue(3)
+
+    # Back again: this tab's own cutoff, not the one just set on the other scale.
+    window.navigate("cgmlst_tree")
+    assert window.typing_kind == "cgmlst"
+    assert window.cluster_threshold.value() == cg_threshold
+    assert window._current_snapshot["target_loci"] == CG_TARGETS
