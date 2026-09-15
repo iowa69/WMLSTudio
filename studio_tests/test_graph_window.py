@@ -16,6 +16,7 @@ from wmlstudio.graph_window import (
     GraphIdentity,
     GraphWindow,
     clamp_size,
+    honesty_lines,
 )
 from wmlstudio.investigation import typing_scale
 from wmlstudio.widgets import TreeView, graph_text_scale, set_graph_text_scale
@@ -201,7 +202,9 @@ def test_nodes_stay_where_they_are_put_and_their_edges_follow_them(window, qtbot
     assert state["view"]["positions"][source] == [400.0, 250.0]
     assert state["identity"] == {"kind": "cgmlst", "title": "cgMLST", "scheme": "kpneumoniae cgMLST",
                                  "targets": 2358, "target_word": "targets", "cohort": "Ward B review",
-                                 "threshold": 5, "created": "2026-09-15 08:30", "note": ""}
+                                 "threshold": 5, "created": "2026-09-15 08:30", "note": "",
+                                 "difference_word": "allele differences",
+                                 "distance_phrase": "allele-distance"}
     restored = GraphWindow(window.identity)
     qtbot.addWidget(restored)
     restored.set_contents(view.graph_contents())
@@ -369,6 +372,57 @@ def test_the_controls_show_what_the_view_shows_and_change_presentation_only(wind
     assert window.view.interaction_mode == "pan"
     assert window.mode_button.text() == "Select isolates"
     assert window.view.graph_contents()["edges"] == cg_view.graph_contents()["edges"]
+
+
+SNP_SCALE = {"kind": "snp", "title": "SKA2 split k-mer SNPs", "target_word": "shared split k-mers",
+             "difference_word": "SNPs", "distance_phrase": "SNP-distance", "targets": 0,
+             "scheme": "ska2:assembly-split-kmer-k31",
+             "caption": "SKA2 split k-mer SNPs · reference-free, k=31 · 3 isolates",
+             "denominator_note": "Every pair carries its own denominator: the split k-mers those "
+                                 "two isolates share.",
+             "separation": "A SNP distance, a classical MLST allele distance and a cgMLST target "
+                           "distance are three different quantities."}
+
+
+@pytest.fixture
+def snp_view(qtbot):
+    """A SNP forest: no cohort target count, a per-pair denominator, no link threshold."""
+    view = TreeView()
+    qtbot.addWidget(view)
+    view.resize(900, 600)
+    view.show_contents({
+        "results": [{"sample_id": key, "sample_name": f"Isolate {key}", "st": None}
+                    for key in ("a", "b", "c")],
+        "edges": [{"source": "a", "target": "b", "distance": 3,
+                   "denominator_label": "19,880 split k-mers shared, 99.1% of the pair's "
+                                        "combined set"}],
+        "cluster_threshold": -1, "scale": dict(SNP_SCALE)})
+    return view
+
+
+def test_a_snp_window_states_the_quantity_it_shows_and_never_calls_it_an_allele(snp_view, qtbot):
+    window = GraphWindow.from_view(snp_view, cohort="Ward B review",
+                                   created="2026-09-15T08:30:00")
+    qtbot.addWidget(window)
+    assert window.identity.kind == "snp"
+    assert window.kind_badge.text() == "SKA2 split k-mer SNPs"
+    # A per-pair denominator is not a missing target count, and is not reported as one.
+    assert window.identity.caption() == SNP_SCALE["caption"]
+    assert "target count not recorded" not in window.headline.text()
+    assert window.identity.threshold_words() == "no link threshold set"
+    assert window.windowTitle().startswith("SKA2 split k-mer SNPs forest · no link threshold set "
+                                           "· Ward B review · ska2:assembly-split-kmer-k31")
+    assert window.identity.export_title().endswith("· SNP-distance minimum spanning forest")
+    assert "single linkage" not in window.identity.export_subtitle()
+    assert "This is a layout of SNPs." in window.honesty.text()
+    assert "own denominator" in window.honesty.text()
+    assert "never a zero distance" in window.honesty.text()
+    assert "allele" not in window.honesty.text().casefold()
+    assert window.toggles["edges"].text() == "SNPs on edges"
+    assert "SNPs" in window.toggles["edges"].toolTip()
+    # A classical window opened beside it keeps every one of its own words.
+    assert honesty_lines(GraphIdentity.from_scale(None)) == HONESTY
+    window.close()
 
 
 def test_an_identity_with_nothing_recorded_says_so_rather_than_guessing():

@@ -437,6 +437,71 @@ def test_two_forests_can_be_shown_side_by_side_with_the_limit_in_the_picture(qui
     assert QImage(str(tmp_path / "pair.png")).width() == 1800
 
 
+SNP_SCALE = {"kind": "snp", "title": "SKA2 split k-mer SNPs", "target_word": "shared split k-mers",
+             "difference_word": "SNPs", "distance_phrase": "SNP-distance", "targets": 0,
+             "caption": "SKA2 split k-mer SNPs · reference-free, k=31 · 2 isolates",
+             "separation": "A SNP distance and an allele distance are different quantities."}
+SNP_EDGE = {"source": "a", "target": "b", "distance": 3,
+            "denominator_label": "19,880 split k-mers shared, 99.1% of the pair's combined set"}
+
+
+def test_a_forest_that_is_not_allele_typing_takes_every_word_from_its_own_scale(quiet_graph, tmp_path):
+    """A SNP edge carries no shared_loci at all: its denominator belongs to the pair.
+
+    Reading one off the edge raised KeyError before this, so the tooltip is
+    asserted here rather than only the wording, and every other place the view
+    names a quantity is asserted beside it.
+    """
+    quiet_graph.show_contents({"results": records()[:2], "edges": [dict(SNP_EDGE)],
+                               "cluster_threshold": -1, "scale": dict(SNP_SCALE)})
+    assert "shared_loci" not in SNP_EDGE
+    tooltip = quiet_graph._edge_tooltip(SNP_EDGE)
+    assert tooltip.startswith("3 SNPs / 19,880 split k-mers shared, 99.1% of the pair's combined set")
+    assert quiet_graph.edges[0][2].toolTip() == tooltip
+    assert "SNP-distance minimum spanning forest; not a phylogeny." in quiet_graph._view_tooltip()
+    assert quiet_graph.graph_subtitle().endswith("edge labels are SNPs")
+    # Nothing is grouped below a negative threshold, so nothing is outlined and no
+    # group is numbered: seven halos labelled "Group 1" read as seven clusters.
+    assert quiet_graph._halos == [] and quiet_graph._halo_labels == {}
+    assert [group["name"] for group in quiet_graph.groups()] == ["Not grouped", "Not grouped"]
+    quiet_graph.save_svg(tmp_path / "snp.svg")
+    written = (tmp_path / "snp.svg").read_text()
+    assert "SNP-distance minimum spanning forest" in written
+    assert "edge labels are SNPs" in written
+    assert "single-link threshold: none set" in written
+    assert "allele" not in written.casefold()
+    quiet_graph.save_newick(tmp_path / "snp.nwk")
+    assert "SNP-distance MST topology; not a phylogeny" in (tmp_path / "snp.nwk").read_text()
+    quiet_graph.save_graphml(tmp_path / "snp.graphml")
+    document = ElementTree.parse(tmp_path / "snp.graphml")
+    namespace = {"g": "http://graphml.graphdrawing.org/xmlns"}
+    assert [key.get("id") for key in document.findall(".//g:key[@for='edge']", namespace)] == [
+        "distance", "unit", "shared_denominator"]
+    assert {data.get("key"): data.text
+            for data in document.findall(".//g:edge/g:data", namespace)} == {
+        "distance": "3", "unit": "SNPs", "shared_denominator": SNP_EDGE["denominator_label"]}
+    # An empty forest names what it is not showing rather than asking for profiles.
+    quiet_graph.show_contents({"results": [], "edges": [], "scale": dict(SNP_SCALE)})
+    assert any("No SKA2 split k-mer SNPs comparison is drawn yet." == item.text()
+               for item in quiet_graph.canvas.items() if hasattr(item, "text"))
+
+
+def test_an_allele_forest_keeps_every_word_it_had_before_a_scale_could_rename_them(graph, tmp_path):
+    """The defaults are the wording this view has always used, so nothing moved."""
+    assert graph._edge_tooltip(edges()[1]).startswith("1 differing alleles / 2 shared loci")
+    assert "Allele-distance minimum spanning forest; not a phylogeny." in graph._view_tooltip()
+    assert graph.graph_subtitle() == GRAPH_SUBTITLE
+    assert [group["name"] for group in graph.groups()] == ["Group 1", "Group 2"]
+    assert graph._halos and "Single-link group at ≤ 1 allele differences" in graph._halos[0][1].toolTip()
+    graph.set_scale({"targets": 2358, "target_word": "targets", "caption": "cgMLST · kp · 2358 targets"})
+    assert graph._edge_tooltip(edges()[1]).startswith("1 differing alleles / 2 of 2358 targets shared")
+    graph.save_svg(tmp_path / "allele.svg")
+    written = (tmp_path / "allele.svg").read_text()
+    assert "cgMLST · kp · 2358 targets · allele-distance minimum spanning forest" in written
+    assert GRAPH_SUBTITLE in written
+    assert "single-link threshold: 1 of 2358 targets" in written
+
+
 def test_a_pinned_colour_is_shared_and_pinning_the_same_key_twice_is_quiet(quiet_graph):
     quiet_graph.set_color_by("st")
     categories = quiet_graph.color_categories()

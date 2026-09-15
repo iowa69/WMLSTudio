@@ -191,6 +191,57 @@ def test_plasmid_hypothesis_requires_actual_same_contig_coordinates():
     assert not synthesize_accessory_evidence(sample, {'databases': ['plasmidfinder']}, {'c': 2000})['plasmid_hypotheses']['contig_associations']
 
 
+def test_a_replicon_on_a_contig_never_becomes_a_plasmid_a_count_or_a_mobility_call():
+    replicon = amr_hit('IncFIB', 'PLASMID', database='plasmidfinder', sequence='Contig_2_201.434_Circ',
+                       start=301, end=400)
+    marker = amr_hit(sequence='Contig_2_201.434_Circ', start=1000, end=1800)
+    sample = {'hits': [marker, replicon]}
+    lengths = {'Contig_1_48.6581': 2_800_000, 'Contig_2_201.434_Circ': 4372}
+    result = synthesize_accessory_evidence(sample, {'status': 'completed', 'databases': ['plasmidfinder']},
+                                           lengths, contig_headers={name: name for name in lengths})
+    plasmids = result['plasmid_hypotheses']
+    assert plasmids['reconstruction'] == 'not_run' and plasmids['mobility'] == 'not_predicted'
+    assert plasmids['plasmid_count'] == 'not_estimated'
+    row = [entry for entry in plasmids['contig_evidence'] if entry['replicons']][0]
+    assert row['support_state'] == 'replicon_marker_plus_closure_and_depth'
+    assert row['contig'] == 'Contig_2_201.434_Circ' and 4.0 < row['depth_ratio'] < 4.2
+    assert plasmids['contig_associations'][0]['status'] == 'hypothesis'
+    assert any('not MOB-suite' in note or 'MOB-suite' in note for note in plasmids['mob_suite_gap'])
+
+
+def test_contig_evidence_degrades_to_unknown_when_the_assembler_declared_nothing():
+    """A plain header must leave closure and depth unknown, not silently absent."""
+    replicon = amr_hit('IncFIB', 'PLASMID', database='plasmidfinder', sequence='c', start=301, end=400)
+    result = synthesize_accessory_evidence({'hits': [amr_hit(), replicon]},
+                                           {'status': 'completed', 'databases': ['plasmidfinder']},
+                                           {'c': 2000})['plasmid_hypotheses']
+    row = [entry for entry in result['contig_evidence'] if entry['replicons']][0]
+    assert row['closure'] == 'unknown' and row['support_state'] == 'not_assessable'
+    assert result['depth_basis']['status'] == 'unavailable'
+
+
+def test_an_amr_determinant_on_a_replicon_free_contig_stays_visible_and_unplaced_on_no_contig():
+    replicon = amr_hit('IncFIB', 'PLASMID', database='plasmidfinder', sequence='c', start=301, end=400)
+    elsewhere = amr_hit('blaSHV-1', sequence='other', start=10, end=800)
+    nowhere = amr_hit('blaTEM-1', sequence='absent', start=10, end=800)
+    result = synthesize_accessory_evidence({'hits': [replicon, elsewhere, nowhere]},
+                                           {'status': 'completed', 'databases': ['plasmidfinder']},
+                                           {'c': 2000, 'other': 5000})['plasmid_hypotheses']
+    placement = {row['gene']: row['placement'] for row in result['determinant_placement']}
+    assert placement == {'blaSHV-1': 'no_replicon_on_this_contig', 'blaTEM-1': 'unplaced'}
+    assert result['unplaced_determinants'] == 1
+
+
+def test_a_full_characterization_carries_the_mob_suite_claim_boundary(tmp_path):
+    path = tmp_path / 'a.fasta'
+    path.write_text('>Contig_1_48.6581\n' + 'ACGT' * 100 + '\n')
+    result = characterize_assembly(path)
+    assert any('not MOB-suite' in note for note in result['limitations'])
+    # Positional limitation reuse elsewhere in the module must stay intact.
+    assert 'susceptibility' in characterization.LIMITATIONS[1]
+    assert 'one contig' in characterization.LIMITATIONS[2]
+
+
 def test_characterization_hashless_or_stale_hydra_is_not_promoted(tmp_path):
     path = tmp_path / 'a.fasta'
     path.write_text('>c\n' + 'ACGT' * 100 + '\n')
@@ -507,3 +558,297 @@ def test_a_transient_download_failure_does_not_lose_the_whole_snapshot(tmp_path,
     with pytest.raises(urllib.error.HTTPError):
         refs._fetch("kleborate", "z.fasta", tmp_path / "c.fasta")
     assert attempts["count"] == 1, "a permanent refusal must not be retried"
+
+
+def hydra_check(*, installed=('ncbi', 'protein'), organisms=('Escherichia', 'Staphylococcus_aureus'),
+                catalogues=('Escherichia',), virulence=None):
+    """A preflight answer in the shape hydra_prerequisites returns one."""
+    enabled = virulence is True
+    return {'ready': True, 'message': '', 'missing': [], 'warnings': [],
+            'databases': list(installed),
+            'database': {'label': 'Reference release 2026-01-01.1.',
+                         'organisms': list(organisms),
+                         'point_mutation_organisms': list(catalogues),
+                         'dna_point_mutation_organisms': list(catalogues),
+                         'protein_point_mutation_organisms': list(catalogues)},
+            'organism': {'requested': '', 'resolved': '', 'reason': '', 'point_mutations': True,
+                         'point_mutation_level': 'unknown'},
+            'virulence': {'requested': 'auto' if virulence is None else virulence, 'enabled': enabled,
+                          'reason': 'reason recorded by the engine', 'organism_curated': False,
+                          'available': True, 'virulence_elements': 400, 'stress_elements': 60}}
+
+
+def test_the_plasmid_drilldown_reports_contigs_and_never_a_reconstructed_plasmid():
+    """A replicon on a contig is evidence about that contig, and the page says so."""
+    from wmlstudio.ui_characterization import plasmid_html
+
+    replicon = amr_hit('IncFIB', 'PLASMID', database='plasmidfinder', sequence='Contig_2_201.434_Circ',
+                       start=301, end=400)
+    marker = amr_hit(sequence='Contig_2_201.434_Circ', start=1000, end=1800)
+    lengths = {'Contig_1_48.6581': 2_800_000, 'Contig_2_201.434_Circ': 4372}
+    evidence = synthesize_accessory_evidence({'hits': [marker, replicon]},
+                                             {'status': 'completed', 'databases': ['plasmidfinder']},
+                                             lengths, contig_headers={name: name for name in lengths})
+    body = plasmid_html(evidence['plasmid_hypotheses'])
+
+    assert '<h3>Plasmid evidence · completed</h3>' in body
+    # The contig, its own closure claim and its depth departure, not a plasmid.
+    assert 'Contig_2_201.434_Circ' in body and 'declared_circular' in body
+    assert 'replicon_marker_plus_closure_and_depth' in body
+    assert 'IncFIB' in body and 'blaKPC-2' in body
+    assert 'co_located_with_replicon' in body
+    assert 'not_predicted' in body and 'not_estimated' in body
+    # The engine's own gap sentences reach the reader word for word.
+    assert 'not MOB-suite' in body and 'No origin of transfer (oriT) is searched for' in body
+    assert 'plasmid reconstruction' in body
+
+
+def test_the_drilldown_shows_a_determinant_that_could_not_be_placed_on_any_contig():
+    """An unplaced determinant that vanished from the page would read as absent."""
+    from wmlstudio.ui_characterization import plasmid_html
+
+    replicon = amr_hit('IncFIB', 'PLASMID', database='plasmidfinder', sequence='c', start=301, end=400)
+    nowhere = amr_hit('blaTEM-1', sequence='absent', start=10, end=800)
+    evidence = synthesize_accessory_evidence({'hits': [replicon, nowhere]},
+                                             {'status': 'completed', 'databases': ['plasmidfinder']},
+                                             {'c': 2000})
+    body = plasmid_html(evidence['plasmid_hypotheses'])
+
+    assert 'blaTEM-1' in body and 'unplaced' in body
+    assert 'nothing is claimed about where it sits' in body
+
+
+def test_a_plasmid_block_that_never_ran_says_so_rather_than_printing_an_empty_table():
+    from wmlstudio.ui_characterization import plasmid_html
+
+    body = plasmid_html({'status': 'not_run', 'reason': 'No plasmid-reference assay was run.'})
+    assert 'not_run' in body and 'No plasmid-reference assay was run.' in body
+    assert '<table' not in body
+
+
+def test_the_plan_names_the_isolates_this_release_holds_no_mutation_catalogue_for(qtbot, tmp_path):
+    """Accepted by a release and covered by a catalogue are two different things."""
+    from wmlstudio.ui_characterization import CharacterizationPlanDialog
+
+    empty = tmp_path / 'amr-store'
+    empty.mkdir()
+    dialog = CharacterizationPlanDialog(
+        [isolate_record('iso-1', genus='Escherichia', species='coli'),
+         isolate_record('iso-2', 'Isolate 2', genus='Staphylococcus', species='aureus'),
+         isolate_record('iso-3', 'Isolate 3', genus='', species='')],
+        database_root=str(empty))
+    qtbot.addWidget(dialog)
+    # Accepted for both, but only Escherichia has a point-mutation catalogue here.
+    sentence = dialog.mutation_sentence(hydra_check())
+
+    assert 'Staphylococcus aureus' in sentence and 'Escherichia coli' not in sentence
+    assert 'screened for genes only' in sentence
+    assert 'no assigned genus and species' in sentence and '1 of 3' in sentence
+    dialog.point_mutations.setChecked(False)
+    assert 'switched off' in dialog.mutation_sentence(hydra_check())
+    assert 'not evidence that none is present' in dialog.mutation_sentence(hydra_check())
+
+
+def test_the_plan_says_which_isolates_get_a_curated_virulence_search_and_which_do_not(qtbot, tmp_path):
+    from wmlstudio.ui_characterization import CharacterizationPlanDialog
+
+    empty = tmp_path / 'amr-store'
+    empty.mkdir()
+    dialog = CharacterizationPlanDialog(
+        [isolate_record('iso-1', genus='Escherichia', species='coli'),
+         isolate_record('iso-2', 'Isolate 2', genus='', species='')],
+        database_root=str(empty))
+    qtbot.addWidget(dialog)
+
+    auto = dialog.virulence_sentence(hydra_check())
+    assert '1 of 2 isolates whose genus and species are assigned' in auto
+    assert 'curated for that organism' in auto
+    assert 'not evidence that they carry no virulence gene' in auto
+    assert 'not a demonstrated virulence phenotype' in auto
+
+    always = dialog.virulence_sentence(hydra_check(virulence=True))
+    assert 'uncurated' in always and 'every isolate here' in always
+
+    never = dialog.virulence_sentence(hydra_check(virulence=False))
+    assert never == 'reason recorded by the engine'
+
+
+def test_the_plan_states_which_reference_sets_this_run_will_read(qtbot, tmp_path):
+    from wmlstudio.ui_characterization import CharacterizationPlanDialog
+
+    empty = tmp_path / 'amr-store'
+    empty.mkdir()
+    dialog = CharacterizationPlanDialog([isolate_record()], database_root=str(empty))
+    qtbot.addWidget(dialog)
+    sentence = dialog.database_sentence(hydra_check(),
+                                        {'summary': '2 of 15 reference sets are installed.'})
+
+    assert sentence.startswith('This run will search: ncbi, protein.')
+    assert '2 of 15 reference sets are installed.' in sentence
+    # An empty store says so on the dialog itself, whatever this machine holds.
+    assert 'This run will search: none.' in dialog.hydra_databases.text()
+
+
+def test_hydra_mutation_and_virulence_choices_travel_in_the_plan(qtbot, tmp_path):
+    """The HYDRA options are kept apart from the defined virulence-locus panel."""
+    from wmlstudio.ui_characterization import CharacterizationPlanDialog
+
+    empty = tmp_path / 'amr-store'
+    empty.mkdir()
+    dialog = CharacterizationPlanDialog([isolate_record()], database_root=str(empty))
+    qtbot.addWidget(dialog)
+    dialog.hydra.setChecked(False)
+    dialog.species.setChecked(False)
+    dialog.virulence.setChecked(True)
+    for control in dialog.module_boxes.values():
+        control.setChecked(False)
+    dialog.point_mutations.setChecked(False)
+    dialog.hydra_virulence.setCurrentIndex(dialog.hydra_virulence.findData(False))
+    # The defined virulence panel needs a snapshot; clear it so the plan is about
+    # the HYDRA options alone.
+    dialog.virulence.setChecked(False)
+    dialog.accept()
+
+    assert dialog.plan is not None
+    assert dialog.plan['point_mutations'] is False
+    assert dialog.plan['hydra_virulence'] is False
+    assert dialog.plan['virulence'] is False, 'the Klebsiella panel keeps its own flag'
+
+
+def test_only_an_assigned_genus_and_species_chooses_a_catalogue():
+    from wmlstudio.ui_characterization import assigned_organism_name
+
+    assert assigned_organism_name(isolate_record()) == 'Staphylococcus aureus'
+    assert assigned_organism_name(isolate_record(genus='Escherichia', species='')) == ''
+    detected = {'id': 'x', 'name': 'x', 'metadata': {},
+                'result': {'identification': {'organism': {'genus': 'Klebsiella',
+                                                           'species': 'pneumoniae'}}}}
+    assert assigned_organism_name(detected) == '', 'a provisional detection is not an assignment'
+
+
+def amr_store(tmp_path, *, accepted=('Escherichia', 'Staphylococcus_aureus'),
+              catalogues=('Escherichia',), release='2026-01-01.1'):
+    """A minimal HYDRA reference store: a manifest, a protein set and its organism tables.
+
+    Built here rather than probed from the machine, so the sentences under test
+    do not change with whatever reference data this computer happens to hold.
+    """
+    root = tmp_path / 'amr-store'
+    (root / 'nucl' / 'ncbi').mkdir(parents=True)
+    (root / 'prot').mkdir(parents=True)
+    (root / 'prot' / 'taxgroup.tsv').write_text('taxgroup\n' + '\n'.join(accepted) + '\n')
+    (root / 'prot' / 'AMRProt-mutation.tsv').write_text('organism\n' + '\n'.join(catalogues) + '\n')
+    (root / 'prot' / 'meta.tsv').write_text(
+        'gene\telement_type\telement_subtype\n'
+        + 'blaKPC-2\tAMR\tAMR\n' * 3 + 'ybtS\tVIRULENCE\tVIRULENCE\n' * 2 + 'arsB\tSTRESS\tSTRESS\n')
+    (root / 'manifest.json').write_text(json.dumps({'databases': {
+        'ncbi': {'path': 'nucl/ncbi', 'version': release, 'kind': 'nucleotide'},
+        'protein': {'path': 'prot', 'version': release, 'kind': 'protein'}}}))
+    return root
+
+
+def planned(identifier, genus='', species=''):
+    """A sample row in the shape the run plan reads its configuration from."""
+    metadata = {'organism': {'genus': genus, 'species': species}} if genus else {}
+    return {'id': identifier, 'name': identifier, 'metadata': metadata,
+            'result': {'kind': 'fasta'}}
+
+
+def test_the_run_plan_names_the_reference_sets_it_will_read_and_the_ones_it_will_not(qtbot, tmp_path):
+    """Not installed reports nothing, and nothing reported reads like a clean isolate."""
+    from wmlstudio.analysis_plan import RunPlanDialog
+
+    dialog = RunPlanDialog([planned('one', 'Escherichia', 'coli')],
+                           db_root=str(amr_store(tmp_path)))
+    qtbot.addWidget(dialog)
+
+    assert dialog.hydra_state.text().startswith('2 of ')
+    assert 'reference sets are installed' in dialog.hydra_state.text()
+    assert 'never screened against a set that is not installed' in dialog.hydra_state.text()
+    names = [dialog.database_choice.itemData(row) for row in range(dialog.database_choice.count())]
+    assert names[0] is None and set(names[1:]) == {'ncbi', 'protein'}
+    assert 'ncbi — ' in dialog.database_choice.itemText(names.index('ncbi'))
+
+
+def test_the_run_plan_says_which_isolates_have_no_point_mutation_catalogue(qtbot, tmp_path):
+    from wmlstudio.analysis_plan import RunPlanDialog
+
+    dialog = RunPlanDialog([planned('one', 'Escherichia', 'coli'),
+                            planned('two', 'Staphylococcus', 'aureus'),
+                            planned('three')],
+                           db_root=str(amr_store(tmp_path)))
+    qtbot.addWidget(dialog)
+    gaps = dialog.hydra_gaps.text()
+
+    # Accepted by the release is not covered by a catalogue.
+    assert 'Staphylococcus aureus' in gaps and 'Escherichia coli' not in gaps
+    assert 'screened for genes only' in gaps
+    assert 'no assigned genus and species' in gaps and '1 of 3 inputs' in gaps
+    assert "no other organism's catalogue is substituted" in gaps
+
+    dialog.point_mutations.setChecked(False)
+    assert 'Point mutations are switched off' in dialog.hydra_gaps.text()
+    assert 'not evidence that none is present' in dialog.hydra_gaps.text()
+
+
+def test_the_run_plan_carries_the_virulence_choice_and_states_what_it_does(qtbot, tmp_path):
+    from wmlstudio.analysis_plan import RunPlanDialog
+
+    dialog = RunPlanDialog([planned('one', 'Escherichia', 'coli')],
+                           db_root=str(amr_store(tmp_path)))
+    qtbot.addWidget(dialog)
+    assert dialog.virulence.currentData() is None, 'auto by default: where the organism is established'
+
+    dialog.virulence.setCurrentIndex(dialog.virulence.findData(True))
+    assert 'uncurated' in dialog.hydra_gaps.text()
+    dialog.virulence.setCurrentIndex(dialog.virulence.findData(False))
+    assert 'limited to acquired resistance' in dialog.hydra_gaps.text()
+
+    dialog.accept()
+    assert dialog.plan['virulence'] is False
+    assert dialog.plan['point_mutations'] is True
+
+
+def test_an_empty_store_is_stated_before_the_run_not_discovered_in_the_result(qtbot, tmp_path):
+    from wmlstudio.analysis_plan import RunPlanDialog
+
+    empty = tmp_path / 'nothing'
+    empty.mkdir()
+    dialog = RunPlanDialog([planned('one', 'Escherichia', 'coli')], db_root=str(empty))
+    qtbot.addWidget(dialog)
+
+    assert 'would have nothing to search' in dialog.hydra_gaps.text()
+    assert 'That is not a negative result.' in dialog.hydra_gaps.text()
+
+
+def test_the_run_plan_says_a_release_is_old_rather_than_letting_it_look_complete(qtbot, tmp_path):
+    from wmlstudio.analysis_plan import RunPlanDialog
+
+    dialog = RunPlanDialog([planned('one', 'Escherichia', 'coli')],
+                           db_root=str(amr_store(tmp_path, release='2019-01-01.1')))
+    qtbot.addWidget(dialog)
+
+    assert 'days old (2019-01-01.1)' in dialog.hydra_gaps.text()
+    assert 'determinants named after it are not in it' in dialog.hydra_gaps.text()
+
+
+def test_asking_for_the_database_list_keeps_the_reviewed_cohort_and_re_reads_the_store(qtbot, tmp_path):
+    """Discovering a missing reference set must not cost the cohort just reviewed."""
+    from wmlstudio.ui_characterization import CharacterizationPlanDialog
+
+    empty = tmp_path / 'empty'
+    empty.mkdir()
+    dialog = CharacterizationPlanDialog([isolate_record()], database_root=str(empty))
+    qtbot.addWidget(dialog)
+    asked, closed = [], []
+    dialog.databasesRequested.connect(lambda: asked.append(True))
+    dialog.rejected.connect(lambda: closed.append(True))
+    dialog.request_databases()
+
+    assert asked == [True] and closed == [], 'the plan stays open'
+    assert dialog.table.rowCount() == 1 and dialog.plan is None
+    assert 'This run will search: none.' in dialog.hydra_databases.text()
+
+    # A snapshot installed from that list is read straight back into the plan.
+    dialog.set_database_root(str(amr_store(tmp_path)))
+    assert 'This run will search: ncbi, protein.' in dialog.hydra_databases.text()

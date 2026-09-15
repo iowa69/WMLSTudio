@@ -1,5 +1,25 @@
 # Active work
 
+## Pipeline revision: packaging status
+
+| Artefact | Bundled | Compressed cost | Gate |
+| --- | --- | --- | --- |
+| fastp 1.3.7 | Linux yes; Windows only with a reviewed native artifact | 4,981,685 B | `stage_read_tools.verify` in the spec, plus a real trimming run in the frozen bundle |
+| AMR core + point mutations | yes | 5,834,726 B | staging refuses a store without `AMRProt-mutation.tsv` or `mutation/dna` |
+| Plasmid evidence screen | yes, pure Python | 9,848 B | no third-party artefact, so no new notice |
+| SNP tree | yes, pure Python | ~45,000 B | reuses the already-staged SKA2 |
+| Every other AMR database | no — downloaded on request | 0 | non-open licences excluded from "install everything" |
+
+- [x] Gate the portable archive at 1,000,000,000 bytes, per component, in CI and
+      in `check_frozen.py`. The reference Windows package measures 147,572,214 B;
+      the current staged trees predict roughly 390 MB, so about 60% is unspent.
+- [ ] Build and review a native Windows fastp artifact, or leave Windows without
+      read trimming. Upstream publishes no Windows binary; the application already
+      states the absence, so this is a capability decision and not a defect.
+- [ ] `studio_packaging/build_windows.ps1` still has no `-FastpSource` parameter,
+      so a local PowerShell build cannot stage a reviewed Windows fastp. CI can.
+- [ ] Clean Windows 11 desktop acceptance remains open, unchanged by this round.
+
 ## Investigation-first revision: the 100-isolate outbreak scenario
 
 - [ ] Translate the 15 user questions into a source-backed problem-to-result workflow contract.

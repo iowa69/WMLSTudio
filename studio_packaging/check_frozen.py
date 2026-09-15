@@ -20,6 +20,11 @@ from wmlstudio.sequence import file_sha256, iter_sequences
 from wmlstudio.typing import load_scheme
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+from check_size_budget import check as check_budget  # noqa: E402 - this script's own directory
+from check_size_budget import format_report as format_budget  # noqa: E402
+from check_size_budget import measure_tree  # noqa: E402
+from stage_bio_tools import point_mutation_inventory, require_point_mutations  # noqa: E402
+from stage_read_tools import verify as verify_fastp  # noqa: E402
 from stage_reference_panels import (  # noqa: E402 - resolved from this script's own directory
     UNBUNDLED_NOTE,
     panel_summary,
@@ -82,6 +87,101 @@ def check_fastqc(cli, root):
     return {"status": "passed", "version": report["version"], "input_sha256": before,
             "control": "Two synthetic full reads, Unicode input/output paths; original bytes unchanged",
             "modules": report["reports"][0]["modules"], "provenance": report["provenance"]}
+
+
+def check_core_reference(bundle):
+    """Prove the bundled AMR core reached the package with its point mutations.
+
+    Bundling the core is what makes the first run work with no network, and point
+    mutations are part of that core. A package that carried only the acquired-gene
+    references would report nothing at all for mutations, which a reader cannot
+    distinguish from a negative result — so it fails here rather than shipping.
+    """
+    from wmlstudio.hydra_runtime import element_counts, organism_catalogue
+
+    store = bundle / "_internal/wmlstudio/resources/hydra/starter"
+    inventory = require_point_mutations(point_mutation_inventory(store), store)
+    catalogue = organism_catalogue(store)
+    counts = element_counts(store)
+    if not counts["read"] or counts["total"] <= 0:
+        raise ValueError("The frozen bundle's AMR protein reference could not be read at all")
+    uncatalogued = sorted(set(catalogue["accepted"]) - set(catalogue["point_mutations"]))
+    return {"status": "passed", "store": str(store),
+            "dna_point_mutation_catalogues": inventory["dna_catalogues"],
+            "protein_point_mutation_organisms": len(catalogue["protein_point_mutations"]),
+            "accepted_organisms": len(catalogue["accepted"]),
+            "accepted_without_any_catalogue": uncatalogued,
+            "elements": counts,
+            "boundary": ("An organism with no bundled catalogue is screened for acquired genes "
+                         "only. That is an absent catalogue, never a negative mutation result.")}
+
+
+def check_fastp(bundle, root, suffix):
+    """Trim one synthetic pair with the bundle's own fastp, or say why there is none.
+
+    Upstream publishes no Windows binary, so an absent tool is a legitimate
+    package state and is reported as `not_bundled` with the reason the application
+    itself shows. When the tool is there it is re-verified against its manifest and
+    then actually run, because a staged file that cannot execute inside the frozen
+    bundle is the failure this check exists to catch. fastp's own JSON report is
+    read, never recomputed, and the inputs are hashed before and after.
+    """
+    directory = bundle / "_internal/Tools/fastp"
+    if not (directory / "manifest.json").is_file():
+        return {"status": "not_bundled", "reason":
+                "This package carries no verified fastp payload, so read trimming is "
+                "unavailable in it. Reads remain usable untrimmed, and nothing is "
+                "downloaded to substitute for the missing tool."}
+    manifest = verify_fastp(directory)
+    binary = directory / ("fastp.exe" if suffix else "fastp")
+    work = root / "read trimming é"
+    work.mkdir()
+    reads = []
+    for mate, lead in ((1, "ACGT"), (2, "TGCA")):
+        path = work / f"original reads é_{mate}.fastq"
+        path.write_text("".join(
+            f"@pair{index}/{mate}\n{lead}{'ACGTACGTACGTACGTACGTACGTAC'}\n+\n{'I' * 30}\n"
+            for index in range(1, 5)), encoding="ascii")
+        reads.append(path)
+    before = [file_sha256(path) for path in reads]
+    report_path = work / "fastp.json"
+    command = [str(binary), "--in1", str(reads[0]), "--in2", str(reads[1]),
+               "--out1", str(work / "trimmed_1.fastq"), "--out2", str(work / "trimmed_2.fastq"),
+               "--json", str(report_path), "--html", str(work / "fastp.html"), "--thread", "1"]
+    completed = subprocess.run(command, capture_output=True, text=True, timeout=120)
+    if completed.returncode:
+        raise RuntimeError(f"Bundled fastp failed: {completed.stdout[-2000:]}\n{completed.stderr[-4000:]}")
+    summary = json.loads(report_path.read_text(encoding="utf-8"))["summary"]
+    if summary["fastp_version"] != manifest["version"]:
+        raise ValueError(f"Bundled fastp reported {summary['fastp_version']}, staged {manifest['version']}")
+    kept, supplied = summary["after_filtering"]["total_reads"], summary["before_filtering"]["total_reads"]
+    if supplied != 8 or not 0 < kept <= supplied:
+        raise ValueError(f"Bundled fastp did not account for its eight synthetic reads: {summary}")
+    if [file_sha256(path) for path in reads] != before:
+        raise ValueError("Bundled fastp altered the original read files it was given")
+    if not Path(binary).resolve().is_relative_to(bundle.resolve()):
+        raise ValueError("Bundled fastp resolved to a tool outside the portable package")
+    return {"status": "passed", "version": summary["fastp_version"], "platform": manifest["platform"],
+            "source_commit": manifest["source_commit"], "input_sha256": before,
+            "control": "Four synthetic pairs, Unicode paths; fastp's own report, originals unchanged",
+            "reads_supplied": supplied, "reads_kept": kept,
+            "boundary": ("Adapter trimming and quality filtering. Not an isolate validation, "
+                         "a purity check, a species assignment or a clinical result.")}
+
+
+def check_size_budget(bundle, output):
+    """Measure the package per component and refuse a build that outgrew its budget."""
+    report = check_budget(measure_tree(bundle))
+    print(format_budget(report))
+    if output:
+        output.parent.mkdir(parents=True, exist_ok=True)
+        output.write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
+    if report["status"] == "over_budget":
+        raise ValueError(
+            f"The portable package predicts {report['total_bytes']:,} bytes compressed, over its "
+            f"{report['budget_bytes']:,}-byte download budget. The largest component above is "
+            "where the budget went; move it to an explicit on-request download.")
+    return report
 
 
 def check_species(cli, bundle, root):
@@ -234,8 +334,10 @@ def main() -> int:
             raise ValueError(f"Frozen typing expected complete ST {expected}, observed {result['st']}")
         if result.get("engine_version") != __version__:
             raise ValueError(f"Frozen engine version differs from build source: {result.get('engine_version')} != {__version__}")
+        core = check_core_reference(bundle)
         hydra = check_hydra(bundle, root, suffix)
         fastqc = check_fastqc(cli, root)
+        fastp = check_fastp(bundle, root, suffix)
         species = check_species(cli, bundle, root)
         panels = check_reference_panels(bundle)
         modules = check_organism_modules(cli, root, panels["characterization"],
@@ -248,6 +350,7 @@ def main() -> int:
             module_spec.loader.exec_module(module)
             skesa = module.check(bundle / "_internal/wmlstudio/resources/tools/skesa/skesa.exe")
     args.output.parent.mkdir(parents=True, exist_ok=True)
+    budget = check_size_budget(bundle, args.output.with_name("size-budget.json"))
     screenshot = args.output.with_suffix(".png").resolve()
     subprocess.run([str(gui), "--smoke-test", "--demo", "--screenshot", str(screenshot)],
                    check=True, timeout=90)
@@ -260,9 +363,10 @@ def main() -> int:
         "control": "Synthetic assembly generated from one complete bundled profile",
         "expected_st": expected, "observed_st": result["st"],
         "typing": "passed", "desktop_demo": "passed", "screenshot": str(screenshot),
-        "hydra_frozen_worker": hydra, "native_skesa": skesa,
-        "original_fastqc": fastqc, "native_pyskani": species,
+        "bundled_amr_core": core, "hydra_frozen_worker": hydra, "native_skesa": skesa,
+        "original_fastqc": fastqc, "original_fastp": fastp, "native_pyskani": species,
         "native_ska2": ska, "reference_panels": panels, "organism_modules": modules,
+        "size_budget": budget,
     }
     revision = os.environ.get("GITHUB_SHA") or os.environ.get("WMLSTUDIO_SOURCE_REVISION")
     if revision:

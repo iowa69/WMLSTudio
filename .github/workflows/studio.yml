@@ -79,6 +79,28 @@ jobs:
       - name: Stage original FastQC and private Linux Java with sources and notices
         if: runner.os == 'Linux'
         run: uv run python studio_packaging/stage_fastqc.py --platform linux-x64
+      # Staging also switches on the opt-in genuine trimming test: without a real
+      # tool that test skips, and a skipped test is not evidence of anything.
+      - name: Stage the original pinned Linux fastp
+        if: runner.os == 'Linux'
+        run: |
+          uv run python studio_packaging/stage_read_tools.py --platform linux-x64
+          echo "WMLSTUDIO_TEST_FASTP_ROOT=${{ github.workspace }}/src/wmlstudio/resources/tools/fastp/linux-x64" >> "$GITHUB_ENV"
+      # Upstream fastp publishes no Windows binary, so the Windows package ships
+      # without read trimming unless a separately built, reviewed native artifact
+      # with its own manifest and trimming smoke evidence is dropped in here. That
+      # is a legitimate build: the application says trimming is unavailable rather
+      # than substituting another program.
+      - name: Stage a reviewed native Windows fastp when one is supplied
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          if [ -f artifacts/fastp-windows/manifest.json ]; then
+            uv run python studio_packaging/stage_read_tools.py --platform windows-x64 --source artifacts/fastp-windows
+            echo "WMLSTUDIO_TEST_FASTP_ROOT=${{ github.workspace }}/src/wmlstudio/resources/tools/fastp/windows-x64" >> "$GITHUB_ENV"
+          else
+            echo "No reviewed native Windows fastp artifact; this package ships without read trimming."
+          fi
       - name: Stage pinned native BLAST for Windows
         if: runner.os == 'Windows'
         run: uv run python studio_packaging/stage_bio_tools.py --platform windows-x64 --download-hydra-starter
@@ -127,6 +149,14 @@ jobs:
           $archive = "dist/WMLSTudio-${{ steps.appversion.outputs.value }}-Windows-x64.zip"
           Compress-Archive -Path dist/WMLSTudio -DestinationPath $archive
           Get-FileHash -Algorithm SHA256 $archive | Format-List | Out-File dist/windows-sha256.txt
+      # The download is what the size promise is about, so the archive itself is
+      # gated, per component, before it can be published as an artifact.
+      - name: Hold the portable download inside its size budget
+        if: runner.os == 'Windows'
+        run: uv run python studio_packaging/check_size_budget.py dist/WMLSTudio-${{ steps.appversion.outputs.value }}-Windows-x64.zip --output artifacts/size-budget-archive.json
+      - name: Hold the portable download inside its size budget
+        if: runner.os == 'Linux'
+        run: uv run python studio_packaging/check_size_budget.py dist/WMLSTudio-${{ steps.appversion.outputs.value }}-Linux-x64.tar.gz --output artifacts/size-budget-archive.json
       - name: Attach validation results
         if: always()
         uses: actions/upload-artifact@v4

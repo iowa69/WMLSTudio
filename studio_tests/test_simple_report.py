@@ -623,3 +623,81 @@ def test_simple_report_picture_is_never_wider_than_the_printed_page(qapp, tmp_pa
     assert pictures, "the report should carry exactly one embedded picture"
     for width, available in pictures:
         assert 0 < width <= available, f"a {width}px picture is cut off by a {available}px page body"
+
+
+def plasmid_record(sample_id, vector="1111", *, replicons=("IncFIB",), links=(("IncFIB", "blaKPC-2"),),
+                   stale=False):
+    """An isolate with replicon markers and a characterization that placed them."""
+    digest = genome_hash(sample_id)
+    evidence = hydra(sample_id, input_sha256=digest)
+    evidence["hits"] += [{"gene": gene, "element_type": "PLASMID", "primary": True}
+                         for gene in replicons]
+    entry = record(sample_id, vector, evidence=evidence)
+    entry["metadata"]["characterization"] = {
+        "input_sha256": "b" * 64 if stale else digest,
+        "plasmid_hypotheses": {
+            "status": "completed",
+            "contig_associations": [{"replicon": replicon, "marker": marker, "contig": "Contig_2",
+                                     "marker_type": "AMR", "gap_bp": 100}
+                                    for replicon, marker in links]}}
+    return entry
+
+
+def test_the_summary_prints_plasmid_markers_only_when_that_section_was_asked_for():
+    records = [plasmid_record("ward-A-001"), plasmid_record("ward-A-002", "2111")]
+    snapshot = snapshot_for(records)
+
+    without = render(records, snapshot)
+    assert "Plasmid markers" not in without
+
+    page = render(records, snapshot, settings={"plasmid_hypotheses": True})
+    assert "<h2>Plasmid markers</h2>" in page
+    assert "IncFIB" in page and "blaKPC-2 with IncFIB on Contig_2" in page
+    # The boundary is joined to the table in one string, so no option can part them.
+    assert "</table><p class=\"notice\"><b>A replicon marker sitting on an assembled contig" in page
+    assert "not MOB-suite" in page
+    assert "same replicon name are not thereby carrying the same plasmid" in page
+
+
+def test_the_summary_withholds_plasmid_co_location_that_belongs_to_another_assembly():
+    """Stale characterization is named, never printed as this assembly's evidence."""
+    records = [plasmid_record("ward-A-001", stale=True)]
+    page = render(records, snapshot_for(records + [plasmid_record("ward-A-002", "2111")]),
+                  settings={"plasmid_hypotheses": True})
+
+    assert "IncFIB" in page, "the replicon marker itself is still input-verified"
+    assert "earlier or different assembly" in page
+    assert "Contig_2" not in page
+
+
+def test_a_replicon_free_isolate_is_not_reported_as_having_a_chromosomal_gene():
+    records = [plasmid_record("ward-A-001", replicons=(), links=())]
+    page = render(records, snapshot_for(records + [plasmid_record("ward-A-002", "2111")]),
+                  settings={"plasmid_hypotheses": True})
+
+    assert "No replicon marker reported by the reference database used" in page
+    assert "does not place those genes on the chromosome" in page
+
+
+def test_the_summary_names_snp_distance_as_a_third_quantity_it_does_not_report():
+    records = [record("ward-A-001", "1111"), record("ward-A-002", "2111")]
+    page = render(records, snapshot_for(records))
+
+    assert "three different quantities" in page
+    assert "SNP distances are not reported here at all" in page
+    assert "evidence about the assembled contig it was found on" in page
+
+
+def test_the_reports_page_says_where_the_third_quantity_is(window, qtbot, tmp_path):
+    ids = [add_isolate(window, name, vector) for name, vector in
+           [("ward-A-001", "1111"), ("ward-A-002", "2111")]]
+    build_comparison(window, ids)
+    window.report_ids = set(ids)
+    window._report_investigation_snapshot = window._current_snapshot
+    window.refresh_report_table()
+
+    line = window.report_typing_label.text()
+    assert "classical MLST over 4 loci" in line
+    assert "SNP distances from the SNP tree are a third quantity" in line
+    assert "never comparable with the figures above" in line
+    assert window.test_errors == []

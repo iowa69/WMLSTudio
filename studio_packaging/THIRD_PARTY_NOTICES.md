@@ -78,6 +78,21 @@ No custom QC calculation is labeled FastQC, and FastQC reports do not imply
 automatic trimming or clinical suitability. The full source archives are
 intentionally retained despite the additional portable archive size.
 
+fastp 1.3.7 is MIT-licensed; the original upstream LICENSE text is retained in
+`Tools/fastp`, together with the exact pinned source archive for commit
+`8a2397b6628ae14127efdb7566f67fc05f9aea56` and the upstream README. The Linux
+tool is the official unmodified opengene.org release binary, pinned to the
+SHA-256 recorded in `Tools/fastp/manifest.json`; it is not a WMLSTudio build.
+Upstream publishes no official Windows binary, so a Windows package carries
+fastp only when a separately built, reviewed native artifact with its own
+manifest and trimming smoke evidence was staged, and otherwise ships without it.
+A package without fastp is a legitimate build: the application reports read
+trimming as unavailable, downloads nothing to replace it, and leaves the reads
+usable exactly as they were supplied. fastp adapter-trims and quality-filters
+reads. Its report is not an isolate validation, a purity check, a species
+assignment, or a clinical result, and WMLSTudio labels no calculation of its own
+as fastp.
+
 HYDRA 1.4.0 is bundled from the pinned source revision
 [`6d36c109491c16544e8919fe6962b4b62e97d3d7`](https://github.com/iowa69/hydra/tree/6d36c109491c16544e8919fe6962b4b62e97d3d7)
 under its MIT license. Its original assembly calling pipeline runs in the
@@ -130,6 +145,26 @@ authoritative. No CARD, VFDB or other independently licensed provider data are
 silently included by the HYDRA starter-staging command. Its reference files,
 mutation companions, manifest and observed provider release are hashed in
 `wmlstudio/resources/hydra/starter/snapshot_provenance.json`.
+
+Point-mutation reference data are part of that bundled core, not an optional
+extra: the packaging step refuses a starter snapshot without the protein
+`AMRProt-mutation.tsv` table and the per-organism DNA catalogues under
+`mutation/dna`. The bundled release carries 13 DNA catalogues and 30 organisms
+with curated protein mutations, 31 organisms in total, out of 32 organism names
+the engine accepts. An organism outside that list is screened for acquired genes
+only, which the application states as an absent catalogue and never as a negative
+mutation result.
+
+The AMR reference databases window now lists every reference set the pinned
+HYDRA engine knows how to use, whether or not it is installed, with the
+provider, licence, citation and upstream address the engine's own registry
+records. Only the NCBI sets are bundled. Nothing else is downloaded except on an
+explicit per-set request, and a set whose licence is not an open one (CARD's
+academic licence, and every provider that records no licence) is listed and
+downloadable but is never included in the "install and update everything"
+action; the provider's terms are shown before any download begins. Databases
+obtained this way are the providers' own data under the providers' own terms,
+not part of this distribution.
 
 The bundled starter is pinned to NCBI AMRFinderPlus reference release
 2026-08-07.1, staged 2026-09-12. The application reports that release, the day it
@@ -200,6 +235,31 @@ A snapshot staged before these panels existed is format version 1. It keeps
 validating unchanged, and the organism-specific assays then report `not_run`
 naming the missing manifest section. That is a diagnosable reference state, not
 a negative result.
+
+## The plasmid evidence screen bundles nothing, and is not MOB-suite
+
+The plasmid view reads the replicon markers HYDRA already reports against the
+bundled NCBI reference data, places determinants on the contigs those markers
+sit on, and stops there. It adds no third-party artefact to this distribution:
+no new binary, no new database, no new staged reference and no new licence
+obligation. It is **not** MOB-suite output and is not equivalent to it. No
+relaxase or MPF type is determined, no oriT is searched, no plasmid is
+reconstructed, no mobility is predicted and no plasmid count is estimated. Those
+are stated in the application wherever the screen's results are read. MOB-suite's
+own reference database is a single ~473 MB download, which is why bundling it was
+rejected rather than attempted quietly and abandoned.
+
+## The portable package has a published size budget
+
+WMLSTudio is distributed as one portable archive a user downloads and extracts,
+so its size is a promise to that user and is enforced, not estimated. The
+packaging gate `studio_packaging/check_size_budget.py` measures the archive from
+its own directory table, attributes every byte to a named component — each
+staged tool, each reference snapshot, Qt, the Python runtime — and fails the
+build above 1,000,000,000 bytes, warning from 80% of that. The frozen-bundle
+check runs the same measurement on the built folder as a conservative prediction
+before the archive exists. Every component above states whether it is bundled or
+downloaded on request; anything that would not fit belongs in the second group.
 
 ## Public genome references downloaded on request
 

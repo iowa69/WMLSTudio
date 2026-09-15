@@ -2,9 +2,17 @@
 
 The portable Windows build contains native Qt, Python, the typing engine,
 Pyrodigal, a dedicated HYDRA worker, official Windows BLAST+, a verified native
-SKESA tool package, classical reference schemes and an NCBI AMR starter snapshot.
-No WSL, Docker, Conda, browser server or separately installed Python is required
-by the end user.
+SKESA tool package, SKA2, FastQC with its own private Java runtime, classical and
+core-genome reference schemes, and the NCBI AMR reference core **including its
+point-mutation catalogues**, so the first run works with no network. No WSL,
+Docker, Conda, browser server or separately installed Python is required by the
+end user.
+
+One tool is conditional. fastp, which does the optional read trimming, has no
+official upstream Windows binary, so a Windows package carries it only when a
+separately built, reviewed native artifact was staged. Without it the application
+states that trimming is unavailable, downloads nothing to replace it, and leaves
+the reads usable exactly as supplied.
 
 This is a non-commercial research workbench. Windows 11 is the target platform;
 hosted Windows tests and Windows binaries under Wine are distinct from a clean
@@ -132,9 +140,54 @@ user's own downloads to the adjacent `Data` directory and never travel in the ZI
 `artifacts/frozen-check.json` records which panel sections the built bundle
 actually carries, or the reason it carries none.
 
+Staging the optional trimmer is a separate, explicit step. Linux takes the
+official upstream release binary, pinned to its published SHA-256 together with
+the exact source archive for its commit:
+
+```bash
+uv run python studio_packaging/stage_read_tools.py --platform linux-x64
+```
+
+Windows refuses to stage anything without a reviewed artifact, and the artifact
+must carry its own manifest, licence, corresponding source and a successful
+trimming smoke result before it is accepted:
+
+```powershell
+uv run python studio_packaging/stage_read_tools.py --platform windows-x64 --source C:\validated-tools\fastp
+```
+
+Leave that step out and the package simply ships without trimming. The frozen
+check then reports `original_fastp` as `not_bundled` with the reason, rather than
+passing silently; where the tool is present it is re-verified against its manifest
+and then actually run inside the bundle on four synthetic pairs with Unicode
+paths, with the original read files hashed before and after.
+
+## The size budget is a gate, not an aspiration
+
+The package is one ZIP a user downloads, so its size is a promise and is enforced:
+
+```bash
+uv run python studio_packaging/check_size_budget.py dist/WMLSTudio-0.4.0-Windows-x64.zip
+```
+
+It reads the archive's own directory table, attributes every byte to a named
+component — each staged tool, each reference snapshot, Qt, the Python runtime —
+and fails above **1,000,000,000 bytes**, warning from 80% of that with the
+component table printed so the growth has a name. `check_frozen.py` runs the same
+measurement on the built folder before the archive exists, as a deliberately
+conservative prediction: per-file deflate plus measured ZIP entry overhead plus a
+3% margin, because zlib level 6 came out 1.5% below what `Compress-Archive`
+actually produced on a real 147.6 MB package. Both write `size-budget*.json` to
+`artifacts/`.
+
+The rule that follows from the gate: a reference set large enough to threaten the
+budget is a download the user asks for, not a bundled file. That is why the AMR
+catalogue lists fifteen databases and bundles two, and why MOB-suite's 473 MB
+database was rejected rather than squeezed in.
+
 ## What you download separately
 
-Two things are deliberately not in the ZIP, both because they are sequence data
+Three things are deliberately not in the ZIP. The first two are sequence data
 belonging to their depositors rather than to this project:
 
 - The **broad species panel** (17 NCBI RefSeq references, about 15.7 MiB) —
@@ -146,12 +199,21 @@ belonging to their depositors rather than to this project:
 Both are pinned by accession and checksum, verified byte for byte on download, and
 attributed in the [third-party notices](../studio_packaging/THIRD_PARTY_NOTICES.md).
 
+The third is **every AMR reference database except the NCBI core**. The catalogue
+in **Update → AMR reference databases** names all fifteen sets the engine can use
+with their provider, licence, citation and upstream address, and downloads one
+only when you ask. "Install and update everything" deliberately skips any set
+whose licence is not an open one — CARD's academic licence, and any provider that
+records none — so an automatic action never accepts a licence on your behalf.
+Those remain one explicit click each, with the terms shown first.
+
 ## Validation gates
 
 Required package checks include offline startup, native menu repainting,
 reference discovery, genuine positive-control typing/AMR, real native assembly,
-spaces/Unicode/comma paths, cancellation, complete-pair validation, interrupted
-jobs, input immutability, stale-evidence handling, sample selection and report scope.
+real read trimming where the tool is bundled, spaces/Unicode/comma paths,
+cancellation, complete-pair validation, interrupted jobs, input immutability,
+stale-evidence handling, sample selection, report scope and the size budget.
 
 Local real-data checks and synthetic controls are kept distinct. A small number
 of successful assemblies or exact cross-platform calls do not establish clinical

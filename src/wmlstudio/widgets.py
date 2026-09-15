@@ -349,10 +349,16 @@ class TreeNode(QGraphicsEllipseItem):
 
 
 class TreeView(QGraphicsView):
-    """Editable *presentation* of an allele-distance MST/forest, never a phylogeny.
+    """Editable *presentation* of a distance MST/forest, never a phylogeny.
 
     Source results and allele calls are not modified by arranging, recoloring,
     relabeling, highlighting, or merging nodes. Stable sample IDs carry edits.
+
+    Which quantity a forest measures is the scale's to say, never this view's to
+    assume: with nothing recorded it draws allele differences, as every caller
+    before the SNP forest did, and a scale that names its own difference word,
+    distance phrase and per-edge denominator is taken at its word everywhere the
+    view writes a tooltip, a title, a footer or an export.
     """
 
     selectionChanged = Signal(list)
@@ -569,22 +575,49 @@ class TreeView(QGraphicsView):
         """'cgMLST · Scheme name · 2358 targets', or '' when nothing is recorded."""
         return str((self.scale or {}).get("caption") or "")
 
+    # A forest that measures something other than allele differences says so in
+    # its own words. Every default below is the allele-typing wording this view
+    # has always used, so a scale that records no vocabulary draws exactly as it
+    # did before, and no quantity is ever relabelled as another.
+    def _difference_word(self, default="differences"):
+        """What the numbers on this forest's edges count."""
+        return str((self.scale or {}).get("difference_word") or default)
+
+    def _distance_phrase(self):
+        """'allele-distance' / 'SNP-distance': the quantity this layout arranges."""
+        return str((self.scale or {}).get("distance_phrase") or "allele-distance")
+
+    def _target_word(self):
+        """What a shared denominator is counted in."""
+        return str((self.scale or {}).get("target_word") or "loci")
+
     def _view_tooltip(self):
-        caption = self.scale_caption()
+        phrase = self._distance_phrase()
         return ("\n".join(filter(None, [
-            caption, "Allele-distance minimum spanning forest; not a phylogeny.",
+            self.scale_caption(), f"{phrase[:1].upper()}{phrase[1:]} minimum spanning forest; "
+                                  "not a phylogeny.",
             (self.scale or {}).get("separation", ""),
             "Drag nodes · Ctrl-click / rectangle-select · middle-drag to pan · scroll to zoom"])))
 
     def _edge_tooltip(self, edge):
         scale = self.scale or {}
-        targets, word = scale.get("targets"), scale.get("target_word", "loci")
-        shared = (f"{edge['shared_loci']} of {targets} {word} shared" if targets
-                  else f"{edge['shared_loci']} shared loci")
+        targets, word = scale.get("targets"), self._target_word()
+        shared = edge.get("shared_loci")
+        # A forest whose pairs each have their own denominator carries that
+        # denominator on the edge; one that has none says so rather than letting a
+        # distance appear with nothing to read it against.
+        denominator = edge.get("denominator_label") or (
+            f"{shared} of {targets} {word} shared" if targets and shared is not None else
+            f"{shared} shared {word}" if shared is not None else "denominator not recorded")
         return "\n".join(filter(None, [
-            f"{edge['distance']} differing alleles / {shared}",
+            f"{edge['distance']} {self._difference_word('differing alleles')} / {denominator}",
             scale.get("caption", ""),
             "Line length is layout only, not evolutionary time or transmission."]))
+
+    def graph_subtitle(self):
+        """The line printed under an exported picture, naming what its edges count."""
+        return ("Not a phylogeny or transmission tree · positions are editable "
+                f"· edge labels are {self._difference_word('allele differences')}")
 
     @staticmethod
     def _merge_signature(result):
@@ -645,7 +678,11 @@ class TreeView(QGraphicsView):
                                     for group in self._group_definitions]
             self._cluster_groups = [group for group in self._cluster_groups if group]
         else:
-            self._group_definitions = [{"name": f"Group {index + 1}", "number": index + 1,
+            # A negative threshold is "no link threshold set": nothing is grouped, so
+            # the one-isolate groups it leaves must not be numbered as if they were
+            # findings. They keep their membership and lose the group number.
+            self._group_definitions = [{"name": f"Group {index + 1}" if cluster_threshold >= 0
+                                        else "Not grouped", "number": index + 1,
                                        "members": [member for key in group for member in self._members[key]],
                                        "status": "cluster" if len(group) > 1 else "singleton"}
                                       for index, group in enumerate(self._cluster_groups)]
@@ -688,7 +725,9 @@ class TreeView(QGraphicsView):
             self.canvas.addItem(text)
             text.setVisible(self.show_edge_labels)
             self.edges.append((edge["source"], edge["target"], line, text))
-        for index, group in enumerate(self._cluster_groups):
+        # Nothing is grouped below a negative threshold, so nothing is outlined: a
+        # halo around every isolate reads as a page of one-isolate clusters.
+        for index, group in (enumerate(self._cluster_groups) if cluster_threshold >= 0 else ()):
             definition = self._group_definitions[index]
             fill = QColor(self._palette[index % len(self._palette)])
             border = QColor(fill)
@@ -698,8 +737,9 @@ class TreeView(QGraphicsView):
             halo.setZValue(-2)
             halo.setAcceptedMouseButtons(Qt.MouseButton.NoButton)
             halo.setToolTip("\n".join(filter(None, [
-                f"Single-link group at ≤ {cluster_threshold} allele differences"
-                + (f" over {self.scale['targets']} {self.scale.get('target_word', 'loci')}."
+                f"Single-link group at ≤ {cluster_threshold} "
+                + self._difference_word("allele differences")
+                + (f" over {self.scale['targets']} {self._target_word()}."
                    if (self.scale or {}).get("targets") else "."),
                 self.scale_caption(),
                 "A visual grouping, not evidence of an outbreak or transmission."])))
@@ -714,7 +754,7 @@ class TreeView(QGraphicsView):
         if not records:
             kind = (self.scale or {}).get("title")
             message = GraphLabel(
-                f"No {kind} profiles to compare yet." if kind else
+                f"No {kind} comparison is drawn yet." if kind else
                 "Analyse at least two assemblies with the same scheme to compare profiles.")
             message.setBrush(QColor(MUTED))
             self.canvas.addItem(message)
@@ -1159,20 +1199,24 @@ class TreeView(QGraphicsView):
         painter.fillRect(QRectF(0, 0, width, height), QColor(BACKGROUND))
         painter.setPen(QColor(INK))
         painter.setFont(_graph_font(16))
-        caption = self.scale_caption()
+        caption, phrase = self.scale_caption(), self._distance_phrase()
         painter.drawText(QPointF(35, 38), title or (
-            caption + " · allele-distance minimum spanning forest" if caption
-            else "Allele-distance minimum spanning forest"))
+            f"{caption} · {phrase} minimum spanning forest" if caption
+            else f"{phrase[:1].upper()}{phrase[1:]} minimum spanning forest"))
         painter.setPen(QColor(MUTED))
         painter.setFont(_graph_font(10, QFont.Weight.Normal))
-        painter.drawText(QPointF(35, 63), subtitle or GRAPH_SUBTITLE)
+        painter.drawText(QPointF(35, 63), subtitle or self.graph_subtitle())
         self.canvas.render(painter, QRectF(0, 90, width, height - 205), bounds)
         painter.setFont(_graph_font(10))
         painter.setPen(QColor(MUTED))
         targets = (self.scale or {}).get("targets")
+        # A threshold nobody justified is "none set", never a number printed under
+        # the picture as though a cutoff had been applied.
         painter.drawText(QPointF(35, height - 82),
-                         f"Color by: {self.color_by} · single-link threshold: {self.cluster_threshold} "
-                         + (f"of {targets} {self.scale.get('target_word', 'loci')}" if targets else "differences")
+                         f"Color by: {self.color_by} · single-link threshold: "
+                         + (f"{self.cluster_threshold} " + (f"of {targets} {self._target_word()}"
+                                                            if targets else self._difference_word())
+                            if self.cluster_threshold >= 0 else "none set")
                          + (" · manual color overrides present" if self._manual_colors else ""))
         x, y = 35, height - 54
         for category, color in self._legend.items():
@@ -1209,7 +1253,7 @@ class TreeView(QGraphicsView):
         generator.setFileName(str(path))
         generator.setSize(QSize(1800, 1200))
         generator.setViewBox(QRectF(0, 0, 1800, 1200))
-        generator.setTitle("WMLSTudio allele-distance minimum spanning forest")
+        generator.setTitle(f"WMLSTudio {self._distance_phrase()} minimum spanning forest")
         generator.setDescription("Presentation layout only; not a phylogeny or transmission tree.")
         painter = QPainter(generator)
         if not painter.isActive():
@@ -1223,16 +1267,22 @@ class TreeView(QGraphicsView):
         def tag(name):
             return f"{{{namespace}}}{name}"
         root = ElementTree.Element(tag("graphml"))
+        # The edge keys name the quantity rather than assuming alleles: "distance"
+        # with its own "unit" and the denominator it was measured over travels
+        # correctly for a SNP forest and for an allele one.
+        phrase = self._distance_phrase()
         for name, target, kind in [("label", "node", "string"), ("members", "node", "string"),
                                    ("metadata", "node", "string"), ("x", "node", "double"),
                                    ("y", "node", "double"), ("colors", "node", "string"),
-                                   ("allele_differences", "edge", "int"), ("shared_loci", "edge", "int"),
+                                   ("distance", "edge", "int"), ("unit", "edge", "string"),
+                                   ("shared_denominator", "edge", "string"),
                                    ("interpretation", "graph", "string")]:
             ElementTree.SubElement(root, tag("key"), {"id": name, "for": target, "attr.name": name, "attr.type": kind})
-        graph = ElementTree.SubElement(root, tag("graph"), {"id": "allele-distance-forest", "edgedefault": "undirected"})
+        graph = ElementTree.SubElement(root, tag("graph"), {"id": f"{phrase}-forest", "edgedefault": "undirected"})
         ElementTree.SubElement(graph, tag("data"), {"key": "interpretation"}).text = " ".join(filter(None, [
             self.scale_caption() + "." if self.scale_caption() else "",
-            "Allele-distance minimum spanning forest; layout coordinates are presentation only.",
+            f"{phrase[:1].upper()}{phrase[1:]} minimum spanning forest; layout coordinates are "
+            "presentation only.",
             "Not a phylogeny or transmission tree.", (self.scale or {}).get("separation", "")]))
         for key, node in self.nodes.items():
             item = ElementTree.SubElement(graph, tag("node"), {"id": key})
@@ -1248,7 +1298,10 @@ class TreeView(QGraphicsView):
                 ElementTree.SubElement(item, tag("data"), {"key": name}).text = str(value)
         for index, edge in enumerate(self._display_edges):
             item = ElementTree.SubElement(graph, tag("edge"), {"id": f"e{index}", "source": edge["source"], "target": edge["target"]})
-            for name, value in (("allele_differences", edge["distance"]), ("shared_loci", edge["shared_loci"])):
+            for name, value in (("distance", edge["distance"]),
+                                ("unit", self._difference_word("allele differences")),
+                                ("shared_denominator", edge.get("denominator_label")
+                                 or edge.get("shared_loci", "not recorded"))):
                 ElementTree.SubElement(item, tag("data"), {"key": name}).text = str(value)
         ElementTree.ElementTree(root).write(path, encoding="utf-8", xml_declaration=True)
 
@@ -1256,8 +1309,10 @@ class TreeView(QGraphicsView):
         """Export rooted MST topology for interchange, explicitly not a phylogeny.
 
         Every isolate is a labeled zero-length leaf attached to its observed
-        genotype vertex. MST edge lengths are raw allele differences. Distinct
-        disconnected components are separate Newick trees, never invented links.
+        genotype vertex. MST edge lengths are this forest's own raw differences —
+        allele differences, or the SNPs of a split k-mer forest, whichever the
+        scale records. Distinct disconnected components are separate Newick trees,
+        never invented links.
         """
         adjacent = defaultdict(list)
         for edge in self._display_edges:
@@ -1278,7 +1333,7 @@ class TreeView(QGraphicsView):
             return "(" + ",".join(branches) + ")"
 
         trees = ["[" + (self.scale_caption() + "; " if self.scale_caption() else "")
-                 + "allele-distance MST topology; not a phylogeny; root arbitrary; "
+                 + f"{self._distance_phrase()} MST topology; not a phylogeny; root arbitrary; "
                  "disconnected components separate]"]
         for key in sorted(self.nodes):
             if key not in visited:

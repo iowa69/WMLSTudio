@@ -51,6 +51,18 @@ def organism_line(sample):
     return f"{name} ({source})" if name else "Unknown organism"
 
 
+def assigned_organism_name(sample):
+    """The isolate's assigned 'Genus species', or '' when one was never assigned.
+
+    A provisional detection is not a verified assignment, so only an assigned
+    genus AND species chooses a point-mutation catalogue or an organism-curated
+    virulence search. The plan dialog and the run itself read this one rule, so
+    what the dialog promises is what the run does.
+    """
+    genus, species, source = organism_for(sample)
+    return f"{genus} {species}".strip() if source == "Assigned" and genus and species else ""
+
+
 def classical_st(sample):
     """The classical ST, or a plain statement that this result is another quantity.
 
@@ -100,6 +112,60 @@ def hits_html(evidence, limit=HIT_LIMIT):
         body += f"<p>Showing the {limit} highest-identity matches of {len(ordered)}.</p>"
     return body + ("<p>A match is sequence similarity to a reference allele at this assay's threshold. It is not "
                    "proof that the gene is intact, expressed, or part of the element being typed.</p>")
+
+
+def plasmid_html(plasmids):
+    """Contig-level plasmid evidence, and the sentences saying what it is not.
+
+    Every row is about one assembled contig: which replicon markers sit on it,
+    which determinants share it, what the assembler itself claimed about closure
+    and coverage, and which of those signals are present. Nothing here is a
+    reconstructed plasmid, a plasmid count or a mobility prediction, so the
+    engine's own gap notes are printed word for word rather than summarised into
+    something that would read as a smaller caveat than it is.
+    """
+    def escape(value):
+        return html.escape(str(value if value is not None else "—"))
+
+    def genes(row, key):
+        return "; ".join(entry["gene"] for entry in row.get(key) or [] if entry.get("gene")) or "—"
+
+    body = (f"<h3>Plasmid evidence · {escape(plasmids.get('status', 'not_run'))}</h3>"
+            f"<p>{escape(plasmids.get('reason', ''))}</p>")
+    rows = plasmids.get("contig_evidence") or []
+    if rows:
+        body += ("<table cellpadding='5'><tr><th>Contig</th><th>Length (bp)</th>"
+                 "<th>Closure (assembler's claim)</th><th>Coverage vs backbone</th>"
+                 "<th>Replicon markers</th><th>Determinants on the same contig</th>"
+                 "<th>Evidence present</th></tr>")
+        for row in rows:
+            ratio = row.get("depth_ratio")
+            body += ("<tr>" + f"<td>{escape(row.get('contig'))}</td>"
+                     f"<td>{escape(row.get('length_bp'))}</td>"
+                     f"<td>{escape(row.get('closure'))}</td>"
+                     f"<td>{escape('%.1f×' % ratio if ratio else 'unknown')}</td>"
+                     f"<td>{escape(genes(row, 'replicons'))}</td>"
+                     f"<td>{escape(genes(row, 'determinants'))}</td>"
+                     f"<td>{escape(row.get('support_state'))}</td></tr>")
+        basis = plasmids.get("depth_basis") or {}
+        body += f"</table><p>{escape(basis.get('reason', ''))} {escape(basis.get('basis', ''))}</p>"
+    for association in plasmids.get("contig_associations", []):
+        body += (f"<p><b>{escape(association.get('replicon'))}</b> + {escape(association.get('marker'))}"
+                 f" on {escape(association.get('contig'))}; {escape(association.get('gap_bp'))} bp apart. "
+                 "Same-contig evidence only; complete plasmid identity and transmission are unproven.</p>")
+    # Every determinant is listed, the unplaced ones included: a determinant that
+    # is absent from this list would read as a determinant that was not found.
+    for row in plasmids.get("determinant_placement", []):
+        where = f" on {escape(row.get('contig'))}" if row.get("contig") else ""
+        body += (f"<p><b>{escape(row.get('gene'))}</b> — {escape(row.get('placement'))}{where}. "
+                 f"{escape(row.get('interpretation'))}</p>")
+    if plasmids.get("mobility") or plasmids.get("plasmid_count"):
+        body += (f"<p>Mobility: {escape(plasmids.get('mobility'))} · plasmid count: "
+                 f"{escape(plasmids.get('plasmid_count'))} · reconstruction: "
+                 f"{escape(plasmids.get('reconstruction'))}.</p>")
+    for note in plasmids.get("mob_suite_gap", []):
+        body += f"<p>{escape(note)}</p>"
+    return body
 
 
 def characterization_html(sample):
@@ -154,13 +220,7 @@ def characterization_html(sample):
             body += "<tr>" + "".join(f"<td>{escape(entry.get(key) or '—')}</td>" for key in ("gene", "class", "subclass", "method")) + "</tr>"
         body += "</table>"
     body += "<p>Not an AST result. No determinant detected does not mean susceptible.</p>"
-    plasmids = evidence.get("plasmid_hypotheses") or {}
-    body += f"<h3>Plasmid hypotheses · {escape(plasmids.get('status', 'not_run'))}</h3>"
-    body += f"<p>{escape(plasmids.get('reason', ''))}</p>"
-    for association in plasmids.get("contig_associations", []):
-        body += (f"<p><b>{escape(association.get('replicon'))}</b> + {escape(association.get('marker'))}"
-                 f" on {escape(association.get('contig'))}; {escape(association.get('gap_bp'))} bp apart. "
-                 "Same-contig evidence only; complete plasmid identity and transmission are unproven.</p>")
+    body += plasmid_html(evidence.get("plasmid_hypotheses") or {})
     body += f"<h3>Provenance</h3><p>Assembly SHA-256: {escape(evidence.get('input_sha256'))}</p>"
     for section in (species, virulence):
         digest = section.get("reference_digest") or section.get("provenance", {}).get("reference_digest")
@@ -171,8 +231,31 @@ def characterization_html(sample):
     return body
 
 
+def plasmid_cohort(records, *, cancelled=None):
+    """Replicon and replicon/determinant co-occurrence across the chosen isolates.
+
+    An isolate whose characterization is missing or stale is named with that
+    reason rather than counted as carrying nothing: an empty row and an unasked
+    question are the same picture otherwise. Recurrence across isolates is not
+    transmission, not one plasmid and not a relatedness measure, and this
+    produces no distance and no threshold anybody could cluster on.
+    """
+    from wmlstudio.characterization import current_characterization
+    from wmlstudio.plasmid_evidence import cohort_replicon_cooccurrence
+
+    entries = []
+    for record in records:
+        state = current_characterization(record)
+        evidence = state.get("evidence") or {}
+        entries.append({"sample_id": record["id"], "sample_name": record.get("name") or record["id"],
+                        "plasmid_hypotheses": evidence.get("plasmid_hypotheses")
+                        or {"status": "not_run", "reason": state["reason"]}})
+    return cohort_replicon_cooccurrence(entries, cancelled=cancelled)
+
+
 class CharacterizationPlanDialog(QDialog):
     installRequested = Signal()
+    databasesRequested = Signal()
 
     def __init__(self, samples, reference_path=None, parent=None, *, project=None, scheme_entries=(),
                  database_root=None):
@@ -182,6 +265,7 @@ class CharacterizationPlanDialog(QDialog):
         self.project = project
         self.database_root = str(database_root or "")
         self.hydra_check = None
+        self.catalogue = {"entries": [], "summary": ""}
         self.scheme_entries = list(scheme_entries)
         self.module_boxes = {}
         self.module_notes = {}
@@ -213,10 +297,35 @@ class CharacterizationPlanDialog(QDialog):
         self.hydra.setChecked(True)
         for control in (self.species, self.virulence, self.hydra):
             layout.addWidget(control)
-        # What HYDRA is about to search, and what it cannot search for, stated
-        # before the run rather than discovered in an empty result afterwards.
+        # HYDRA is powerful and silent about its inputs. What it is about to
+        # search, which reference sets this computer holds, which isolates have a
+        # mutation catalogue and whether virulence elements are read at all are
+        # all answered here, before the run, rather than discovered afterwards in
+        # a result where "not searched for" and "not found" look the same.
+        hydra_options = QFormLayout()
+        self.point_mutations = QCheckBox(
+            "Search the isolate's own point-mutation catalogue where the release has one")
+        self.point_mutations.setChecked(True)
+        self.point_mutations.stateChanged.connect(self.render_hydra_state)
+        hydra_options.addRow("Mutation evidence", self.point_mutations)
+        self.hydra_virulence = QComboBox()
+        self.hydra_virulence.addItem("Where the isolate's organism is established", None)
+        self.hydra_virulence.addItem("Always, even with no organism (uncurated)", True)
+        self.hydra_virulence.addItem("Never; acquired resistance only", False)
+        self.hydra_virulence.setToolTip(
+            "The engine's virulence and stress curation is keyed to the organism, so a run with no "
+            "assigned organism is a different, uncurated search and is reported as one.")
+        self.hydra_virulence.currentIndexChanged.connect(self.refresh_hydra_state)
+        hydra_options.addRow("Virulence and stress elements", self.hydra_virulence)
+        layout.addLayout(hydra_options)
         self.hydra_state = label("", "small", True)
         layout.addWidget(self.hydra_state)
+        self.hydra_databases = label("", "small", True)
+        layout.addWidget(self.hydra_databases)
+        databases_row = QHBoxLayout()
+        databases_row.addWidget(button("Choose / download reference databases…", self.request_databases))
+        databases_row.addStretch()
+        layout.addLayout(databases_row)
         self.refresh_hydra_state()
         layout.addWidget(self.build_module_group())
         layout.addWidget(label("Species/virulence reference panel: focused Klebsiella representatives and E. coli outgroup; not a comprehensive taxonomy database. Existing HYDRA plasmid assays may support co-location hypotheses; the AMR starter alone does not assay plasmids.", "small", True))
@@ -257,40 +366,110 @@ class CharacterizationPlanDialog(QDialog):
 
         try:
             self.hydra_check = provisioning.hydra_prerequisites(
-                selected=self.database_root or None)
+                selected=self.database_root or None,
+                virulence=self.hydra_virulence.currentData())
+            self.catalogue = provisioning.hydra_database_catalogue(
+                selected=self.database_root or None, measure=False)
         except (OSError, ValueError) as error:
             self.hydra_check = None
             self.hydra.setChecked(False)
             self.hydra.setEnabled(False)
             self.hydra_state.setText(f"The AMR reference store could not be read: {error}")
+            self.hydra_databases.setText("")
             return
+        self.render_hydra_state()
+
+    def render_hydra_state(self):
+        """Re-word what the last probe found; ticking a box re-reads no reference table."""
         check = self.hydra_check
+        if check is None:
+            return
+        self.hydra_databases.setText(self.database_sentence(check, self.catalogue))
         self.hydra.setEnabled(check["ready"])
         if not check["ready"]:
             self.hydra.setChecked(False)
             self.hydra.setToolTip(check["message"])
             self.hydra_state.setText(check["message"])
             return
-        notes = [check["database"]["label"]]
-        covered = set(check["database"]["organisms"])
+        notes = [check["database"]["label"], self.mutation_sentence(check),
+                 self.virulence_sentence(check)]
+        # The engine's own organism and virulence sentences are answered per
+        # isolate above, so the cohort-level copies of them are not repeated:
+        # this check was made with no organism, and saying "no organism was
+        # given" beside a cohort that has them would be false.
+        answered = {check["organism"]["reason"], check["virulence"]["reason"]}
+        notes.extend(note for note in check["warnings"] if note not in answered)
+        self.hydra_state.setText(" ".join(filter(None, notes)))
+
+    def mutation_sentence(self, check):
+        """Which of these isolates the release actually holds a mutation catalogue for."""
+        if not self.point_mutations.isChecked():
+            return ("Point mutations are switched off for this run, so none is reported for any "
+                    "isolate here. That is not evidence that none is present.")
+        accepted, catalogues = (check["database"]["organisms"],
+                                check["database"]["point_mutation_organisms"])
         uncovered = sorted({organism_line(sample).split(" (")[0] for sample in self.samples
                             if organism_line(sample) != "Unknown organism"
-                            and not self.organism_covered(sample, covered)})
+                            and not self.organism_covered(sample, accepted, catalogues)})
+        unassigned = sum(1 for sample in self.samples if not assigned_organism_name(sample))
+        parts = []
         if uncovered:
-            notes.append("No point-mutation catalogue is installed for " + "; ".join(uncovered)
+            parts.append("No point-mutation catalogue is installed for " + "; ".join(uncovered)
                          + ". Those isolates are screened for genes only, which is not evidence "
                          "that they carry no resistance mutation.")
-        notes.extend(check["warnings"])
-        self.hydra_state.setText(" ".join(notes))
+        if unassigned:
+            parts.append(f"{unassigned} of {len(self.samples)} isolates have no assigned genus and "
+                         "species, so no catalogue is chosen for them; assign one to have their "
+                         "mutations assessed.")
+        return " ".join(parts)
+
+    def virulence_sentence(self, check):
+        """What the translated search will do about virulence and stress elements.
+
+        The engine's curation is keyed to the organism, so an uncurated screen and
+        an organism's curated one are two different results and are never reported
+        as the same one. Whatever this says, the nucleotide catalogues report their
+        own virulence-typed genes regardless: "off" never means none was sought.
+        """
+        block = check["virulence"]
+        if block["requested"] is False or not block["available"]:
+            return block["reason"]
+        counts = (f"{block['virulence_elements']} virulence and {block['stress_elements']} stress "
+                  "elements in the protein reference")
+        if block["requested"] is True:
+            return (f"{counts} will be searched for every isolate here, including those with no "
+                    "established organism: that search is uncurated, so nothing an organism's "
+                    "curation would have suppressed is suppressed. A gene is not a demonstrated "
+                    "virulence phenotype.")
+        established = sum(1 for sample in self.samples if assigned_organism_name(sample))
+        return (f"{counts} will be searched for the {established} of {len(self.samples)} isolates "
+                "whose genus and species are assigned, curated for that organism. The rest are "
+                "searched for acquired resistance only, which is not evidence that they carry no "
+                "virulence gene. A gene is not a demonstrated virulence phenotype.")
 
     @staticmethod
-    def organism_covered(sample, accepted):
-        """True when the installed release has a catalogue this isolate can be run against."""
-        from wmlstudio.hydra_runtime import match_organism
+    def database_sentence(check, catalogue):
+        """Which reference sets this run reads, and which are simply not here."""
+        searched = ", ".join(check["databases"]) or "none"
+        return f"This run will search: {searched}. " + (catalogue.get("summary") or "")
+
+    @staticmethod
+    def organism_covered(sample, accepted, catalogues=None):
+        """True when the installed release has a catalogue this isolate can be run against.
+
+        ``accepted`` is every taxgroup the release will take at all; ``catalogues``,
+        when given, is the smaller set that actually holds point mutations. Being
+        accepted is not being covered, and both questions are decided by the
+        engine's own parent/child taxgroup rule rather than by exact membership.
+        """
+        from wmlstudio.hydra_runtime import catalogue_covers, match_organism
 
         genus, species, _ = organism_for(sample)
         name = f"{genus} {species}".strip()
-        return bool(name) and match_organism(name, accepted=accepted) is not None
+        resolved = match_organism(name, accepted=accepted) if name else None
+        if resolved is None:
+            return False
+        return True if catalogues is None else catalogue_covers(resolved, catalogues)
 
     def refresh_plan_table(self):
         """Fill the cohort rows, keeping whatever the user has already excluded."""
@@ -447,6 +626,15 @@ class CharacterizationPlanDialog(QDialog):
         self.reject()
         self.installRequested.emit()
 
+    def request_databases(self):
+        """Ask for the reference-database list. Nothing is downloaded from this dialog."""
+        self.databasesRequested.emit()
+
+    def set_database_root(self, path):
+        """Follow a snapshot chosen or installed from that list, and re-read it."""
+        self.database_root = str(path or "")
+        self.refresh_hydra_state()
+
     def accept(self):
         identifiers = [self.table.item(row, 0).data(Qt.ItemDataRole.UserRole) for row in range(self.table.rowCount())
                        if self.table.item(row, 0).checkState() == Qt.CheckState.Checked]
@@ -477,6 +665,11 @@ class CharacterizationPlanDialog(QDialog):
                      "species": self.species.isChecked(), "virulence": self.virulence.isChecked(),
                      "hydra": self.hydra.isChecked(), "modules": modules,
                      "modules_off_panel": self.include_off_panel.isChecked(),
+                     # HYDRA's own options, kept apart from the defined virulence
+                     # panel above: these two search different references and
+                     # answer different questions.
+                     "point_mutations": self.point_mutations.isChecked(),
+                     "hydra_virulence": self.hydra_virulence.currentData(),
                      "resources": allocation.to_dict()}
         super().accept()
 
@@ -514,7 +707,92 @@ class CharacterizationWorkspaceMixin:
         splitter.addWidget(self.characterization_detail)
         splitter.setSizes([320, 230])
         layout.addWidget(splitter, 1)
-        tabs.insertTab(0, panel, "Identity / virulence / plasmid hypotheses")
+        tabs.insertTab(0, panel, "Identity / virulence / plasmid evidence")
+        tabs.insertTab(1, self.build_plasmid_cohort(), "Plasmid evidence across the cohort")
+
+    def build_plasmid_cohort(self):
+        """Which replicon markers, and which replicon/determinant pairs, recur here.
+
+        Two tables, never one: a replicon and a determinant that share an
+        assembled contig and a pair that is merely present in the same isolate
+        are different observations, and collapsing them would turn an assembly
+        artefact into a shared finding. Neither table is sorted or coloured by
+        count, because a ranked list of co-occurrence counts reads as clustering
+        and nothing here is a distance.
+        """
+        panel = QWidget()
+        layout = QVBoxLayout(panel)
+        self.plasmid_scope = label("", "small", True)
+        layout.addWidget(self.plasmid_scope)
+        layout.addWidget(label("Replicon markers detected, by isolate count", "cardTitle"))
+        self.plasmid_replicon_table = make_table(
+            ["Replicon marker", "Isolates carrying it", "Of isolates assayed", "Isolates"])
+        self.plasmid_replicon_table.setSortingEnabled(False)
+        layout.addWidget(self.plasmid_replicon_table, 1)
+        layout.addWidget(label("Replicon and determinant on one assembled contig", "cardTitle"))
+        self.plasmid_pair_table = make_table(
+            ["Replicon marker", "Determinant", "Marker type", "Co-located on one contig",
+             "Both present, not co-located", "Of isolates assayed"])
+        self.plasmid_pair_table.setSortingEnabled(False)
+        layout.addWidget(self.plasmid_pair_table, 1)
+        self.plasmid_notes = QTextBrowser()
+        self.plasmid_notes.setOpenExternalLinks(False)
+        layout.addWidget(self.plasmid_notes, 1)
+        return panel
+
+    def refresh_plasmid_cohort(self, samples):
+        """Recount co-occurrence over the evidence cohort, denominators and all."""
+        if not hasattr(self, "plasmid_replicon_table"):
+            return
+        result = plasmid_cohort(samples)
+        names = {sample["id"]: sample["name"] for sample in samples}
+        denominator = result["denominator"]
+        self.plasmid_replicon_table.setRowCount(len(result["replicons"]))
+        for row, entry in enumerate(result["replicons"]):
+            members = "; ".join(sorted(names.get(value, value) for value in entry["isolates"]))
+            for column, value in enumerate([entry["replicon"], entry["isolate_count"],
+                                            denominator, members]):
+                self.plasmid_replicon_table.setItem(row, column, cell(value))
+        self.plasmid_pair_table.setRowCount(len(result["co_occurrence"]))
+        for row, entry in enumerate(result["co_occurrence"]):
+            values = [entry["replicon"], entry["marker"], entry["marker_type"] or "—",
+                      entry["co_located_count"], entry["not_co_located_count"], denominator]
+            for column, value in enumerate(values):
+                item = cell(value)
+                item.setToolTip(entry["interpretation"])
+                self.plasmid_pair_table.setItem(row, column, item)
+        excluded = result["isolates_excluded"]
+        self.plasmid_scope.setText(
+            f"{denominator} of {len(samples)} isolates in this evidence cohort had a plasmid-marker "
+            f"assay to read; {len(excluded)} did not and are listed below rather than counted as "
+            "carrying nothing. Rows are in alphabetical order, not ranked: these are counts of what "
+            "was seen, not a distance and not a cluster.")
+        self.plasmid_notes.setHtml(self.plasmid_notes_html(result, names))
+
+    @staticmethod
+    def plasmid_notes_html(result, names):
+        """The exclusions, the unplaced determinants and the claim boundary, verbatim."""
+        def escape(value):
+            return html.escape(str(value if value is not None else "—"))
+
+        body = ""
+        if result["isolates_excluded"]:
+            body += "<h3>Not assayed, so not counted either way</h3>"
+            for entry in result["isolates_excluded"]:
+                body += (f"<p><b>{escape(names.get(entry['sample_id'], entry['sample_name']))}</b> — "
+                         f"{escape(entry['reason'])}</p>")
+        if result["unplaced_determinants"]:
+            body += ("<h3>Determinants with no usable contig coordinates</h3><p>These are neither "
+                     "co-located nor apart: counting them as apart would read as evidence of "
+                     "separation.</p><p>"
+                     + escape("; ".join(sorted({f"{names.get(row['sample_id'], row['sample_id'])}: "
+                                                f"{row['gene']}"
+                                                for row in result["unplaced_determinants"]})))
+                     + "</p>")
+        body += "<h3>What this table is not</h3>"
+        for note in [*result["limitations"], *result["mob_suite_gap"]]:
+            body += f"<p>{escape(note)}</p>"
+        return body
 
     def refresh_features(self):
         super().refresh_features()
@@ -548,6 +826,7 @@ class CharacterizationWorkspaceMixin:
         table.setSortingEnabled(True)
         table.blockSignals(False)
         self.show_characterization_detail()
+        self.refresh_plasmid_cohort(samples)
 
     def show_characterization_detail(self):
         if not hasattr(self, "characterization_table"):
@@ -592,6 +871,24 @@ class CharacterizationWorkspaceMixin:
             self.notify(f"Characterization snapshot installed: {result['species_count']} references. Review characterization to select and run assays.")
         self.launch_task(lambda cancelled, progress: provision_characterization_references(root, cancelled=cancelled, progress=progress), "characterization_references", finished)
 
+    def manage_characterization_databases(self, plan_dialog):
+        """Show the whole reference-database list over the plan, then re-read the store.
+
+        The plan stays open: a person who discovers here that a reference set is
+        missing should be able to install it and carry on, not lose the cohort
+        they had just reviewed. Nothing is downloaded without their confirmation.
+        """
+        from wmlstudio.amr_databases import AMRDatabaseDialog
+        dialog = AMRDatabaseDialog(self.active_amr_database(), plan_dialog,
+                                   update_root=self.root / "references" / "hydra",
+                                   project=self.project)
+        self.amr_database_dialog = dialog
+        dialog.snapshotInstalled.connect(
+            lambda path: self.project.set_setting("hydra_database_root", path))
+        dialog.snapshotInstalled.connect(plan_dialog.set_database_root)
+        dialog.exec()
+        plan_dialog.refresh_hydra_state()
+
     def context_run_characterization(self, selection):
         """Right-click route into the same reviewed plan, for the clicked isolates only."""
         if self.busy():
@@ -631,6 +928,7 @@ class CharacterizationWorkspaceMixin:
             scheme_entries=self.scheme_entries(CLASSICAL_KINDS),
             database_root=self.active_amr_database())
         dialog.installRequested.connect(self.install_characterization_references)
+        dialog.databasesRequested.connect(lambda: self.manage_characterization_databases(dialog))
         if dialog.exec() != QDialog.DialogCode.Accepted:
             return
         plan = dialog.plan
@@ -654,18 +952,20 @@ class CharacterizationWorkspaceMixin:
                 hydra = hydra_report_for_record(sample)
                 generated = None
                 genus, species, _ = organism_for(sample)
-                assigned = (sample.get("metadata") or {}).get("organism") or {}
                 # A provisional detection is not a verified mutation-catalog assignment,
                 # so only an assigned genus AND species chooses a point-mutation catalog.
                 # The engine's taxgroups are underscore-joined and genus-level for some
                 # organisms, so run_assemblies resolves this name against the installed
                 # catalogue: an unknown one stops the whole run upstream, and a name it
                 # cannot resolve is reported rather than replaced by a near neighbour.
-                organism = f"{genus} {species}" if assigned.get("genus") and assigned.get("species") else None
+                organism = assigned_organism_name(sample) or None
                 if plan["hydra"] and hydra is None:
                     generated = run_assemblies([sample["input_path"]], database_root,
                                               sample_names=[sample["id"]], threads=resources.threads_per_sample,
-                                              organism=organism, point_mutations=True, cancelled=stopped, progress=report)
+                                              organism=organism,
+                                              point_mutations=plan.get("point_mutations", True),
+                                              virulence=plan.get("hydra_virulence"),
+                                              cancelled=stopped, progress=report)
                     hydra = generated
                 modules, skipped = selection_for_record(sample, plan.get("modules"),
                                                         include_off_panel=plan.get("modules_off_panel", False))

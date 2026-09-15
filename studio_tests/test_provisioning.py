@@ -82,7 +82,8 @@ def characterization_snapshot(root, *, format_version=1):
 
 
 def hydra_store(root, names=("ncbi", "protein"),
-                organisms=("Escherichia", "Klebsiella_pneumoniae"), release="2026-08-07.1"):
+                organisms=("Escherichia", "Klebsiella_pneumoniae"), release="2026-08-07.1",
+                staged="2026-09-12 18:41:37"):
     """A HYDRA database store in the shape hydra_runtime.installed_databases reads."""
     root = Path(root)
     entries = {}
@@ -91,7 +92,7 @@ def hydra_store(root, names=("ncbi", "protein"),
         target.mkdir(parents=True, exist_ok=True)
         (target / "sequences.fna").write_text(">ref\nACGT\n")
         entries[name] = {"path": f"stores/{name}", "version": release, "kind": "nucl",
-                         "installed": "2026-09-12 18:41:37"}
+                         "installed": staged}
         if name == "protein":
             entries[name]["organisms"] = list(organisms)
     (root / "manifest.json").write_text(json.dumps({"hydra_db_version": 1, "databases": entries}))
@@ -480,6 +481,208 @@ def test_updating_downloads_and_starts_using_the_new_store_in_one_action(tmp_pat
     assert unrecorded["selected"] is False
     assert "Select it for a project" in unrecorded["summary"]
     project.close()
+
+
+def test_the_whole_reference_catalogue_is_listed_not_only_what_is_installed(tmp_path, bare):
+    """HYDRA needs inputs it never names; a user cannot choose from a list they cannot see."""
+    store = hydra_store(tmp_path / "amr")
+    catalogue = provisioning.hydra_database_catalogue(tmp_path / "data", str(store))
+    rows = {entry["name"]: entry for entry in catalogue["entries"]}
+    assert catalogue["installed"] == ["ncbi", "protein"]
+    assert len(rows) > 10 and set(catalogue["available"]) == set(rows) - {"ncbi", "protein"}
+    assert all(entry["purpose"] and entry["provider"] and entry["licence"]
+               for entry in catalogue["entries"])
+    assert "2 of" in catalogue["summary"] and "downloaded only when you ask" in catalogue["summary"]
+    # The same count reaches the installation report, so the Update page can show it.
+    detail = item_of(probe(tmp_path, hydra_database_root=str(store)), "hydra_database")["detail"]
+    assert detail["catalogue"]["installed"] == ["ncbi", "protein"]
+    assert detail["catalogue"]["total"] == len(rows)
+    assert set(detail["catalogue"]["downloadable"]) <= set(rows)
+
+
+def test_the_plan_says_what_is_missing_what_is_stale_and_what_is_left_alone(tmp_path, bare,
+                                                                            monkeypatch):
+    store = hydra_store(tmp_path / "amr")
+    monkeypatch.setattr(provisioning, "hydra_update_available", lambda *args, **options: {
+        "installed": "2026-08-07.1", "latest": "2026-09-01.1", "newer_available": True,
+        "message": "NCBI publishes 2026-09-01.1 today.", "error": ""})
+    plan = provisioning.installation_plan(tmp_path / "data", str(store))
+    steps = {step["key"]: step for step in plan["steps"]}
+    # Installed but superseded: an update, named with both releases.
+    assert steps["database:ncbi"]["action"] == "update"
+    assert "2026-09-01.1" in steps["database:ncbi"]["reason"]
+    # Not installed and nobody asked for it: listed, and explicitly not fetched.
+    assert steps["database:card"]["action"] == "skip"
+    assert steps["database:card"]["state"] == "not selected"
+    assert "no isolate is screened against it" in steps["database:card"]["reason"]
+    # Missing, and something in this application can install it.
+    assert steps["species_panel"]["action"] == "install"
+    assert plan["databases"] == ["ncbi", "protein"]
+    assert plan["work"] is True
+    assert "published beside" in plan["summary"]
+    assert json.loads(json.dumps(plan)) == plan
+
+
+def test_a_reference_set_nobody_asked_for_is_listed_but_never_fetched(tmp_path, bare, monkeypatch):
+    store = hydra_store(tmp_path / "amr")
+    monkeypatch.setattr(provisioning, "hydra_update_available", lambda *args, **options: {
+        "installed": "2026-08-07.1", "latest": "2026-08-07.1", "newer_available": False,
+        "message": "", "error": ""})
+    quiet = provisioning.installation_plan(tmp_path / "data", str(store))
+    assert quiet["databases"] == []
+    asked = provisioning.installation_plan(tmp_path / "data", str(store), databases=["card"])
+    assert asked["databases"] == ["card"]
+    # The snapshot that would be published still carries everything already installed:
+    # fetching only the missing set would publish a store narrower than the one in use.
+    assert asked["database_snapshot_contents"] == ["card", "ncbi", "protein"]
+
+
+def test_a_set_whose_provider_publishes_no_version_is_judged_by_age_not_assumed_current(
+        tmp_path, bare, monkeypatch):
+    """Only NCBI publishes a release string; for the rest, "unknown" is not "current"."""
+    store = hydra_store(tmp_path / "amr", names=("ncbi", "protein", "vfdb"),
+                        staged="2019-01-04 09:00:00")
+    monkeypatch.setattr(provisioning, "hydra_update_available", lambda *args, **options: {
+        "installed": "2026-08-07.1", "latest": "2026-08-07.1", "newer_available": False,
+        "message": "", "error": ""})
+    steps = {step["key"]: step for step in
+             provisioning.installation_plan(tmp_path / "data", str(store))["steps"]}
+    aged = steps["database:vfdb"]
+    assert aged["state"] == "stale" and aged["action"] == "update"
+    assert "publishes no version this application can compare against" in aged["reason"]
+    assert "days ago" in aged["reason"]
+    # The NCBI sets are judged by the release NCBI publishes, not by their age.
+    assert steps["database:ncbi"]["action"] == "skip"
+    assert "is the one NCBI publishes today" in steps["database:ncbi"]["reason"]
+
+    # When NCBI could not be reached, an old copy is not quietly called current.
+    monkeypatch.setattr(provisioning, "hydra_update_available", lambda *args, **options: {
+        "installed": "2026-08-07.1", "latest": "", "newer_available": False,
+        "message": "", "error": "Could not reach NCBI."})
+    offline = {step["key"]: step for step in
+               provisioning.installation_plan(tmp_path / "data", str(store))["steps"]}
+    assert offline["database:ncbi"]["action"] == "update"
+    assert "current release could not be checked" in offline["database:ncbi"]["reason"]
+
+
+def test_a_hand_installed_set_is_not_handed_to_a_downloader_that_cannot_fetch_it(tmp_path, bare,
+                                                                                  monkeypatch):
+    """Asking the engine for a set it has no fetcher for would fail the whole batch."""
+    store = hydra_store(tmp_path / "amr", names=("ncbi", "protein", "vfdb_full"))
+    monkeypatch.setattr(provisioning, "hydra_update_available", lambda *args, **options: {
+        "installed": "2026-08-07.1", "latest": "2026-09-01.1", "newer_available": True,
+        "message": "", "error": ""})
+    plan = provisioning.installation_plan(tmp_path / "data", str(store))
+    assert plan["installed_by_hand"] == ["vfdb_full"]
+    assert "vfdb_full" not in plan["databases"]
+    assert "vfdb_full" not in plan["database_snapshot_contents"]
+    # And its absence from the new snapshot is stated rather than discovered later.
+    assert "installed by hand" in plan["summary"] and "vfdb_full" in plan["summary"]
+
+
+def test_a_licence_that_has_to_be_read_is_never_swept_into_install_everything(tmp_path, bare,
+                                                                              monkeypatch):
+    store = hydra_store(tmp_path / "amr")
+    monkeypatch.setattr(provisioning, "hydra_update_available", lambda *args, **options: {
+        "installed": "2026-08-07.1", "latest": "2026-08-07.1", "newer_available": False,
+        "message": "", "error": ""})
+    plan = provisioning.installation_plan(tmp_path / "data", str(store))
+    restricted = [step for step in plan["steps"] if step["kind"] == "database"
+                  and step.get("licence") and "academic" in step["licence"]]
+    assert restricted and all(step["action"] == "skip" for step in restricted)
+    assert all(step["name"] not in plan["databases"] for step in restricted)
+
+
+def test_the_update_page_shows_the_plan_before_anything_is_downloaded(tmp_path, bare, monkeypatch):
+    """"Update everything" is a leap of faith unless the list comes first."""
+    from wmlstudio.update_center import UpdateCenter
+
+    store = hydra_store(tmp_path / "amr")
+    monkeypatch.setattr(provisioning, "hydra_update_available", lambda *args, **options: {
+        "installed": "2026-08-07.1", "latest": "2026-09-01.1", "newer_available": True,
+        "message": "NCBI publishes 2026-09-01.1 today.", "error": ""})
+    text = UpdateCenter.plan_text(provisioning.installation_plan(tmp_path / "data", str(store)))
+    assert "Will be installed:" in text and "Will be updated:" in text
+    assert "Species reference panel" in text and "NCBI AMRFinderPlus" in text
+    assert "Cannot be installed from here:" in text
+    assert "NCBI publishes 2026-09-01.1 today." in text
+    assert "sequences are never uploaded" in text and "published beside it" in text
+
+
+def _no_network(monkeypatch, *, newer=False):
+    monkeypatch.setattr(provisioning, "hydra_update_available", lambda *args, **options: {
+        "installed": "2026-08-07.1", "latest": "2026-09-01.1" if newer else "2026-08-07.1",
+        "newer_available": newer, "message": "", "error": ""})
+
+
+def test_install_and_update_everything_is_safe_to_press_twice(tmp_path, bare, monkeypatch):
+    """The second press must find nothing to do rather than download the same data again."""
+    store = hydra_store(tmp_path / "amr")
+    published = hydra_store(tmp_path / "published")
+    calls = []
+    _no_network(monkeypatch, newer=True)
+    monkeypatch.setattr(provisioning, "install_species_panel",
+                        lambda root=None, **options: calls.append("panel"))
+    monkeypatch.setattr(provisioning, "update_hydra_databases",
+                        lambda root, names, **options: calls.append(list(names)) or {
+                            "database_root": str(published), "selected": False})
+    first = provisioning.install_everything(tmp_path / "data", selected=str(store))
+    assert "panel" in calls and ["ncbi", "protein"] in calls
+    assert first["failed"] == [] and first["updated"]
+    assert "Previous snapshots are kept" in first["summary"]
+
+    calls.clear()
+    species_panel(tmp_path / "data")
+    _no_network(monkeypatch, newer=False)
+    second = provisioning.install_everything(tmp_path / "data", selected=str(store))
+    assert calls == [], "a second press must not re-download what is already current"
+    assert second["installed"] == [] and second["updated"] == []
+    assert "Nothing needed installing or updating" in second["summary"]
+
+
+def test_install_everything_publishes_beside_the_store_an_analysis_already_used(tmp_path, bare,
+                                                                                monkeypatch):
+    project = Project(tmp_path / "investigation.wmlstudio")
+    store = hydra_store(tmp_path / "amr")
+    manifest = (store / "manifest.json").read_bytes()
+    published = hydra_store(tmp_path / "published")
+    _no_network(monkeypatch, newer=True)
+    monkeypatch.setattr(provisioning, "install_species_panel", lambda root=None, **options: None)
+    # Only the download itself is replaced: publishing beside, recording the new
+    # snapshot and saying so are the behaviour under test.
+    monkeypatch.setattr(provisioning, "install_hydra_databases",
+                        lambda root, names, **options: {"database_root": str(published),
+                                                        "previous_database_root": str(root)})
+    result = provisioning.install_everything(tmp_path / "data", project=project,
+                                             selected=str(store))
+    assert result["database_root"] == str(published)
+    assert project.get_setting("hydra_database_root") == str(published.resolve())
+    # The store the previous analyses ran against is byte-for-byte where it was.
+    assert (store / "manifest.json").read_bytes() == manifest
+    assert "keep the snapshot they were run against" in result["summary"]
+    assert json.loads(json.dumps(result)) == result
+    project.close()
+
+
+def test_a_failed_download_is_named_and_leaves_everything_else_that_worked(tmp_path, bare,
+                                                                           monkeypatch):
+    store = hydra_store(tmp_path / "amr")
+    manifest = (store / "manifest.json").read_bytes()
+    _no_network(monkeypatch, newer=True)
+    monkeypatch.setattr(provisioning, "install_species_panel", lambda root=None, **options: None)
+
+    def refuse(root, names, **options):
+        raise ValueError("Downloading protein, ncbi failed; the store you are using is unchanged.")
+
+    monkeypatch.setattr(provisioning, "update_hydra_databases", refuse)
+    result = provisioning.install_everything(tmp_path / "data", selected=str(store))
+    assert result["installed"] == ["species_panel"], "the step that worked is still recorded"
+    assert [failure["key"] for failure in result["failed"]] == ["hydra_database"]
+    assert "the store you are using is unchanged" in result["failed"][0]["error"]
+    assert "unchanged" in result["failed"][0]["state"]
+    assert "failed" in result["summary"]
+    assert result["database_root"] == str(store.resolve())
+    assert (store / "manifest.json").read_bytes() == manifest
 
 
 def test_checking_for_a_newer_release_never_reports_up_to_date_on_a_failed_request(tmp_path,

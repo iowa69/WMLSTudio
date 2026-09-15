@@ -195,6 +195,38 @@ def stage(platform, destination, archive=None):
     return manifest
 
 
+def point_mutation_inventory(root):
+    """What a starter store can screen for beyond acquired genes.
+
+    Two separate things, reported separately because they answer different
+    questions: `AMRProt-mutation.tsv` carries the curated protein-level mutations,
+    and `mutation/dna/*.fna` are the per-organism DNA catalogues. An organism with
+    neither is screened for genes only, which is not the same as having none.
+    """
+    root = Path(root)
+    table = root / "prot/protein/AMRProt-mutation.tsv"
+    return {"dna_catalogues": sorted(path.stem for path in sorted((root / "mutation/dna").glob("*.fna"))),
+            "protein_mutation_table": table.is_file(),
+            "protein_mutation_bytes": table.stat().st_size if table.is_file() else 0,
+            "meaning": ("Organisms with a bundled point-mutation catalogue. An organism absent "
+                        "from this list is screened for acquired genes only; that is an absent "
+                        "catalogue, never a negative mutation result.")}
+
+
+def require_point_mutations(inventory, where):
+    """The bundled core must work offline on the first run, point mutations included."""
+    if inventory["dna_catalogues"] and inventory["protein_mutation_table"]:
+        return inventory
+    raise ValueError(
+        f"The bundled AMR core at {where} carries {len(inventory['dna_catalogues'])} DNA "
+        f"point-mutation catalogue(s) and "
+        f"{'a' if inventory['protein_mutation_table'] else 'no'} protein mutation table. "
+        "The portable package bundles the core reference so the first run works offline, and "
+        "point mutations are part of that core: without them the build would screen for "
+        "acquired genes only and report nothing for mutations, which a reader cannot "
+        "distinguish from a negative result.")
+
+
 def stage_hydra_database(source, destination):
     """Stage only the reviewed NCBI starter data; never redistribute other providers implicitly."""
     from wmlstudio.hydra_runtime import _database_provenance, installed_databases
@@ -203,13 +235,17 @@ def stage_hydra_database(source, destination):
     entries = installed_databases(source)
     if set(entries) != {"ncbi", "protein"}:
         raise ValueError("The portable starter must contain exactly the NCBI nucleotide and protein databases.")
+    inventory = require_point_mutations(point_mutation_inventory(source), source)
     provenance = _database_provenance(source, ["ncbi", "protein"])
+    provenance["point_mutations"] = inventory
     if destination.exists():
         previous = destination / "snapshot_provenance.json"
         recorded = json.loads(previous.read_text()) if previous.is_file() else {}
         if recorded.get("manifest_sha256") == provenance["manifest_sha256"]:
             current = _database_provenance(destination, ["ncbi", "protein"])
             if current["databases"] == provenance["databases"] == recorded.get("databases"):
+                current["point_mutations"] = require_point_mutations(
+                    point_mutation_inventory(destination), destination)
                 return current
         raise ValueError(f"Starter staging already contains a different snapshot: {destination}")
     destination.parent.mkdir(parents=True, exist_ok=True)
@@ -220,6 +256,7 @@ def stage_hydra_database(source, destination):
             if (source / relative).is_dir():
                 shutil.copytree(source / relative, target / relative)
         shutil.copy2(source / "manifest.json", target / "manifest.json")
+        require_point_mutations(point_mutation_inventory(target), target)
         provenance["redistribution_scope"] = "NCBI AMRFinderPlus reference data only; provider terms and attribution retained separately."
         (target / "snapshot_provenance.json").write_text(json.dumps(provenance, indent=2) + "\n", encoding="utf-8")
         os.replace(target, destination)
@@ -237,6 +274,8 @@ def download_hydra_starter(destination):
             recorded = json.loads(provenance_path.read_text(encoding="utf-8"))
             current = _database_provenance(destination, ["ncbi", "protein"])
             if current["manifest_sha256"] == recorded["manifest_sha256"] and current["databases"] == recorded["databases"]:
+                current["point_mutations"] = require_point_mutations(
+                    point_mutation_inventory(destination), destination)
                 return current
         raise ValueError("An existing HYDRA starter staging directory failed snapshot verification.")
     with tempfile.TemporaryDirectory(prefix="wmlstudio-build-reference-") as temporary:

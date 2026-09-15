@@ -13,6 +13,7 @@ sys.path.insert(0, str(root / "src"))
 from stage_bio_tools import (filter_hoisted_tool_binaries, filter_windows_qt_tls,
                             stage_hydra_database, verify_skesa_bundle)
 from stage_fastqc import verify as verify_fastqc
+from stage_read_tools import verify as verify_fastp
 from stage_reference_panels import assay_module_imports, panel_summary, verify_bundle_payload
 from stage_ska import verify as verify_ska
 schemes = root / "src/wmlstudio/resources/schemes"
@@ -56,13 +57,30 @@ datas.append((str(fastqc), "Tools/fastqc"))
 ska = root / "src/wmlstudio/resources/tools/ska2" / platform
 verify_ska(ska, platform)
 datas.append((str(ska), "Tools/ska2"))
+# fastp is optional. Upstream publishes no Windows binary, so a package without it
+# is a legitimate build: the Read QC tab reports trimming as unavailable and says
+# reads remain usable untrimmed, rather than substituting another program. When a
+# payload is staged it is re-verified file by file before it is allowed in.
+fastp = root / "src/wmlstudio/resources/tools/fastp" / platform
+if (fastp / "manifest.json").is_file():
+    trimmer = verify_fastp(fastp, platform)
+    print("Bundled read trimming: " + json.dumps(
+        {key: trimmer[key] for key in ("tool", "version", "platform", "source_commit")}))
+    datas.append((str(fastp), "Tools/fastp"))
+else:
+    print(f"No verified fastp payload for {platform}; this package ships without read trimming.")
 if json.loads((tools / "manifest.json").read_text())["platform"] != platform:
     raise SystemExit("Staged BLAST+ archive does not match the target build platform")
 datas.append((str(tools), "Tools/blast"))
 hydra_database = root / "src/wmlstudio/resources/hydra/starter"
 if not (hydra_database / "manifest.json").is_file():
     raise SystemExit("The all-in-one build requires the verified NCBI HYDRA starter snapshot")
-stage_hydra_database(hydra_database, hydra_database)
+# The core AMR store is bundled, point-mutation catalogues included, so the first
+# run works offline. Staging refuses a starter without them: a package that could
+# screen only for acquired genes would report nothing for point mutations, which
+# reads exactly like a negative result.
+core_reference = stage_hydra_database(hydra_database, hydra_database)
+print("Bundled AMR core reference: " + json.dumps(core_reference["point_mutations"]))
 datas.append((str(hydra_database), "wmlstudio/resources/hydra/starter"))
 characterization_database = root / "src/wmlstudio/resources/characterization/starter"
 if not (characterization_database / "manifest.json").is_file():
@@ -127,7 +145,7 @@ hydra_exe = EXE(
 # one of its libraries lifted beside the executable is inert — a JRE's java.dll
 # resolves jvm.dll from its own bin/server — so it is removed rather than shipped.
 for analysis in (gui, cli, hydra):
-    analysis.binaries = filter_hoisted_tool_binaries(analysis.binaries, (fastqc, ska, tools))
+    analysis.binaries = filter_hoisted_tool_binaries(analysis.binaries, (fastqc, ska, tools, fastp))
 if sys.platform == "win32":
     for analysis in (gui, cli, hydra):
         analysis.binaries = filter_windows_qt_tls(analysis.binaries)

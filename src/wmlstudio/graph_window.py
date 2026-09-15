@@ -1,13 +1,15 @@
-"""One allele-distance forest in its own window: movable, editable, self-describing.
+"""One distance forest in its own window: movable, editable, self-describing.
 
 A window draws a *copy* of a panel's forest — the same records, edges, threshold,
 groups and scale in a view of its own — so dragging, recoloring or relabelling
 here never moves a node on the page behind it, and closing a window leaves that
 page exactly as it was. Several windows can stand side by side, which is why each
 one states its own typing kind, reference, target count, cohort, link threshold
-and the time it was opened: a "3" on an edge of a classical MLST forest and a "3"
-on an edge of a cgMLST forest are different quantities, and two windows must
-never be mistaken for one another.
+and the time it was opened: a "3" on an edge of a classical MLST forest, a "3" on
+an edge of a cgMLST forest and a "3" on an edge of a SKA2 split k-mer SNP forest
+are three different quantities, and two windows must never be mistaken for one
+another. A window takes those words from the scale it was opened on rather than
+assuming allele typing, so a SNP window never says "alleles" anywhere.
 
 Nothing here reads a sequence, recalculates a distance or edits a call. Arranging
 and coloring are presentation, and the window says so where it cannot be cropped
@@ -45,14 +47,31 @@ DEFAULT_SIZE = (1180, 820)
 
 # The three statements that must travel with the picture, in the window and in
 # every image saved from it.
+_OVERLAP = "Too little overlap is an excluded pair, never a zero distance."
 HONESTY = (
     "Groups are single linkage: a chain of small differences can join two isolates whose own "
     "distance is larger than the threshold.",
-    "Every distance is counted over the loci the two isolates actually share. Too little overlap "
-    "is an excluded pair, never a zero distance.",
+    "Every distance is counted over the loci the two isolates actually share. " + _OVERLAP,
     "This is a layout of allele differences. It is not a phylogeny, not a time line and not a "
     "transmission chain, and line length carries no meaning.",
 )
+
+
+def honesty_lines(identity=None):
+    """The same three statements, in the words of whatever this window measures.
+
+    An identity that records no vocabulary of its own is an allele-distance forest
+    and gets :data:`HONESTY` unchanged. One that names its own difference word and
+    its own denominator states those instead, because "a layout of allele
+    differences" is a false description of a SNP forest and the sentence that
+    keeps unshared sequence from reading as zero has to be true of the quantity it
+    is printed beside.
+    """
+    note = str(getattr(identity, "denominator_note", "") or "")
+    difference = str(getattr(identity, "difference_word", "") or "allele differences")
+    return (HONESTY[0], f"{note} {_OVERLAP}" if note else HONESTY[1],
+            f"This is a layout of {difference}. It is not a phylogeny, not a time line and not a "
+            "transmission chain, and line length carries no meaning.")
 EDIT_NOTE = ("Arranging, coloring and renaming change this picture only. Allele calls, distances "
              "and group membership are untouched.")
 EXPORT_FORMATS = (("PNG image", "png"), ("JPEG image", "jpg"), ("SVG vector", "svg"),
@@ -128,6 +147,13 @@ class GraphIdentity:
     created: str = ""
     separation: str = ""
     note: str = ""
+    # What this window's numbers are, in its own words. The defaults are the
+    # allele-typing vocabulary every window used before a SNP forest could be
+    # opened, so a scale that records none of these reads exactly as it did.
+    difference_word: str = "allele differences"
+    distance_phrase: str = "allele-distance"
+    caption_text: str = ""
+    denominator_note: str = ""
 
     @classmethod
     def from_scale(cls, scale=None, *, kind=None, cohort="", threshold=None, created=None, note=""):
@@ -146,19 +172,32 @@ class GraphIdentity:
                    cohort=str(cohort or ""),
                    threshold=None if threshold is None else int(threshold),
                    created=_clock(created), separation=str(scale.get("separation") or ""),
-                   note=str(note or ""))
+                   note=str(note or ""),
+                   difference_word=str(scale.get("difference_word") or "allele differences"),
+                   distance_phrase=str(scale.get("distance_phrase") or "allele-distance"),
+                   caption_text=str(scale.get("caption") or ""),
+                   denominator_note=str(scale.get("denominator_note") or ""))
 
     def caption(self):
-        """'cgMLST · kpneumoniae · 2358 targets', naming the quantity this window shows."""
-        return " · ".join([self.title, self.scheme or "reference not recorded",
-                           f"{self.targets} {self.target_word}" if self.targets
-                           else "target count not recorded"])
+        """'cgMLST · kpneumoniae · 2358 targets', naming the quantity this window shows.
+
+        A scale that wrote its own caption is trusted with it: a forest whose
+        denominator is per pair has no cohort target count, and "target count not
+        recorded" would describe that as a gap rather than as the truth.
+        """
+        return self.caption_text or " · ".join(
+            [self.title, self.scheme or "reference not recorded",
+             f"{self.targets} {self.target_word}" if self.targets else "target count not recorded"])
 
     def threshold_words(self):
         if self.threshold is None:
             return "link threshold not recorded"
+        # A negative threshold is this application's way of saying no cutoff was
+        # justified. It groups nothing, and must never be printed as a number.
+        if self.threshold < 0:
+            return "no link threshold set"
         return (f"link ≤ {self.threshold} of {self.targets} {self.target_word}" if self.targets
-                else f"link ≤ {self.threshold} allele differences")
+                else f"link ≤ {self.threshold} {self.difference_word}")
 
     def cohort_words(self):
         return self.cohort or "cohort not named"
@@ -174,19 +213,21 @@ class GraphIdentity:
                                         self.note]))
 
     def export_title(self):
-        return f"{self.caption()} · allele-distance minimum spanning forest"
+        return f"{self.caption()} · {self.distance_phrase} minimum spanning forest"
 
     def export_subtitle(self):
         """The line printed under every picture saved from this window."""
         return " · ".join(filter(None, [
-            self.cohort_words(), f"{self.threshold_words()}, single linkage",
+            self.cohort_words(),
+            self.threshold_words() + (", single linkage" if (self.threshold or 0) >= 0 else ""),
             f"opened {self.created}" if self.created else "",
             "not a phylogeny or transmission chain"]))
 
     def as_dict(self):
         return {"kind": self.kind, "title": self.title, "scheme": self.scheme,
                 "targets": self.targets, "target_word": self.target_word, "cohort": self.cohort,
-                "threshold": self.threshold, "created": self.created, "note": self.note}
+                "threshold": self.threshold, "created": self.created, "note": self.note,
+                "difference_word": self.difference_word, "distance_phrase": self.distance_phrase}
 
 
 def _field_title(field):
@@ -243,7 +284,7 @@ class GraphWindow(QMainWindow):
         # honesty lines sit in one block so they cost one gap, not three.
         self.view.setMinimumHeight(220)
         layout.addWidget(self.view, 1)
-        self.honesty = label("\n".join(HONESTY), "small", wrap=True)
+        self.honesty = label("\n".join(honesty_lines(self.identity)), "small", wrap=True)
         layout.addWidget(self.honesty)
         self._fit_timer = QTimer(self)
         self._fit_timer.setSingleShot(True)
@@ -352,12 +393,19 @@ class GraphWindow(QMainWindow):
         """Restate what this window shows; nothing is redrawn and no number changes."""
         self.identity = (identity if isinstance(identity, GraphIdentity)
                          else GraphIdentity.from_scale(identity))
+        difference = self.identity.difference_word
         self.setWindowTitle(self.identity.window_title())
         self.kind_badge.setText(self.identity.title)
         self.headline.setText(self.identity.caption())
         self.summary.setText(self.identity.summary())
         self.separation.setText(self.identity.separation)
         self.separation.setVisible(bool(self.identity.separation))
+        # The controls name this window's own quantity too: a checkbox offering
+        # "allele differences on edges" over a SNP forest is simply false.
+        self.toggles["edges"].setText(f"{difference[:1].upper()}{difference[1:]} on edges")
+        self.toggles["edges"].setToolTip(f"Show how many {difference} separate two isolates, over "
+                                         "the sequence they share, which the tooltip states.")
+        self.honesty.setText("\n".join(honesty_lines(self.identity)))
         return self.identity
 
     def refresh_controls(self):

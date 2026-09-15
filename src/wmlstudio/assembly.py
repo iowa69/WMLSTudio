@@ -17,6 +17,7 @@ import sys
 import tempfile
 import time
 import uuid
+from collections import Counter
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -237,13 +238,106 @@ def _normalise_pairs(first, second, directory, cancelled, progress):
     return inputs, pairing, [qc.result("fastq", True, None) for qc in accumulators]
 
 
+#: What a run records when nothing trimmed or filtered the reads it was given.
+RAW_READ_SOURCE = {
+    "kind": "original_reads", "tool": None, "version": None,
+    "description": "The reads exactly as supplied; no trimming or quality filtering was performed.",
+}
+
+#: SKESA names each contig after its own estimated k-mer depth, optionally circular.
+_SKESA_CONTIG = re.compile(r"^Contig_(\d+)_(\d+(?:\.\d+)?)(?:_(\w+))?$")
+
+
+def _check_read_source(read_source, inputs):
+    """A run may only claim trimmed provenance for the exact files it assembled."""
+    if read_source is None:
+        return copy.deepcopy(RAW_READ_SOURCE)
+    source = copy.deepcopy(dict(read_source))
+    if source.get("kind") != "fastp_trimmed":
+        raise ValueError("A read source must describe either fastp-trimmed reads or nothing at all.")
+    claimed = [source.get("read1_sha256"), source.get("read2_sha256")]
+    if claimed != [item["sha256"] for item in inputs]:
+        raise AssemblyError(
+            "The trimming record describes different files from the ones being assembled. "
+            "Assemble the trimmed pair that run produced, or assemble the originals.")
+    return source
+
+
+def _preprocessing_summary(source):
+    """State in one sentence which reads went in, without overstating what that means."""
+    if source.get("kind") != "fastp_trimmed":
+        return "Format normalization only. No fastp trimming or filtering was performed."
+    removed = source.get("reads_removed")
+    detail = f" {removed:,} reads were removed before assembly." if isinstance(removed, int) else ""
+    return (f"Assembled from reads trimmed and quality-filtered by fastp {source.get('version')}."
+            f"{detail} The original FASTQs are unchanged and remain on record.")
+
+
+def assembly_metrics(path, *, cancelled=None):
+    """Exact contiguity, plus the per-contig depth SKESA writes into its contig names.
+
+    The depth is the assembler's own k-mer estimate for a contig, not an
+    independent read-mapping measurement, and not genome coverage.
+    """
+    path = Path(path).expanduser().resolve()
+    lengths, depths, weighted, named = [], [], 0.0, 0
+    circular, bases = 0, Counter()
+    with SequenceReader(path, cancelled) as reader:
+        if reader.kind != "fasta":
+            raise AssemblyError("Assembly metrics require a FASTA assembly, not raw reads.")
+        for record in reader:
+            lengths.append(len(record.sequence))
+            bases.update(record.sequence)
+            match = _SKESA_CONTIG.match(record.identifier)
+            if match:
+                named += 1
+                depths.append(float(match.group(2)))
+                weighted += float(match.group(2)) * len(record.sequence)
+                circular += match.group(3) == "Circ"
+    if not lengths:
+        raise AssemblyError("The assembly FASTA contains no records.")
+    total = sum(lengths)
+    cumulative, n50 = 0, None
+    for length in sorted(lengths, reverse=True):
+        cumulative += length
+        if cumulative * 2 >= total:
+            n50 = length
+            break
+    canonical = sum(bases[letter] for letter in "ACGT")
+    reported = named == len(lengths)
+    return {
+        "contigs": len(lengths), "total_length": total, "n50": n50,
+        "largest_contig": max(lengths), "smallest_contig": min(lengths),
+        "gc_percent": 100 * (bases["G"] + bases["C"]) / canonical if canonical else None,
+        "gc_denominator": "ACGT bases",
+        "n_bases": bases["N"], "ambiguous_bases": total - canonical,
+        "assembler_depth": {
+            "reported": reported,
+            "contigs_with_depth": named,
+            "length_weighted_mean": weighted / total if reported and total else None,
+            "minimum": min(depths) if reported and depths else None,
+            "maximum": max(depths) if reported and depths else None,
+            "circular_contigs": circular if reported else None,
+            "basis": ("SKESA's own k-mer depth estimate, read from each contig name."
+                      if reported else
+                      "This FASTA does not carry SKESA contig names, so no assembler depth is available."),
+        },
+        "interpretation": ("These numbers describe one assembly. They are not a species, "
+                           "a completeness or contamination assessment, or a clinical result."),
+    }
+
+
 def run_skesa(read1, read2, output_dir, *, executable=None, threads=4, memory_gb=8,
-              min_contig=200, cancelled=None, progress=None):
+              min_contig=200, read_source=None, cancelled=None, progress=None):
     """Assemble explicit short-read pairs into a NEW output directory atomically.
 
     progress receives (done, total, message). Cancellation raises AnalysisCancelled.
     Existing output directories/files are never replaced, even if empty.
     Failure logs are retained as uniquely named sibling *.failed-*.log files.
+    ``read_source`` is the trimming record from read_tools.read_source_for or
+    reads_for_assembly when the caller is assembling a trimmed pair; its recorded
+    output hashes must match the files given here, so an assembly can never claim
+    a preprocessing step that did not produce its input.
     """
     for name, value in (("threads", threads), ("memory_gb", memory_gb), ("min_contig", min_contig)):
         if isinstance(value, bool) or not isinstance(value, int) or value < 1:
@@ -271,6 +365,7 @@ def run_skesa(read1, read2, output_dir, *, executable=None, threads=4, memory_gb
         try:
             tool_info = _tool_info(tool, directory, cancelled)
             inputs, pairing, read_qc = _normalise_pairs(first, second, directory, cancelled, progress)
+            source = _check_read_source(read_source, inputs)
             command = [str(tool), "--reads", "mate1.fastq,mate2.fastq", "--cores", str(threads),
                        "--memory", str(memory_gb), "--min_contig", str(min_contig),
                        "--contigs_out", "contigs.fasta"]
@@ -279,7 +374,7 @@ def run_skesa(read1, read2, output_dir, *, executable=None, threads=4, memory_gb
             launch_plan = {
                 "state": "prepared_not_completed", "started_at": started,
                 "output_directory": str(destination), "command": command, "engine": tool_info,
-                "inputs": inputs, "pairing": pairing, "read_qc": read_qc,
+                "inputs": inputs, "pairing": pairing, "read_qc": read_qc, "read_source": source,
                 "threads": threads, "memory_gb": memory_gb, "min_contig": min_contig,
                 "recovery_policy": "Review logs and validate outputs; no automatic PID reuse or success inference.",
             }
@@ -297,6 +392,19 @@ def run_skesa(read1, read2, output_dir, *, executable=None, threads=4, memory_gb
             result = inspect_sequence(contigs, cancelled=cancelled)
             if result["kind"] != "fasta" or not result["qc"]["records"]:
                 raise AssemblyError("SKESA output is not a nonempty FASTA assembly.")
+            # A second pass reads the contig names inspect_sequence does not keep,
+            # which is where SKESA records its own per-contig depth estimate.
+            metrics = assembly_metrics(contigs, cancelled=cancelled)
+            read_bases = sum(item["total_bases"] for item in read_qc)
+            coverage = {
+                "assembler_reported_depth": metrics["assembler_depth"],
+                "input_read_bases": read_bases,
+                "read_bases_per_assembled_base": (read_bases / metrics["total_length"]
+                                                  if metrics["total_length"] else None),
+                "denominator": "Bases in the reads given to the assembler, over the assembled length.",
+                "basis": ("Not genome coverage: the genome size is unknown, repeats collapse into one "
+                          "contig, and reads that did not assemble are still counted."),
+            }
             provenance = {
                 "workflow": "paired_short_read_isolate_assembly", "engine": tool_info,
                 "started_at": started, "completed_at": datetime.now(timezone.utc).isoformat(),
@@ -304,21 +412,23 @@ def run_skesa(read1, read2, output_dir, *, executable=None, threads=4, memory_gb
                 "threads": threads, "memory_gb": memory_gb,
                 "memory_policy": "SKESA sorted-counter budget, not an OS-enforced process memory limit.",
                 "min_contig": min_contig, "inputs": inputs, "pairing": pairing,
-                "assembly_sha256": result["input_sha256"],
-                "read_preprocessing": "Format normalization only. No fastp trimming or filtering was performed.",
+                "assembly_sha256": result["input_sha256"], "read_source": source,
+                "read_preprocessing": _preprocessing_summary(source),
                 "biological_qc": {"completeness": "not assessed", "contamination": "not assessed",
                                   "QUAST": "not run", "QuickClade": "not run; not bundled with native adapter"},
             }
             notes = [
                 "Short-read isolate assembly only; not a metagenome or long-read assembly workflow.",
                 "Genome completeness and contamination were not assessed; contiguity is not a purity check.",
-                "FASTQ quality assumes Phred+33. Read preprocessing was format normalization, not quality filtering.",
+                "Assembly metrics describe this assembly. They are not a species, a purity verdict or a clinical result.",
+                "FASTQ quality assumes Phred+33. " + _preprocessing_summary(source),
                 "The memory setting is SKESA's sorted-counter budget, not an operating-system enforced limit.",
             ]
             if not pairing["explicit_mates"]:
                 notes.append("Read IDs match completely but lack explicit mate markers; biological pairing is user-assigned.")
             payload = {"assembly_path": str(destination / "contigs.fasta"), "provenance": provenance,
-                       "qc": result["qc"], "read_qc": read_qc, "pairing": pairing, "notes": notes}
+                       "qc": result["qc"], "metrics": metrics, "coverage": coverage,
+                       "read_qc": read_qc, "pairing": pairing, "read_source": source, "notes": notes}
             _write_json(directory / "assembly.json", payload)
             (directory / "mate1.fastq").unlink()
             (directory / "mate2.fastq").unlink()
@@ -420,3 +530,79 @@ def associate_assembly(project, primary_id, mate_id, assembly_result):
                 "read_inputs": inputs,
             })
     return primary_id
+
+
+def _input_kind(path):
+    """Peek one header to say whether a record's input is reads or an assembly."""
+    if not path:
+        return None
+    try:
+        with SequenceReader(path) as reader:
+            return reader.kind
+    except (OSError, SequenceError):
+        return None
+
+
+def assembly_view(sample, *, inspect_input=True):
+    """One sample's assembly status and metrics for the assembly tab.
+
+    Everything here comes from what a run actually recorded. Nothing is inferred
+    about the organism, and no threshold decides that an assembly is good enough:
+    the numbers that inform that judgement are shown, and the judgement is the
+    microbiologist's. ``inspect_input`` reads one header from an unanalysed input
+    to distinguish reads from an assembly; pass False to keep the view off disk.
+    """
+    metadata = sample.get("metadata") or {}
+    workflow = metadata.get("workflow") or {}
+    record = metadata.get("assembly") or {}
+    source = record.get("read_source") or (record.get("provenance") or {}).get("read_source")
+    view = {
+        "sample_id": sample.get("id"), "sample_name": sample.get("name"),
+        "status": "unknown", "assembly_path": None, "engine": None, "completed_at": None,
+        "metrics": None, "coverage": None, "pairing": None,
+        "read_source": copy.deepcopy(source) if source else None,
+        "from_trimmed_reads": (source or {}).get("kind") == "fastp_trimmed" if source else None,
+        "notes": ["Assembly metrics describe an assembly. They are not a species, a purity "
+                  "verdict, or a clinical result, and no threshold here decides usability."],
+    }
+    if workflow.get("source_kind") == "read_mate":
+        view.update(status="read_mate", assembly_path=workflow.get("assembly_path"))
+        view["notes"].insert(0, "This record is the second mate of a read pair; its assembly and "
+                                f"metrics belong to sample {workflow.get('paired_with')}.")
+        return view
+    provenance = record.get("provenance") or {}
+    if record.get("assembly_path") and provenance:
+        engine = provenance.get("engine") or {}
+        view.update(status="assembled", assembly_path=record.get("assembly_path"),
+                    engine=" ".join(str(engine.get(key, "")).strip() for key in ("name", "version")).strip()
+                    or engine.get("name"),
+                    completed_at=provenance.get("completed_at"),
+                    metrics=copy.deepcopy(record.get("metrics")),
+                    coverage=copy.deepcopy(record.get("coverage")),
+                    pairing=copy.deepcopy(record.get("pairing")))
+        if view["read_source"] is None:
+            view["read_source"] = {"kind": "unrecorded", "description": provenance.get(
+                "read_preprocessing", "This assembly predates read-source recording.")}
+            view["from_trimmed_reads"] = None
+        if view["metrics"] is None:
+            view["notes"].append("This assembly was recorded before per-contig metrics were kept; "
+                                 "read the FASTA with assembly_metrics for its exact numbers.")
+        if view["coverage"] is None:
+            view["notes"].append("No depth was recorded for this assembly.")
+        if not (record.get("pairing") or {}).get("explicit_mates", True):
+            view["notes"].append("The read pair carried no explicit mate markers; pairing was user-assigned.")
+        return view
+    kind = (sample.get("result") or {}).get("kind")
+    if kind is None and inspect_input:
+        kind = _input_kind(sample.get("input_path"))
+    if kind == "fastq":
+        view["status"] = "reads_not_assembled"
+        view["notes"].insert(0, "These reads have not been assembled here.")
+    elif kind == "fasta":
+        view["status"] = "assembly_supplied"
+        view["notes"].insert(0, "This assembly was supplied, not produced here, so there is no "
+                                "assembler, read source or run provenance to show.")
+    else:
+        view["notes"].insert(0, "The input of this record could not be read, so nothing is claimed "
+                                "about whether it holds reads or an assembly.")
+    return view

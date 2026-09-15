@@ -48,7 +48,7 @@ def test_pages_keep_their_build_order_number_and_are_shown_in_pipeline_order(tab
 
 
 def test_the_bar_reads_as_the_users_own_workflow(tabs):
-    """Samples, the read and assembly slots, typing, its tree, cgMLST, its tree, HYDRA."""
+    """Samples, read QC, assembly, typing, its tree, cgMLST, its tree, SNP, HYDRA."""
     shown = [tabs.tabText(position) for position in range(tabs.count())]
     assert shown == [
         "Overview", "Samples", "Read QC", "Assembly", "MLST", "MLST tree", "cgMLST",
@@ -56,9 +56,12 @@ def test_the_bar_reads_as_the_users_own_workflow(tabs):
     # A seven-locus tree and a cgMLST tree are different quantities, so they are
     # different tabs and neither label can be mistaken for the other.
     assert shown.index("MLST tree") < shown.index("cgMLST") < shown.index("cgMLST tree")
-    # The slots a later round fills sit where that work belongs, not at the end.
+    # Raw reads come first: trim, then assemble, then type what was assembled.
     assert shown.index("Read QC") == shown.index("Samples") + 1
     assert shown.index("Assembly") == shown.index("Read QC") + 1
+    assert shown.index("MLST") == shown.index("Assembly") + 1
+    # The one slot a later round still fills sits where that work belongs, not at
+    # the end: SNP distances are a separate line of evidence from allele typing.
     assert shown.index("SNP tree") == shown.index("cgMLST tree") + 1
 
 
@@ -462,6 +465,18 @@ def test_a_typing_station_counts_what_this_project_actually_has(window, tmp_path
     # A cgMLST count is never inferred from a seven-locus result.
     assert window.station_status["cgmlst"].text().startswith("0 of 1 samples")
     assert window.station_status["cgmlst_tree"].text().startswith("0 samples carry a cgMLST")
+
+
+def test_the_two_pipeline_pages_are_adopted_without_moving_a_single_number(window):
+    """Read QC and Assembly stopped being placeholders; their numbers did not move."""
+    for key in ("reads", "assembly"):
+        assert key not in PLANNED
+        assert window.stations[key]["adopted"] is not None, key
+        assert window.stations[key]["placeholder"].isVisibleTo(window) is False
+        assert window.station_status[key].isVisibleTo(window) is False
+        assert "planned" not in window.pages.tabToolTip(window.pages.position_of(key))
+    assert window.page_index == {key: index for index, key in enumerate(PAGE_KEYS)}
+    assert window.pages.tab_order() == PIPELINE
 
 
 def test_a_station_hands_its_page_over_without_moving_a_single_number(window):

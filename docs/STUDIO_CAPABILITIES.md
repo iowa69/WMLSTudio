@@ -1,12 +1,63 @@
-# WMLSTudio 0.3 investigation revision — capability and reach
+# WMLSTudio 0.4 pipeline revision — capability and reach
 
-Audit date: 2026-09-14. This revision adds the interconnected tab shell, adjustable
-display scaling, automatic organism filing, a registry of organism-specific typing
-modules, a dual-tree change comparison, a plain-language summary report, practice
-cohorts and a documented threshold catalogue.
+Audit date: 2026-09-15. This revision adds read trimming and assembly metrics at
+the front of the pipeline, a SNP-distance tree beside the two allele trees, a
+contig-level plasmid evidence screen, and an AMR reference catalogue that names
+every database the engine can use instead of silently assuming two.
 
 The **Reach** column says where each capability can actually be used, because a
 capability that exists only in `studio_tests` is not one a microbiologist has.
+
+| Capability | What is implemented | Boundary | Reach |
+| --- | --- | --- | --- |
+| Read QC — read trimming | Bundled fastp 1.3.7, pinned to its upstream SHA-256, run on a reviewed pair; fastp's own JSON report is displayed, never recomputed; the trimmed pair is recorded beside the originals, which are never replaced | Adapter trimming and quality filtering. Not an isolate validation, a purity check, a species assignment or a clinical result. Upstream publishes no Windows binary, so a Windows package carries fastp only when a reviewed native artifact was staged, and otherwise says trimming is unavailable and leaves the reads usable untrimmed | Where staged |
+| Assembly metrics and read source | Contigs, total length, N50, largest/smallest contig, GC with its denominator, N and ambiguous bases, and the assembler's own reported depth; every assembly records whether it was built from trimmed or original reads | Assembler-reported depth is the assembler's number, not an independent coverage measurement; metrics are not a quality verdict | Interface |
+| SNP tree — split k-mer distances | SKA2 split k-mer distances over the same cohort, with shared split k-mers as the denominator on every pair, an adjustable comparability floor and its basis, refused pairs listed with their reason, and a separate tree that names its own quantity | A separate quantity from MLST and cgMLST allele distances: no shared scale, axis, column or threshold. Insufficient overlap is a refused pair, never a zero distance. No curated SNP cutoff is applied, and a tree is not a phylogeny | Engine and payload; the tab is the last wiring step |
+| Plasmid evidence | Replicon markers placed on the contigs they sit on, determinants reported as co-located or not, assembler-declared closure and coverage departure from the chromosomal backbone, and cohort replicon co-occurrence | **Not MOB-suite and not equivalent to it**: no relaxase or MPF type, no oriT, no plasmid reconstruction, no mobility prediction, no plasmid count. Contig co-location is an assembly observation, not proof two genes travel together | Interface |
+| AMR reference catalogue | Every reference set the pinned engine can use is listed by name with its provider, licence, citation, upstream address and installed state; the NCBI core is bundled, anything else is a per-set download | A set with a non-open or unrecorded licence is listed and downloadable but never swept into "install and update everything"; provider terms are shown before any download | Interface |
+| Bundled offline core | AMRFinderPlus nucleotide and protein reference data **plus** point mutations — 13 DNA catalogues, 30 organisms with curated protein mutations, 31 in total — bundled so the first run works with no network | The engine accepts 32 organism names, so one accepted organism has no catalogue at all. An organism outside the list is screened for acquired genes only: an absent catalogue, stated as such, never a negative mutation result | Interface and command line |
+| Size budget | The portable archive is measured per component and the build fails above 1,000,000,000 bytes, warning from 80% | A size gate is a distribution promise, not a scientific control | Build gate |
+
+MLST, cgMLST and SNP distances are three different quantities. They are reported
+on three separate scales, in separate columns, with separate denominators, and no
+threshold from one is offered for another.
+
+## What the portable package costs
+
+Measured from the staged trees this revision builds, compressed as the archive
+stores them:
+
+| Component | Bundled or downloaded | Compressed in the archive |
+| --- | --- | --- |
+| FastQC and its private Java runtime | bundled | 173.2 MB |
+| BLAST+ 2.17.0 | bundled | 41.4 MB |
+| SKA2 0.5.1 | bundled | 40.2 MB |
+| Species, virulence and organism-module panels | bundled | 25.2 MB |
+| MLST and cgMLST scheme snapshot | bundled | 7.0 MB |
+| AMRFinderPlus core **and point mutations** | bundled | 5.8 MB |
+| **fastp 1.3.7** | bundled where staged | **4,981,685 B** |
+| SKESA | bundled | 3.3 MB |
+| Read trimming, assembly metrics and read source (Python) | bundled | 25,011 B |
+| SNP tree, including the SKA2 adapter's growth (Python) | bundled | 19,787 B — the tool itself was already staged |
+| Database catalogue and install-everything (Python) | bundled | 22,561 B |
+| Plasmid evidence screen (Python) | bundled | 10,128 B — no database, no binary, no new licence |
+| Every other AMR database the catalogue lists | downloaded on request | 0 |
+| MOB-suite database | not available | 0 — its 473 MB alone would have taken the archive past 845 MB |
+| Practice cohorts and the broad species panel | downloaded on request | 0 |
+
+The Python figures are each module compiled at optimize level 2 and compressed as
+PyInstaller stores it, measured against the previous revision rather than
+estimated: **77,487 bytes for everything this revision adds in code**. fastp is
+the only new binary, at 4,981,685 bytes compressed — 0.5% of the budget — and it
+adds nothing at all to a Windows package today, because upstream publishes no
+Windows binary and the package ships without it.
+
+The archive gate refuses any build over 1,000,000,000 bytes and warns from
+800,000,000, with the table above printed so the growth has a name; the same
+measurement runs on the frozen folder before the archive exists, as a
+deliberately conservative prediction.
+
+## 0.3 investigation revision
 
 | Capability | What is implemented | Boundary | Reach |
 | --- | --- | --- | --- |
@@ -28,10 +79,23 @@ Windows 11 acceptance claim. The frozen-build checks described below are
 self-consistency controls against bundled references, not independent biological
 validation.
 
-## Frozen-build verification added in this revision
+## Frozen-build verification
 
-`studio_packaging/check_frozen.py` now re-verifies the reference panels inside the
-built bundle rather than assuming staging succeeded:
+`studio_packaging/check_frozen.py` exercises the built bundle rather than assuming
+staging succeeded. Added in 0.4:
+
+- The bundled fastp is re-verified against its manifest and then actually run
+  inside the frozen bundle on four synthetic pairs with Unicode paths. Its own
+  report is read, the original read files are hashed before and after, and the
+  executable is proved to resolve inside the package. A package with no fastp
+  reports `not_bundled` **with the reason the application itself shows**, which is
+  a legitimate build state and not a silent pass.
+- The package is measured per component and gated against the size budget, so a
+  bundle that outgrew the download promise fails the build instead of shipping.
+- Packaging refuses an AMR core store without its point-mutation catalogues, so
+  the offline first run cannot quietly become genes-only.
+
+Added in 0.3:
 
 - The bundled characterization snapshot is re-hashed file by file in the frozen
   bundle and its manifest fingerprint recomputed, so a panel truncated by
@@ -70,7 +134,7 @@ This is not a production, clinical, or SeqSphere+ equivalence claim. See the
 | Classical typing | Both-strand exact alleles and complete-profile lookup | No registered ST for missing/mixed loci or an unregistered combination |
 | cgMLST/wgMLST | Exact-first calling, native BLAST+, complete-CDS checks and full-SHA novel IDs | Local novel IDs are not centrally registered allele numbers |
 | Local ad-hoc scheme | Reference-anchored unique complete CDSs; explicit prevalence/identity/coverage | Cohort-defined research nomenclature |
-| Paired short reads | Reviewed pairing, complete pair/QC validation, cancellable native SKESA, atomic assembly/provenance | Native tool must pass its platform gate; no fastp/SPAdes/long-read pipeline |
+| Paired short reads | Reviewed pairing, complete pair/QC validation, optional fastp trimming, cancellable native SKESA, atomic assembly/provenance | Native tool must pass its platform gate; trimming is optional and does not validate an isolate; no SPAdes or long-read pipeline |
 | Unassembled reads | Labelled bounded-prefix Phred+33 QC and full file-byte hash | Not complete-file quality or contamination validation |
 | Library | SQLite projects, collections/history, organism/ST/AMR and metadata research search; cross-project frozen-profile reuse | Index represents saved evidence, not automatic reanalysis |
 | Interoperability | Profile-only tables with missing-token validation; complete profile export and sequence-free bundles | Unverified external tables remain distinct snapshots |
@@ -120,10 +184,24 @@ clean Windows 11 acceptance test.
 
 ## Remaining full-suite work and reference rights
 
-The complete Kleborate/Kaptive, AMRFinderPlus, agr/SCCmec/spa, MOB-recon and
+The complete Kleborate/Kaptive, AMRFinderPlus, agr/SCCmec/spa, MOB-suite and
 abricate execution stack is not included. Species-complex resolution,
-contamination quantification, long-read assembly, fastp preprocessing, validated
-phenotype flags and multi-user clinical deployment remain separate work.
+contamination quantification, long-read assembly, validated phenotype flags and
+multi-user clinical deployment remain separate work.
+
+Read preprocessing is no longer absent: fastp 1.3.7 is bundled where a verified
+native artifact exists for the platform, and its report is shown as fastp's own
+numbers. It remains **optional** — an assembly records whether it used the
+trimmed pair or the originals — and trimming an isolate's reads validates
+nothing about that isolate.
+
+MOB-suite specifically cannot be bundled or run in this portable application, and
+that was verified rather than assumed: its reference database alone is a 473 MB
+download, and its pipeline needs a second Python runtime with SciPy, pandas,
+PyTables, ete3, pycurl, Biopython and a Windows Mash binary that does not exist.
+The plasmid evidence screen reports contig-level replicon and determinant
+placement instead, and says in the application that it is not MOB-suite: no
+relaxase or MPF type, no oriT, no plasmid reconstruction, no mobility prediction.
 
 The 0.3 organism modules narrow that gap without closing it, and the distinction
 matters. WMLSTudio runs its own exact-allele and BLAST+ screens against *pinned

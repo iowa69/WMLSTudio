@@ -49,6 +49,62 @@ from wmlstudio.widgets import button, card, label
 _COMPARISON_WAIT_STEP_MS = 250
 _COMPARISON_WAIT_LIMIT_MS = 120_000
 
+# Three quantities, three methods, never one axis. A report built on allele
+# distances says where the third one is rather than leaving a reader to assume
+# every number in the workspace belongs on the same scale.
+METHOD_SEPARATION = (
+    "SNP distances from the SNP tree are a third quantity, produced by a different method over the "
+    "split k-mers two isolates share rather than over loci. They are not in this report and are "
+    "never comparable with the figures above.")
+
+PLASMID_SCOPE = (
+    "Plasmid evidence in a report is a screen over replicon markers on assembled contigs: a marker "
+    "is evidence about the contig it sits on, not a reconstructed plasmid, a plasmid count or a "
+    "mobility prediction, and it is not MOB-suite.")
+
+# How the engine's point-mutation levels read to somebody deciding what a blank
+# mutation column means. "none" is not "no mutations": it is "nothing to look in".
+MUTATION_WORDS = {
+    "dna_and_protein": "DNA and protein catalogues",
+    "protein_only": "protein catalogue only — no DNA-level target was assessed",
+    "dna_only": "DNA catalogue only — no curated protein mutation was assessed",
+    "none": "no catalogue for this organism — genes only, which is not an absence of mutations",
+    "unknown": "not recorded by this run",
+}
+
+
+def amr_method_fields(sample):
+    """Which reference sets, release and searches produced this isolate's AMR evidence.
+
+    A determinant list means nothing without the question it answers: a run
+    against two reference sets and a run against ten look identical in a table of
+    gene names. The run's own provenance is read, never inferred, and an older
+    result that recorded none of this says so rather than borrowing today's.
+    """
+    from wmlstudio.sample_workflow import current_hydra_evidence
+
+    evidence = current_hydra_evidence(sample)
+    if not evidence:
+        return dict.fromkeys(("AMR reference sets", "AMR reference release",
+                              "Point mutations searched", "Virulence elements searched"),
+                             "No current AMR evidence")
+    execution = evidence.get("execution_provenance") or {}
+    organism = execution.get("organism") or {}
+    virulence = execution.get("virulence") or {}
+    release = (execution.get("reference_release") or {}).get("release")
+    databases = evidence.get("databases") or list(
+        ((execution.get("reference_snapshot") or {}).get("databases") or {}))
+    return {"AMR reference sets": "; ".join(sorted(str(name) for name in databases)) or "not recorded",
+            "AMR reference release": str(release or "not recorded"),
+            "Point mutations searched": MUTATION_WORDS.get(
+                str(organism.get("point_mutation_level") or "unknown"), "not recorded by this run"),
+            "Virulence elements searched": (
+                "yes, curated for " + str(organism.get("resolved") or "this isolate's organism")
+                if virulence.get("enabled") and virulence.get("organism_curated") else
+                "yes, with no organism curation" if virulence.get("enabled") else
+                "no — the translated search was acquired resistance only"
+                if virulence else "not recorded by this run")}
+
 
 class ReportWorkspaceMixin:
     def build_reports(self):
@@ -125,7 +181,8 @@ class ReportWorkspaceMixin:
                                 "full target count, the threshold in force, and whether that threshold is a published "
                                 "cutoff you adopted or your own setting — with the citation, its DOI and the authors’ "
                                 "own caveat when it is published. A sequence type and a core-genome profile are "
-                                "reported as separate quantities and never share a threshold.", "small", True))
+                                "reported as separate quantities and never share a threshold. " + METHOD_SEPARATION,
+                                "small", True))
         layout.addWidget(panel)
 
     def report_options(self):
@@ -157,7 +214,8 @@ class ReportWorkspaceMixin:
         checks = {}
         for key, text in [('investigation', 'Groups and nearest-neighbour comparisons'), ('qc', 'Input quality evidence'),
                           ('amr', 'AMR determinants'), ('virulence', 'Virulence assay'),
-                          ('plasmid_hypotheses', 'Plasmid-marker hypotheses'), ('drug_associations', 'Reference-reported drug classes'),
+                          ('plasmid_hypotheses', 'Plasmid evidence: replicon markers on assembled contigs'),
+                          ('drug_associations', 'Reference-reported drug classes'),
                           ('graph', 'Graph with focal isolates highlighted'),
                           ('graph_jpeg', 'Embed the picture as JPEG (smaller file, slightly softer text)'),
                           ('provenance', 'Full technical provenance appendix')]:
@@ -166,6 +224,7 @@ class ReportWorkspaceMixin:
             checks[key] = check
             layout.addWidget(check)
         layout.addWidget(label('Omitted or unassessed assays are not negative results. Genomic drug annotations do not replace measured susceptibility.', 'small', True))
+        layout.addWidget(label(PLASMID_SCOPE, 'small', True))
         buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
         buttons.accepted.connect(dialog.accept)
         buttons.rejected.connect(dialog.reject)
@@ -218,7 +277,7 @@ class ReportWorkspaceMixin:
         typing = provenance["typing"]
         return (f"This report is {typing['label']}: {provenance['scheme']} · "
                 f"{provenance['total_loci']} targets in the reference. {provenance['statement']} "
-                f"{typing['note']}")
+                f"{typing['note']} {METHOD_SEPARATION}")
 
     def report_typing_kind(self):
         """'mlst', 'cgmlst' or '' — the word that keeps two reports apart on a desk."""
@@ -667,7 +726,10 @@ class ReportWorkspaceMixin:
         menu.addAction('AMR database snapshots…', self.open_amr_databases)
         menu.addAction('Link imported source report…', self.link_hydra_samples)
         menu.addAction('Refresh scoped evidence', self.refresh_features)
-        for title, kind in [('Export feature table…', 'features'), ('Export AMR matrix…', 'amr'), ('Export characterization table…', 'characterization')]:
+        for title, kind in [('Export feature table…', 'features'), ('Export AMR matrix…', 'amr'),
+                            ('Export characterization table…', 'characterization'),
+                            ('Export replicon markers across the cohort…', 'plasmid_replicons'),
+                            ('Export replicon / determinant co-location…', 'plasmid_pairs')]:
             menu.addAction(title, lambda checked=False, kind=kind: self.export_feature_table(kind))
         tools.setMenu(menu)
         actions.addWidget(tools)
@@ -723,10 +785,13 @@ class ReportWorkspaceMixin:
             row = {'_sample_id': sample['id'], "Sample": sample["name"], "Genus": genus or "Unknown", "Species": species or "—", "Organism evidence": status,
                    "ST": result.get("st"), "Scheme": result.get("scheme"), "AMR genes": "; ".join(gene_names(sample)),
                    "HYDRA linked": bool(sample.get("metadata", {}).get("hydra")), "AMR evidence state": amr_state["status"],
-                   "AMR evidence note": amr_state["reason"], **{'Annotation.' + key: value for key, value in annotation_values(sample).items()}}
+                   "AMR evidence note": amr_state["reason"], **amr_method_fields(sample),
+                   **{'Annotation.' + key: value for key, value in annotation_values(sample).items()}}
             row.update({"QC." + key: value for key, value in result.get("qc", {}).items() if not isinstance(value, (dict, list))})
             rows.append(row)
-        main = ["Sample", "Genus", "Species", "Organism evidence", "ST", "Scheme", "AMR genes", "HYDRA linked", "AMR evidence state", "AMR evidence note"]
+        main = ["Sample", "Genus", "Species", "Organism evidence", "ST", "Scheme", "AMR genes",
+                "HYDRA linked", "AMR evidence state", "AMR evidence note", "AMR reference sets",
+                "AMR reference release", "Point mutations searched", "Virulence elements searched"]
         self.feature_model.replace(main + sorted({key for row in rows for key in row} - set(main) - {'_sample_id'}), rows)
         query = self.gene_filter.text().casefold() if hasattr(self, "gene_filter") else ""
         genes = sorted({gene for sample in samples for gene in gene_names(sample) if query in gene.casefold()})
@@ -760,10 +825,22 @@ class ReportWorkspaceMixin:
         import csv
 
         from wmlstudio.export import _atomic_text, _csv_cell
-        if kind == 'characterization':
-            table = self.characterization_table
-            headers = ['sample_id', *[table.horizontalHeaderItem(column).text() for column in range(table.columnCount())]]
-            rows = [[table.item(row, 0).data(Qt.ItemDataRole.UserRole), *[table.item(row, column).text() for column in range(table.columnCount())]] for row in range(table.rowCount())]
+        # The widget tables are written exactly as they are read on screen, each
+        # count beside the denominator it was counted against. The two plasmid
+        # tables stay two files: merging replicon counts with co-location counts
+        # would put two different observations under one heading.
+        widgets = {'characterization': getattr(self, 'characterization_table', None),
+                   'plasmid_replicons': getattr(self, 'plasmid_replicon_table', None),
+                   'plasmid_pairs': getattr(self, 'plasmid_pair_table', None)}
+        if kind in widgets:
+            table = widgets[kind]
+            if table is None:
+                raise ValueError('That evidence table has not been built in this window yet.')
+            headers = [*(['sample_id'] if kind == 'characterization' else []),
+                       *[table.horizontalHeaderItem(column).text() for column in range(table.columnCount())]]
+            rows = [[*([table.item(row, 0).data(Qt.ItemDataRole.UserRole)] if kind == 'characterization' else []),
+                     *[table.item(row, column).text() if table.item(row, column) is not None else ''
+                       for column in range(table.columnCount())]] for row in range(table.rowCount())]
         else:
             model = self.feature_model if kind == 'features' else self.amr_model
             headers = ['sample_id', *model.headers]

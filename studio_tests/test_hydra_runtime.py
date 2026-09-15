@@ -6,6 +6,7 @@ import time
 from pathlib import Path
 
 import pytest
+from PySide6.QtCore import Qt
 
 from wmlstudio import hydra_runtime as runtime
 from wmlstudio.sequence import AnalysisCancelled
@@ -22,18 +23,36 @@ def database(root):
 
 
 def complete_database(root, *, release="2026-08-07.1", separator="/",
-                      organisms=("Escherichia", "Klebsiella_pneumoniae", "Staphylococcus_aureus")):
+                      organisms=("Escherichia", "Klebsiella_pneumoniae", "Staphylococcus_aureus"),
+                      protein_mutations=None, virulence=3, stress=2):
     """A store in the shape a real staged snapshot has: both sets, plus the catalogues.
 
     ``separator`` reproduces a snapshot staged on Windows, whose manifest records
     ``nucl\\ncbi`` and which must still read correctly wherever it is opened.
+    ``organisms`` have a DNA mutation catalogue; ``protein_mutations`` defaults to
+    the same names and is given separately where the two lists must differ, as
+    they do in the real release.
     """
+    protein_mutations = organisms if protein_mutations is None else protein_mutations
     for relative in ("nucl/ncbi", "prot/protein"):
         (root / relative).mkdir(parents=True)
         (root / relative / "sequences.fna").write_text(">ref\nACGTACGT\n")
     (root / "prot/protein/taxgroup.tsv").write_text(
         "#taxgroup\tgpipe_taxgroup\tnumber_of_nucl_ref_genes\n"
         + "".join(f"{name}\t{name}\t1\n" for name in (*organisms, "Pseudomonas_aeruginosa")))
+    (root / "prot/protein/AMRProt-mutation.tsv").write_text(
+        "#taxgroup\taccession_version\tmutation_position\n"
+        + "".join(f"{name}\tWP_00{index}.1\t{index}\n"
+                  for index, name in enumerate(protein_mutations)))
+    (root / "prot/protein/AMRProt-suppress.tsv").write_text(
+        "#taxgroup\tprotein_accession\n"
+        + "".join(f"{name}\tWP_9{index}.1\n" for index, name in enumerate(organisms)))
+    rows = [("AMR", "AMR")] * 5 + [("VIRULENCE", "VIRULENCE")] * virulence
+    rows += [("STRESS", "METAL")] * stress + [("AMR", "POINT")]
+    (root / "prot/protein/meta.tsv").write_text(
+        "seqid\tgene\telement_type\telement_subtype\n"
+        + "".join(f"afp_{index:05}\tgene{index}\t{kind}\t{subtype}\n"
+                  for index, (kind, subtype) in enumerate(rows)))
     (root / "mutation/dna").mkdir(parents=True)
     for name in organisms:
         (root / "mutation/dna" / f"{name}.fna").write_text(">locus\nACGT\n")
@@ -382,6 +401,45 @@ def test_a_reference_release_older_than_the_threshold_says_so_before_the_run(tmp
     assert "Determinants named after it are not in it" in stale
 
 
+def test_the_database_page_lets_a_user_see_and_choose_from_the_whole_catalogue(tmp_path, qtbot):
+    """The user's complaint verbatim: HYDRA needs inputs it never names."""
+    from wmlstudio.amr_databases import COLUMNS, AMRDatabaseDialog
+
+    store = complete_database(tmp_path / "store")
+    dialog = AMRDatabaseDialog(store)
+    qtbot.addWidget(dialog)
+    names = [dialog.table.item(row, 0).text() for row in range(dialog.table.rowCount())]
+    assert set(names) == {entry["name"] for entry in dialog.catalogue["entries"]}
+    assert len(names) > 2, "the page must list more than what happens to be installed"
+    rows = {dialog.table.item(row, 0).text(): row for row in range(dialog.table.rowCount())}
+    state, purpose = COLUMNS.index("Installed"), COLUMNS.index("What it is searched for")
+    assert "Installed" in dialog.table.item(rows["ncbi"], state).text()
+    assert "Not installed" in dialog.table.item(rows["card"], state).text()
+    assert "nothing is reported for it" in dialog.table.item(rows["card"], state).text()
+    assert dialog.table.item(rows["card"], purpose).text()
+
+    # Installed sets are ticked, so the button means "update these"; a set the
+    # engine cannot fetch cannot be ticked at all.
+    assert dialog.selected_names() == ["ncbi", "protein"]
+    manual = next(entry["name"] for entry in dialog.catalogue["entries"]
+                  if entry["download"] == "by hand")
+    assert not (dialog.table.item(rows[manual], 0).flags()
+                & Qt.ItemFlag.ItemIsUserCheckable)
+
+    # A tick survives re-reading the store from disk.
+    dialog.table.item(rows["card"], 0).setCheckState(Qt.CheckState.Checked)
+    assert "card" in dialog.selected_names()
+    dialog.refresh()
+    assert "card" in dialog.selected_names()
+    # And the confirmation names the licence before anything is downloaded.
+    text = dialog.confirmation(dialog.selected_names())
+    assert "CARD academic licence" in text and "read them before installing" in text
+    assert "samples are not uploaded" in text
+    assert dialog.organism_sentence(runtime.database_status(store)).count("catalogue") >= 2
+    assert "no other organism's catalogue is ever substituted" in dialog.organism_sentence(
+        runtime.database_status(store))
+
+
 def test_the_database_surface_says_what_an_empty_store_would_report(tmp_path):
     """A table with no rows reads as "nothing found"; the gap must be said in words."""
     from wmlstudio.amr_databases import AMRDatabaseDialog
@@ -400,6 +458,194 @@ def test_the_database_surface_says_what_an_empty_store_would_report(tmp_path):
     old = AMRDatabaseDialog.gap_sentence(
         runtime.database_status(complete_database(tmp_path / "old", release="2019-01-01.1")))
     assert "days old" in old and "Determinants named after it are not in it" in old
+
+
+def test_every_reference_set_the_engine_can_search_is_named_whether_or_not_it_is_here(tmp_path):
+    """HYDRA's silence about its inputs is the complaint; the whole list answers it."""
+    catalogue = runtime.database_catalogue(complete_database(tmp_path / "store"))
+    rows = {entry["name"]: entry for entry in catalogue["entries"]}
+    # Every set the engine knows, not only the two that are installed.
+    assert set(catalogue["installed"]) == {"ncbi", "protein"}
+    assert len(rows) > len(catalogue["installed"])
+    assert {"card", "vfdb", "plasmidfinder"} <= set(catalogue["available"])
+    for entry in catalogue["entries"]:
+        assert entry["purpose"] and entry["title"] and entry["licence"]
+        assert entry["state"] in {"installed", "not installed"}
+        assert entry["download"] in {"automatic", "by hand"}
+        # A size is either measured, estimated with its basis named, or admitted absent.
+        assert entry["size_basis"]
+    assert rows["ncbi"]["installed"] and rows["ncbi"]["version"] == "2026-08-07.1"
+    assert "measured" in rows["ncbi"]["size_basis"] and rows["ncbi"]["size"].endswith("B")
+    assert not rows["card"]["installed"] and rows["card"]["size"] == ""
+    # A licence nobody can act on without reading it is never presented as open.
+    assert rows["ncbi"]["open_licence"] is True and rows["ncbi"]["licence_note"] == ""
+    assert rows["card"]["open_licence"] is False and "terms apply" in rows["card"]["licence_note"]
+    assert json.loads(json.dumps(catalogue)) == catalogue
+
+
+def test_a_set_the_engine_cannot_fetch_is_listed_rather_than_promised(tmp_path):
+    catalogue = runtime.database_catalogue(complete_database(tmp_path / "store"))
+    rows = {entry["name"]: entry for entry in catalogue["entries"]}
+    manual = [name for name, entry in rows.items() if entry["download"] == "by hand"]
+    assert manual and not set(manual) & set(catalogue["automatic"])
+    # It is still named, still says what it is for, and still says who publishes it.
+    assert all(rows[name]["purpose"] and rows[name]["url"] for name in manual)
+
+
+def test_a_reference_set_name_the_engine_does_not_know_is_refused_before_any_download(
+        ready, monkeypatch):
+    monkeypatch.setattr(runtime, "_run_child", lambda *args: pytest.fail("must not launch"))
+    with pytest.raises(runtime.HydraRuntimeError) as failure:
+        runtime.update_databases(ready, ["ncbi", "carrd"])
+    assert "no reference set called carrd" in str(failure.value)
+    assert "card" in str(failure.value)
+
+
+def test_a_failed_download_says_what_failed_and_leaves_the_old_snapshot_alone(ready, tmp_path,
+                                                                              monkeypatch):
+    before = sorted(tmp_path.iterdir())
+    manifest = (ready / "manifest.json").read_bytes()
+
+    def child(arguments, directory, *args):
+        raise runtime.HydraRuntimeError("HYDRA exited with code 1.\nprovider unreachable")
+
+    monkeypatch.setattr(runtime, "_run_child", child)
+    with pytest.raises(runtime.HydraRuntimeError) as failure:
+        runtime.update_databases(ready, ["ncbi", "protein"])
+    message = str(failure.value)
+    assert "Downloading protein, ncbi failed" in message
+    assert "reference store you are using is unchanged" in message
+    assert "provider unreachable" in message
+    assert sorted(tmp_path.iterdir()) == before
+    assert (ready / "manifest.json").read_bytes() == manifest
+
+
+def test_dna_and_protein_point_mutation_catalogues_are_counted_separately(tmp_path):
+    """Two different catalogues answer two different questions; one number hides that."""
+    store = complete_database(tmp_path / "store",
+                              organisms=("Escherichia", "Staphylococcus_aureus"),
+                              protein_mutations=("Escherichia", "Staphylococcus_aureus",
+                                                 "Pseudomonas_aeruginosa"))
+    catalogue = runtime.organism_catalogue(store)
+    assert catalogue["dna_point_mutations"] == ["Escherichia", "Staphylococcus_aureus"]
+    assert "Pseudomonas_aeruginosa" in catalogue["protein_point_mutations"]
+    assert "Pseudomonas_aeruginosa" not in catalogue["dna_point_mutations"]
+    assert "Pseudomonas_aeruginosa" in catalogue["point_mutations"]
+    status = runtime.database_status(store)
+    assert status["dna_point_mutation_organisms"] == catalogue["dna_point_mutations"]
+    assert status["protein_point_mutation_organisms"] == catalogue["protein_point_mutations"]
+
+
+def test_a_genus_level_catalogue_is_recognised_as_covering_its_species(tmp_path, monkeypatch):
+    """The engine applies a parent taxgroup to a child; saying otherwise understates cover."""
+    monkeypatch.setattr(runtime, "runtime_capabilities", lambda db_root=None: capabilities())
+    store = complete_database(tmp_path / "store",
+                              organisms=("Klebsiella_pneumoniae",),
+                              protein_mutations=("Klebsiella",))
+    assert runtime.catalogue_covers("Klebsiella_pneumoniae", ["Klebsiella"]) is True
+    assert runtime.catalogue_covers("Klebsiella_pneumoniae", ["Klebsiella_oxytoca"]) is False
+    checked = runtime.preflight(store, organism="Klebsiella pneumoniae")
+    assert checked["organism"]["resolved"] == "Klebsiella_pneumoniae"
+    assert checked["organism"]["point_mutation_level"] == "dna_and_protein"
+    assert checked["organism"]["reason"] == ""
+
+
+@pytest.mark.parametrize("organism,level,phrase", [
+    ("Staphylococcus aureus", "dna_and_protein", ""),
+    ("Pseudomonas aeruginosa", "protein_only", "no DNA catalogue"),
+    ("Listeria monocytogenes", "none", "not an absence of mutations"),
+])
+def test_what_a_point_mutation_catalogue_covers_is_stated_per_isolate(tmp_path, monkeypatch,
+                                                                      organism, level, phrase):
+    monkeypatch.setattr(runtime, "runtime_capabilities", lambda db_root=None: capabilities())
+    store = complete_database(tmp_path / "store",
+                              organisms=("Escherichia", "Staphylococcus_aureus"),
+                              protein_mutations=("Escherichia", "Staphylococcus_aureus",
+                                                 "Pseudomonas_aeruginosa"))
+    checked = runtime.preflight(store, organism=organism)
+    assert checked["organism"]["point_mutation_level"] == level
+    if phrase:
+        assert phrase in checked["organism"]["reason"]
+        assert checked["organism"]["reason"] in checked["warnings"]
+    else:
+        assert checked["organism"]["reason"] == ""
+
+
+def test_virulence_is_searched_for_an_established_organism_and_not_for_an_unknown_one(
+        tmp_path, monkeypatch):
+    """The organism decides whose curation applies, so an unknown one gets neither."""
+    monkeypatch.setattr(runtime, "runtime_capabilities", lambda db_root=None: capabilities())
+    store = complete_database(tmp_path / "store")
+    known = runtime.preflight(store, organism="Staphylococcus aureus")
+    assert known["virulence"]["enabled"] is True and known["virulence"]["requested"] == "auto"
+    assert known["virulence"]["organism_curated"] is True
+    assert known["virulence"]["virulence_elements"] == 3
+    assert known["virulence"]["stress_elements"] == 2
+    assert "not a validated virulence prediction" in known["virulence"]["reason"]
+
+    unknown = runtime.preflight(store, organism="Listeria monocytogenes")
+    assert unknown["virulence"]["enabled"] is False
+    assert unknown["virulence"]["available"] is True
+    assert "no organism curation applied" in unknown["virulence"]["reason"]
+    assert unknown["virulence"]["reason"] in unknown["warnings"]
+
+
+def test_virulence_asked_for_without_an_organism_runs_uncurated_and_says_so(tmp_path, monkeypatch):
+    monkeypatch.setattr(runtime, "runtime_capabilities", lambda db_root=None: capabilities())
+    store = complete_database(tmp_path / "store")
+    forced = runtime.preflight(store, virulence=True)
+    assert forced["virulence"]["enabled"] is True
+    assert forced["virulence"]["organism_curated"] is False
+    assert forced["virulence"]["reason"] in forced["warnings"]
+
+    off = runtime.preflight(store, organism="Staphylococcus aureus", virulence=False)
+    assert off["virulence"]["enabled"] is False and off["virulence"]["requested"] is False
+    # Turning it off narrows the protein search only: the nucleotide catalogues
+    # carry virulence-typed genes and report them either way, so the sentence must
+    # not claim that nothing virulent was looked for.
+    assert "governs the protein search only" in off["virulence"]["reason"]
+    assert "limited to acquired resistance" in off["virulence"]["reason"]
+    assert off["virulence"]["reason"] not in off["warnings"]
+
+
+def test_a_store_with_no_protein_set_cannot_offer_virulence_at_all(tmp_path, monkeypatch):
+    monkeypatch.setattr(runtime, "runtime_capabilities", lambda db_root=None: capabilities())
+    checked = runtime.preflight(database(tmp_path / "genes-only"), virulence=True)
+    assert checked["virulence"]["available"] is False
+    assert checked["virulence"]["enabled"] is False
+    assert "not among the databases being searched" in checked["virulence"]["reason"]
+    assert runtime.element_counts(tmp_path / "genes-only")["read"] is False
+
+
+def test_the_recorded_command_says_which_of_the_two_searches_was_run(tmp_path, monkeypatch):
+    """--plus and --no-plus are different searches; a report must not be ambiguous."""
+    store = complete_database(tmp_path / "store")
+    assembly = tmp_path / "isolate.fasta"
+    assembly.write_text(">contig\nACGTACGT\n")
+    monkeypatch.setattr(runtime, "runtime_capabilities", lambda db_root=None: capabilities())
+    captured = []
+
+    def child(arguments, directory, cancelled=None, progress=None):
+        captured.append(list(arguments))
+        output = Path(arguments[arguments.index("--outdir") + 1])
+        output.mkdir()
+        (output / "hydra.json").write_text(json.dumps({
+            "hydra_version": "1.4.0", "command": "hydra run", "databases": ["ncbi", "protein"],
+            "parameters": {}, "samples": [{"sample": "iso", "hits": []}]}))
+        return ["worker", *arguments], "done"
+
+    monkeypatch.setattr(runtime, "_run_child", child)
+    report = runtime.run_assemblies([assembly], store, sample_names=["iso"],
+                                    organism="Staphylococcus aureus")
+    assert "--plus" in captured[-1] and "--no-plus" not in captured[-1]
+    assert report["execution_provenance"]["virulence"]["enabled"] is True
+
+    unknown = runtime.run_assemblies([assembly], store, sample_names=["iso"],
+                                     organism="Listeria monocytogenes")
+    assert "--no-plus" in captured[-1] and "--plus" not in captured[-1]
+    assert unknown["execution_provenance"]["virulence"]["enabled"] is False
+    assert any("no organism curation applied" in text
+               for text in unknown["import_warnings"])
 
 
 def test_a_named_database_that_is_absent_stops_the_run_rather_than_quietly_narrowing_it(

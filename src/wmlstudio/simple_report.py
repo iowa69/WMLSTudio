@@ -41,6 +41,15 @@ SUSCEPTIBILITY_CAVEAT = (
     'infection-control decision. “Not assessed” and “unknown” are never “susceptible”.'
 )
 
+# Escape-stable like the caveat above, and printed joined to the plasmid table so
+# no option can put the table on one page and its boundary on another.
+PLASMID_BOUNDARY = (
+    'A replicon marker sitting on an assembled contig is evidence about that contig. No plasmid was '
+    'reconstructed, no plasmid was counted, no relaxase or mate-pair-formation type was assigned and no '
+    'mobility was predicted: this is not MOB-suite and is not equivalent to it. Two isolates carrying the '
+    'same replicon name are not thereby carrying the same plasmid.'
+)
+
 LIMITATIONS = (
     'It does not prove transmission, or its direction. Genomic similarity is one line of evidence for '
     'epidemiological review.',
@@ -48,9 +57,12 @@ LIMITATIONS = (
     'Loci that could not be called are unknown, not identical — the shared / total column shows how much '
     'was actually compared.',
     'Isolates are grouped by single linkage, so members of one group can differ by more than the threshold.',
-    'A sequence type (7 loci) and a core-genome comparison (hundreds to thousands of targets) are different '
-    'quantities. They never share a scale, a column or a threshold, and a cutoff published for one is not a '
-    'cutoff for the other.',
+    'A sequence type (7 loci), a core-genome comparison (hundreds to thousands of targets) and a SNP '
+    'distance are three different quantities. They never share a scale, a column or a threshold, a cutoff '
+    'published for one is not a cutoff for the other, and every distance in this report is the one named '
+    'above it — SNP distances are not reported here at all.',
+    'A replicon marker is evidence about the assembled contig it was found on. It is not a plasmid, not a '
+    'count of plasmids and not proof that a resistance gene beside it can transfer.',
     'Sections you switched off, and assays that were not run, are absent from this report — absence here '
     'is not a negative result.',
 )
@@ -306,6 +318,59 @@ def _resistance_section(rows, options) -> list[str]:
     return parts
 
 
+def _plasmid_cells(row) -> list[str]:
+    """One isolate's replicon markers and same-contig co-locations, each with its own gate.
+
+    The markers come from the AMR/plasmid assay and the co-locations from the
+    characterization, so the two are gated separately: evidence belonging to an
+    earlier assembly is withheld and named, never printed as this one's.
+    """
+    from wmlstudio.characterization import current_characterization
+
+    status = row.get('hydra_evidence_status') or 'missing'
+    replicons = [str(name) for name in (row.get('plasmid_replicons') or [])]
+    if status == 'stale':
+        markers = _escape('Not shown — the saved plasmid result belongs to a different sequence file')
+    elif status == 'missing':
+        markers = _escape('Not assessed')
+    elif replicons:
+        markers = _escape(', '.join(replicons))
+        if status == 'unverified':
+            markers += _muted('The source report’s identity was not confirmed.')
+    else:
+        markers = _escape('No replicon marker reported by the reference database used')
+    state = current_characterization(row)
+    evidence = (state.get('evidence') or {}).get('plasmid_hypotheses') or {}
+    links = evidence.get('contig_associations') or []
+    if state['status'] != 'current':
+        shared = _escape('Not assessed') + _muted(state['reason'])
+    elif links:
+        shared = _escape('; '.join(sorted({f"{link['marker']} with {link['replicon']} on "
+                                           f"{link['contig']}" for link in links})))
+        shared += _muted('Same assembled contig only — a hypothesis, not a plasmid-borne gene.')
+    else:
+        shared = _escape('No resistance or virulence gene shared a contig with a replicon marker')
+        shared += _muted('A plasmid contig can assemble without its replicon, so this does not place '
+                         'those genes on the chromosome.')
+    return [_escape(row.get('sample_name') or row.get('sample_id')), markers, shared,
+            _escape(_STATE_WORDS.get(status, status))]
+
+
+def _plasmid_section(rows) -> list[str]:
+    parts = ['<h2>Plasmid markers</h2>',
+             '<p>This lists the plasmid replicon markers found in each genome, and any resistance or '
+             'virulence gene that sat on the same assembled contig as one of them. It does not show '
+             'which plasmids an isolate carries, or that any gene can move between isolates.</p>',
+             '<table border="1" cellpadding="5" cellspacing="0"><tr><th>Isolate</th>'
+             '<th>Replicon markers found</th><th>Genes on the same contig as a replicon</th>'
+             '<th>Evidence state</th></tr>']
+    for row in rows:
+        parts.append(_row(_plasmid_cells(row)))
+    # The boundary closes the table in one string, so no option can separate them.
+    parts.append('</table><p class="notice"><b>' + _escape(PLASMID_BOUNDARY) + '</b></p>')
+    return parts
+
+
 def _proximity_cells(focal, threshold) -> list[str]:
     distance = focal.get('nearest_distance')
     nearest = focal.get('nearest') or []
@@ -396,6 +461,11 @@ def simple_report_html(records, *, selected_ids, investigation=None, settings=No
     else:
         parts.extend(_comparison_section(snapshot, options, graph_png, graph_mime, provenance))
     parts.extend(_resistance_section(rows, options))
+    # Off by default in this preset and printed only when it is asked for: a
+    # section nobody selected is covered by the limitation saying that what is
+    # absent from this report is not a negative result.
+    if options.get('plasmid_hypotheses'):
+        parts.extend(_plasmid_section(rows))
     if snapshot is None:
         parts.append('<h2>Closest matches</h2><p class="notice">' + absent + '</p>')
     else:

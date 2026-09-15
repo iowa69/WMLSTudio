@@ -3,6 +3,14 @@
 SKA Distance is a split-kmer SNP count; Mismatch count is presence/absence and
 must never be relabelled SNPs. Reference-mapped/filter-specific distances are
 separate evidence and cannot inherit a cutoff from the reference-free run.
+
+Three denominators are produced here and none of them may be swapped for
+another. The pairwise run reports the split k-mers two samples actually share,
+which is the denominator that belongs beside a pairwise SNP count. The cohort
+alignment reports variable columns, which exist only relative to the cohort and
+the minimum k-mer frequency. The reference-mapped run reports callable
+reference bases. A pair compared over little shared sequence has an unknown
+distance, never a small one.
 """
 
 from __future__ import annotations
@@ -106,6 +114,130 @@ def parse_distances(path, aliases, min_shared_fraction=0.95):
     if seen != expected:
         raise ValueError('SKA2 output is missing cohort pair comparisons.')
     return rows
+
+
+def _kmer_inventory(binary, work, aliases, cancelled=None, progress=None):
+    """Each sample's own split k-mer count and the cohort's, from ``ska nk``.
+
+    A shared count means nothing without the sets it was drawn from: 900,000
+    shared split k-mers is nearly everything of a 950,000-k-mer sample and less
+    than a third of a 3,000,000-k-mer one.
+    """
+    path = _run([binary, 'nk', 'cohort.skf'], work, 'nk', cancelled, progress)
+    fields = {}
+    for line in Path(path).read_text(encoding='utf-8').splitlines():
+        key, separator, value = line.partition('=')
+        if separator:
+            fields[key.strip()] = value.strip()
+    try:
+        names, counts = json.loads(fields['sample_names']), json.loads(fields['sample_kmers'])
+        total, k, canonical = int(fields['k-mers']), int(fields['k']), fields['rc'] == 'true'
+    except (KeyError, ValueError, TypeError) as error:
+        raise ValueError(f'SKA2 nk output is not readable: {error}') from error
+    if sorted(map(str, names)) != sorted(aliases) or len(counts) != len(names):
+        raise ValueError('SKA2 nk does not describe this exact cohort.')
+    if any(isinstance(count, bool) or not isinstance(count, int) or count < 0 for count in counts):
+        raise ValueError('SKA2 nk reported a non-integer split k-mer count.')
+    by_alias = {str(name): int(count) for name, count in zip(names, counts, strict=True)}
+    return {'k': k, 'reverse_complement_canonical': canonical, 'cohort_split_kmers': total,
+            'by_alias': by_alias,
+            'per_sample': {aliases[alias]['sample_id']: count for alias, count in by_alias.items()},
+            'meaning': 'Split k-mers held for each sample and for the cohort union; not genome length, '
+                       'not assembly size and not sequencing coverage.'}
+
+
+# One bit per alignment column per base, so a pairwise comparison over hundreds
+# of thousands of columns is four big-integer AND/popcounts rather than a Python
+# loop over every column of every pair.
+_BASE_TABLES = {base: bytes(1 if value == base else 0 for value in range(256)) for base in b'ACGT'}
+
+
+def _alignment_rows(path, aliases):
+    """Equal-length named rows of a SKA2 alignment; gaps and N are not bases."""
+    rows, identifier, parts = {}, None, []
+    with Path(path).open('rb') as handle:
+        for line in handle:
+            line = line.strip()
+            if line.startswith(b'>'):
+                if identifier is not None:
+                    rows[identifier] = b''.join(parts)
+                identifier, parts = line[1:].decode('ascii'), []
+                if identifier not in aliases or identifier in rows:
+                    raise ValueError('Unknown or duplicate SKA2 alignment sample name.')
+            elif line:
+                if identifier is None or set(line) - set(b'ACGTN-'):
+                    raise ValueError('Unexpected SKA2 alignment format or alphabet.')
+                parts.append(line)
+        if identifier is not None:
+            rows[identifier] = b''.join(parts)
+    if set(rows) != set(aliases) or len({len(row) for row in rows.values()}) > 1:
+        raise ValueError('SKA2 alignment is not a complete, equal-length cohort alignment.')
+    return rows
+
+
+def _variant_alignment(binary, work, aliases, *, min_freq, threads, max_sites, cancelled, progress):
+    """Cohort variable-site alignment, and the columns each pair can be compared over.
+
+    This is a cohort measurement: which columns exist depends on who else is in
+    the run and on the minimum k-mer frequency, so adding one isolate changes
+    these counts without any sequence having changed. It is reported beside the
+    pairwise split k-mer distance and never instead of it.
+    """
+    output = work / 'alignment.fasta'
+    # Every filter is stated rather than inherited, so a later change of the
+    # tool's defaults cannot silently change what these columns mean.
+    _run([binary, 'align', 'cohort.skf', '-o', output.name, '-m', str(float(min_freq)),
+          '--filter', 'no-const', '--ambig-mask', '--no-gap-only-sites', '--threads', str(threads)],
+         work, 'align', cancelled, progress)
+    common = {'method': 'cohort-variable-site-split-kmer-alignment', 'file': output.name,
+              'min_freq': float(min_freq), 'filter': 'no-const',
+              'ambiguous_bases': 'masked as N and excluded from every count',
+              'gap_only_constant_columns': 'excluded'}
+    size = output.stat().st_size
+    if size > 256 * 1024 * 1024:
+        return dict(common, status='refused', rows=[], columns=None, per_sample_called_columns={},
+                    reason=f'The cohort alignment is {size:,} bytes, above the explicit 256 MiB bound. '
+                           'No truncated alignment was accepted; narrow the cohort or raise the minimum '
+                           'k-mer frequency. Pairwise split k-mer distances are unaffected.')
+    rows = _alignment_rows(output, aliases)
+    columns = len(next(iter(rows.values()), b''))
+    if columns > max_sites:
+        return dict(common, status='refused', rows=[], columns=columns, per_sample_called_columns={},
+                    reason=f'The cohort alignment holds {columns:,} variable columns, above the explicit '
+                           f'{max_sites:,}-column bound. No truncated alignment was accepted; a cohort this '
+                           'diverse is usually the wrong cohort for a SNP comparison. Pairwise split k-mer '
+                           'distances are unaffected.')
+    coded, present = {}, {}
+    for alias, row in rows.items():
+        check_cancelled(cancelled)
+        bases = {base: int.from_bytes(row.translate(table), 'little')
+                 for base, table in _BASE_TABLES.items()}
+        # A column is comparable for a pair only where both called a base: N and
+        # gap are absent evidence and are never counted as agreement.
+        coded[alias] = bases
+        present[alias] = bases[ord('A')] | bases[ord('C')] | bases[ord('G')] | bases[ord('T')]
+    rows = None
+    pairs = []
+    for a, b in combinations(aliases, 2):
+        check_cancelled(cancelled)
+        comparable = (present[a] & present[b]).bit_count()
+        matching = sum((coded[a][base] & coded[b][base]).bit_count() for base in _BASE_TABLES)
+        pairs.append({'source': aliases[a]['sample_id'], 'target': aliases[b]['sample_id'],
+                      'source_name': aliases[a]['sample_name'], 'target_name': aliases[b]['sample_name'],
+                      'comparable_columns': comparable, 'differing_columns': comparable - matching,
+                      'alignment_columns': columns,
+                      'comparable_fraction': comparable / columns if columns else 0.0})
+    return dict(common, status='completed', columns=columns, rows=pairs,
+                sha256=file_sha256(output, cancelled),
+                per_sample_called_columns={aliases[alias]['sample_id']: value.bit_count()
+                                           for alias, value in present.items()},
+                limitations=[
+                    'Variable columns only: constant and gap-only-constant columns are not written, so the '
+                    'column count is not a genome length or an aligned genome fraction.',
+                    'Which columns exist depends on this cohort and this minimum k-mer frequency. Adding or '
+                    'removing one isolate changes these counts without any sequence having changed.',
+                    'These differing-column counts are a cohort-filtered quantity and are not the pairwise '
+                    'split k-mer SNP distance; the two are never merged, summed or plotted on one axis.'])
 
 
 def _alignment(path, aliases, reference_length):
@@ -222,7 +354,8 @@ def _mapped_evidence(binary, work, aliases, reference, *, threads, repeat_mask, 
 
 def run_ska(samples, output_root, *, threads=4, k=31, min_shared_fraction=0.95,
             reference_path=None, annotation_path=None, annotation_reference_sha256=None,
-            mask_bed=None, coding_only=False, repeat_mask=True, root=None, cancelled=None, progress=None):
+            mask_bed=None, coding_only=False, repeat_mask=True, align=True, align_min_freq=0.9,
+            max_alignment_columns=500_000, root=None, cancelled=None, progress=None):
     samples = list(samples)
     if not 2 <= len(samples) <= 200 or len({s['id'] for s in samples}) != len(samples):
         raise ValueError('Choose 2–200 distinct assembled isolates for a bounded SNP cohort.')
@@ -232,6 +365,11 @@ def run_ska(samples, output_root, *, threads=4, k=31, min_shared_fraction=0.95,
         raise ValueError('SKA k must be an odd integer from 5 to 63.')
     if not 0 <= min_shared_fraction <= 1 or not math.isfinite(min_shared_fraction):
         raise ValueError('Minimum shared split-kmer fraction must be between 0 and 1.')
+    if not 0 <= align_min_freq <= 1 or not math.isfinite(align_min_freq):
+        raise ValueError('Minimum cohort k-mer frequency must be between 0 and 1.')
+    if (isinstance(max_alignment_columns, bool) or not isinstance(max_alignment_columns, int)
+            or not 1 <= max_alignment_columns <= 5_000_000):
+        raise ValueError('The alignment column bound must be an integer from 1 to 5,000,000.')
     if (annotation_path or mask_bed or coding_only) and not reference_path:
         raise ValueError('Coding annotation and interval masks require an exact reference FASTA.')
     capability = runtime_capabilities(root)
@@ -277,6 +415,21 @@ def run_ska(samples, output_root, *, threads=4, k=31, min_shared_fraction=0.95,
         _run([binary, 'build', '-f', 'inputs.tsv', '-o', 'cohort', '-k', str(k), '--threads', str(threads)], work, 'build', cancelled, progress)
         distance_path = _run([binary, 'distance', 'cohort.skf', '--threads', str(threads)], work, 'distance', cancelled, progress)
         rows = parse_distances(distance_path, aliases, min_shared_fraction)
+        inventory = _kmer_inventory(binary, work, aliases, cancelled, progress)
+        by_id = {aliases[alias]['sample_id']: count for alias, count in inventory['by_alias'].items()}
+        for row in rows:
+            # The pair's own sets, so a shared count can be read as a fraction of
+            # the smaller sample rather than of a number the reader cannot see.
+            held = [by_id[row['source']], by_id[row['target']]]
+            row['source_split_kmers'], row['target_split_kmers'] = held
+            row['shared_fraction_of_smaller'] = row['shared_split_kmers'] / min(held) if min(held) else 0.0
+        if align:
+            alignment = _variant_alignment(binary, work, aliases, min_freq=align_min_freq, threads=threads,
+                max_sites=max_alignment_columns, cancelled=cancelled, progress=progress)
+        else:
+            alignment = {'status': 'not_run', 'rows': [],
+                'method': 'cohort-variable-site-split-kmer-alignment',
+                'reason': 'No cohort alignment was requested; only pairwise split k-mer distances were computed.'}
         mapped = _mapped_evidence(binary, work, aliases, reference_path, threads=threads,
             repeat_mask=repeat_mask, annotation_path=annotation_path, annotation_reference_sha256=annotation_reference_sha256,
             mask_bed=mask_bed, coding_only=coding_only, min_shared_fraction=min_shared_fraction,
@@ -287,14 +440,18 @@ def run_ska(samples, output_root, *, threads=4, k=31, min_shared_fraction=0.95,
         result = {'format_version': 1, 'status': 'completed', 'engine': 'SKA2', 'version': VERSION,
             'run_id': work.name, 'created_at': datetime.now(timezone.utc).isoformat(),
             'method': 'reference-free-assembly-split-kmer-SNPs', 'parameters': {'k': k, 'threads': threads,
-                'ambiguous_bases': 'excluded', 'min_frequency': 0.0, 'minimum_shared_fraction': min_shared_fraction},
+                'ambiguous_bases': 'excluded', 'min_frequency': 0.0, 'minimum_shared_fraction': min_shared_fraction,
+                'alignment_min_frequency': float(align_min_freq) if align else None},
             'binary_sha256': capability['expected_sha256'], 'source_revision': SOURCE_REVISION,
             'inputs': list(aliases.values()), 'rows': rows, 'mapped': mapped,
+            'split_kmers': inventory, 'alignment': alignment,
             'output_directory': str(work), 'threshold': None,
             'limitations': ['SNP similarity is not direct transmission or direction of spread.',
                 'Reference-free counts are not reference-mapped, coding-only, repeat-masked or recombination-filtered counts.',
+                'Split k-mer SNPs exclude repetitive and accessory sequence that no split k-mer set can place, and recombination is neither detected nor removed.',
                 'SKA2 assembly results cannot inherit the Higgs 2022 original-SKA read-based cutoff.',
-                'Shared split-kmer fraction is a comparison filter, not genome coverage or an assembly quality pass.']}
+                'Shared split-kmer fraction is a comparison filter, not genome coverage or an assembly quality pass.',
+                'Cohort alignment columns and pairwise shared split k-mers are different denominators and are never interchanged.']}
         from .export import _atomic_text
         with _atomic_text(work / 'result.json') as handle:
             json.dump(result, handle, indent=2, ensure_ascii=False, allow_nan=False)

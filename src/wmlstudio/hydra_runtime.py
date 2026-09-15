@@ -37,17 +37,84 @@ HYDRA_VERSION = "1.4.0"
 TOOLS = ("blastn", "blastx", "blastp", "tblastn", "makeblastdb")
 NCBI_REFERENCE_ROOT = "https://ftp.ncbi.nlm.nih.gov/pathogen/Antimicrobial_resistance/AMRFinderPlus/database/latest"
 # The stores a run uses when the caller names none, in the order a report reads.
+# These two ship with the application, so a first run works with no download.
 DEFAULT_DATABASES = ("ncbi", "protein")
 # What each store is for, said in the words a microbiologist reads. A run without
 # one of these does not fail: it returns nothing for that whole class of evidence,
 # which reads exactly like a negative result. Every refusal below names the store
 # and this sentence, so "nothing was found" is never confused with "nothing ran".
+# The names are the engine's own; these sentences are ours, because a registry
+# entry titled "MEGARes" tells a microbiologist nothing about what it answers.
 DATABASE_PURPOSE = {
     "ncbi": ("acquired resistance, stress and virulence genes, searched with blastn against the "
              "NCBI AMRFinderPlus nucleotide catalogue"),
     "protein": ("the translated protein search and every organism point-mutation catalogue, "
                 "searched with blastx against AMRProt"),
+    "card": ("a second, broader opinion on acquired resistance, including the efflux pumps and "
+             "regulators the NCBI catalogue deliberately leaves out; a hit here that NCBI does "
+             "not report is a difference between two catalogues, not a stronger finding"),
+    "resfinder": ("the acquired-resistance gene set behind the CGE tools, for comparing a call "
+                  "against what a ResFinder-based report would have named"),
+    "argannot": ("an older acquired-resistance gene set, useful when a gene name in a paper "
+                 "predates the current NCBI catalogue"),
+    "megares": ("resistance together with biocide and heavy-metal determinants, for disinfectant "
+                "and metal-exposure questions the AMR sets do not cover"),
+    "vfdb": "the curated core virulence factors of VFDB (setA)",
+    "vfdb_full": ("every predicted virulence factor VFDB publishes (setB): a much broader screen "
+                  "whose hits are hypotheses rather than curated calls"),
+    "ecoli_vf": ("Escherichia coli virulence factors, for pathotype questions the general "
+                 "virulence sets do not answer"),
+    "plasmidfinder": ("plasmid replicon types, which suggest what kind of plasmid a contig may "
+                      "belong to; a replicon is not a plasmid, a location or a transfer event"),
+    "ecoh": "Escherichia coli O and H antigen loci, for serotype prediction from sequence",
+    "pubmlst": ("the engine's own 7-locus MLST schemes; WMLSTudio types MLST itself from its own "
+                "scheme library, so this is only needed to reproduce the engine's own ST call"),
+    "lineage": ("Kleborate-derived lineage and sublineage loci for the Klebsiella complex; this "
+                "is a screen over that project's published reference data, not Kleborate"),
+    "sccmec": ("whole SCCmec cassette references for staphylococci, read by the engine's typing "
+               "step rather than by gene screening"),
+    "species": ("optional Mash sketches for the engine's own species guess; WMLSTudio identifies "
+                "organisms from its own species panel and does not need this"),
 }
+# Who publishes each set. The engine's registry records an address and a citation
+# but not a name a reader would recognise, and "whose data is this" is the first
+# question asked of any screen that is not the tool it screens for.
+DATABASE_PROVIDER = {
+    "ncbi": "NCBI, US National Library of Medicine",
+    "protein": "NCBI, US National Library of Medicine",
+    "card": "McMaster University (CARD)",
+    "resfinder": "Center for Genomic Epidemiology, DTU",
+    "argannot": "IHU Méditerranée Infection",
+    "megares": "Colorado State University (MEGARes)",
+    "vfdb": "Institute of Pathogen Biology, CAMS (VFDB)",
+    "vfdb_full": "Institute of Pathogen Biology, CAMS (VFDB)",
+    "ecoli_vf": "Public Health Agency of Canada",
+    "plasmidfinder": "Center for Genomic Epidemiology, DTU",
+    "ecoh": "SRST2 / Holt laboratory",
+    "pubmlst": "PubMLST, University of Oxford",
+    "lineage": "Kleborate, Holt laboratory",
+    "sccmec": "Center for Genomic Epidemiology, DTU",
+    "species": "Kleborate, Holt laboratory",
+}
+# How large a set is. Only four figures exist here, and each says where it came
+# from: the two core sets are measured from the copy bundled with this release,
+# and two more are the estimate the engine's own registry records. No provider
+# publishes a size for the rest, so those rows say so and report a measured size
+# once the set is installed, rather than showing a number nobody checked.
+DATABASE_SIZE = {
+    "ncbi": (14, "measured from the copy bundled with this release"),
+    "protein": (10, "measured from the copy bundled with this release, point-mutation "
+                    "catalogues included"),
+    "vfdb_full": (70, "the estimate the engine's registry records"),
+    "lineage": (70, "the engine's registry records one ~70 MB archive shared with the species "
+                    "sketches"),
+    "species": (70, "the engine's registry records one ~70 MB archive shared with the lineage "
+                    "loci"),
+}
+# A licence a reader can act on without asking anyone. Anything else — including a
+# licence the provider never recorded — is listed, downloadable on request, and
+# never swept into an "install everything" that nobody read the terms for.
+OPEN_LICENCE_TOKENS = ("public domain", "apache", "cc0", "cc-0", "mit", "bsd", "creative commons")
 # What each executable is for, so a missing one is a sentence and not a filename.
 TOOL_PURPOSE = {
     "blastn": "the nucleotide gene search",
@@ -145,48 +212,181 @@ def _release_date(version):
         return None
 
 
-def organism_catalogue(db_root):
-    """The organism names the installed store will actually accept, and why.
+def _first_column(path, *, skip_header=True):
+    """The first tab-separated column of a reference table, comments excluded."""
+    values = set()
+    try:
+        with path.open(encoding="utf-8") as handle:
+            if skip_header:
+                handle.readline()
+            for line in handle:
+                value = line.split("\t")[0].strip()
+                if value and not value.startswith("#"):
+                    values.add(value)
+    except OSError as exc:
+        raise HydraRuntimeError(f"Cannot read the organism table: {exc}") from exc
+    return values
 
-    Upstream resolves --organism against its own taxgroup table and its DNA
-    mutation catalogues, so this reads the same two places rather than inventing a
-    list. "accepted" is every name the engine will take; "point_mutations" is the
-    smaller set that has a curated catalogue behind it. An organism outside the
-    first list stops the run upstream; one inside the first but outside the second
-    is accepted and simply has no mutations to report, which is not the same thing
-    as having none.
+
+def organism_catalogue(db_root):
+    """The organism names the installed store will accept, and what each one buys.
+
+    Upstream resolves --organism against its own taxgroup table, its protein
+    mutation table and its DNA mutation catalogues, so this reads the same three
+    places rather than inventing a list. They are three different things and are
+    reported separately:
+
+    "accepted" is every name the engine will take. "protein_point_mutations" is
+    the set with curated protein-level mutations in AMRProt-mutation.tsv;
+    "dna_point_mutations" is the smaller set that also has a DNA catalogue staged
+    for it. "point_mutations" is their union, kept because an isolate outside it
+    is screened for genes only.
+
+    An organism outside "accepted" stops the run upstream. One inside it but
+    outside "point_mutations" is accepted and simply has no mutation catalogue to
+    report from, which is not the same thing as having no mutations.
     """
     root = Path(db_root).resolve() if db_root is not None else None
-    accepted, catalogued = set(), set()
+    empty = {"accepted": [], "point_mutations": [], "dna_point_mutations": [],
+             "protein_point_mutations": [], "suppressed": [], "root": str(root or "")}
     if root is None or not root.is_dir():
-        return {"accepted": [], "point_mutations": [], "root": str(root or "")}
+        return empty
     try:
         entries = installed_databases(root)
     except HydraRuntimeError:
         entries = {}
-    for name in (entries.get("protein", {}).get("organisms") or []):
-        if isinstance(name, str) and name.strip():
-            accepted.add(name.strip())
-            catalogued.add(name.strip())
+    dna = {name.strip() for name in (entries.get("protein", {}).get("organisms") or [])
+           if isinstance(name, str) and name.strip()}
     mutation = root / "mutation" / "dna"
     if mutation.is_dir():
-        for path in sorted(mutation.glob("*.fna")):
-            accepted.add(path.stem)
-            catalogued.add(path.stem)
-    protein = entries.get("protein")
-    taxgroup = (_entry_directory(root, protein) / "taxgroup.tsv") if protein else None
-    if taxgroup is not None and taxgroup.is_file():
-        try:
-            with taxgroup.open(encoding="utf-8") as handle:
-                handle.readline()
-                for line in handle:
-                    value = line.split("\t")[0].strip()
-                    if value and not value.startswith("#"):
-                        accepted.add(value)
-        except OSError as exc:
-            raise HydraRuntimeError(f"Cannot read the organism table: {exc}") from exc
-    return {"accepted": sorted(accepted), "point_mutations": sorted(catalogued),
-            "root": str(root)}
+        dna.update(path.stem for path in mutation.glob("*.fna"))
+    protein_entry = entries.get("protein")
+    directory = _entry_directory(root, protein_entry) if protein_entry else None
+    protein, accepted, suppressed = set(), set(), set()
+    if directory is not None:
+        if (directory / "AMRProt-mutation.tsv").is_file():
+            protein = _first_column(directory / "AMRProt-mutation.tsv")
+        if (directory / "AMRProt-suppress.tsv").is_file():
+            suppressed = _first_column(directory / "AMRProt-suppress.tsv")
+        if (directory / "taxgroup.tsv").is_file():
+            accepted = _first_column(directory / "taxgroup.tsv")
+    accepted |= dna | protein
+    return {"accepted": sorted(accepted), "point_mutations": sorted(dna | protein),
+            "dna_point_mutations": sorted(dna), "protein_point_mutations": sorted(protein),
+            "suppressed": sorted(suppressed), "root": str(root)}
+
+
+# Counting element types means reading a 1.5 MB table, and the same store is asked
+# about on every preflight and every refresh of the database page. The answer only
+# changes when the file does, so it is cached against the file's own identity.
+_ELEMENT_COUNTS = {}
+
+
+def element_counts(db_root):
+    """How many acquired-gene, virulence and stress elements the protein set holds.
+
+    This is what decides whether offering virulence would offer anything at all.
+    A store whose protein reference is absent returns zeros and says so through
+    the caller, rather than letting an unperformed search look like a clean result.
+    """
+    root = Path(db_root).resolve() if db_root is not None else None
+    counts = {"AMR": 0, "VIRULENCE": 0, "STRESS": 0, "point": 0, "total": 0, "read": False}
+    if root is None or not root.is_dir():
+        return counts
+    try:
+        entries = installed_databases(root)
+    except HydraRuntimeError:
+        return counts
+    entry = entries.get("protein")
+    if entry is None:
+        return counts
+    path = _entry_directory(root, entry) / "meta.tsv"
+    if not path.is_file():
+        return counts
+    try:
+        stamp = path.stat()
+        key = (str(path), stamp.st_mtime_ns, stamp.st_size)
+        if key in _ELEMENT_COUNTS:
+            return dict(_ELEMENT_COUNTS[key])
+        with path.open(encoding="utf-8") as handle:
+            columns = handle.readline().rstrip("\n").split("\t")
+            kind = columns.index("element_type") if "element_type" in columns else None
+            subtype = columns.index("element_subtype") if "element_subtype" in columns else None
+            for line in handle:
+                fields = line.rstrip("\n").split("\t")
+                if kind is None or len(fields) <= kind:
+                    continue
+                counts["total"] += 1
+                counts[fields[kind]] = counts.get(fields[kind], 0) + 1
+                if subtype is not None and len(fields) > subtype and fields[subtype] == "POINT":
+                    counts["point"] += 1
+    except (OSError, ValueError) as exc:
+        raise HydraRuntimeError(f"Cannot read the protein reference table: {exc}") from exc
+    counts["read"] = True
+    _ELEMENT_COUNTS[key] = dict(counts)
+    return counts
+
+
+def virulence_support(db_root=None, *, organism=None, catalogue=None, counts=None):
+    """Whether this store can report virulence and stress elements, and for whom.
+
+    This is about the protein reference only. The nucleotide catalogues carry
+    virulence-typed genes of their own and report them whatever this says, so
+    "virulence off" never means "no virulence gene was reported" — it means the
+    translated search was limited to acquired resistance.
+
+    AMRFinderPlus's "plus" elements are one curated catalogue that is not split by
+    organism: the same virulence genes are searched for whatever the isolate is.
+    What the organism does change is curation — the suppression table is keyed by
+    taxgroup — so a run with an established organism is curated for that organism
+    and a run without one is not. Both are reported for what they are here, so a
+    generic screen is never presented as an organism's curated virulence panel.
+    """
+    catalogue = catalogue if catalogue is not None else organism_catalogue(db_root)
+    counts = counts if counts is not None else element_counts(db_root)
+    resolved = match_organism(organism, accepted=catalogue["accepted"]) if organism else None
+    if organism and not catalogue["accepted"]:
+        resolved = str(organism)
+    support = {"available": bool(counts.get("VIRULENCE") or counts.get("STRESS")),
+               "virulence_elements": int(counts.get("VIRULENCE") or 0),
+               "stress_elements": int(counts.get("STRESS") or 0),
+               "organism": resolved or "", "organism_curated": bool(resolved),
+               "suppression_organisms": list(catalogue["suppressed"]), "reason": ""}
+    if not counts.get("read"):
+        support["reason"] = ("The protein reference set is not installed, so no virulence or "
+                             "stress element can be read from it.")
+    elif not support["available"]:
+        support["reason"] = ("The installed protein reference carries no virulence or stress "
+                             "elements, so there is nothing for this option to add.")
+    elif resolved:
+        support["reason"] = (
+            f"{support['virulence_elements']} virulence and {support['stress_elements']} stress "
+            f"elements in the protein reference are searched, curated for '{resolved}'. This is "
+            "NCBI's published reference data, not a validated virulence prediction, and a gene is "
+            "not a demonstrated phenotype.")
+    else:
+        support["reason"] = (
+            "No organism is established for this isolate, so the protein virulence and stress "
+            "search would run with no organism curation applied: the same elements are reported, "
+            "but nothing an organism's curation would have suppressed is suppressed. Assign a "
+            "genus and species to have it curated.")
+    return support
+
+
+def catalogue_covers(organism, names):
+    """The engine's own taxgroup rule: a catalogue row applies to a parent or a child.
+
+    Mirrors hydra_amr.engines.mutations.MutationCatalog._taxgroup_matches, where
+    "Escherichia" covers "Escherichia_coli" and "Campylobacter" covers every
+    campylobacter. Testing exact membership instead would tell a user that an
+    isolate has no catalogue when the engine is about to apply one — a false
+    statement about coverage in the direction that looks safe and is not.
+    """
+    org = str(organism or "")
+    if not org:
+        return False
+    return any(org == name or org.startswith(name + "_") or name.startswith(org + "_")
+               for name in names)
 
 
 def match_organism(name, db_root=None, *, accepted=None):
@@ -220,7 +420,9 @@ def database_status(db_root=None, databases=None):
     status = {"root": str(root or ""), "bundled": False, "installed": {}, "requested": wanted,
               "missing": [], "error": "", "release": "", "released_utc": "", "staged": "",
               "age_days": None, "stale": False, "label": "No AMR reference database is installed.",
-              "organisms": [], "point_mutation_organisms": []}
+              "organisms": [], "point_mutation_organisms": [],
+              "dna_point_mutation_organisms": [], "protein_point_mutation_organisms": [],
+              "suppression_organisms": []}
     bundled = bundled_database_root()
     status["bundled"] = bool(root is not None and bundled is not None
                              and root == Path(bundled).resolve())
@@ -248,6 +450,9 @@ def database_status(db_root=None, databases=None):
     catalogue = organism_catalogue(root)
     status["organisms"] = catalogue["accepted"]
     status["point_mutation_organisms"] = catalogue["point_mutations"]
+    status["dna_point_mutation_organisms"] = catalogue["dna_point_mutations"]
+    status["protein_point_mutation_organisms"] = catalogue["protein_point_mutations"]
+    status["suppression_organisms"] = catalogue["suppressed"]
     versions = sorted({item["version"] for item in status["installed"].values() if item["version"]})
     status["release"] = versions[0] if len(versions) == 1 else ("; ".join(versions) or "unrecorded")
     staged = sorted({item["installed"] for item in status["installed"].values()
@@ -264,6 +469,124 @@ def database_status(db_root=None, databases=None):
                        f"({', '.join(sorted(entries))}), {where}"
                        + (f" on {status['staged'][:10]}" if status["staged"] else "") + age + ".")
     return status
+
+
+def _registry_specs():
+    """The engine's own database registry, or an explanation of why it is absent."""
+    try:
+        from hydra_amr.db.fetch import can_fetch
+        from hydra_amr.db.registry import DATABASES
+    except ImportError as exc:
+        return {}, None, (f"The HYDRA engine is not installed in this environment ({exc}), so "
+                          "only the reference sets already in the store can be listed.")
+    return dict(DATABASES), can_fetch, ""
+
+
+def _database_bytes(root, entry, name):
+    """Measured size of one installed set, the point-mutation catalogues included."""
+    directories = [_entry_directory(root, entry)]
+    if name == "protein" and (Path(root) / "mutation").is_dir():
+        directories.append(Path(root) / "mutation")
+    total = 0
+    try:
+        for directory in directories:
+            for path in directory.rglob("*"):
+                if path.is_file():
+                    total += path.stat().st_size
+    except OSError:
+        return None
+    return total
+
+
+def _human_size(count):
+    if not count:
+        return ""
+    megabytes = count / (1024 * 1024)
+    return f"{megabytes:.0f} MB" if megabytes >= 1 else f"{count / 1024:.0f} KB"
+
+
+def _licence_is_open(licence):
+    text = str(licence or "").casefold()
+    return any(token in text for token in OPEN_LICENCE_TOKENS)
+
+
+def database_catalogue(db_root=None, *, measure=True):
+    """Every reference set HYDRA can search, by name, and whether this computer has it.
+
+    This exists because the engine is powerful and silent about its inputs: it
+    will happily run against whatever is installed and report nothing for
+    everything that is not, and until a person can see the whole list there is no
+    way to tell a clean isolate from an unasked question. So every set is listed
+    whether or not it is installed, with what it is for, who publishes it, under
+    what licence, how large it is and which release is here.
+
+    The names, titles, addresses, citations and licences come from the engine's
+    own registry rather than a second list that could drift away from it. The
+    plain-language purpose, the provider's name and the size are ours, because the
+    registry does not carry them. Nothing is downloaded and no server is
+    contacted: a row that says "not installed" is a statement about this computer.
+    """
+    root = Path(db_root).resolve() if db_root is not None else None
+    error = ""
+    try:
+        entries = installed_databases(root) if root is not None else {}
+    except HydraRuntimeError as exc:
+        entries, error = {}, str(exc)
+    specs, can_fetch, registry_error = _registry_specs()
+    error = error or registry_error
+    bundled = bundled_database_root()
+    is_bundled = bool(root is not None and bundled is not None
+                      and root == Path(bundled).resolve())
+    rows = []
+    for name in sorted(set(specs) | set(entries) | set(DEFAULT_DATABASES)):
+        spec, entry = specs.get(name), entries.get(name)
+        licence = getattr(spec, "licence", "") or ""
+        size, basis = DATABASE_SIZE.get(name, (None, ""))
+        measured = _database_bytes(root, entry, name) if (entry and measure and root) else None
+        if measured:
+            readable, basis = _human_size(measured), "measured in the installed store"
+        elif size:
+            readable = f"about {size} MB"
+        else:
+            readable = ""
+            basis = ("no size is published for this set; it is measured once it is installed")
+        rows.append({
+            "name": name,
+            "title": getattr(spec, "title", "") or (entry or {}).get("title") or name,
+            "kind": getattr(spec, "kind", "") or (entry or {}).get("kind", ""),
+            "element_type": getattr(spec, "element_type", "") or (entry or {}).get("element_type", ""),
+            "purpose": DATABASE_PURPOSE.get(name, "an additional reference set this engine reads"),
+            "provider": DATABASE_PROVIDER.get(name, ""),
+            "url": getattr(spec, "url", ""), "citation": getattr(spec, "citation", ""),
+            "notes": getattr(spec, "notes", ""),
+            "licence": licence or "not recorded by the provider",
+            "open_licence": _licence_is_open(licence),
+            "licence_note": ("" if _licence_is_open(licence) else
+                             "The provider's own terms apply; read them before installing, using "
+                             "or sharing this data."),
+            "download": ("automatic" if (can_fetch and can_fetch(name)) else "by hand"),
+            "core": name in DEFAULT_DATABASES,
+            "installed": entry is not None,
+            "bundled": is_bundled and entry is not None,
+            "version": str((entry or {}).get("version", "") or ""),
+            "staged": str((entry or {}).get("installed", "") or ""),
+            "sequences": (entry or {}).get("sequences"),
+            "bytes": measured, "size": readable, "size_basis": basis,
+            "state": "installed" if entry is not None else "not installed",
+        })
+    # Core sets first, then whatever else is already here, then the rest by name:
+    # the order somebody reads the list in, not the order a dict happened to hold.
+    rows.sort(key=lambda row: (not row["core"], not row["installed"], row["name"]))
+    here = [row["name"] for row in rows if row["installed"]]
+    elsewhere = [row["name"] for row in rows if not row["installed"]]
+    summary = (f"{len(here)} of {len(rows)} reference sets are installed in "
+               f"{root or 'no store'}" + (": " + ", ".join(here) if here else "")
+               + f". The other {len(elsewhere)} are listed here and downloaded only when you ask "
+                 "for one; an isolate is never screened against a set that is not installed, and "
+                 "a result does not say so unless you read this page.")
+    return {"root": str(root or ""), "error": error, "entries": rows, "installed": here,
+            "available": elsewhere, "core": list(DEFAULT_DATABASES), "summary": summary,
+            "automatic": [row["name"] for row in rows if row["download"] == "automatic"]}
 
 
 def runtime_capabilities(db_root=None):
@@ -299,7 +622,7 @@ def runtime_capabilities(db_root=None):
 
 
 def preflight(db_root=None, *, databases=None, organism=None, point_mutations=True,
-              capabilities=None):
+              virulence=None, capabilities=None):
     """Everything a run needs, checked before a single sequence file is opened.
 
     The failure this exists to stop is the quiet one: HYDRA is installed, BLAST is
@@ -312,6 +635,12 @@ def preflight(db_root=None, *, databases=None, organism=None, point_mutations=Tr
     Nothing here downloads, creates or repairs anything, and `warnings` is kept
     separate from `missing`: a warning narrows what the run can report and is
     recorded with the result, a missing item stops it.
+
+    `virulence` is None for "use it where the organism makes it meaningful", True
+    to search for virulence and stress elements whatever the organism is, and
+    False to leave them alone. Whichever is chosen, the returned `virulence` block
+    says what was searched for and under whose curation, because an uncurated
+    plus-element screen and an organism's curated one are not the same result.
     """
     capabilities = capabilities if capabilities is not None else runtime_capabilities(db_root)
     tools = capabilities.get("tools") or {}
@@ -357,28 +686,90 @@ def preflight(db_root=None, *, databases=None, organism=None, point_mutations=Tr
                 warnings.append(
                     f"The '{entry['name']}' reference set is not installed, so {entry['purpose']} "
                     "did not run. Nothing was reported for it; that is not a negative result.")
-    resolved, organism_reason = None, ""
+    resolved, organism_reason, level = None, "", "unknown"
     if organism:
         accepted = status["organisms"]
         resolved = match_organism(organism, accepted=accepted) if accepted else str(organism)
+        dna = catalogue_covers(resolved, status["dna_point_mutation_organisms"])
+        protein_level = catalogue_covers(resolved, status["protein_point_mutation_organisms"])
         if accepted and resolved is None:
+            level = "none"
             organism_reason = (
                 f"The installed reference release has no catalogue for '{organism}', so point "
                 "mutations were not assessed for this isolate. Genes were still searched for. "
                 "An absent catalogue is not an absence of mutations.")
             warnings.append(organism_reason)
-        elif resolved and accepted and resolved not in status["point_mutation_organisms"]:
+        elif resolved and accepted and dna and protein_level:
+            level = "dna_and_protein"
+        elif resolved and accepted and protein_level:
+            level = "protein_only"
             organism_reason = (
-                f"'{resolved}' is accepted by the installed release but has no DNA point-mutation "
-                "catalogue in it, so only protein-level mutations could be reported.")
+                f"'{resolved}' has a curated protein mutation catalogue in this release but no DNA "
+                "catalogue, so mutations in genes that are read at the DNA level (23S rRNA and the "
+                "other non-coding targets) could not be assessed for it.")
+            warnings.append(organism_reason)
+        elif resolved and accepted and dna:
+            level = "dna_only"
+            organism_reason = (
+                f"'{resolved}' has a DNA mutation catalogue in this release but no curated protein "
+                "mutation entries, so only DNA-level mutations could be reported for it.")
+            warnings.append(organism_reason)
+        elif resolved and accepted:
+            level = "none"
+            organism_reason = (
+                f"'{resolved}' is accepted by the installed release but has no point-mutation "
+                "catalogue in it at all, so this isolate was screened for genes only. That is not "
+                "evidence that it carries no resistance mutation.")
             warnings.append(organism_reason)
     elif point_mutations:
+        level = "none"
         organism_reason = ("No organism was given, so no point-mutation catalogue was selected. "
                            "Assign a genus and species to this isolate to have them assessed.")
         warnings.append(organism_reason)
     if point_mutations and "protein" not in chosen and status["installed"]:
+        level = "none"
         warnings.append("Point mutations were requested but the protein reference set is not "
                         "among the databases being searched, so none can be reported.")
+    # Virulence and stress elements from the PROTEIN reference: offered where the
+    # isolate's organism is established, because the engine's curation is keyed to
+    # that organism and a run without one is a different, uncurated search. "auto"
+    # is the caller saying "use it where it applies" and is the only setting that
+    # decides by itself; True and False are the user's own choice and are obeyed.
+    # The nucleotide catalogues report their own virulence-typed genes either way,
+    # so none of these sentences may say that nothing virulent was looked for.
+    support = {"available": False, "virulence_elements": 0, "stress_elements": 0,
+               "organism": resolved or "", "organism_curated": bool(resolved),
+               "suppression_organisms": [], "reason": ""}
+    if status["installed"] and "protein" in chosen:
+        try:
+            # database_status has already read the organism tables; handing them
+            # over keeps one preflight to one read of each reference table.
+            support = virulence_support(
+                status["root"], organism=resolved or organism,
+                catalogue={"accepted": status["organisms"],
+                           "suppressed": status["suppression_organisms"]})
+        except HydraRuntimeError as exc:
+            support["reason"] = str(exc)
+    elif status["installed"]:
+        support["reason"] = ("The protein reference set is not among the databases being searched, "
+                             "so no virulence or stress element can be read from it.")
+    requested = "auto" if virulence is None else bool(virulence)
+    virulence_reason = support["reason"]
+    if requested is False:
+        enabled = False
+        virulence_reason = ("The translated protein search was limited to acquired resistance, so "
+                            "no virulence or stress element was read from the protein reference. "
+                            "Virulence-typed genes in the nucleotide catalogues are reported "
+                            "regardless: this setting governs the protein search only.")
+    elif not support["available"]:
+        enabled = False
+    elif requested is True:
+        enabled = True
+    else:
+        enabled = bool(support["organism_curated"])
+    if virulence_reason and requested is not False and (not enabled
+                                                        or not support["organism_curated"]):
+        warnings.append(virulence_reason)
     if status["stale"]:
         warnings.append(f"This reference release is {status['age_days']} days old "
                         f"({status['release']}). Determinants named after it are not in it; use "
@@ -396,7 +787,14 @@ def preflight(db_root=None, *, databases=None, organism=None, point_mutations=Tr
             "databases": chosen, "database_status": status,
             "organism": {"requested": str(organism or ""), "resolved": resolved or "",
                          "reason": organism_reason,
-                         "point_mutations": bool(point_mutations)},
+                         "point_mutations": bool(point_mutations),
+                         "point_mutation_level": level},
+            "virulence": {"requested": requested, "enabled": enabled,
+                          "reason": virulence_reason,
+                          "organism_curated": bool(support["organism_curated"]),
+                          "available": bool(support["available"]),
+                          "virulence_elements": support["virulence_elements"],
+                          "stress_elements": support["stress_elements"]},
             "engine": {"installed": version or "", "expected": HYDRA_VERSION},
             "tools": dict(tools), "limitations": list(capabilities.get("limitations") or ())}
 
@@ -518,7 +916,7 @@ def _database_provenance(db_root, names, cancelled=None):
 
 
 def run_assemblies(inputs, db_root, databases=None, *, sample_names=None, organism=None,
-                   threads=2, protein=True, point_mutations=True, cancelled=None,
+                   threads=2, protein=True, point_mutations=True, virulence=None, cancelled=None,
                    progress=None, work_root=None, min_identity=80, min_coverage=60,
                    protein_min_identity=90, protein_min_coverage=90):
     """Run the original HYDRA assembly pipeline and return its validated JSON report.
@@ -538,7 +936,8 @@ def run_assemblies(inputs, db_root, databases=None, *, sample_names=None, organi
     # One gate for every caller: a run that cannot finish never starts, and the
     # refusal names each missing tool or reference set and what it was for.
     checked = preflight(db_root, databases=databases, organism=organism,
-                        point_mutations=point_mutations, capabilities=capabilities)
+                        point_mutations=point_mutations, virulence=virulence,
+                        capabilities=capabilities)
     if not checked["ready"]:
         raise HydraRuntimeError(checked["message"])
     if not isinstance(threads, int) or isinstance(threads, bool) or not 1 <= threads <= 256:
@@ -604,6 +1003,10 @@ def run_assemblies(inputs, db_root, databases=None, *, sample_names=None, organi
         arguments.append("--no-protein")
     if not point_mutations:
         arguments.append("--no-point-mutations")
+    # Stress and virulence elements are reported only when preflight decided they
+    # apply to this isolate; the flag is always passed explicitly so the recorded
+    # command says which of the two searches was performed.
+    arguments.append("--plus" if checked["virulence"]["enabled"] else "--no-plus")
     if work_root is not None:
         Path(work_root).mkdir(parents=True, exist_ok=True)
     started = time.monotonic()
@@ -628,6 +1031,7 @@ def run_assemblies(inputs, db_root, databases=None, *, sample_names=None, organi
         # What the run could and could not look for travels with the result, so a
         # report is never read as a complete screen when part of it never ran.
         "organism": dict(checked["organism"]),
+        "virulence": dict(checked["virulence"]),
         "reference_release": {key: checked["database_status"][key]
                               for key in ("release", "released_utc", "staged", "age_days",
                                           "stale", "bundled", "label")},
@@ -672,6 +1076,16 @@ def update_databases(db_root, names, *, cancelled=None, progress=None, work_root
     selected = list(names)
     if not selected or any(not isinstance(name, str) or not name or name.startswith("-") for name in selected):
         raise HydraRuntimeError("Select explicit database names for download/update.")
+    # A name the engine does not know is refused here, by name, against the list a
+    # person can read; without this the typo surfaces minutes later as an engine
+    # error in the middle of a download, with the previous store already replaced
+    # in the user's mind if not on disk.
+    known = {row["name"] for row in database_catalogue(measure=False)["entries"]}
+    unknown = sorted(set(selected) - known) if known else []
+    if unknown:
+        raise HydraRuntimeError(
+            f"This engine has no reference set called {', '.join(unknown)}. The sets it can "
+            f"install are: {', '.join(sorted(known))}.")
     # Nucleotide normalization consumes protein family annotations when present.
     # Fetch protein first so the original upstream importer can attach those
     # curated classes instead of leaving them absent in a brand-new store.
@@ -686,8 +1100,17 @@ def update_databases(db_root, names, *, cancelled=None, progress=None, work_root
     provider_version = _ncbi_version() if set(selected).intersection({"ncbi", "protein"}) else None
     with tempfile.TemporaryDirectory(prefix=".wmlstudio-hydra-stage-", dir=root.parent) as work:
         staged = Path(work) / "snapshot"
-        command, log = _run_child(["db", "download", *selected, "--db-dir", str(staged)],
-                                  work, cancelled, progress)
+        try:
+            command, log = _run_child(["db", "download", *selected, "--db-dir", str(staged)],
+                                      work, cancelled, progress)
+        except HydraRuntimeError as exc:
+            # Nothing has been published at this point: the staging directory is
+            # discarded with the temporary folder and the store in use is exactly
+            # as it was. Saying so is the difference between a failed download and
+            # a user who believes their reference data is now in an unknown state.
+            raise HydraRuntimeError(
+                f"Downloading {', '.join(selected)} failed, so no new snapshot was published and "
+                f"the reference store you are using is unchanged.\n{exc}") from exc
         if provider_version:
             if _ncbi_version() != provider_version:
                 raise HydraRuntimeError("NCBI changed its current database version during download; retry to obtain one consistent snapshot.")

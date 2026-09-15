@@ -17,20 +17,31 @@ capability in this revision is listed in the
 
 ## Finding your way around
 
-Seven tabs run across the top of the window. Each one answers a different
-question, and each says so in a plain sentence directly under the tab bar, with a
-button for the usual next step and a **?** that opens this guide at the right
-place.
+The tabs run across the top of the window in the order the work actually happens.
+Each one answers a different question, and each says so in a plain sentence
+directly under the tab bar, with a button for the usual next step and a **?** that
+opens this guide at the right place.
 
 | Tab | The question it answers |
 | --- | --- |
 | **Overview** | What is in this project, and what should I do next? |
-| **Isolates** | Which isolates do I have, and is each one trustworthy? |
-| **Compare** | How close are these isolates to each other? |
-| **Schemes** | Which reference definitions do I have installed? |
-| **Evidence** | What genes and markers were found, by which assay? |
-| **Reports** | What can I hand to a colleague? |
+| **Samples** | Which isolates do I have, and is each one trustworthy? |
+| **Read QC** | Are these reads worth assembling, and do they need trimming? |
+| **Assembly** | What did these reads assemble into, and from which reads? |
+| **MLST** | What is the seven-locus sequence type? |
+| **MLST tree** | How close are these isolates at seven loci? |
+| **cgMLST** | What did the core-genome scheme call, and what is missing? |
+| **cgMLST tree** | How close are these isolates across the core genome? |
+| **SNP tree** | How different are these isolates at nucleotide level? |
+| **HYDRA** | What resistance and virulence evidence was found, by which assay? |
+| **Report** | What can I hand to a colleague? |
+| **Update** | Which reference definitions and databases do I have, and what can I install? |
 | **Settings** | Text size, screen size, reference data, and what this version cannot do |
+
+Three of those tabs draw trees, and they measure three different things. A
+seven-locus allele difference, a core-genome allele difference and a SNP distance
+never share a scale, an axis, a column or a threshold, which is exactly why they
+are three tabs and not one with a dropdown.
 
 The tabs are connected but they do not silently drag each other around. Selecting
 isolates anywhere sets a **focus**: the strip at the top says how many isolates
@@ -41,9 +52,10 @@ what it is reviewing and where that cohort came from: "Reviewing 7 · from Graph
 selection". That cohort belongs to that tab only. Two tabs can be looking at two
 different sets on purpose, and each will tell you which.
 
-The Compare strip says *similarity is not proof of transmission*; the Evidence
-strip says *genotype is not measured susceptibility*. Those limits are on the
-screen, not buried in a tooltip.
+Every tree strip says *similarity is not proof of transmission*; the HYDRA strip
+says *genotype is not measured susceptibility*; the Read QC strip says trimming
+improves reads without validating an isolate. Those limits are on the screen, not
+buried in a tooltip.
 
 ## I have never done this before: can I practise on real data first?
 
@@ -249,6 +261,36 @@ QC; generic gene detection does not reproduce all Kleborate/Kaptive outputs.
 
 Source: [NCBI interpretation guidance](https://github.com/ncbi/amr/wiki/Interpreting-results).
 
+## Which reference databases do I have, and what do I need?
+
+**Update → AMR reference databases** lists every reference set the engine can use,
+whether or not you have it. Each row names the provider, the licence, the citation
+and the upstream address, says whether it is installed and, where a size is known,
+where that number came from. Nothing about your store is guessed: a set the engine
+does not know how to fetch says so, and a set nobody publishes a size for says
+that rather than showing a number nobody checked.
+
+Two sets are bundled: the NCBI AMRFinderPlus nucleotide and protein references,
+**including point mutations**. That is deliberate — it means the first run works
+on a laboratory machine with no network. Everything else is a download you choose.
+
+**Install and update everything** checks what is actually present, installs what
+is missing and updates the rest in one pass, and tells you what it will do before
+it does it. It deliberately leaves out any set whose licence is not an open one —
+CARD's academic licence, and every provider that records no licence at all. Those
+stay one explicit click each, with the provider's terms in front of you first.
+A licence you have not read is not a licence you have accepted.
+
+Point mutations depend on the organism. An isolate whose organism the catalogue
+covers is screened for its curated mutations; one outside it is screened for
+acquired genes only, and the application says so. **No mutation catalogue is not
+the same as no mutations**, and the two are never displayed the same way.
+
+Virulence and stress elements are searched where the isolate's organism is
+established. You can force that search on for an isolate with no organism, or off
+entirely — the run records which of the three you chose and what it therefore did
+not look for.
+
 ## Is there a tool specific to my organism?
 
 Three, in this revision. Some questions only make sense for one genus, so they
@@ -332,7 +374,40 @@ layers. For stronger claims, consider reconstruction with a documented method,
 long-read/hybrid closure, coverage and epidemiological context. MOB-suite's
 reconstructions are predictions, not a substitute for experimental confirmation.
 
+The plasmid view shows each contig that carries a replicon marker, which
+determinants sit on that same contig, the closure the assembler itself claimed,
+and how far the contig's declared coverage departs from the chromosomal backbone.
+**This is not MOB-suite and is not equivalent to it.** No relaxase or MPF type is
+determined, no oriT is searched, no plasmid is reconstructed, no mobility is
+predicted and no plasmid count is estimated. Those six gaps are printed beside the
+table, because the useful question is what this screen cannot tell you. A
+determinant that is not on a replicon-bearing contig is reported as *not
+co-located*, in its own column, never merged with the co-located count: short-read
+assembly routinely separates things that travel together, and collapsing the two
+would turn an assembly artefact into a finding.
+
 Source: [MOB-suite methods and scope](https://github.com/phac-nml/mob-suite).
+
+## How different are these isolates at nucleotide level?
+
+The **SNP tree** answers a different question from the two allele trees, using
+SKA2 split k-mers over the assemblies you already have. It is a third quantity,
+kept apart on purpose: a SNP distance is not an MLST allele difference and not a
+cgMLST allele difference, so it has its own scale, its own axis, its own column
+and its own tree, and no threshold moves between them.
+
+Every pair carries its own denominator — the split k-mers the two isolates
+actually share. A pair that does not share enough to be comparable is refused and
+listed as refused, with its reason, beside the tree. It is never drawn as a zero
+distance, and never silently missing. The comparability floor is a control you
+can move, and moving it re-reads the same run rather than re-running SKA2: no SNP
+count changes when you change the floor, only which pairs are admitted.
+
+No curated SNP cutoff is applied. Where a published protocol exists it is named,
+along with every way this run differs from it; where the run does not match that
+protocol the cutoff is refused rather than approximated. A minimum spanning
+forest of SNP distances is a layout, not a phylogeny and not a transmission
+chain.
 
 ## How do I find and review every cluster?
 
@@ -494,9 +569,24 @@ typing evidence. Validate the complete pair, record both hashes, and keep the
 read association separate from the primary assembly. A manually confirmed
 filename association does not prove the reads generated that assembly.
 
-SKESA can assemble reviewed paired short reads without a mandatory fastp step.
+SKESA assembles reviewed paired short reads without a mandatory trimming step.
+That is now a choice rather than an absence: **Read QC** runs fastp on a pair when
+you ask it to, and the assembly records which reads it actually used — the trimmed
+pair or the originals. Trimming is never applied behind your back, the original
+files are never replaced, and a trimmed pair does not invalidate anything already
+computed from the originals.
+
+fastp adapter-trims and quality-filters. It does not validate an isolate, check
+its purity, assign a species or produce a clinical result, and the numbers on the
+Read QC tab are fastp's own report, not a WMLSTudio calculation. Where the
+package carries no fastp — upstream publishes no Windows binary, so a Windows
+package has it only when a reviewed native build was staged — the tab says
+trimming is unavailable, downloads nothing, and tells you the reads remain usable
+exactly as supplied. There is deliberately no "trim anyway" button.
+
 Read validation and quality review still matter. Built-in sampled QC is labelled
-as sampled QC; it must not be described as a completed FastQC analysis.
+as sampled QC; it must not be described as a completed FastQC analysis, and a
+fastp report is not one either.
 
 ## Missing targets or disagreement: can I investigate further?
 
