@@ -35,6 +35,7 @@ from PySide6.QtWidgets import (
 
 from . import cgmlst_schemes
 from .paths import cgmlst_library_roots, resource_root, scheme_locations
+from .progress_words import describe_progress  # noqa: F401  (this dialog's own wording)
 from .reference_catalog import CGMLSTOrgCatalog, PasteurCatalog, PubMLSTCatalog
 from .reference_index import scheme_library
 from .sequence import AnalysisCancelled
@@ -77,36 +78,6 @@ class _ReferenceWorker(QThread):
             self.progress.emit(0, 1, "Reference operation cancelled")
         except Exception as error:
             self.failed.emit(str(error))
-
-
-def describe_progress(current, total, text, elapsed):
-    """Say where a long step has got to, and roughly how much is left.
-
-    A step that only names the item it just finished looks identical whether it
-    has ten items left or two thousand, which is why a working cgMLST download
-    was read as a frozen one. An estimate is only offered once enough of the work
-    has been done for it to mean anything, and it is called an estimate.
-    """
-    if total <= 0 or current <= 0:
-        return f"{text} · {_duration(elapsed)} so far" if elapsed >= 5 else text
-    current = min(current, total)
-    percent = int(current * 100 / total)
-    detail = f"{current:,} of {total:,} ({percent}%)"
-    if current >= 12 and elapsed >= 10 and current < total:
-        remaining = elapsed / current * (total - current)
-        return f"{text} · {detail} · about {_duration(remaining)} left"
-    return f"{text} · {detail}"
-
-
-def _duration(seconds):
-    seconds = max(0, int(seconds))
-    if seconds < 60:
-        return f"{seconds} seconds"
-    minutes, seconds = divmod(seconds, 60)
-    if minutes < 60:
-        return f"{minutes} min" if not seconds else f"{minutes} min {seconds} s"
-    hours, minutes = divmod(minutes, 60)
-    return f"{hours} h {minutes} min"
 
 
 def _count_words(count, kind):

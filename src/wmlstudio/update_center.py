@@ -23,11 +23,18 @@ analysis"):
   to be read is reported as needing a decision, is never swept into "install and
   update everything", and its own button shows those terms and stops.
 
+* **An install that worked has to look like one.** The row updates itself the
+  moment the task stops, rather than telling the reader to press Rescan. A
+  species panel really does install in about twenty-four seconds, and the page
+  used to go on saying "Not installed" with an "Install…" button beside it
+  afterwards, which is indistinguishable from a button that does nothing — the
+  second half of the same report.
+
 The state comes from `provisioning.report`, which probes rather than guesses. The
 read-only probes run on this page's own background thread, so opening the tab
-never raises the analysis progress dialog over the workspace; anything that
-changes this computer runs through the window's own `launch_task`, where the
-progress bar and Cancel behave exactly as they do for an analysis.
+never raises the progress dialog over the workspace; anything that changes this
+computer runs through the window's own `launch_task`, captioned as a download, so
+Cancel behaves as it does for an analysis without the dialog claiming to be one.
 """
 
 from __future__ import annotations
@@ -51,6 +58,7 @@ from PySide6.QtWidgets import (
 )
 
 from wmlstudio import provisioning
+from wmlstudio.analysis_progress import installing
 from wmlstudio.background import FunctionWorker
 from wmlstudio.ui_common import FlowLayout
 from wmlstudio.widgets import button, label
@@ -455,6 +463,12 @@ class UpdateCenter(QWidget):
         # True while the window's own worker is installing everything, so the
         # button cannot be pressed twice by a probe finishing underneath it.
         self.installing = False
+        # The row whose install is running, so its own button says so instead of
+        # sitting there reading "Install…" while the thing installs.
+        self.working = ""
+        # An install finished while this page was already reading, so the answer
+        # on its way back is out of date and another read is owed.
+        self.reread_owed = False
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.addWidget(label(INTRO, "muted", True))
@@ -536,6 +550,25 @@ class UpdateCenter(QWidget):
         """
         return self.refresh() if self.report is None else False
 
+    def install_stopped(self):
+        """Something that installs has stopped — finished, failed or cancelled.
+
+        Both flags are cleared here rather than on success, because an install
+        that raised left `installing` set and the "Install and update everything"
+        button disabled for the rest of the session, with nothing to turn it back
+        on. Then this computer is read again, so every row tells the truth about
+        what is now on it without anybody being asked to press Rescan.
+        """
+        self.installing = False
+        self.working = ""
+        self.everything_button.setEnabled(True)
+        if not self.refresh():
+            # A read this page started before the install finished is still
+            # running, and its answer is already out of date. Re-read the moment
+            # it lets go, rather than leaving a filled row saying "Not installed".
+            self.reread_owed = True
+        return True
+
     def refresh(self):
         """Re-probe this computer. Touches the disk, runs no tools, contacts nothing."""
         window = self.window_ref
@@ -581,6 +614,11 @@ class UpdateCenter(QWidget):
         # A probe finishing must not hand back a button an install is still using:
         # the plan arrives on this same signal, one step before the install starts.
         self.everything_button.setEnabled(not self.installing)
+        if self.reread_owed:
+            # Cleared first: this read's own completion arrives here too, and a
+            # flag still set would start another read from inside that one.
+            self.reread_owed = False
+            self.refresh()
 
     def probe_failed(self, message):
         """A probe that could not finish says so here, and claims nothing about updates."""
@@ -765,6 +803,7 @@ class UpdateCenter(QWidget):
         listing = self.rows()
         self.table.setRowCount(len(listing))
         for index, row in enumerate(listing):
+            running = bool(self.working) and row["key"] == self.working
             for column, text in enumerate([row["title"], row["installed"], row["version"],
                                            row["size"], row["update"]]):
                 cell = QTableWidgetItem(str(text))
@@ -773,9 +812,12 @@ class UpdateCenter(QWidget):
                 cell.setToolTip(row["size_note"] if column == 3
                                 else row["tooltip"] or str(text))
                 self.table.setItem(index, column, cell)
-            action = button(row["action"],
+            action = button("Installing…" if running else row["action"],
                             lambda checked=False, key=row["key"]: self.start(key))
-            action.setEnabled(bool(row["enabled"]))
+            # A row that is being installed, and every other row while one is:
+            # two downloads into the same store at once is not something to allow
+            # by leaving the buttons live.
+            action.setEnabled(bool(row["enabled"]) and not self.working)
             self.table.setCellWidget(index, 5, action)
         self.table.resizeRowsToContents()
         return listing
@@ -855,27 +897,36 @@ class UpdateCenter(QWidget):
                                                    progress=progress)
 
         launch = getattr(window, "launch_task", None)
-        if callable(launch) and launch(operation, "update:everything", self.everything_finished):
+        if callable(launch) and launch(operation, "update:everything", self.everything_finished,
+                                       caption=installing("everything that is missing or stale")):
             self.installing = True
+            self.working = "everything"
             self.everything_button.setEnabled(False)
-            self.status.setText("Installing and updating…")
+            self.render()
+            self.status.setText("Installing and updating. This page re-reads itself the moment it "
+                                "finishes.")
             return True
         self.status.setText("Another background task is running. Try again when it finishes.")
         return False
 
     def everything_finished(self, result):
-        """Say what landed and what did not; a failure here is not a silent one."""
-        self.installing = False
-        self.everything_button.setEnabled(True)
+        """Say what landed and what did not; a failure here is not a silent one.
+
+        The flags are cleared by `install_stopped`, which runs whether this
+        finished, failed or was cancelled — clearing them only here left the
+        button disabled for good on the one path that matters.
+        """
         if not isinstance(result, dict):
             return
         waiting = decisions_needed(result.get("plan") or {})
-        self.status.setText(result.get("summary", "")
-                            + (f" {len(waiting)} reference set(s) were left out because their "
-                               "provider's terms are yours to accept, not ours: "
-                               + ", ".join(row["title"] for row in waiting) + "."
-                               if waiting else "")
-                            + " Press “Rescan what is installed here” to re-read this computer.")
+        landed = len(result.get("installed") or ()) + len(result.get("updated") or ())
+        self.status.setText(
+            f"{landed} item(s) installed or updated. " + result.get("summary", "")
+            + (f" {len(waiting)} reference set(s) were left out because their provider's terms "
+               "are yours to accept, not ours: "
+               + ", ".join(row["title"] for row in waiting) + "."
+               if waiting else "")
+            + " Re-reading this computer to show the new state…")
         if result.get("failed"):
             self.tell("Some items were not installed", "\n\n".join(
                 f"{failure['title']}: {failure['error']}\n{failure['state']}"
@@ -902,16 +953,40 @@ class UpdateCenter(QWidget):
                 return row
         return None
 
+    def busy_with_install(self) -> bool:
+        """Did something that writes to this computer actually start?
+
+        Anything that installs runs on the window's own worker, so this is how the
+        page tells "the download is under way" from "the person said no to the
+        confirmation" without either of them guessing.
+        """
+        worker = getattr(self.window_ref, "worker", None)
+        return bool(worker is not None and worker.isRunning())
+
     def start(self, key):
         """Install or update one thing, through the paths that already exist."""
         if str(key).startswith("database:"):
             return self.start_set(str(key).split(":", 1)[1])
+        if self.working:
+            self.status.setText(f"{self.working} is being installed. One at a time: two downloads "
+                                "into the same store would not both survive.")
+            return False
         item = self.item_for(key) or {"key": key, "action": None}
         handler = self.route_for(key)
         if handler is not None:
+            self.working = key
             handler()
-            self.status.setText("Press “Rescan what is installed here” once that finishes, to "
-                                "see the new state.")
+            if self.busy_with_install():
+                self.status.setText(f"Installing {item.get('title', key)}. This page re-reads "
+                                    "itself the moment it finishes.")
+            else:
+                # The handler asked and was answered no, or opened a window
+                # instead of starting work. Either way no row is mid-install.
+                self.working = ""
+                self.status.setText("Nothing has been installed yet. This page re-reads itself as "
+                                    "soon as something is.")
+                if self.report is not None:
+                    self.render()
             return True
         if self.report is None:
             # Reached from the menu before the tab has read anything. "Nothing here
@@ -971,9 +1046,13 @@ class UpdateCenter(QWidget):
                                                        progress=progress)
 
         launch = getattr(window, "launch_task", None)
-        if callable(launch) and launch(operation, "update:database:" + name, self.installed):
+        if callable(launch) and launch(operation, "update:database:" + name, self.installed,
+                                       caption=installing(row["title"])):
+            self.working = "database:" + name
+            self.render()
             self.status.setText(f"Downloading {row['title']} and everything the store already "
-                                "holds, into a new snapshot beside it…")
+                                "holds, into a new snapshot beside it. This page re-reads itself "
+                                "the moment it finishes.")
             return True
         self.status.setText("Another background task is running. Try again when it finishes.")
         return False
@@ -1000,22 +1079,33 @@ class UpdateCenter(QWidget):
             return target(cancelled=cancelled, progress=progress)
 
         launch = getattr(self.window_ref, "launch_task", None)
-        if callable(launch) and launch(operation, "update:" + item["key"], self.installed):
-            self.status.setText(f"{item.get('title', 'Installing')}: working…")
+        title = item.get("title", "this reference data")
+        if callable(launch) and launch(operation, "update:" + item["key"], self.installed,
+                                       caption=installing(title)):
+            self.working = item["key"]
+            self.render()
+            self.status.setText(f"Installing {title}. This page re-reads itself the moment it "
+                                "finishes.")
             return True
         self.status.setText("Another background task is running. Try again when it finishes.")
         return False
 
     def installed(self, result):
-        """Say what landed, and leave re-reading the disk to a deliberate press."""
+        """Say what landed. The disk is re-read for you the moment the task stops.
+
+        The instruction this used to end on — press Rescan — was the whole of the
+        reported bug: the species panel really did install, in twenty-four
+        seconds, and the row went on saying "Not installed" with an "Install…"
+        button beside it, so a download that worked was indistinguishable from one
+        that did nothing.
+        """
         detail = ""
         if isinstance(result, dict):
-            for key in ("path", "root", "database_root", "species_count", "installed"):
+            for key in ("species_count", "path", "root", "database_root", "installed"):
                 if result.get(key):
                     detail = f" {key.replace('_', ' ').capitalize()}: {result[key]}."
                     break
-        self.status.setText(f"Finished.{detail} Press “Rescan what is installed here” to re-read "
-                            "the state from disk.")
+        self.status.setText(f"Installed.{detail} Re-reading this computer to show the new state…")
 
 
 def open_update_center(window):

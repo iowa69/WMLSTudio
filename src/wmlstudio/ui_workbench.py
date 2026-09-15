@@ -59,6 +59,11 @@ def quarantine_bucket(sample):
 REVIEW_STYLES = {"conflict": ("#E08A2E", "#20160A"), "undecided": ("#F2C94C", "#241D07")}
 REVIEW_PREFIX = "Needs organism review"
 STEP_KEYS = ("assembly", "st", "cgmlst", "hydra")
+#: Task roles that put reference data on this computer rather than computing
+#: anything from a sample. When one of these stops, the Update page re-reads the
+#: disk: a row that still says "Not installed" after a download that worked is
+#: indistinguishable from a download that never ran.
+INSTALL_ROLES = ("species_panel", "characterization_references", "scheme_import")
 # The heading each step is known by. "ST" is the classical seven-locus scheme and
 # cgMLST is a different quantity against a different scheme; they never share a
 # column, a tab or a threshold.
@@ -387,6 +392,9 @@ class WorkbenchMixin:
         self._task_succeeded = False
         self._typing_override = None
         self._progress_dialog = None
+        # What the progress dialog should call the running task. Set per launch;
+        # None means the analysis wording, which is what most callers are.
+        self._task_caption = None
         self._pending_import = None
         self._import_notes = []
         self._practice_cohort = None
@@ -2252,10 +2260,18 @@ class WorkbenchMixin:
         def operation(cancelled, progress):
             return organism_panel.provision_species_panel(root, cancelled=cancelled, progress=progress)
 
-        self.launch_task(operation, "species_panel", lambda result: self.notify(
-            f"Species panel installed: {result['species_count']} references at {result['path']}. "
-            "New imports will be compared against it. Use 'Identify waiting samples again' on the "
-            "Assembly tab to re-run identification on the isolates already waiting."))
+        from wmlstudio.analysis_progress import installing
+
+        def finished(result):
+            self.notify(
+                f"Species panel installed: {result['species_count']} references at "
+                f"{result['path']}. New imports will be compared against it. Use 'Identify "
+                "waiting samples again' on the Assembly tab to re-run identification on the "
+                "isolates already waiting.")
+            self.refresh_update_center()
+
+        self.launch_task(operation, "species_panel", finished,
+                         caption=installing("the species reference panel"))
 
     # --- one step at a time -------------------------------------------------
 
@@ -2555,11 +2571,20 @@ class WorkbenchMixin:
             return True
         return False
 
-    def launch_task(self, operation, role, completed=None):
+    def launch_task(self, operation, role, completed=None, *, caption=None):
+        """Run one background task, with the progress dialog captioned by its caller.
+
+        ``caption`` is an analysis_progress.TaskCaption naming what is running.
+        Without one the dialog says an analysis is running, which is true of most
+        callers and was badly untrue of the reference-data downloads: a person who
+        pressed Install was told "your analysis is running" and reported that the
+        update button runs analyses.
+        """
         if self.busy():
             return False
         self.worker_role = role
         self._task_succeeded = False
+        self._task_caption = caption
         self.worker = FunctionWorker(operation, self)
         self.worker.completed.connect(lambda result: setattr(self, "_task_succeeded", True))
         if completed:
@@ -2585,8 +2610,13 @@ class WorkbenchMixin:
         if running:
             self.progress_bar.setValue(0)
             from wmlstudio.analysis_progress import AnalysisProgressDialog
+            caption = getattr(self, "_task_caption", None)
             if self._progress_dialog is None or self._progress_dialog.finished_safely:
-                self._progress_dialog = AnalysisProgressDialog(self)
+                self._progress_dialog = AnalysisProgressDialog(self, caption)
+            else:
+                # A dialog being shown again must be re-labelled: it carries the
+                # previous task's words until it is told what this one is.
+                self._progress_dialog.set_caption(caption)
             self._progress_dialog.show()
         elif self._progress_dialog is not None:
             self._progress_dialog.finish()
@@ -2775,6 +2805,13 @@ class WorkbenchMixin:
         if self.closing_after_cancel:
             self.close()
             return
+        if role in INSTALL_ROLES or role.startswith("update:"):
+            # Whatever installed something has stopped — finished, failed or
+            # cancelled — so the page that lists what is installed re-reads this
+            # computer rather than leaving a row that a person has just filled
+            # still reading "Not installed" beside an "Install…" button. After the
+            # close check: a window on its way out starts no new probe.
+            self.refresh_update_center()
         if role == "fastqc_pipeline":
             self.continue_after_fastqc()
             return

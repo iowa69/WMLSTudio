@@ -57,6 +57,10 @@ class Scheme:
     metadata: dict
     digest: str
     notes: list[str] = field(default_factory=list)
+    #: False when this scheme was loaded to be checked rather than to be typed
+    #: against, so its allele sequences were never kept. Nothing may match
+    #: against such a scheme: every locus would silently report no hit.
+    sequences_loaded: bool = True
     _automaton: object | None = field(default=None, init=False, repr=False, compare=False)
 
     @property
@@ -93,23 +97,43 @@ def _allele_identifier(header: str, locus: str) -> str:
     return allele
 
 
-def _source_digest(files: list[Path], root: Path, cancelled: CancelCallback) -> str:
+def _source_digest(files: list[Path], root: Path, cancelled: CancelCallback,
+                   progress: ProgressCallback = None) -> str:
+    ordered = sorted(files, key=lambda file: file.relative_to(root).as_posix())
     digest = hashlib.sha256(b"WMLSTudio-schema-v1\0")
-    for path in sorted(files, key=lambda file: file.relative_to(root).as_posix()):
+    for number, path in enumerate(ordered, 1):
         check_cancelled(cancelled)
         name = path.relative_to(root).as_posix().encode("utf-8")
         digest.update(len(name).to_bytes(8, "big"))
         digest.update(name)
         digest.update(bytes.fromhex(file_sha256(path, cancelled)))
+        if progress:
+            progress(number, len(ordered), f"Fingerprinting {path.name}")
     return digest.hexdigest()
 
 
-def load_scheme(path: str | Path, cancelled: CancelCallback = None) -> Scheme:
+def load_scheme(path: str | Path, cancelled: CancelCallback = None, *,
+                progress: ProgressCallback = None, sequences: bool = True) -> Scheme:
     """Load a flat local allele FASTA directory and optional tab-separated profiles.
 
     Locus names are allele-file stems. Profiles use an ST column and one column
     per locus; extra metadata columns are allowed. Allele-only cgMLST directories
     are supported, and never acquire an inferred sequence type.
+
+    ``sequences=False`` checks a scheme without keeping it. Every file is still
+    read, parsed and fingerprinted and every error is still raised, but the allele
+    sequences are discarded as they are read: only the identifiers are kept, which
+    is all the remaining checks and the digest need. A 2,358-target cgMLST scheme
+    is several gigabytes of FASTA, and holding it to confirm a freshly downloaded
+    copy cost about 1.5 times its own size in memory — on a laptop with 8 GB that
+    is the difference between a check that takes a minute and one that swaps for
+    an hour and reads as a frozen download. A scheme loaded this way can never be
+    typed against: ``_automaton`` refuses it by name rather than quietly matching
+    nothing.
+
+    ``progress`` is called as ``progress(done, total, message)`` per file. This
+    pass reads the whole scheme twice, so a caller that shows nothing here leaves
+    a full progress bar standing still for minutes.
     """
     root = Path(path).resolve()
     if not root.is_dir():
@@ -126,8 +150,10 @@ def load_scheme(path: str | Path, cancelled: CancelCallback = None) -> Scheme:
     alleles: dict[str, dict[str, str]] = {}
     included: list[Path] = []
     ambiguous_references: list[str] = []
-    for file, locus in allele_files:
+    for number, (file, locus) in enumerate(allele_files, 1):
         check_cancelled(cancelled)
+        if progress:
+            progress(number, len(allele_files), f"Reading locus {locus}")
         if locus in alleles:
             raise SchemeError(f"More than one allele FASTA file defines locus {locus!r}.")
         values: dict[str, str] = {}
@@ -141,7 +167,10 @@ def load_scheme(path: str | Path, cancelled: CancelCallback = None) -> Scheme:
                         raise SchemeError(f"{file.name}: duplicate allele ID {identifier!r}.")
                     if set(record.sequence) - set("ACGT"):
                         ambiguous_references.append(f"{locus}_{identifier}")
-                    values[identifier] = record.sequence
+                    # Checking a download needs the identifiers, not the bases; the
+                    # sequence is dropped here rather than after gigabytes of it
+                    # have been accumulated.
+                    values[identifier] = record.sequence if sequences else ""
         except SequenceError as error:
             raise SchemeError(str(error)) from error
         alleles[locus] = values
@@ -244,16 +273,24 @@ def load_scheme(path: str | Path, cancelled: CancelCallback = None) -> Scheme:
         included.append(file)
     else:
         notes.append("No ST profile table supplied; exact allele calls are available without ST assignment.")
-    digest = _source_digest(included, root, cancelled)
+    digest = _source_digest(included, root, cancelled, progress)
     if any(file_signature(file) != signatures[file] for file in included):
         raise SchemeError("Scheme files changed while loading; load the scheme again.")
     return Scheme(
         name=str(metadata.get("name") or root.name), path=root, loci=loci, alleles=alleles,
         profiles=profiles, metadata=metadata, digest=digest, notes=notes,
+        sequences_loaded=sequences,
     )
 
 
 def _automaton(scheme: Scheme, cancelled: CancelCallback, progress: ProgressCallback):
+    if not scheme.sequences_loaded:
+        # A scheme loaded to be checked holds allele identifiers and no bases.
+        # Matching against it would find nothing and report every locus missing,
+        # which is a wrong answer rather than an error, so it is refused here.
+        raise SchemeError(
+            f"{scheme.name} was loaded to be checked, not to be typed against, so its reference "
+            "sequences were never read. Load the scheme again before matching.")
     if scheme._automaton is not None:
         return scheme._automaton
     automaton = ahocorasick.Automaton()

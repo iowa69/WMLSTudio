@@ -1024,6 +1024,21 @@ class BaseWindow(QMainWindow):
         from wmlstudio.update_center import open_update_center
         return open_update_center(self)
 
+    def refresh_update_center(self):
+        """Tell the Update page that something which installs has stopped.
+
+        Called for every install, wherever it was started from. An install that
+        finishes and leaves the row still reading "Not installed" with an
+        "Install…" button beside it is indistinguishable from one that never ran,
+        which is what a working 24-second download was reported as.
+        """
+        centre = getattr(self, "update_center", None)
+        if centre is None or centre.report is None:
+            # Nothing has read this computer yet, so there is no stale list to
+            # correct and no reason to start a probe nobody asked for.
+            return False
+        return centre.install_stopped()
+
     def build_update_menu(self):
         """A menu for everything that can be installed or updated, and nothing else."""
         from wmlstudio.update_center import MENU_ENTRIES, ROUTES

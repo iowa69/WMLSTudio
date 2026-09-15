@@ -978,21 +978,32 @@ def migrate_downloads(root, *, sources=None) -> list[dict]:
     return moved
 
 
-def install_into(source: Path, destination: Path) -> None:
+def install_into(source: Path, destination: Path, *, progress=None) -> None:
     """Move a scheme folder into place, filling a pre-created empty slot if there is one.
 
     A labelled slot already carries its README and scheme_slot.json, so the slot is
     filled file by file rather than replaced; those two descriptions are what tell
     a person whose scheme this is and under what terms it was obtained.
+
+    Filling a slot is thousands of moves, and a copying move across a filesystem
+    boundary carries gigabytes, so it reports each file rather than going quiet
+    at the very last step of a long download.
     """
     if not destination.exists():
+        if progress:
+            progress(0, 1, f"Moving the scheme into {destination.name}")
         try:
             source.rename(destination)
         except OSError:
             shutil.move(str(source), str(destination))
+        if progress:
+            progress(1, 1, f"Moved the scheme into {destination.name}")
         return
-    for child in sorted(source.iterdir()):
+    children = sorted(source.iterdir())
+    for number, child in enumerate(children, 1):
         target = destination / child.name
+        if progress:
+            progress(number, len(children), f"Filing {child.name}")
         if target.exists():
             continue
         try:

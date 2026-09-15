@@ -276,3 +276,63 @@ def test_palindromic_allele_is_one_hit(tmp_path):
     assert result["alleles"] == {"pal": "1"}
     assert result["calls"][0]["hit_count"] == 1
     assert result["calls"][0]["hits"][0]["strand"] == "both"
+
+
+def test_checking_a_scheme_keeps_the_identifiers_and_drops_the_bases(schema_path):
+    """The reported hang: a multi-gigabyte cgMLST download held in memory to be checked.
+
+    Confirming a fresh download needs the digest, the loci, the allele
+    identifiers and the errors — never the sequences. Keeping them cost about
+    1.5 times the scheme's own size in RAM, which for a 2,358-target scheme is
+    several gigabytes and, on a laptop, the difference between a check that takes
+    a minute and one that swaps until it is reported as frozen.
+    """
+    full = load_scheme(schema_path)
+    checked = load_scheme(schema_path, sequences=False)
+    # Everything the download path actually reads must be identical.
+    assert checked.digest == full.digest
+    assert checked.loci == full.loci
+    assert checked.locus_count == full.locus_count
+    assert checked.allele_count == full.allele_count
+    assert checked.notes == full.notes
+    assert checked.profiles == full.profiles
+    assert sorted(checked.alleles["arcA"]) == sorted(full.alleles["arcA"])
+    # And the bases themselves are gone, which is the entire point.
+    assert set(checked.alleles["arcA"].values()) == {""}
+    assert full.alleles["arcA"]["1"] == ARC1
+    assert checked.sequences_loaded is False and full.sequences_loaded is True
+
+
+def test_a_scheme_loaded_to_be_checked_can_never_be_typed_against(tmp_path, schema_path):
+    """Matching against it would find nothing and call every locus missing.
+
+    That is a wrong answer rather than an error, so it is refused by name.
+    """
+    path = assembly(tmp_path, "NNN" + ARC1 + "NNNNN" + GYR1 + "NN")
+    with pytest.raises(SchemeError, match="loaded to be checked"):
+        call_assembly(path, load_scheme(schema_path, sequences=False))
+
+
+def test_reading_a_scheme_reports_every_file_it_reads(schema_path):
+    """A pass that reports nothing is what leaves a full progress bar standing still."""
+    seen = []
+    load_scheme(schema_path, progress=lambda done, total, message: seen.append(
+        (done, total, message)), sequences=False)
+    read = [row for row in seen if row[2].startswith("Reading locus ")]
+    fingerprinted = [row for row in seen if row[2].startswith("Fingerprinting ")]
+    assert [row[2] for row in read] == ["Reading locus arcA", "Reading locus gyrB"]
+    assert [row[0] for row in read] == [1, 2] and {row[1] for row in read} == {2}
+    # The second pass over the same files is reported as its own, because it is
+    # the one that takes the time on a scheme of any size.
+    assert fingerprinted and [row[0] for row in fingerprinted] == list(
+        range(1, len(fingerprinted) + 1))
+    assert all(row[1] == len(fingerprinted) for row in fingerprinted)
+
+
+def test_an_error_in_a_checked_scheme_is_still_raised(tmp_path):
+    """Dropping the sequences must not drop the reason a download should be refused."""
+    directory = tmp_path / "broken"
+    directory.mkdir()
+    (directory / "arcA.tfa").write_text(f">arcA_1\n{ARC1}\n>arcA_1\n{ARC2}\n")
+    with pytest.raises(SchemeError, match="duplicate FASTA identifier"):
+        load_scheme(directory, sequences=False)

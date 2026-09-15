@@ -578,3 +578,49 @@ def test_install_destination_never_sends_two_kinds_to_one_library(tmp_path):
     partial = {**gene_by_gene, 'locus_count': 12}
     assert install_destination(library, partial, 'f' * 64).parent == \
         tmp_path / cgmlst_schemes.LIBRARY_DIRNAME
+
+
+def test_the_stages_after_the_last_locus_report_what_they_are_doing(tmp_path):
+    """The reported hang: "it downloads, then gets stuck" at 2,358 of 2,358.
+
+    Extraction reports every locus and then stops reporting, while the scheme is
+    read back in full, fingerprinted file by file and moved into the library.
+    On a real cgMLST scheme those stages are gigabytes of work behind a progress
+    bar that is already showing 100%, which is indistinguishable from frozen.
+    """
+    client = cg_remote()
+    selected = client.search_schemes('Examplegenus', scheme_type='cgMLST')['schemes'][0]
+    seen = []
+    installed = client.download_scheme(
+        selected, tmp_path, terms_acknowledged=True,
+        progress=lambda done, total, message: seen.append((done, total, message)))
+    assert installed['created'] is True
+    messages = [message for _done, _total, message in seen]
+    extraction = [index for index, text in enumerate(messages)
+                  if text.startswith('Validated archive locus ')]
+    assert extraction, 'the extraction still reports each locus'
+    after = messages[extraction[-1] + 1:]
+    assert after, 'everything after the last locus used to be silent'
+    # Each remaining stage says which stage it is, because all three count to the
+    # same total and an unlabelled bar restarting at 1 of 2,358 explains nothing.
+    assert any('read back and fingerprinted' in text for text in after)
+    assert any(text.startswith('Checking what was downloaded: Reading locus ') for text in after)
+    assert any(text.startswith('Checking what was downloaded: Fingerprinting ') for text in after)
+    assert any(text.startswith('Filing it in your library: ') for text in after)
+
+
+def test_checking_a_download_never_holds_the_scheme_it_is_checking(tmp_path, monkeypatch):
+    """The same stall's other half: the check used to keep every allele in memory."""
+    from wmlstudio import reference_catalog
+    calls = []
+    original = reference_catalog.load_scheme
+
+    def watched(path, cancelled=None, **options):
+        calls.append(options.get('sequences'))
+        return original(path, cancelled=cancelled, **options)
+
+    monkeypatch.setattr(reference_catalog, 'load_scheme', watched)
+    client = cg_remote()
+    selected = client.search_schemes('Examplegenus', scheme_type='cgMLST')['schemes'][0]
+    client.download_scheme(selected, tmp_path, terms_acknowledged=True)
+    assert calls and all(kept is False for kept in calls)
