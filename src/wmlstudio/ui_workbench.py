@@ -1389,8 +1389,13 @@ class WorkbenchMixin:
         for source in paths:
             path = Path(source)
             # Sorted, so a dropped folder is reviewed in the order the user sees it
-            # in their own file manager rather than in filesystem order.
-            candidates = sorted(path.rglob("*")) if path.is_dir() else [path]
+            # in their own file manager rather than in filesystem order. The key is
+            # explicit because sorting Path objects is case-insensitive on Windows
+            # and case-sensitive elsewhere: the same folder would otherwise import
+            # in a different order on each platform, and when two files hold the
+            # same bytes it decides which one becomes the isolate.
+            candidates = (sorted(path.rglob("*"), key=lambda entry: (str(entry).casefold(), str(entry)))
+                          if path.is_dir() else [path])
             for candidate in candidates:
                 name = candidate.name.lower().removesuffix(".gz").removesuffix(".bz2")
                 if candidate.is_file() and name.endswith((".fa", ".fasta", ".fna", ".fq", ".fastq")):

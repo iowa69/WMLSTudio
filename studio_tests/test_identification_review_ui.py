@@ -120,20 +120,24 @@ def test_identification_reads_the_original_files_before_any_copy_is_written(wind
     assert sorted(seen["paths"]) == sorted([str(first), str(duplicate), str(second)])
     assert seen["copies"] == [], "identification must run before anything is copied"
     samples = {sample["name"]: sample for sample in window.project.samples()}
-    assert set(samples) == {"KPNIH1", "mystery"}, "byte-identical files are imported once"
+    # Two files hold the same bytes, so exactly one becomes an isolate. Which one
+    # is decided by the order the folder is shown in, which is case-insensitive
+    # like a file manager and therefore the same on every platform: "also_KPNIH1"
+    # precedes "KPNIH1". Sorting Path objects directly would differ by platform.
+    assert set(samples) == {"also_KPNIH1", "mystery"}, "byte-identical files are imported once"
     assert "not copied again" in window.progress_text.text()
     assert duplicate.is_file(), "a skipped duplicate is the user's file and is never touched"
-    filed = storage.Path(samples["KPNIH1"]["input_path"]).relative_to(root).parts
+    filed = storage.Path(samples["also_KPNIH1"]["input_path"]).relative_to(root).parts
     assert filed[:3] == ("Klebsiella", "pneumoniae", "ST_unassigned")
     quarantined = storage.Path(samples["mystery"]["input_path"]).relative_to(root).parts
     assert quarantined[:2] == ("_Unresolved", "Not_in_reference_panel")
     assert first.read_text().startswith(">one"), "the user's original file is never moved"
     assert second.is_file()
     assert (root / "_Unresolved" / "README.txt").is_file()
-    evidence = samples["KPNIH1"]["metadata"]["organism_evidence"]
+    evidence = samples["also_KPNIH1"]["metadata"]["organism_evidence"]
     assert evidence["status"] == "confirmed" and evidence["confirmed_by"] == "user"
     assert evidence["basis"] == "genomic_ani"
-    assert samples["KPNIH1"]["metadata"]["workflow"]["typing_mode"] == "auto", \
+    assert samples["also_KPNIH1"]["metadata"]["workflow"]["typing_mode"] == "auto", \
         "accepting an organism decides the folder, not how the typing scheme is chosen"
     assert window.project.get_sample(samples["mystery"]["id"])["metadata"]["organism"]["genus"] == ""
     assert window.test_errors == []
