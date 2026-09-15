@@ -981,11 +981,12 @@ def test_an_install_that_fails_hands_its_own_button_back(window, qtbot):
     centre.working = "everything"
     centre.everything_button.setEnabled(False)
     assert window.refresh_update_center() is True
-    qtbot.waitUntil(lambda: centre.worker is None or not centre.worker.isRunning(), timeout=60000)
+    # Wait on the button, not on the thread: the worker stops first and the
+    # handler that hands the button back runs on the next pass of the event loop.
+    qtbot.waitUntil(lambda: centre.everything_button.isEnabled(), timeout=60000)
     settled(window, qtbot)
     assert centre.installing is False
     assert centre.working == ""
-    assert centre.everything_button.isEnabled()
     assert all(centre.table.cellWidget(index, 5).isEnabled()
                for index in range(centre.table.rowCount())
                if centre.rows()[index]["enabled"])
