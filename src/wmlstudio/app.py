@@ -414,21 +414,40 @@ class BaseWindow(QMainWindow):
                 entry.setAccessibleName(f"Go to {name.strip()}")
                 column.addWidget(entry)
                 self.nav_entries.setdefault(entry_key, entry)
-        # Scoped to this frame, not the application: setting the application
-        # stylesheet re-polishes every widget of every window, which is why it is
-        # done once at startup and never per widget.
-        holder.setStyleSheet(
-            "QPushButton#navEntry { text-align: left; padding: 5px 9px; border: none; "
-            "background: transparent; color: #C2D3E6; font-size: 12px; border-radius: 5px; }"
-            "QPushButton#navEntry:hover { background: #17243A; color: #E7EFF9; }"
-            "QPushButton#navEntry:checked { background: #17323C; color: #7FE9D2; "
-            "font-weight: 600; }"
-            "QPushButton#navSub { text-align: left; padding: 3px 9px; border: none; "
-            "background: transparent; color: #8FA9C2; font-size: 11px; border-radius: 5px; }"
-            "QPushButton#navSub:hover { background: #17243A; color: #E7EFF9; }")
         self.sidebar_layout.insertWidget(self.nav_slot, holder)
         self.navigator = holder
+        self.restyle_navigator()
         return holder
+
+    def restyle_navigator(self):
+        """Paint the navigator from the theme in force, and repaint it when it changes.
+
+        Scoped to this one frame rather than set on the application: the
+        application stylesheet re-polishes every widget of every open window,
+        which is why it is assembled once and applied through a single guarded
+        entry point. Hard-coding the colours here instead was worse — the entries
+        stayed pale blue-grey under the light theme and could not be read.
+        """
+        holder = getattr(self, "navigator", None)
+        if holder is None:
+            return None
+        from wmlstudio import theme
+        tokens = theme.theme_tokens(theme.active_theme())
+        sheet = (
+            "QPushButton#navEntry { text-align: left; padding: 5px 9px; border: none; "
+            "background: transparent; color: %(ink)s; font-size: 12px; border-radius: 5px; }"
+            "QPushButton#navEntry:hover { background: %(hover)s; color: %(strong)s; }"
+            "QPushButton#navEntry:checked { background: %(on)s; color: %(on_ink)s; "
+            "font-weight: 600; }"
+            "QPushButton#navSub { text-align: left; padding: 3px 9px; border: none; "
+            "background: transparent; color: %(quiet)s; font-size: 11px; border-radius: 5px; }"
+            "QPushButton#navSub:hover { background: %(hover)s; color: %(strong)s; }"
+            "QPushButton#navSub:checked { background: %(on)s; color: %(on_ink)s; }"
+            % {"ink": tokens["nav_ink"], "hover": tokens["nav_hover_bg"],
+               "strong": tokens["ink"], "on": tokens["nav_on_bg"],
+               "on_ink": tokens["nav_on_ink"], "quiet": tokens["eyebrow_ink"]})
+        holder.setStyleSheet(sheet)
+        return sheet
 
     def navigator_row(self, entry):
         """One navigator row, or None when the page or sub-tab it names is absent.
@@ -1251,7 +1270,56 @@ class BaseWindow(QMainWindow):
         self.register_command(menu.addAction(
             "Text too small? Window size, text size and screen resolution…",
             self.open_display_settings))
+        menu.addSeparator()
+        # The two complaints this answers were "very crowded, the fonts are big"
+        # and "its theme is a little too dark", so both are named here in the
+        # words they were reported in rather than only in Settings.
+        from wmlstudio import theme
+        appearance = menu.addMenu("Theme and table density")
+        for name, title in theme.THEME_LABELS.items():
+            action = appearance.addAction(
+                title, lambda checked=False, chosen=name: self.set_appearance(theme=chosen))
+            action.setToolTip(theme.THEME_NOTES.get(name, ""))
+        appearance.addSeparator()
+        for name, title in theme.DENSITY_LABELS.items():
+            appearance.addAction(
+                title, lambda checked=False, chosen=name: self.set_appearance(density=chosen))
+        self.register_command(appearance.menuAction())
+        bar = menu.addAction("Show the tab bar as well")
+        bar.setCheckable(True)
+        bar.setChecked(self.pages.tabBar().isVisible())
+        bar.setToolTip("The workflow down the side is the navigation. This puts the old row "
+                       "of tabs back above the page as well.")
+        bar.toggled.connect(self.set_tab_bar_visible)
+        self.register_command(bar)
         return menu
+
+    def set_appearance(self, *, theme=None, density=None):
+        """Change the theme or the table density now, and remember the choice.
+
+        Routed through the Settings panel's own apply rather than repeating it:
+        that method knows the order these have to be done in — write the
+        preference, set the active palette, repaint Qt's own dialogs, rebuild the
+        sheet through the one entry point that re-applies it, and restyle the
+        tables already on screen. Two copies of that sequence would drift.
+        """
+        panel = getattr(self, "interface_panel", None)
+        if panel is None:
+            return None
+        for combo, chosen in ((getattr(panel, "theme", None), theme),
+                              (getattr(panel, "density", None), density)):
+            if combo is None or chosen is None:
+                continue
+            index = combo.findData(chosen)
+            if index >= 0:
+                combo.setCurrentIndex(index)
+        panel.apply_appearance()
+        # The navigator carries its own scoped sheet, so it is repainted here or
+        # it keeps the previous theme's colours against the new ground.
+        self.restyle_navigator()
+        self.notify("Appearance changed. Nothing about your evidence, your distances or your "
+                    "thresholds changed with it.")
+        return {"theme": panel.theme.currentData(), "density": panel.density.currentData()}
 
     def open_update_center(self):
         """The Update tab, from a menu, the command search or another page.
