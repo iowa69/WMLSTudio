@@ -171,12 +171,20 @@ class BaseWindow(QMainWindow):
         # application still means the page it has always meant.
         self.build_update()
         self.install_pipeline_pages()
+        self.install_tree_station()
+        self.install_typing_stations()
         self.install_workspace_headers()
         self.fold_duplicate_pages()
         # A page that reads the project every time it is opened says so here rather
         # than recomputing on every keystroke somewhere else in the window.
         self.page_shown = {key: hook for key, hook in (
-            ("compare", getattr(self, "refresh_comparison", None)),
+            # The two tree tabs are the same workspace bound to two scales, so
+            # each one mounts it before redrawing. Neither inherits the other's
+            # threshold: show_typing_view stores and restores per kind.
+            ("compare", getattr(self, "show_mlst_tree_tab", None)),
+            ("cgmlst_tree", getattr(self, "show_cgmlst_tree_tab", None)),
+            ("cgmlst", getattr(getattr(self, "cgmlst_calls", None), "refresh", None)),
+            ("snp", getattr(getattr(self, "snp_tree_page", None), "refresh_cohort", None)),
             ("reads", getattr(getattr(self, "read_trimming_page", None), "refresh", None)),
             ("assembly", getattr(getattr(self, "assembly_page", None), "refresh", None)),
             # The first time only, and it reads this computer's folders: opening
@@ -721,6 +729,103 @@ class BaseWindow(QMainWindow):
             return {}
         return install_pipeline_panels(self)
 
+    def install_typing_stations(self):
+        """Give the cgMLST and SNP tree tabs the finished pages they already had.
+
+        Both pages exist and are tested. The SNP tree panel had simply never been
+        mounted anywhere, so its tab said "Nothing runs on this tab yet" about a
+        page that was complete; the cgMLST calls table was reachable only as a
+        sub-tab of the tree page, so the tab named cgMLST showed a signpost to it.
+        A tab that names a task and does not carry it is worth less than no tab.
+        """
+        installed = {}
+        calls = getattr(self, "cgmlst_calls", None)
+        if calls is not None and self.adopt_station("cgmlst", calls):
+            # It was a sub-tab of the comparison page; a widget lives in one place,
+            # and its place is the tab that carries its name.
+            subtabs = self.pages.subtabs("compare")
+            if subtabs is not None:
+                index = subtabs.indexOf(calls)
+                if index >= 0:
+                    subtabs.removeTab(index)
+            installed["cgmlst"] = calls
+        self.snp_tree_page = None
+        try:
+            from wmlstudio.ui_snp import SnpTreePanel
+            panel = SnpTreePanel(self)
+        except (ImportError, TypeError):
+            return installed
+        self.snp_tree_page = panel
+        if self.adopt_station("snp", panel):
+            installed["snp"] = panel
+        return installed
+
+    def install_tree_station(self):
+        """Give the cgMLST tree tab somewhere the comparison workspace can live.
+
+        The reported failure, in the user's words: "cgmlst tree i cannot draw".
+        The tab said "Nothing is drawn on this tab yet" and offered a button to
+        the other tree page, because there is exactly one comparison workspace —
+        its widgets are attributes of this window, so a second one cannot exist —
+        and two tabs that each need a tree.
+
+        Rather than leave the core of this application behind a signpost, the
+        workspace itself moves into whichever of the two tabs is in front and is
+        bound to that tab's typing kind. Each kind already keeps its own
+        reference, threshold, minimum overlap, investigation and legend, so the
+        two tabs still never share a scale, an axis, a column or a threshold.
+        """
+        station = self.stations.get("cgmlst_tree")
+        if station is None or getattr(self, "comparison_content", None) is None:
+            return None
+        holder = QScrollArea()
+        holder.setWidgetResizable(True)
+        self.cgmlst_tree_scroll = holder
+        self.adopt_station("cgmlst_tree", holder)
+        return holder
+
+    def tree_holders(self):
+        """The two scroll areas the one comparison workspace moves between."""
+        return {"compare": self.pages.page_for("compare"),
+                "cgmlst_tree": getattr(self, "cgmlst_tree_scroll", None)}
+
+    def mount_comparison(self, key):
+        """Move the comparison workspace into this tab, bound to this tab's kind.
+
+        QScrollArea.takeWidget hands the content back without destroying it,
+        which is what makes one workspace serving two tabs safe rather than a
+        trick: the widget is never reparented behind Qt's back and never exists
+        in two places.
+        """
+        content = getattr(self, "comparison_content", None)
+        holders = self.tree_holders()
+        holder = holders.get(key)
+        if content is None or holder is None:
+            return False
+        if holder.widget() is not content:
+            for other in holders.values():
+                if other is not None and other.widget() is content:
+                    other.takeWidget()
+            holder.setWidget(content)
+            content.show()
+        kind = "cgmlst" if key == "cgmlst_tree" else "mlst"
+        show = getattr(self, "show_typing_view", None)
+        if callable(show):
+            # chosen=False: which tree this tab shows is what the tab is for, and
+            # must not overwrite the kind the user last chose for themselves.
+            show(kind, chosen=False)
+        return True
+
+    def show_mlst_tree_tab(self):
+        """The MLST tree tab: the workspace, on the seven-locus scale."""
+        self.mount_comparison("compare")
+        return self.refresh_comparison()
+
+    def show_cgmlst_tree_tab(self):
+        """The cgMLST tree tab: the same workspace, on the core-genome scale."""
+        self.mount_comparison("cgmlst_tree")
+        return self.refresh_comparison()
+
     def adopt_station(self, key, widget, *, title=None):
         """Give a pipeline station its real page, built elsewhere.
 
@@ -856,14 +961,16 @@ class BaseWindow(QMainWindow):
         return self.pages.show_subtab("compare", "cgMLST calls")
 
     def goto_cgmlst_tree_view(self):
-        """Draw the cgMLST tree on the tree page, with its own reference and threshold.
+        """Draw the cgMLST tree, on its own tab, with its own reference and threshold.
 
-        The tree page labels every graph with the scheme and the target count it was
-        built from, so a cgMLST graph is never presented on a seven-locus scale. When
-        this station is given a drawing of its own, it draws here instead.
+        The tab carries the comparison workspace bound to the core-genome scale and
+        labels every graph with the scheme and the target count it was built from,
+        so a cgMLST graph is never presented on a seven-locus scale. The fallback
+        below is for a build where that tab could not be given the workspace.
         """
         if (self.stations.get("cgmlst_tree") or {}).get("adopted") is not None:
-            return self.navigate("cgmlst_tree")
+            self.navigate("cgmlst_tree")
+            return self.typing_kind
         draw = getattr(self, "show_cgmlst_tree", None)
         if not callable(draw):
             self.notify("This build draws cgMLST trees from the tree page.")
@@ -1103,7 +1210,11 @@ class BaseWindow(QMainWindow):
                 page.update()
                 if isinstance(page, QScrollArea):
                     page.viewport().update()
-                    page.widget().update()
+                    # A tree tab's scroll area is empty until its show hook, below,
+                    # moves the one comparison workspace into it.
+                    content = page.widget()
+                    if content is not None:
+                        content.update()
         finally:
             self._navigating = False
         hook = self.page_shown.get(key)

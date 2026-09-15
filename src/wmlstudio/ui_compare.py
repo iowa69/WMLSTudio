@@ -994,6 +994,11 @@ class ComparisonWorkspaceMixin:
 
     def build_compare(self):
         page, layout = self.page()
+        # Kept because there is one comparison workspace and two tabs that each
+        # need a tree. MainWindow.mount_comparison moves this widget into
+        # whichever of the two is in front, so neither tab has to say "nothing
+        # is drawn on this tab yet" about the tool the page exists for.
+        self.comparison_content = page
         # Dense workbench controls need breathing room at 1080×720 with native
         # Windows font metrics. Keep text size intact; reduce padding rather
         # than letting action strips consume the graph's usable height.

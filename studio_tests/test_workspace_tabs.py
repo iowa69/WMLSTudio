@@ -545,13 +545,52 @@ def test_a_station_only_offers_an_action_this_build_can_perform(window):
         getattr(window, "show_cgmlst_tree", None))
 
 
-def test_the_cgmlst_tree_station_asks_the_tree_page_for_a_cgmlst_graph(window, monkeypatch):
-    """Until it draws its own, the station takes you to the page and says so."""
-    drawn = []
-    monkeypatch.setattr(type(window), "show_cgmlst_tree",
-                        lambda self: (drawn.append(self.pages.current_key()), "cgmlst")[1])
+def test_the_cgmlst_tree_tab_draws_the_cgmlst_tree_on_the_cgmlst_tree_tab(window):
+    """The reported failure: "cgmlst tree i cannot draw".
+
+    The tab said "Nothing is drawn on this tab yet" and offered a button to the
+    other tree page. There is one comparison workspace — its widgets are
+    attributes of the window, so a second cannot exist — and two tabs that each
+    need a tree, so the workspace moves into whichever of the two is in front and
+    is bound to that tab's scale.
+    """
     assert window.goto_cgmlst_tree_view() == "cgmlst"
-    assert drawn == ["compare"], "the page is asked only once it is the page in front"
+    assert window.pages.current_key() == "cgmlst_tree"
+    holder = window.tree_holders()["cgmlst_tree"]
+    assert holder.widget() is window.comparison_content
+    assert window.tree.isVisibleTo(holder)
+
+    # And the seven-locus tab is the seven-locus tab. Two quantities, two tabs,
+    # never one scale: the workspace follows the tab rather than the other way.
+    window.navigate("compare")
+    assert window.typing_kind == "mlst"
+    assert window.tree_holders()["compare"].widget() is window.comparison_content
+    assert window.tree_holders()["cgmlst_tree"].widget() is None
+
+    window.navigate("cgmlst_tree")
+    assert window.typing_kind == "cgmlst"
+    assert window.tree_holders()["cgmlst_tree"].widget() is window.comparison_content
+    assert window.tree_holders()["compare"].widget() is None
+
+
+def test_every_tab_in_the_bar_carries_the_work_it_names(window):
+    """Four tabs were signposts, two of them for the core of this application.
+
+    The SNP tree panel was finished and tested and simply never mounted; the
+    cgMLST calls table was reachable only as a sub-tab of the tree page.
+    """
+    from wmlstudio.ui_cgmlst import CgmlstCallsPanel
+    from wmlstudio.ui_snp import SnpTreePanel
+    for key, expected in (("cgmlst", CgmlstCallsPanel), ("snp", SnpTreePanel)):
+        adopted = (window.stations.get(key) or {}).get("adopted")
+        assert isinstance(adopted, expected), f"{key} still shows a signpost"
+    # A working tab must not still be labelled as reserved for a later round.
+    for position in range(window.pages.count()):
+        assert "planned" not in (window.pages.tabToolTip(position) or "").casefold()
+    # The calls table lives in one place, and it is the tab that carries its name.
+    subtabs = window.pages.subtabs("compare")
+    titles = [subtabs.tabText(index) for index in range(subtabs.count())]
+    assert "cgMLST calls" not in titles
 
 
 def test_an_adopted_station_takes_over_its_navigation_and_its_own_clear(window, monkeypatch):
