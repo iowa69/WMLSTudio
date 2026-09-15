@@ -14,18 +14,30 @@ import pytest
 from wmlstudio import cgmlst_schemes
 from wmlstudio.cgmlst_schemes import (
     CGMLST_TARGET_FLOOR,
+    LIBRARY_DIRNAME,
+    MIGRATIONS_FILENAME,
     PROVIDERS,
+    TARGET_SET_CORE,
     SchemeCatalogError,
     bundled_entries,
     catalog_digest,
     catalog_entries,
+    classical_root,
     download_only_entries,
     download_plan,
     entry_for,
+    entry_for_source,
+    install_folder,
+    install_root,
+    installed_entries,
     installed_scheme,
     library_root,
     library_status,
+    migrate_downloads,
     prepare_library,
+    resolve_migrated_path,
+    scheme_variants,
+    slot_for,
     threshold_citations,
     threshold_for,
 )
@@ -43,6 +55,28 @@ def install(root, key, *, loci=None, api=None):
     (folder / "scheme.json").write_text(json.dumps(
         {"name": entry["scheme_name"], "type": "cgMLST",
          "API": entry["source_url"] if api is None else api}))
+    return folder
+
+
+def legacy_download(root, key, *, loci=None, digest="abcdef0123456789"):
+    """A scheme installed the way releases up to 0.3.0 installed one.
+
+    Every download landed in <data root>/schemes under a digest-shaped folder name,
+    which is exactly the reported bug: the scheme is on disk and nobody can find it.
+    """
+    entry = entry_for(key)
+    slug = entry["scheme_id"] if entry["provider"] == "cgmlst.org" else entry["database"]
+    folder = classical_root(root) / f"cgmlst_org_{slug}_{digest}"
+    folder.mkdir(parents=True, exist_ok=True)
+    count = loci if loci is not None else entry["locus_count"]
+    for index in range(count):
+        (folder / f"t{index:05d}.fasta").write_text(">1\nACGT\n")
+    (folder / "scheme.json").write_text(json.dumps(
+        {"name": f"{entry['organism']} cgMLST", "organism": entry["organism"],
+         "type": "cgMLST", "source": "cgMLST.org", "API": entry["source_url"],
+         "locus_count": count}))
+    (folder / "reference_manifest.json").write_text(json.dumps(
+        {"format_version": 1, "provider": "cgMLST.org", "scheme_digest": digest * 4}))
     return folder
 
 
@@ -184,8 +218,13 @@ def test_preparing_twice_is_idempotent_and_never_touches_installed_data(tmp_path
     before = (folder / "locus00000.fasta").read_bytes()
     second = prepare_library(tmp_path)
     assert second["created"] == []
-    assert second["refreshed"] == []
+    # The only thing a second run rewrites is the slot's own description, and only
+    # because the slot is no longer empty: no allele file and no manifest is read,
+    # written or moved.
+    assert second["refreshed"] == ["Enterococcus_faecium__cgmlst_org_1423/README.txt"]
+    assert "IS installed in this folder" in (folder / "README.txt").read_text(encoding="utf-8")
     assert (folder / "locus00000.fasta").read_bytes() == before
+    assert prepare_library(tmp_path)["refreshed"] == []
 
 
 def test_an_installed_scheme_is_recognised_only_when_its_identity_matches(tmp_path):
@@ -377,3 +416,203 @@ def test_a_scheme_downloaded_into_the_existing_schemes_folder_is_still_recognise
                if row["key"] == "cgmlst.org:saureus-1861")
     assert row["ready"] is True
     assert row["threshold"]["threshold"] == 24
+
+
+# ----------------------------------------------------------- one library, not two
+
+def test_a_scheme_downloaded_into_the_old_place_is_moved_to_where_it_is_looked_for(tmp_path):
+    # The reported bug: "I can search and download the cgMLST scheme but then I
+    # cannot find it and it does not work." It landed in <data root>/schemes under
+    # a digest-shaped name, sorted alphabetically between two seven-locus schemes.
+    old = legacy_download(tmp_path, "cgmlst.org:kpneumoniae-2358", loci=2358)
+    report = prepare_library(tmp_path)
+    moved = report["migrated"]
+    assert [row["from"] for row in moved] == [str(old)]
+    new = library_root(tmp_path) / entry_for("cgmlst.org:kpneumoniae-2358")["slot"]
+    assert Path(moved[0]["to"]) == new
+    assert not old.exists()
+    assert len(list(new.glob("*.fasta"))) == 2358
+    # The slot's own description travelled with it rather than being overwritten.
+    assert (new / "README.txt").is_file() and (new / "scheme_slot.json").is_file()
+    found = installed_scheme(tmp_path, "cgmlst.org:kpneumoniae-2358")
+    assert found["identity_matched"] is True and found["count_matched"] is True
+    assert Path(found["path"]) == new
+
+
+def test_a_moved_scheme_keeps_a_trail_back_to_the_path_a_project_stored(tmp_path):
+    old = legacy_download(tmp_path, "cgmlst.org:efaecalis-1972", loci=1972)
+    prepare_library(tmp_path)
+    new = library_root(tmp_path) / entry_for("cgmlst.org:efaecalis-1972")["slot"]
+    ledger = json.loads((library_root(tmp_path) / MIGRATIONS_FILENAME).read_text(encoding="utf-8"))
+    assert [row["from"] for row in ledger["moved"]] == [str(old)]
+    assert resolve_migrated_path(tmp_path, old) == new
+    # A path that was never moved is handed back unchanged, so a caller can route
+    # every stored scheme_path through this without deciding first.
+    assert resolve_migrated_path(tmp_path, tmp_path / "elsewhere") == tmp_path / "elsewhere"
+
+
+def test_a_classical_scheme_is_never_moved_out_of_the_mlst_library(tmp_path):
+    classical = classical_root(tmp_path) / "pubmlst_kpneumoniae_seqdef_1_0123456789abcdef"
+    classical.mkdir(parents=True)
+    for locus in ("gapA", "infB", "mdh", "pgi", "phoE", "rpoB", "tonB"):
+        (classical / f"{locus}.tfa").write_text(">1\nACGT\n")
+    (classical / "scheme.json").write_text(json.dumps({"name": "MLST", "type": "MLST"}))
+    assert prepare_library(tmp_path)["migrated"] == []
+    assert classical.is_dir()
+    assert not (library_root(tmp_path) / classical.name).exists()
+
+
+def test_a_migration_never_overwrites_a_scheme_already_in_the_slot(tmp_path):
+    prepare_library(tmp_path)
+    kept = install(tmp_path, "cgmlst.org:abaumannii-2390", loci=2390)
+    before = sorted(path.name for path in kept.iterdir())
+    stale = legacy_download(tmp_path, "cgmlst.org:abaumannii-2390", loci=2390, digest="0" * 16)
+    moved = migrate_downloads(tmp_path)
+    # The second copy is kept, under its own digest-suffixed folder. Two snapshots
+    # of one scheme can differ in their target set, so neither is discarded and
+    # neither is merged into the other.
+    assert [row["from"] for row in moved] == [str(stale)]
+    assert Path(moved[0]["to"]).name == kept.name + "__000000000000"
+    assert not stale.exists()
+    assert sorted(path.name for path in kept.iterdir()) == before
+
+
+def test_an_unreadable_folder_in_the_mlst_library_is_left_alone(tmp_path):
+    # No allele files and nothing declared: the kind cannot be read, so the folder
+    # is not moved on a guess.
+    mystery = classical_root(tmp_path) / "mystery"
+    mystery.mkdir(parents=True)
+    (mystery / "notes.txt").write_text("nothing here")
+    assert prepare_library(tmp_path)["migrated"] == []
+    assert mystery.is_dir()
+
+
+# --------------------------------------------------------------- readable naming
+
+def test_a_library_folder_is_named_for_the_organism_and_never_for_a_digest():
+    entry = entry_for("cgmlst.org:kpneumoniae-2358")
+    assert entry["slot"] == "Klebsiella_pneumoniae__cgmlst_org_2358"
+    assert "Klebsiella pneumoniae" in entry["title"]
+    assert "2358 targets" in entry["title"]
+    assert PROVIDERS["cgmlst.org"]["name"] in entry["title"]
+    for row in catalog_entries():
+        assert row["organism"] in row["title"]
+        assert f"{row['locus_count']} targets" in row["title"]
+        assert not any(part in row["slot"] for part in ("  ", "__cgmlst_org_0"))
+
+
+def test_a_download_is_matched_to_its_pinned_slot_by_the_providers_own_identifier():
+    # cgMLST.org names the scheme by slug, PubMLST by database and scheme id. The
+    # organism label a catalogue page shows is never what resolves the identity.
+    ridom = {"organism": "Klebsiella pneumoniae sensu lato", "provider": "cgMLST.org",
+             "slug": "Kpneumoniae_complex", "locus_count": 2358,
+             "url": "https://www.cgmlst.org/ncs/schema/Kpneumoniae_complex/"}
+    assert entry_for_source(ridom)["key"] == "cgmlst.org:kpneumoniae-2358"
+    assert slot_for(ridom) == entry_for("cgmlst.org:kpneumoniae-2358")["slot"]
+    oxford = {"organism": "Salmonella spp.", "provider": "PubMLST",
+              "database": "pubmlst_salmonella_seqdef", "scheme_id": "4", "locus_count": 3002}
+    assert entry_for_source(oxford)["key"] == "pubmlst:senterica-cgmlst-3002"
+    pasteur = {"organism": "Listeria monocytogenes", "provider": "BIGSdb-Pasteur",
+               "url": "https://bigsdb.pasteur.fr/api/db/pubmlst_listeria_seqdef/schemes/3"}
+    assert entry_for_source(pasteur)["key"] == "pasteur:lmonocytogenes-1748"
+    # An uncatalogued scheme still gets a readable folder rather than a digest.
+    unknown = {"organism": "Vibrio cholerae", "provider": "cgMLST.org", "slug": "Vcholerae",
+               "locus_count": 1234, "url": "https://www.cgmlst.org/ncs/schema/Vcholerae/"}
+    assert entry_for_source(unknown) is None
+    assert slot_for(unknown) == "Vibrio_cholerae__cgmlst_org_1234"
+
+
+def test_equal_target_counts_from_two_providers_never_resolve_to_one_identity():
+    ridom = {"provider": "cgMLST.org", "slug": "Smarcescens", "locus_count": 2692,
+             "url": "https://www.cgmlst.org/ncs/schema/Smarcescens/"}
+    oxford = {"provider": "PubMLST", "database": "pubmlst_serratia_seqdef", "scheme_id": "2",
+              "locus_count": 2692}
+    assert entry_for_source(ridom)["key"] == "cgmlst.org:smarcescens-2692"
+    assert entry_for_source(oxford)["key"] == "pubmlst:smarcescens-cgmlst-2692"
+    assert slot_for(ridom) != slot_for(oxford)
+
+
+def test_a_redefined_scheme_of_the_same_size_gets_its_own_folder(tmp_path):
+    prepare_library(tmp_path)
+    entry = entry_for("cgmlst.org:efaecium-1423")
+    slot = library_root(tmp_path) / entry["slot"]
+    descriptor = {"organism": entry["organism"], "provider": "cgMLST.org",
+                  "slug": entry["scheme_id"], "locus_count": entry["locus_count"],
+                  "url": entry["source_url"]}
+    # An empty labelled slot IS the destination: that is what the folder is for.
+    assert install_folder(library_root(tmp_path), descriptor, digest="a" * 64) == slot
+    install(tmp_path, "cgmlst.org:efaecium-1423", loci=1423)
+    (slot / "reference_manifest.json").write_text(json.dumps({"scheme_digest": "a" * 64}))
+    assert install_folder(library_root(tmp_path), descriptor, digest="a" * 64) == slot
+    second = install_folder(library_root(tmp_path), descriptor, digest="b" * 64)
+    assert second != slot and second.name.startswith(entry["slot"])
+    assert "bbbbbbbbbbbb" in second.name
+
+
+def test_a_gene_by_gene_scheme_installs_into_the_one_cgmlst_library(tmp_path):
+    assert install_root(tmp_path / "schemes") == tmp_path / LIBRARY_DIRNAME
+    assert install_root(tmp_path / LIBRARY_DIRNAME) == tmp_path / LIBRARY_DIRNAME
+    assert install_root(tmp_path / "anywhere") == tmp_path / "anywhere" / LIBRARY_DIRNAME
+    # A classical scheme keeps the library the caller named; existing projects
+    # store those exact folder paths.
+    assert install_root(tmp_path / "schemes", kind="mlst") == tmp_path / "schemes"
+
+
+# ------------------------------------------------------------- core vs accessory
+
+def test_every_catalogued_scheme_is_declared_a_core_target_set():
+    rows = catalog_entries()
+    assert {row["target_set"] for row in rows} == {TARGET_SET_CORE}
+    assert all(row["scheme_group"].startswith(("pubmlst:", "pasteur:", "cgmlst_org:"))
+               for row in rows)
+
+
+def test_an_organism_with_only_a_core_set_says_so_instead_of_offering_an_empty_choice():
+    variants = scheme_variants("Klebsiella pneumoniae")
+    assert [row["key"] for row in variants["core"]] == ["cgmlst.org:kpneumoniae-2358"]
+    assert variants["accessory"] == []
+    assert variants["has_core"] is True and variants["has_accessory"] is False
+    assert "Only a core target set is catalogued" in variants["message"]
+    absent = scheme_variants("Vibrio cholerae")
+    assert absent["core"] == [] and absent["accessory"] == []
+    assert "gap in this catalogue" in absent["message"]
+    # Two providers publish a core Staphylococcus aureus scheme; both are offered,
+    # and neither is an accessory set.
+    aureus = scheme_variants("Staphylococcus aureus")
+    assert {row["provider"] for row in aureus["core"]} == {"cgmlst.org", "pubmlst"}
+    assert aureus["has_accessory"] is False
+
+
+# -------------------------------------------------------- what the cgMLST tab lists
+
+def test_the_cgmlst_tab_lists_what_is_installed_with_a_readable_title(tmp_path):
+    prepare_library(tmp_path)
+    install(tmp_path, "cgmlst.org:efaecalis-1972", loci=1972)
+    rows = installed_entries(tmp_path)
+    assert [row["catalog_key"] for row in rows] == ["cgmlst.org:efaecalis-1972"]
+    row = rows[0]
+    assert row["kind"] == "cgmlst"
+    assert "Enterococcus faecalis" in row["title"]
+    assert "1972 targets" in row["title"]
+    assert row["count_matched"] is True
+    assert row["threshold"]["status"] == "threshold_offerable"
+    assert row["threshold"]["threshold"] == \
+        threshold_for("cgmlst.org:efaecalis-1972", locus_count=1972)["threshold"]
+    # An empty labelled slot is a description, not an installed scheme.
+    assert all("Klebsiella" not in entry["title"] for entry in rows)
+
+
+def test_an_uncatalogued_installed_scheme_is_listed_without_a_borrowed_cutoff(tmp_path):
+    prepare_library(tmp_path)
+    folder = library_root(tmp_path) / "Vibrio_cholerae__cgmlst_org_40"
+    folder.mkdir(parents=True)
+    for index in range(40):
+        (folder / f"t{index:03d}.fasta").write_text(">1\nACGT\n")
+    (folder / "scheme.json").write_text(json.dumps(
+        {"name": "Vibrio cholerae cgMLST", "organism": "Vibrio cholerae", "type": "cgMLST",
+         "source": "cgMLST.org", "API": "https://www.cgmlst.org/ncs/schema/Vcholerae/"}))
+    row = next(entry for entry in installed_entries(tmp_path) if "Vibrio" in entry["title"])
+    assert row["catalogued"] is False and row["catalog_key"] is None
+    assert row["threshold"]["status"] == "scheme_not_catalogued"
+    assert row["threshold"]["threshold"] is None
+    assert "Distances can still be computed" in row["threshold"]["reason"]

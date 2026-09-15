@@ -41,6 +41,7 @@ from PySide6.QtWidgets import (
 
 from wmlstudio.comparison import forest_from_distances, pairwise_distances
 from wmlstudio.context_menus import TableWidgetAdapter
+from wmlstudio.graph_window import GraphWindow
 from wmlstudio.identification import cached_scheme, scheme_organism
 from wmlstudio.investigation import (
     DIFF_ROW_FIELDS,
@@ -64,6 +65,7 @@ from wmlstudio.project import CGMLST_LOCUS_FLOOR
 from wmlstudio.project import typing_kind as stored_typing_kind
 from wmlstudio.sample_workflow import current_input_sha256, hydra_evidence_status
 from wmlstudio.sequence import AnalysisCancelled, SequenceReader, check_cancelled, file_sha256
+from wmlstudio.ui_cgmlst import CgmlstCallsPanel
 from wmlstudio.ui_common import FlowLayout, cell, gene_names, make_table, organism_for
 from wmlstudio.widgets import TreeView, button, label, render_side_by_side
 
@@ -1098,6 +1100,12 @@ class ComparisonWorkspaceMixin:
         self.typing_menu.setMenu(typing_menu)
         investigations.addWidget(self.typing_menu)
         investigations.addWidget(button('Compare', self.refresh_comparison))
+        # Start this tab again without touching a stored profile: the cohort, the
+        # filters, the drawn trees and the cgMLST table go, the evidence stays.
+        clear_button = button('Clear', self.clear_compare_tab)
+        clear_button.setToolTip('Empty this tab so a new, a past or a mixed cohort can be started '
+                                'here. No profile, investigation or snapshot is deleted.')
+        investigations.addWidget(clear_button)
         layout.addLayout(investigations)
         self.cohort_search = QLineEdit()
         self.cohort_search.setPlaceholderText("Find isolates…")
@@ -1142,6 +1150,13 @@ class ComparisonWorkspaceMixin:
         threshold_layout.addWidget(label('Group ≤', 'small'))
         threshold_layout.addWidget(self.cluster_threshold)
         toolbar.addWidget(threshold_row)
+        # The popup the user asked for: the drawn forest in a window of its own,
+        # movable and editable, without the page losing the tree it is showing.
+        popup = button('Open tree in a window', self.open_graph_window)
+        popup.setToolTip('Open this tree in its own window, where it can be arranged, recoloured and '
+                         'relabelled. The window draws its own copy; this page keeps its tree, and '
+                         'arranging a picture changes no allele call, distance or group.')
+        toolbar.addWidget(popup)
         self.advanced_toggle = QToolButton()
         self.advanced_toggle.setCheckable(True)
         self.advanced_toggle.setText('Advanced ▸')
@@ -1160,6 +1175,11 @@ class ComparisonWorkspaceMixin:
         graph_options.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
         menu = QMenu(graph_options)
         menu.addAction('Fit graph', lambda: self.tree.fit_tree())
+        menu.addAction('Open this tree in its own window', lambda: self.open_graph_window('current'))
+        menu.addAction('Open the baseline tree in its own window',
+                       lambda: self.open_graph_window('baseline'))
+        menu.addAction('Open the other typing view in its own window',
+                       lambda: self.open_graph_window('counterpart'))
         menu.addAction('Reference / threshold settings…', self.comparison_settings.show)
         menu.addAction('Colour selected nodes…', self.color_graph_selection)
         menu.addAction('Highlight selected nodes…', self.highlight_graph_selection)
@@ -1292,6 +1312,14 @@ class ComparisonWorkspaceMixin:
         tabs.addTab(self.statistics_view, "Quality / statistics")
         self.changes_view = QTextBrowser()
         tabs.addTab(self.changes_view, "Changes")
+        # The dedicated cgMLST page: which targets called for each isolate, which did
+        # not and why, and the read recheck of the ones that did not. It reads stored
+        # profiles per isolate, so it is refreshed when it is opened, not on every
+        # keystroke in the cohort filter.
+        self.cgmlst_calls = CgmlstCallsPanel(self)
+        self.cgmlst_calls.show_tree_requested = self.show_cgmlst_tree
+        tabs.addTab(self.cgmlst_calls, 'cgMLST calls')
+        tabs.currentChanged.connect(self._compare_tab_changed)
         self.graph_tabs = tabs
         if hasattr(self.pages, 'register_subtabs'):
             self.pages.register_subtabs('compare', tabs)
@@ -1342,6 +1370,9 @@ class ComparisonWorkspaceMixin:
         self._counterpart_payload = None
         self._threshold_suggestion = {}
         self._legends = {'current': {}, 'baseline': {}, 'counterpart': {}}
+        # Detached tree windows are kept alive here; a window that nothing holds a
+        # reference to is collected the moment it is shown.
+        self._graph_windows = []
         self._syncing_graph_selection = False
         self._pending_baseline_graph_state = None
         self._reset_baseline_state()
@@ -1383,6 +1414,35 @@ class ComparisonWorkspaceMixin:
                     lambda *args, callback=callback, role=role: callback(*args, role=role))
         if hasattr(view, 'nodeActivated'):
             view.nodeActivated.connect(self.inspect_graph_sample)
+
+    def _compare_tab_changed(self, index):
+        """Refresh the cgMLST page when it is opened, never on every cohort keystroke.
+
+        It reads one stored analysis list per isolate, which is a database query per
+        isolate; doing that while somebody types into the cohort filter would make the
+        filter crawl on a large project.
+        """
+        tabs = getattr(self, 'graph_tabs', None)
+        if tabs is not None and tabs.widget(index) is self.cgmlst_calls:
+            self.cgmlst_calls.refresh_references()
+
+    def show_cgmlst_tree(self, sample_ids=None):
+        """Show the cgMLST tree, optionally for exactly the isolates of the calls table.
+
+        Only which isolates are being looked at travels from the table of calls to the
+        tree. The tree keeps its own reference, its own link threshold and its own
+        legend, because it answers a different question from the table.
+        """
+        if sample_ids:
+            self.cohort_ids = set(sample_ids)
+            self.project.set_setting('comparison_cohort', sorted(self.cohort_ids))
+            self.refresh_cohort_table()
+        self.show_typing_view('cgmlst')
+        index = self.graph_tabs.indexOf(self.graph_split)
+        if index >= 0:
+            self.graph_tabs.setCurrentIndex(index)
+        self.refresh_comparison()
+        return self.typing_kind
 
     def _graph_views(self):
         return {'current': self.tree, 'baseline': self.baseline_tree,
@@ -1817,6 +1877,46 @@ class ComparisonWorkspaceMixin:
         self.refresh_cluster_table()
         self.refresh_threshold_suggestion()
 
+    def clear_compare_tab(self):
+        """Start this tab again: empty cohort, no filters, no drawn trees, no table.
+
+        Nothing stored is touched. Every profile, investigation, snapshot and frozen
+        review group stays exactly as it was, and the cleared cohort can be refilled
+        from new isolates, past ones or a mixture of both.
+        """
+        self.investigation_combo.blockSignals(True)
+        self.investigation_combo.setCurrentIndex(0)
+        self.investigation_combo.blockSignals(False)
+        self.select_investigation(None)
+        self.project.set_setting(self._kind_setting('investigation'), None)
+        self.cohort_ids = set()
+        self.project.set_setting('comparison_cohort', [])
+        for control in (self.cohort_search, self.graph_search):
+            control.blockSignals(True)
+            control.clear()
+            control.blockSignals(False)
+        for combo in (self.compare_genus, self.compare_species, self.compare_scheme):
+            combo.blockSignals(True)
+            combo.setCurrentIndex(0)
+            combo.blockSignals(False)
+        self.project.set_setting(self._kind_setting('scheme'), '')
+        self._comparison_cache = None
+        self.close_graph_windows()
+        self.clear_counterpart_graph()
+        self.clear_baseline_graph()
+        self._reset_baseline_state()
+        self._clear_comparison()
+        # After the clear, not before: _clear_comparison keeps the arrangement of the
+        # tree it empties so a rebuild can restore it, and a cleared tab must not
+        # bring the previous cohort's layout back with the next comparison.
+        self._pending_graph_state = None
+        self.cgmlst_calls.clear()
+        self.refresh_cohort_table()
+        self.highlight_graphs('')
+        self.tree_status.setText(
+            'Cleared. Nothing stored was changed: choose a cohort and a reference to compare again.')
+        return True
+
     def refresh_comparison(self):
         if not hasattr(self, "tree") or self._comparison_closing:
             return
@@ -1884,6 +1984,7 @@ class ComparisonWorkspaceMixin:
 
     def cancel_comparison_for_close(self):
         """Return True once no comparison work can read the closing project."""
+        self.close_graph_windows()
         self._comparison_closing = True
         self._comparison_generation += 1
         self._comparison_timer.stop()
@@ -2374,6 +2475,14 @@ class ComparisonWorkspaceMixin:
         QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
         try:
             self.baseline_tree.blockSignals(True)
+            # The snapshot recorded its own typing kind, reference and target count.
+            # Restating them here is what keeps a baseline edge label of "3" from
+            # being read against the current tree's target set, and it is what a
+            # detached window opened from this tree names itself with.
+            self.baseline_tree.set_scale(typing_scale(
+                results, self._baseline_snapshot.get('typing_kind') or '',
+                scheme=self._baseline_snapshot.get('scheme') or '',
+                scheme_digest=self._baseline_snapshot.get('scheme_digest') or ''))
             self.baseline_tree.draw_results(results, edges, self._baseline_snapshot.get('threshold', 1),
                                             groups=groups)
             if self._pending_baseline_graph_state is not None and hasattr(self.baseline_tree, 'restore_state'):
@@ -2573,6 +2682,60 @@ class ComparisonWorkspaceMixin:
             if self.sample_table.item(row, 0).data(Qt.ItemDataRole.UserRole) == sid:
                 self.sample_table.setCurrentCell(row, 0)
         self.navigate(1)
+
+    # --- one tree in a window of its own ------------------------------------
+    def open_graph_window(self, role='current'):
+        """Open one drawn tree in its own window: movable, editable, self-describing.
+
+        The window draws a *copy* of the forest, so this page keeps the tree it is
+        showing and two windows — one per threshold, or a baseline beside a current
+        tree — cannot overwrite each other's arrangement. Each window states its own
+        typing kind, reference, target count, cohort and link threshold, because a
+        "3" on a seven-locus edge and a "3" on a 2,358-target edge are different
+        quantities that must never be read off one scale.
+        """
+        role = role if role in self._graph_views() else 'current'
+        if not self._view_active(role):
+            return self.notify(
+                'That tree is not on screen. Open Advanced and show the baseline tree or the other '
+                'typing view first; a hidden tree is not a second opinion.')
+        view = self._graph_view(role)
+        if not getattr(view, 'nodes', None):
+            return self.notify('Build a comparison first: there is nothing drawn to open in a window.')
+        snapshot = self.export_snapshot(role) or {}
+        from wmlstudio.interface_settings import interface_preferences
+        window = GraphWindow.from_view(
+            view, parent=self, preferences=interface_preferences(self.root),
+            cohort=(snapshot.get('investigation_name')
+                    or f'{len(snapshot.get("profiles") or view.nodes)} isolates'),
+            created=snapshot.get('created_at'),
+            note={'baseline': 'stored baseline snapshot; nothing here is recalculated',
+                  'counterpart': 'the other typing view, on its own scale'}.get(role, ''))
+        window.check_output = self.check_output
+        window.nodeActivated.connect(self.inspect_graph_sample)
+        window.selectionChanged.connect(lambda ids, role=role: self.graph_selection_changed(ids, role=role))
+        window.reportRequested.connect(lambda ids, role=role: self.report_graph_selection(ids, role=role))
+        window.proximityRequested.connect(lambda sid, role=role: self.report_isolate_proximity(sid, role=role))
+        # The window's arrangement is deliberately not written back onto the page's
+        # stored style: it is a working surface, and the page must still show what it
+        # showed when the window was opened.
+        if getattr(self.tree, 'context_extension', None) is not None:
+            window.view.context_extension = self.graph_context_entries
+        self._graph_windows.append(window)
+        window.closed.connect(lambda: self._forget_graph_window(window))
+        window.show()
+        return window
+
+    def _forget_graph_window(self, window):
+        """Let a closed window be collected; the page it came from is untouched."""
+        if window in self._graph_windows:
+            self._graph_windows.remove(window)
+
+    def close_graph_windows(self):
+        """Close every detached tree, for example when the project is being replaced."""
+        for window in list(self._graph_windows):
+            window.close()
+        self._graph_windows.clear()
 
     def export_role(self):
         """Which tree the export entries act on; 'current' unless the user chose otherwise."""

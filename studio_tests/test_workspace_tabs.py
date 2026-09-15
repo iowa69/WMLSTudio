@@ -1,16 +1,21 @@
-"""Key-addressed workspace tabs: stable keys, working integer indices, sub-tab registry."""
+"""The workspace laid out as the pipeline: build-order numbers, pipeline tabs, Clear."""
 
 import pytest
-from PySide6.QtWidgets import QTabWidget, QWidget
+from PySide6.QtWidgets import QLabel, QMessageBox, QPushButton, QTabWidget, QWidget
 
 from wmlstudio.ui_tabs import (
-    NAV_SYMBOLS,
+    CLEAR_ACTIONS,
     NEXT_STEP,
     PAGE_KEYS,
     PAGE_PURPOSE,
+    PIPELINE,
+    PLANNED,
+    STATION_PAGES,
     TAB_LABELS,
     WorkspaceTabs,
+    clear_promise,
     page_key,
+    page_name,
     tab_title,
 )
 
@@ -28,35 +33,57 @@ def tabs(qtbot):
     return widget
 
 
-def test_pages_are_added_in_build_order_and_carry_their_stable_key(tabs):
-    assert tabs.count() == len(PAGE_KEYS) == 7
+def test_pages_keep_their_build_order_number_and_are_shown_in_pipeline_order(tabs):
+    """Two orders, on purpose: numbers address the build, the bar shows the workflow."""
+    assert tabs.count() == len(PAGE_KEYS) == len(PIPELINE)
     assert tabs.keys() == PAGE_KEYS
-    assert [tabs.tabBar().tabData(index) for index in range(tabs.count())] == list(PAGE_KEYS)
+    assert tabs.tab_order() == PIPELINE
     assert tabs.page_index() == {key: index for index, key in enumerate(PAGE_KEYS)}
-    for index, key in enumerate(PAGE_KEYS):
-        assert tabs.widget(index).objectName() == f"page-{key}"
-        assert tabs.key_at(index) == key
+    for slot, key in enumerate(PAGE_KEYS):
+        assert tabs.widget(slot).objectName() == f"page-{key}"
+        assert tabs.key_at(slot) == key
+        assert tabs.slot_of(key) == slot
+        assert tabs.position_of(key) == PIPELINE.index(key)
+        assert tabs.key_at_position(PIPELINE.index(key)) == key
 
 
-def test_every_tab_shows_its_glyph_label_and_a_purpose_tooltip(tabs):
-    for index, key in enumerate(PAGE_KEYS):
-        assert TAB_LABELS[key] in tabs.tabText(index)
-        assert NAV_SYMBOLS[index] in tabs.tabText(index)
-        assert tabs.tabToolTip(index) == PAGE_PURPOSE[key]
-        assert tabs.tabToolTip(index).strip()
+def test_the_bar_reads_as_the_users_own_workflow(tabs):
+    """Samples, the read and assembly slots, typing, its tree, cgMLST, its tree, HYDRA."""
+    shown = [tabs.tabText(position) for position in range(tabs.count())]
+    assert shown == [
+        "Overview", "Samples", "Read QC", "Assembly", "MLST", "MLST tree", "cgMLST",
+        "cgMLST tree", "SNP tree", "HYDRA", "Report", "Update", "Settings"]
+    # A seven-locus tree and a cgMLST tree are different quantities, so they are
+    # different tabs and neither label can be mistaken for the other.
+    assert shown.index("MLST tree") < shown.index("cgMLST") < shown.index("cgMLST tree")
+    # The slots a later round fills sit where that work belongs, not at the end.
+    assert shown.index("Read QC") == shown.index("Samples") + 1
+    assert shown.index("Assembly") == shown.index("Read QC") + 1
+    assert shown.index("SNP tree") == shown.index("cgMLST tree") + 1
 
 
-def test_the_old_integer_indices_still_address_the_same_pages(tabs):
-    """The window navigates by number in seventeen places; the swap must not move a page."""
+def test_every_tab_carries_a_purpose_tooltip_and_a_readable_label(tabs):
+    for position, key in enumerate(PIPELINE):
+        assert tabs.tabText(position) == TAB_LABELS[key] == tab_title(key)
+        assert PAGE_PURPOSE[key] in tabs.tabToolTip(position)
+        assert tabs.tabToolTip(position).strip()
+
+
+def test_the_old_integer_call_sites_still_address_the_same_pages(tabs):
+    """`navigate(2)` and `pages.widget(3)` predate the pipeline bar and must not move."""
     assert tabs.show_page(2) is True
-    assert tabs.currentIndex() == 2
     assert tabs.current_key() == "compare"
+    assert tabs.currentIndex() == 2, "an integer is the page number, not the tab position"
+    assert tabs.tabBar().currentIndex() == PIPELINE.index("compare")
+    assert tabs.widget(3) is tabs.page_for("schemes")
     assert tabs.show_page("reports") is True
     assert tabs.currentIndex() == PAGE_KEYS.index("reports")
     assert tabs.index_of(5) == 5
-    assert tabs.index_of("settings") == 6
+    assert tabs.index_of("settings") == PAGE_KEYS.index("settings")
     assert tabs.page_for(1) is tabs.widget(1)
     assert tabs.page_for("compare") is tabs.widget(2)
+    tabs.setCurrentIndex(4)
+    assert tabs.current_key() == "evidence"
 
 
 def test_unknown_keys_and_out_of_range_indices_are_refused_instead_of_guessed(tabs):
@@ -66,7 +93,7 @@ def test_unknown_keys_and_out_of_range_indices_are_refused_instead_of_guessed(ta
     assert tabs.show_page(-1) is False
     assert tabs.index_of("does-not-exist") == -1
     assert tabs.page_for(42) is None
-    assert tabs.currentIndex() == 0
+    assert tabs.current_key() == "overview"
     assert page_key(42) == ""
 
 
@@ -150,15 +177,15 @@ def test_a_page_without_sub_tabs_refuses_a_sub_tab_instead_of_crashing(tabs):
     assert tabs.show_subtab("schemes", "Grouped view") is False
 
 
-def test_a_page_folds_into_a_samples_sub_tab_without_moving_any_index(tabs):
-    """Samples is the hub; a page that also lives there must not be offered twice."""
+def test_a_page_folds_into_another_pages_sub_tab_without_moving_any_number(tabs):
+    """A page that grows a second home must have one place to look, not two."""
     inner = QTabWidget()
     inner.addTab(QWidget(), "Samples")
     inner.addTab(QWidget(), "Schemes")
     tabs.register_subtabs("isolates", inner)
-    assert tabs.fold_page("schemes") is True
+    assert tabs.fold_page("schemes", "isolates", "Schemes") is True
     assert tabs.folded_pages() == {"schemes": ("isolates", "Schemes")}
-    assert tabs.tabBar().isTabVisible(PAGE_KEYS.index("schemes")) is False
+    assert tabs.tabBar().isTabVisible(PIPELINE.index("schemes")) is False
     # Every existing call site keeps working, by key and by its old number.
     assert tabs.page_index() == {key: index for index, key in enumerate(PAGE_KEYS)}
     assert tabs.index_of("schemes") == PAGE_KEYS.index("schemes")
@@ -168,7 +195,7 @@ def test_a_page_folds_into_a_samples_sub_tab_without_moving_any_index(tabs):
     assert tabs.show_page(PAGE_KEYS.index("schemes")) is True
     assert tabs.current_key() == "isolates"
     assert tabs.unfold_page("schemes") is True
-    assert tabs.tabBar().isTabVisible(PAGE_KEYS.index("schemes")) is True
+    assert tabs.tabBar().isTabVisible(PIPELINE.index("schemes")) is True
     assert tabs.show_page("schemes") is True
     assert tabs.current_key() == "schemes"
 
@@ -181,25 +208,53 @@ def test_folding_refuses_a_page_or_a_host_it_does_not_have(tabs):
     assert tabs.folded_pages() == {}
 
 
-def test_seven_tabs_fit_the_narrowest_supported_window_without_scroll_buttons(tabs):
-    """At 1080 px the tab bar is the navigation; it must not need arrows to reach a page."""
-    assert tabs.tabBar().sizeHint().width() <= 1032
+def test_the_bar_gives_up_padding_before_it_gives_up_words(tabs):
+    """Thirteen tabs at the narrowest supported window: tighter, never chopped."""
+    from PySide6.QtCore import Qt
+    assert tabs.tabBar().elideMode() == Qt.TextElideMode.ElideNone
+    tabs.resize(952, 640)
+    assert tabs._fit_tab_bar(952) <= 12
+    assert tabs.tabBar().sizeHint().width() <= 952
+    tabs.resize(1127, 640)
+    assert tabs._fit_tab_bar(1127) == 12, "a roomy window keeps the comfortable padding"
+    for position in range(tabs.count()):
+        assert "…" not in tabs.tabText(position)
 
 
 def test_purpose_lines_state_their_limits_where_a_claim_could_be_read_in(tabs):
     assert set(PAGE_PURPOSE) == set(PAGE_KEYS)
     assert set(NEXT_STEP) == set(PAGE_KEYS)
+    assert set(CLEAR_ACTIONS) == set(PAGE_KEYS)
     assert "not proof of transmission" in PAGE_PURPOSE["compare"]
     assert "not measured susceptibility" in PAGE_PURPOSE["evidence"]
+    assert "never share a scale" in PAGE_PURPOSE["cgmlst_tree"]
+    for key in PLANNED:
+        assert "Planned for a later round" in PAGE_PURPOSE[key], key
     for key, purpose in PAGE_PURPOSE.items():
         assert purpose.endswith("."), key
     for key, (text, method) in NEXT_STEP.items():
         assert text and method.isidentifier(), key
+    for key in PAGE_KEYS:
+        promise = clear_promise(key)
+        assert promise["clears"] and promise["keeps"], key
+
+
+def test_a_station_page_says_what_it_does_not_do(tabs):
+    """A tab a later round fills must not read as finished work."""
+    for key, definition in STATION_PAGES.items():
+        assert definition["title"] and definition["subtitle"].endswith(".")
+        assert definition["body"], key
+    for key in PLANNED:
+        # The page names the round that builds it rather than implying it is ready.
+        assert "a later round" in " ".join(STATION_PAGES[key]["body"]).casefold(), key
+        assert tabs.mark_planned(key) is True
+        assert "planned" in tabs.tabToolTip(PIPELINE.index(key))
+    assert tabs.mark_planned("does-not-exist") is False
 
 
 # ---------------------------------------------------------------------------
-# The real window: the pages it builds, the tabs it shows and the guarded
-# navigation every existing call site still goes through.
+# The real window: the pages it builds, the tabs it shows, the Clear on every
+# one of them, and the guarded navigation every existing call site goes through.
 # ---------------------------------------------------------------------------
 
 
@@ -228,31 +283,46 @@ def page_content(window, key):
     return page.widget() if isinstance(page, QScrollArea) else page
 
 
-def test_the_window_builds_seven_keyed_tabs_and_the_old_indices_still_address_them(window):
+def typed_sample(window, tmp_path, name="isolate.fasta"):
+    """One imported sample carrying a stored result, without running an analysis."""
+    path = tmp_path / name
+    path.write_text(">contig\nACGTACGTACGT\n", encoding="ascii")
+    window.import_paths([path])
+    sample_id = window.project.samples()[-1]["id"]
+    window.project.set_result(sample_id, {
+        "sample_name": path.stem, "status": "complete", "scheme": "practice_7",
+        "scheme_digest": "abc", "st": "7", "alleles": {f"locus{i}": "1" for i in range(7)},
+    })
+    window.refresh()
+    return sample_id
+
+
+def test_the_window_builds_every_pipeline_page_and_the_old_numbers_still_address_them(window):
     assert isinstance(window.pages, WorkspaceTabs)
-    assert window.pages.count() == 7
+    assert window.pages.count() == len(PAGE_KEYS)
     assert window.page_index == {key: index for index, key in enumerate(PAGE_KEYS)}
     assert window.pages.keys() == PAGE_KEYS
-    for index, key in enumerate(PAGE_KEYS):
-        assert window.pages.tabBar().tabData(index) == key
-        assert TAB_LABELS[key] in window.pages.tabText(index)
-        assert NAV_SYMBOLS[index] in window.pages.tabText(index)
-        # The tooltip keeps the long workspace name the breadcrumb and Alt+1…7 use.
-        assert window.nav_names[index] in window.pages.tabToolTip(index)
-        assert PAGE_PURPOSE[key] in window.pages.tabToolTip(index)
+    assert window.pages.tab_order() == PIPELINE
+    for position, key in enumerate(PIPELINE):
+        assert window.pages.tabBar().tabData(position) == key
+        assert window.pages.tabText(position) == TAB_LABELS[key]
+        # The tooltip keeps the long workspace name the breadcrumb and Alt+N use.
+        assert page_name(key) in window.pages.tabToolTip(position)
+        assert PAGE_PURPOSE[key] in window.pages.tabToolTip(position)
+    assert window.nav_names == [page_name(key) for key in PAGE_KEYS]
 
 
 def test_clicking_a_tab_updates_the_breadcrumb_without_navigating_twice(window):
     calls = []
     original = type(window).navigate
-    type(window).navigate = lambda self, index: (calls.append(index), original(self, index))[1]
+    type(window).navigate = lambda self, target: (calls.append(target), original(self, target))[1]
     try:
-        for index, key in enumerate(PAGE_KEYS):
+        for position, key in enumerate(PIPELINE):
             calls.clear()
-            window.pages.setCurrentIndex(index)
-            assert window.pages.currentIndex() == index
-            assert window.breadcrumb.text() == "WORKSPACE  /  " + window.nav_names[index].upper()
-            # currentChanged dispatches navigate, which must not re-enter itself.
+            window.pages.tabBar().setCurrentIndex(position)
+            assert window.pages.current_key() == key
+            assert window.breadcrumb.text() == "WORKSPACE  /  " + page_name(key).upper()
+            # The bar's own signal dispatches navigate, which must not re-enter itself.
             assert len(calls) <= 2, (key, calls)
     finally:
         type(window).navigate = original
@@ -263,7 +333,8 @@ def test_an_index_outside_the_workspace_is_refused_rather_than_guessed(window):
     before = window.breadcrumb.text()
     window.navigate(-1)
     window.navigate(99)
-    assert window.pages.currentIndex() == 2
+    window.navigate("no-such-page")
+    assert window.pages.current_key() == "compare"
     assert window.breadcrumb.text() == before
 
 
@@ -272,7 +343,7 @@ def test_page_six_is_a_real_settings_tab_and_no_longer_opens_a_dialog(window, mo
     monkeypatch.setattr(type(window), "open_interface_settings",
                         lambda self: opened.append(True))
     window.navigate(window.page_index["settings"])
-    assert window.pages.currentIndex() == window.page_index["settings"]
+    assert window.pages.current_key() == "settings"
     assert opened == []
     assert window.settings_tabs.count() == 3
     # QTabBar reads a single "&" as a mnemonic, so the titles escape it.
@@ -299,7 +370,6 @@ def test_the_compare_page_refreshes_itself_when_its_tab_becomes_current(window):
 
 
 def test_every_tab_explains_itself_and_offers_one_obvious_next_step(window):
-    from PySide6.QtWidgets import QLabel, QPushButton
     for key in PAGE_KEYS:
         content = page_content(window, key)
         purposes = [child for child in content.findChildren(QLabel)
@@ -312,14 +382,146 @@ def test_every_tab_explains_itself_and_offers_one_obvious_next_step(window):
         assert bool(buttons) is callable(getattr(window, method, None)), key
 
 
+def test_every_tab_offers_a_clear_that_names_what_it_keeps(window):
+    assert set(window.clear_buttons) == set(PAGE_KEYS)
+    for key in PAGE_KEYS:
+        content = page_content(window, key)
+        # The tab's own Clear, named for the tab, on the same strip on every page.
+        buttons = [child for child in content.findChildren(QPushButton)
+                   if child.accessibleName() == f"Clear the {page_name(key)} tab"]
+        assert len(buttons) == 1, key
+        assert buttons[0] is window.clear_buttons[key]
+        promise = clear_promise(key)
+        assert promise["clears"] in buttons[0].toolTip()
+        assert promise["keeps"] in buttons[0].toolTip()
+
+
+def test_clearing_a_tab_restarts_the_view_and_deletes_no_evidence(window, tmp_path,
+                                                                  monkeypatch):
+    """The whole point of Clear: start again with new, past or mixed samples."""
+    sample_id = typed_sample(window, tmp_path)
+    window.cohort_ids = {sample_id}
+    window.search.setText("isolate")
+    asked = []
+    monkeypatch.setattr(QMessageBox, "question",
+                        lambda parent, title, text, *args: (asked.append((title, text)),
+                                                            QMessageBox.StandardButton.Yes)[1])
+    assert window.clear_page("compare") is True
+    title, text = asked[-1]
+    assert "Clear MLST tree?" == title
+    assert clear_promise("compare")["clears"] in text
+    assert clear_promise("compare")["keeps"] in text
+    assert "Nothing you have imported or analysed is deleted." in text
+    assert window.cohort_ids == set()
+    assert window.distance_rows == []
+    assert window.tree.nodes == {}
+    assert window.clear_page("isolates") is True
+    assert window.search.text() == ""
+    # The evidence itself is untouched: the sample, its input and its result stay.
+    stored = window.project.get_sample(sample_id)
+    assert stored["result"]["st"] == "7"
+    assert len(window.project.samples()) == 1
+    assert window.test_errors == []
+
+
+def test_clearing_can_be_refused_and_then_changes_nothing(window, tmp_path, monkeypatch):
+    sample_id = typed_sample(window, tmp_path)
+    window.cohort_ids = {sample_id}
+    monkeypatch.setattr(QMessageBox, "question",
+                        lambda *args: QMessageBox.StandardButton.No)
+    assert window.clear_page("compare") is False
+    assert window.cohort_ids == {sample_id}
+
+
 def test_the_orientation_strip_repeats_the_limits_a_novice_could_read_past(window):
-    from PySide6.QtWidgets import QLabel
     compare = page_content(window, "compare")
     lines = [child.text() for child in compare.findChildren(QLabel)]
     assert any("not proof of transmission" in line for line in lines)
     evidence = page_content(window, "evidence")
     lines = [child.text() for child in evidence.findChildren(QLabel)]
     assert any("not measured susceptibility" in line for line in lines)
+    cgmlst_tree = page_content(window, "cgmlst_tree")
+    lines = [child.text() for child in cgmlst_tree.findChildren(QLabel)]
+    assert any("never share a scale" in line for line in lines)
+
+
+def test_a_planned_station_says_so_instead_of_pretending_to_work(window):
+    for key in PLANNED:
+        content = page_content(window, key)
+        lines = [child.text() for child in content.findChildren(QLabel)]
+        assert any("Nothing runs on this tab yet" in line for line in lines), key
+        assert "planned" in window.pages.tabToolTip(window.pages.position_of(key))
+        assert window.station_status[key].text().startswith("Nothing runs on this tab yet")
+
+
+def test_a_typing_station_counts_what_this_project_actually_has(window, tmp_path):
+    assert window.station_status["mlst"].text().startswith("0 of 0 samples")
+    typed_sample(window, tmp_path)
+    assert window.station_status["mlst"].text().startswith("1 of 1 samples have a stored "
+                                                           "seven-locus result")
+    # A cgMLST count is never inferred from a seven-locus result.
+    assert window.station_status["cgmlst"].text().startswith("0 of 1 samples")
+    assert window.station_status["cgmlst_tree"].text().startswith("0 samples carry a cgMLST")
+
+
+def test_a_station_hands_its_page_over_without_moving_a_single_number(window):
+    """The seam a later round drops its finished page into."""
+    page = QWidget()
+    page.setObjectName("built-elsewhere")
+    assert window.adopt_station("cgmlst_tree", page, title="cgMLST tree") is True
+    assert page.parent() is not None
+    assert window.stations["cgmlst_tree"]["placeholder"].isVisibleTo(window) is False
+    assert window.page_index == {key: index for index, key in enumerate(PAGE_KEYS)}
+    assert window.pages.tab_order() == PIPELINE
+    assert window.adopt_station("no-such-station", QWidget()) is False
+
+
+def test_a_station_only_offers_an_action_this_build_can_perform(window):
+    """The cgMLST tab links to the table of calls only where this build has one."""
+    labels = [child.text() for child in page_content(window, "cgmlst").findChildren(QPushButton)]
+    assert ("Open the table of calls →" in labels) is (getattr(window, "cgmlst_calls", None)
+                                                       is not None)
+    tree_labels = [child.text() for child in
+                   page_content(window, "cgmlst_tree").findChildren(QPushButton)]
+    assert ("Draw it on the tree page →" in tree_labels) is callable(
+        getattr(window, "show_cgmlst_tree", None))
+
+
+def test_the_cgmlst_tree_station_asks_the_tree_page_for_a_cgmlst_graph(window, monkeypatch):
+    """Until it draws its own, the station takes you to the page and says so."""
+    drawn = []
+    monkeypatch.setattr(type(window), "show_cgmlst_tree",
+                        lambda self: (drawn.append(self.pages.current_key()), "cgmlst")[1])
+    assert window.goto_cgmlst_tree_view() == "cgmlst"
+    assert drawn == ["compare"], "the page is asked only once it is the page in front"
+
+
+def test_an_adopted_station_takes_over_its_navigation_and_its_own_clear(window, monkeypatch):
+    class Page(QWidget):
+        cleared = 0
+
+        def clear(self):
+            type(self).cleared += 1
+
+    page = Page()
+    assert window.adopt_station("cgmlst", page) is True
+    window.navigate("overview")
+    window.goto_cgmlst_calls()
+    assert window.pages.current_key() == "cgmlst", "the calls live on the cgMLST tab now"
+    monkeypatch.setattr(QMessageBox, "question",
+                        lambda *args: QMessageBox.StandardButton.Yes)
+    assert window.clear_page("cgmlst") is True
+    assert Page.cleared == 1
+
+
+def test_a_station_action_takes_you_where_that_work_happens_today(window):
+    window.navigate("assembly")
+    assert window.goto_assembly_step() is True
+    assert window.pages.current_key() == "isolates"
+    assert window.sample_tabs.tabText(window.sample_tabs.currentIndex()) == "Assembly"
+    window.navigate("snp")
+    window.goto_mlst_tree()
+    assert window.pages.current_key() == "compare"
 
 
 def test_the_pages_other_controllers_rearrange_are_left_exactly_as_they_were(window):
@@ -329,24 +531,76 @@ def test_the_pages_other_controllers_rearrange_are_left_exactly_as_they_were(win
     assert "Advanced · imported source" in titles
     assert window.hydra_table.parent() is not None
     # ui_workbench.build_schemes inserted its own action row.
-    assert window.scheme_table.columnCount() == 3
+    assert window.scheme_table.columnCount() == 4
     # The evidence scope label stayed on the evidence page, not inside the strip.
-    from PySide6.QtWidgets import QLabel
     evidence = page_content(window, "evidence")
     assert window.feature_scope_label in evidence.findChildren(QLabel)
 
 
+def test_the_scheme_library_names_each_scheme_and_says_which_kind_it_is(window):
+    """The reported bug: a downloaded cgMLST scheme could be installed and not found."""
+    assert [window.scheme_table.horizontalHeaderItem(column).text()
+            for column in range(4)] == ["SCHEME", "TYPE", "SOURCE", "LOCATION"]
+    kinds = {window.scheme_table.item(row, 1).text()
+             for row in range(window.scheme_table.rowCount())
+             if window.scheme_table.item(row, 1) is not None}
+    assert kinds <= {"MLST", "cgMLST", "Not classified"}
+    for row in range(window.scheme_table.rowCount()):
+        title, kind = (window.scheme_table.item(row, column).text() for column in (0, 1))
+        # The name is the scheme's own, never the install folder read out loud:
+        # "cgmlst org kpneumoniae abcdef0123456789" is what the user could not find.
+        assert not title.startswith("cgmlst org "), title
+        if kind in {"MLST", "cgMLST"}:
+            assert kind in title or " · " in title, title
+
+
 def test_the_tab_bar_reaches_every_page_on_the_narrowest_supported_window(window, qtbot):
-    """Seven tabs must be clickable without scroll arrows at the minimum window size."""
+    """Thirteen tabs must stay readable, and every page reachable, at 1000x680."""
     window.resize(1000, 680)
     # Hiding the sidebar happens in resizeEvent; the layout that gives its width
     # to the tabs runs on the next pass, so wait for the settled geometry.
     qtbot.waitUntil(lambda: not window.sidebar.isVisible()
                     and window.pages.width() >= 940, timeout=5000)
     assert window.pages.tabBar().sizeHint().width() <= window.pages.width()
+    for position, key in enumerate(PIPELINE):
+        assert "…" not in window.pages.tabText(position)
+        window.pages.tabBar().setCurrentIndex(position)
+        assert window.pages.current_key() == key
     window.resize(1380, 940)
     qtbot.waitUntil(lambda: window.sidebar.isVisible(), timeout=5000)
     assert window.pages.tabBar().sizeHint().width() <= window.pages.width()
+
+
+def test_the_sidebar_stands_down_before_a_tab_goes_behind_a_scroll_arrow(window, qtbot):
+    """Navigation first: the decorative column is what gives up its width."""
+    window.resize(1380, 940)
+    qtbot.waitUntil(lambda: window.sidebar.isVisible(), timeout=5000)
+    needed = window.pages.minimum_bar_width()
+    assert needed > 0
+    # Just too narrow to carry both: the sidebar goes, the tabs stay whole.
+    window.resize(needed + 48 + window.sidebar.width() - 30, 940)
+    qtbot.waitUntil(lambda: not window.sidebar.isVisible()
+                    and window.pages.width() >= needed, timeout=5000)
+    assert window.pages.tabBar().sizeHint().width() <= window.pages.width()
+
+
+def test_a_larger_interface_scale_re_measures_the_bar_instead_of_running_off(window, qtbot):
+    """Text scaling has to keep working: the bar is measured again, never clipped."""
+    window.resize(1380, 940)
+    qtbot.waitUntil(lambda: window.pages.width() > 1000, timeout=5000)
+    small = window.pages.minimum_bar_width()
+    window.set_ui_scale(130)
+    try:
+        qtbot.waitUntil(lambda: window.pages.minimum_bar_width() > small, timeout=5000)
+        qtbot.waitUntil(lambda: window.pages.tabBar().sizeHint().width()
+                        <= window.pages.width(), timeout=5000)
+        # Bigger letters buy their room from the padding and the sidebar, never
+        # from the words: a tab that reads "cgMLST t…" has stopped being navigation.
+        assert window.pages.tabBar().elideMode().name == "ElideNone"
+        for position in range(window.pages.count()):
+            assert "…" not in window.pages.tabText(position)
+    finally:
+        window.set_ui_scale(100)
 
 
 # ---------------------------------------------------------------------------
@@ -434,7 +688,6 @@ def test_an_update_row_uses_the_installer_the_application_already_has(window, qt
 
 def test_an_item_with_no_installer_here_explains_how_it_is_installed(window, qtbot,
                                                                      monkeypatch):
-    from PySide6.QtWidgets import QMessageBox
     centre = update_centre(window, qtbot)
     shown = []
     monkeypatch.setattr(QMessageBox, "information",

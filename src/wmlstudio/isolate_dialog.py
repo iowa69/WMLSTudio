@@ -74,9 +74,12 @@ class IsolateRecordDialog(QDialog):
     def edit_organism(self):
         if self.window.busy():
             return
+        from wmlstudio.ui_workbench import CLASSICAL_KINDS
         from wmlstudio.workflow_dialogs import BatchAssignmentDialog
         sample = self.window.project.get_sample(self.sample_id)
-        dialog = BatchAssignmentDialog([sample], self.window.scheme_entries(), self)
+        # The workflow scheme is what an ST is called against, so only classical
+        # schemes are offered here; the cgMLST target set is chosen on its own tab.
+        dialog = BatchAssignmentDialog([sample], self.window.scheme_entries(CLASSICAL_KINDS), self)
         if dialog.exec() != QDialog.DialogCode.Accepted:
             return
         # A corrected label moves the managed copy with it; a label alone would

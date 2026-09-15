@@ -7,12 +7,14 @@ from pathlib import Path
 
 import pytest
 
+from wmlstudio import cgmlst_schemes
 from wmlstudio.reference_catalog import (
     API_ROOT,
     CatalogError,
     CGMLSTOrgCatalog,
     PasteurCatalog,
     PubMLSTCatalog,
+    install_destination,
 )
 from wmlstudio.sequence import AnalysisCancelled
 from wmlstudio.typing import call_assembly, load_scheme
@@ -79,11 +81,16 @@ def entry(client):
 
 
 def published(root):
-    """Scheme folders a user would see. A kept partial download is hidden and is
-    not one: reference_index.filter_scheme_locations drops '.'-prefixed names."""
-    root = Path(root)
-    return [] if not root.is_dir() else sorted(
-        path.name for path in root.iterdir() if not path.name.startswith("."))
+    """Scheme folders a user would see, in either library.
+
+    A kept partial download is hidden and is not one: reference_index.
+    filter_scheme_locations drops '.'-prefixed names. A labelled but empty cgMLST
+    slot is not one either: it holds a README and no allele file.
+    """
+    bases = [Path(root), Path(root) / cgmlst_schemes.LIBRARY_DIRNAME]
+    return sorted(path.name for base in bases if base.is_dir() for path in base.iterdir()
+                  if path.is_dir() and not path.name.startswith(".")
+                  and cgmlst_schemes.has_alleles(path))
 
 
 def test_catalog_discovers_organisms_filters_and_access_notice(remote):
@@ -486,3 +493,88 @@ def test_download_progress_reports_bytes_while_a_length_free_archive_streams(tmp
     client.download_scheme(selected, tmp_path, terms_acknowledged=True,
                            progress=lambda current, total, text: seen.append(text))
     assert any('MB received' in text for text in seen), 'a long transfer must not look frozen'
+
+
+def cg_scheme(client, tmp_path, *, root=None):
+    selected = client.search_schemes('Examplegenus')['schemes'][0]
+    return client.download_scheme(selected, root or tmp_path / "schemes",
+                                  terms_acknowledged=True)
+
+
+def test_a_downloaded_cgmlst_scheme_lands_in_the_cgmlst_library_under_a_readable_name(tmp_path):
+    # The reported bug in one assertion: a downloaded cgMLST scheme used to land in
+    # <data root>/schemes as cgmlst_org_<slug>_<digest16>, sorted alphabetically
+    # among 162 seven-locus schemes under a name nobody could recognise.
+    installed = cg_scheme(cg_remote(), tmp_path)
+    path = Path(installed['path'])
+    assert path.parent == tmp_path / cgmlst_schemes.LIBRARY_DIRNAME
+    assert path.name == 'Examplegenus_species__cgmlst_org_2'
+    assert 'cgmlst_org_Test_' not in path.name
+    assert load_scheme(path).locus_count == 2
+    # Nothing was left in the classical library the caller named.
+    assert not (tmp_path / "schemes").exists() or published(tmp_path / "schemes") == []
+
+
+def test_a_download_fills_the_labelled_slot_the_library_already_describes(tmp_path):
+    # cgmlst_schemes.prepare_library pre-creates a README-bearing folder for every
+    # catalogued scheme. A download must install INTO it, not beside it.
+    cgmlst_schemes.prepare_library(tmp_path, keys=["cgmlst.org:saureus-1861"])
+    slot = cgmlst_schemes.library_root(tmp_path) / \
+        cgmlst_schemes.entry_for("cgmlst.org:saureus-1861")["slot"]
+    assert slot.is_dir() and not cgmlst_schemes.has_alleles(slot)
+    client = cg_remote()
+    selected = client.search_schemes('Examplegenus')['schemes'][0]
+    selected.update({'slug': 'Saureus', 'organism': 'Staphylococcus aureus',
+                     'name': 'Staphylococcus aureus cgMLST'})
+    client.opener.routes.update({
+        'https://www.cgmlst.org/ncs/schema/Saureus/locus/?content-type=csv':
+            client.opener.routes['https://www.cgmlst.org/ncs/schema/Test/locus/?content-type=csv'],
+        'https://www.cgmlst.org/ncs/schema/Saureus/alleles/':
+            client.opener.routes['https://www.cgmlst.org/ncs/schema/Test/alleles/']})
+    installed = client.download_scheme(selected, tmp_path / "schemes", terms_acknowledged=True)
+    assert Path(installed['path']) == slot
+    assert (slot / 'README.txt').is_file(), 'the licence note stayed with the scheme'
+    assert 'Ridom' in (slot / 'README.txt').read_text(encoding='utf-8')
+    assert (slot / 'scheme_slot.json').is_file()
+    assert load_scheme(slot).locus_count == 2
+
+
+def test_a_classical_scheme_keeps_its_content_addressed_folder(tmp_path, remote):
+    # Saved projects store these exact paths, and a seven-locus scheme is small:
+    # only the gene-by-gene library is reorganised.
+    client, _, _ = remote
+    installed = client.download_scheme(entry(client), tmp_path / "schemes")
+    path = Path(installed['path'])
+    assert path.parent == tmp_path / "schemes"
+    assert path.name.startswith('pubmlst_example_seqdef_1_')
+    assert not (tmp_path / cgmlst_schemes.LIBRARY_DIRNAME).exists()
+
+
+def test_a_pubmlst_cgmlst_scheme_is_routed_by_its_target_count_not_its_folder(tmp_path, remote):
+    client, _, routes = remote
+    routes[SCHEME]['description'] = 'cgMLST'
+    selected = client.list_schemes(client.list_organisms()[0], refresh=True)[0]
+    assert selected['type'] == 'cgMLST'
+    installed = client.download_scheme(selected, tmp_path / "schemes")
+    assert Path(installed['path']).parent == tmp_path / cgmlst_schemes.LIBRARY_DIRNAME
+    assert Path(installed['path']).name == 'Examplegenus_species__pubmlst_2'
+    assert load_scheme(installed['path']).locus_count == 2
+    # A kept partial download still lives outside BOTH libraries, so it is never
+    # handed to the typing code as a scheme.
+    assert published(tmp_path / "schemes") == []
+    assert not (tmp_path / cgmlst_schemes.LIBRARY_DIRNAME / ".wmlstudio-partial-downloads").exists()
+
+
+def test_install_destination_never_sends_two_kinds_to_one_library(tmp_path):
+    classical = {'database': 'pubmlst_example_seqdef', 'scheme_id': '1', 'locus_count': 7,
+                 'type': 'MLST'}
+    gene_by_gene = {'database': 'pubmlst_example_seqdef', 'scheme_id': '6', 'locus_count': 2513,
+                    'type': 'cgMLST', 'organism': 'Escherichia coli', 'provider': 'PubMLST'}
+    library = tmp_path / "schemes"
+    assert install_destination(library, classical, 'f' * 64).parent == library
+    assert install_destination(library, gene_by_gene, 'f' * 64).parent == \
+        tmp_path / cgmlst_schemes.LIBRARY_DIRNAME
+    # A small but explicitly declared cgMLST snapshot is still gene-by-gene.
+    partial = {**gene_by_gene, 'locus_count': 12}
+    assert install_destination(library, partial, 'f' * 64).parent == \
+        tmp_path / cgmlst_schemes.LIBRARY_DIRNAME

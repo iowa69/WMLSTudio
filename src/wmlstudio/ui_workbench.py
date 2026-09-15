@@ -74,6 +74,86 @@ STEP_PURPOSE = {
 }
 STEP_ACTIONS = {"assembly": "Assemble selected read pairs…", "st": "Type selected · 7-locus MLST…",
                 "cgmlst": "Call cgMLST on selected…", "hydra": "Run HYDRA on selected…"}
+# The two typing steps are the ones that can already be answered by a stored
+# result, so they are the two that offer to run again anyway.
+RERUN_STEPS = ("st", "cgmlst")
+# What a picker for the classical seven-locus workflow may offer. A scheme whose
+# kind could not be read is still offered there — hiding a scheme somebody
+# installed helps nobody — but a cgMLST target set never is: the workflow scheme
+# is what an ST is called against, and an ST is not a core-genome profile.
+CLASSICAL_KINDS = ("mlst", "unknown")
+RERUN_TOGGLE = "Re-run even when nothing changed"
+STANDING_NOTE = ("Isolates whose stored result nothing has invalidated are left alone, and this "
+                 "tab names what changed for the ones that do run.")
+RERUN_TOGGLE_TIP = (
+    "Off, a stored result that nothing has invalidated is left alone and this tab says so "
+    "instead of repeating the work. A result counts as standing only when the sequence input "
+    "and the scheme's own fingerprint both still match what it was produced from; a result "
+    "that never recorded them is re-run, not assumed current.")
+
+# What a Clear button does and, just as importantly, what it does not. Clearing is
+# about what you are working on at this moment; it never removes an isolate, a
+# result, an allele call, a file or a history entry.
+CLEAR_KEEPS = ("Nothing was removed — every isolate, result, allele call, file and history entry "
+               "is untouched, so the next thing you do can use new, past or a mix of samples.")
+CLEAR_NOTE = ("Cleared: selection, search, organism filters and the library branch. " + CLEAR_KEEPS)
+
+# Dropping files is the fast route the user asked to have back. It is fast because
+# it understands what was dropped and where it landed, not because it skips
+# anything: dropped sequences still go through identification-before-copy and the
+# same review dialog the menus use.
+SEQUENCE_SUFFIXES = (".fa", ".fasta", ".fna", ".fq", ".fastq")
+READ_SUFFIXES = (".fq", ".fastq")
+TABLE_SUFFIXES = (".csv", ".tsv", ".tab")
+SCHEME_MARKERS = ("profiles.tsv", "profiles.txt", "profiles.tab", "scheme.json")
+DROP_HINT = ("Drop sequences to import them, a scheme folder on the Schemes tab to install it, "
+             "a CSV/TSV to review epidemiology, or read files on one assembly row to attach them.")
+
+
+def plain_suffix(path):
+    """A file's own extension, with any compression wrapper taken off."""
+    name = Path(path).name.casefold().removesuffix(".gz").removesuffix(".bz2")
+    return Path(name).suffix
+
+
+def looks_like_scheme(path):
+    """Whether a dropped folder is a typing scheme rather than a folder of isolates.
+
+    Only a scheme's own unambiguous markers count — a profile table, or allele files
+    under the .tfa extension curated schemes use. A folder of .fasta files is a
+    cohort of assemblies everywhere except the scheme library, where a folder can
+    mean nothing else and the caller says so.
+    """
+    folder = Path(path)
+    if not folder.is_dir():
+        return False
+    if any((folder / marker).is_file() for marker in SCHEME_MARKERS):
+        return True
+    try:
+        return any(entry.is_file() and plain_suffix(entry) == ".tfa" for entry in folder.iterdir())
+    except OSError:
+        return False  # An unreadable folder is not claimed to be anything.
+
+
+def sort_dropped(paths, *, schemes_expected=False):
+    """Split a drop into the kinds of thing this workspace knows what to do with.
+
+    Nothing here touches a file: it reads names and asks whether a folder carries a
+    scheme's markers, so a drop can be routed before anything is opened or copied.
+    """
+    sorted_paths = {"sequences": [], "schemes": [], "tables": [], "unusable": []}
+    for value in paths:
+        path = Path(value)
+        if path.is_dir():
+            kind = "schemes" if (schemes_expected or looks_like_scheme(path)) else "sequences"
+        elif plain_suffix(path) in SEQUENCE_SUFFIXES:
+            kind = "sequences"
+        elif plain_suffix(path) in TABLE_SUFFIXES:
+            kind = "tables"
+        else:
+            kind = "unusable"
+        sorted_paths[kind].append(str(path))
+    return sorted_paths
 
 
 def input_kind(sample):
@@ -321,6 +401,16 @@ class WorkbenchMixin:
         self.step_tables = {}
         self.step_buttons = {}
         self.step_notes = {}
+        self.step_toggles = {}
+        self._drop_step = ""
+        self._pending_typing = None
+        self._typing_currency = None
+        self._installed_scheme = None
+        # What a stored result already answers, per (step, isolate). Kept after a
+        # check so the line under the button keeps saying which isolates it left
+        # alone, and dropped for an isolate the moment it is typed again.
+        self._typing_verdicts = {}
+        self.last_typing_report = ""
         self.ui_scale = 100
         super().__init__(*args, **kwargs)
         from wmlstudio import theme
@@ -412,7 +502,9 @@ class WorkbenchMixin:
         self.install_view_menu("overview.recent", self.recent_table)
         content.addWidget(self.recent_table)
         self.drop_zone = DropZone()
-        self.drop_zone.filesDropped.connect(self.intake_paths)
+        # Routed rather than sent straight to intake: a scheme folder or an
+        # epidemiology table dropped here means what it means anywhere else.
+        self.drop_zone.filesDropped.connect(self.handle_drop)
         self.drop_zone.browseRequested.connect(self.browse_files)
         content.addWidget(self.drop_zone)
         splitter.addWidget(recent)
@@ -512,8 +604,8 @@ class WorkbenchMixin:
         content.addWidget(self.sample_columns_button)
         content.addWidget(label("Import with options… opens the per-file dialog: it asks for an "
                                 "organism and a scheme before anything is copied. Dropping files "
-                                "on the window does the same identification without the dialog.",
-                                "small", True))
+                                "on the window does the same identification without the dialog. "
+                                + DROP_HINT, "small", True))
         panel.setVisible(False)
         self.samples_advanced = panel
         self.samples_advanced_button.toggled.connect(panel.setVisible)
@@ -536,7 +628,16 @@ class WorkbenchMixin:
             strip.addWidget(button("Install schemes…", self.open_reference_manager))
         if key == "assembly":
             strip.addWidget(button("Identify waiting samples again", self.reidentify_waiting))
+        clear = button("Clear", lambda checked=False, k=key: self.clear_step(k))
+        clear.setToolTip(CLEAR_NOTE)
+        strip.addWidget(clear)
         layout.addLayout(strip)
+        if key in RERUN_STEPS:
+            from PySide6.QtWidgets import QCheckBox
+            toggle = QCheckBox(RERUN_TOGGLE)
+            toggle.setToolTip(RERUN_TOGGLE_TIP)
+            self.step_toggles[key] = toggle
+            layout.addWidget(toggle)
         note = label("", "small", True)
         note.setObjectName("stepGate")
         self.step_notes[key] = note
@@ -1087,6 +1188,21 @@ class WorkbenchMixin:
     # under the button names the missing fact and where to set it — instead of
     # letting a run start and fail with something only a bioinformatician reads.
 
+    def installed_scheme_path(self, path):
+        """A recorded scheme path, followed to wherever the library moved it.
+
+        A scheme the cgMLST library reorganised has to keep working for a sample
+        that recorded where it used to be. Anything else is a configuration that
+        silently stops running, which is exactly what the user reported.
+        """
+        if not path:
+            return ""
+        from wmlstudio import cgmlst_schemes
+        try:
+            return str(cgmlst_schemes.resolve_migrated_path(self.root, str(path)))
+        except (OSError, ValueError):
+            return str(path)
+
     def installed_scheme_rows(self):
         """Installed references with the organism each one records for itself.
 
@@ -1223,6 +1339,14 @@ class WorkbenchMixin:
         ready, blocked = self.step_partition(key, selected)
         caveats = " ".join(dict.fromkeys(
             note for sample in ready for note in self.step_gate(sample, key)["notes"]))
+        toggle = self.step_toggles.get(key)
+        if ready and toggle is not None and not toggle.isChecked():
+            settled = sum(1 for sample in ready
+                          if (self._typing_verdicts.get((key, sample["id"])) or {}).get("status")
+                          == "current")
+            standing = (f"{settled} of them already have a {STEP_TITLES[key]} result nothing has "
+                        "invalidated, so they would be left alone. " if settled else "")
+            caveats = f"{standing}{STANDING_NOTE} {caveats}".strip()
         if ready and not blocked:
             return (True, f"{len(ready)} of {len(selected)} selected isolates are ready for "
                           f"{STEP_TITLES[key]}. {caveats}".strip())
@@ -1306,7 +1430,24 @@ class WorkbenchMixin:
                 body += f"<p><b>Paired record:</b> {e(paired['name'])} · {e(paired['id'])}<br><b>Read role:</b> {e(workflow.get('source_kind'))}</p>"
             except KeyError:
                 body += "<p>The paired record is not present in this project; its provenance is retained.</p>"
-        body += f"<p><b>Workflow:</b> {e(workflow.get('typing_mode', 'manual'))} · <b>Scheme:</b> {e(result.get('scheme') or workflow.get('scheme_path') or 'Not assigned')}</p>"
+        # One configuration, read the one way, with who set each field and where.
+        # That is what makes a choice made in any menu visible in every other one.
+        from wmlstudio.sample_workflow import sample_configuration
+        configuration = sample_configuration(sample)
+        body += (f"<p><b>Workflow:</b> {e(configuration['typing_mode'] or 'manual')} · "
+                 f"<b>MLST scheme:</b> {e(result.get('scheme') or configuration['scheme_path'] or 'Not assigned')}"
+                 f" · <b>cgMLST scheme:</b> {e(configuration['cgmlst_scheme_path'] or 'Not chosen')}"
+                 f" · <b>Run flags:</b> HYDRA {'on' if configuration['run_hydra'] else 'off'}, "
+                 f"cgMLST {'on' if configuration['run_cgmlst'] else 'off'}</p>")
+        stamps = "; ".join(
+            f"{field} by {entry.get('by') or 'unknown'}"
+            + (f" in {entry['surface']}" if entry.get("surface") else "")
+            + (" (automatic)" if entry.get("automatic") else "")
+            for field, entry in sorted(configuration["set_by"].items()))
+        if stamps:
+            body += f"<p><b>Configuration set:</b> {e(stamps)}</p>"
+        if configuration["organism_note"]:
+            body += f"<p>{e(configuration['organism_note'])}</p>"
         if workflow.get("managed"):
             body += f"<p><b>Managed copy:</b> original remains at {e(workflow.get('source_path', 'recorded in provenance'))}</p>"
         qc = result.get("qc") or {}
@@ -1351,8 +1492,30 @@ class WorkbenchMixin:
                 rows.append(f"<h3>{e(entry['action'].replace('_', ' '))}</h3><p>{e(entry['created_at'])}</p><p>" + "<br>".join(f"<b>{e(key)}:</b> {e(value)}" for key, value in brief.items()) + "</p>")
             self.history_view.setHtml(f"<h2>Sample audit trail · {e(sample['name'])}</h2><p>Showing {min(100, len(history))} of {len(history)} saved events. Original inputs and archived analysis evidence are retained.</p>" + "".join(rows))
 
-    def scheme_entries(self):
-        return [(p.name.replace("_", " "), str(p)) for p in self.scheme_paths]
+    def scheme_entries(self, kind=None):
+        """(title, path) for installed schemes, optionally of one kind only.
+
+        The title is reference_index's row title — organism, scheme, target count,
+        provider, version — so a downloaded cgMLST scheme reads as "Klebsiella
+        pneumoniae sensu lato · cgMLST · 2358 targets · cgMLST.org" rather than as
+        its folder name with the underscores rubbed out. Pass kind="mlst" or
+        kind="cgmlst" wherever a picker offers a scheme to type against: a
+        seven-locus distance and a 2,000-target distance are different quantities
+        and must not be offered from one list. Several kinds may be named together,
+        which is how a classical picker keeps offering a local scheme whose kind
+        could not be read: leaving it out would hide a scheme somebody installed.
+        """
+        rows = self.installed_scheme_rows()
+        if not rows:  # A reference that cannot be read must still be selectable.
+            return [(p.name, str(p)) for p in self.scheme_paths]
+        wanted = {kind} if isinstance(kind, str) else set(kind) if kind is not None else None
+        chosen = [row for row in rows if wanted is None or row.get("kind") in wanted]
+        # Two snapshots of one scheme read alike, and a picker that offers the same
+        # words twice cannot say which one a result was produced against.
+        repeated = {row["title"] for row in chosen
+                    if sum(other["title"] == row["title"] for other in chosen) > 1}
+        return [(f"{row['title']} · {Path(row['path']).name}" if row["title"] in repeated
+                 else row["title"], row["path"]) for row in chosen]
 
     def populate_schemes(self):
         super().populate_schemes()
@@ -1378,9 +1541,264 @@ class WorkbenchMixin:
         if path:
             self.intake_paths([path])
 
-    def dropEvent(self, event):
-        self.intake_paths([u.toLocalFile() for u in event.mimeData().urls() if u.isLocalFile()])
+    # --- drag and drop ------------------------------------------------------
+    # The fastest way to start work, and the reason it is fast is that a drop
+    # means what the thing dropped means, where it landed. It never means less
+    # care: sequences are still identified where they lie before a byte is copied,
+    # and the same review dialog still decides what is filed under which organism.
+
+    def dragEnterEvent(self, event):
+        if not (event.mimeData().hasUrls()
+                and any(url.isLocalFile() for url in event.mimeData().urls())):
+            return
         event.acceptProposedAction()
+        self.statusBar().showMessage(DROP_HINT, 8000)
+
+    def dragMoveEvent(self, event):
+        if event.mimeData().hasUrls() and any(url.isLocalFile() for url in event.mimeData().urls()):
+            event.acceptProposedAction()
+
+    def dropEvent(self, event):
+        position = event.position().toPoint() if hasattr(event, "position") else None
+        paths = [url.toLocalFile() for url in event.mimeData().urls() if url.isLocalFile()]
+        event.acceptProposedAction()
+        self.handle_drop(paths, self.drop_target(position))
+
+    def show_step(self, key):
+        """Bring one Samples step sub-tab forward, found by the title it carries."""
+        tabs = getattr(self, "sample_tabs", None)
+        if tabs is None or key not in STEP_TITLES:
+            return False
+        for index in range(tabs.count()):
+            if tabs.tabText(index) == STEP_TITLES[key]:
+                tabs.setCurrentIndex(index)
+                return True
+        return False
+
+    def drop_target(self, position=None):
+        """Where a drop landed: the page, the step sub-tab, and the row under it.
+
+        The pointer decides when it is over a row of isolates, because that is the
+        one case where a drop is about one named isolate. Everywhere else the
+        visible page decides, which is also what happens on a platform that hands
+        us no position at all.
+        """
+        target = {"page": "", "step": "", "sample_id": ""}
+        if hasattr(self, "pages"):
+            target["page"] = self.pages.current_key()
+        if target["page"] == "isolates" and hasattr(self, "sample_tabs"):
+            title = self.sample_tabs.tabText(self.sample_tabs.currentIndex())
+            target["step"] = next((key for key, value in STEP_TITLES.items() if value == title), "")
+        if position is None:
+            return target
+        widget, table, step = self.childAt(position), None, ""
+        while widget is not None and table is None:
+            for key, candidate in self.step_tables.items():
+                if widget is candidate or widget is candidate.viewport():
+                    table, step = candidate, key
+            widget = widget.parentWidget()
+        if table is None:
+            return target
+        target["step"] = step
+        item = table.itemAt(table.viewport().mapFrom(self, position))
+        if item is not None:
+            target["sample_id"] = item.data(Qt.ItemDataRole.UserRole) or ""
+        return target
+
+    def handle_drop(self, paths, target=None):
+        """Do the obvious thing with what was dropped where. Returns the route taken."""
+        target = dict(target or {})
+        if self.busy():
+            return ""
+        dropped = sort_dropped(paths, schemes_expected=target.get("page") == "schemes")
+        if not any(dropped[kind] for kind in ("sequences", "schemes", "tables")):
+            self.error("Nothing here can be used: drop FASTA or FASTQ sequences, a folder of them, "
+                       "a scheme folder, or a CSV/TSV of epidemiology metadata.")
+            return ""
+        if dropped["schemes"] and not dropped["sequences"]:
+            return self.install_scheme_folders(dropped["schemes"])
+        if dropped["tables"] and not dropped["sequences"]:
+            return self.review_dropped_table(dropped["tables"][0])
+        reads = [path for path in dropped["sequences"] if plain_suffix(path) in READ_SUFFIXES]
+        if target.get("sample_id") and reads and len(reads) == len(dropped["sequences"]):
+            return self.attach_dropped_reads(target["sample_id"], reads)
+        # Everything else is a cohort arriving. The step the drop landed on is
+        # where the user is working, so that is the tab they are returned to.
+        self._drop_step = target.get("step") or ""
+        self.intake_paths(dropped["sequences"])
+        return "import"
+
+    def install_scheme_folders(self, folders):
+        """Install dropped folders of allele FASTA as local typing schemes.
+
+        One at a time, because each is validated and copied by the same worker the
+        Import local scheme… menu uses: a folder that is not a readable scheme is
+        refused by name rather than half-installed.
+        """
+        from wmlstudio.jobs import SchemeImportWorker
+        folder = Path(folders[0])
+        if len(folders) > 1:
+            self.notify(f"{len(folders)} folders were dropped; installing {folder.name} first. "
+                        "Drop the rest once this one is in.")
+        self.worker_role = "scheme_import"
+        self._task_succeeded = False
+        self._installed_scheme = None
+        self.worker = SchemeImportWorker(folder, self.root, self)
+        self.worker.imported.connect(
+            lambda path, loci: setattr(self, "_installed_scheme", (path, loci)))
+        self.worker.failed.connect(self.error)
+        self.worker.progress.connect(self.job_progress)
+        self.worker.finished.connect(self.analysis_finished)
+        self.set_running(True)
+        self.worker.start()
+        return "scheme"
+
+    def dropped_scheme_installed(self):
+        """Say what was installed and which library it joined; choose nothing for the user."""
+        installed, self._installed_scheme = getattr(self, "_installed_scheme", None), None
+        if installed is None:
+            self.notify("That folder was not installed as a scheme; nothing was copied.")
+            return
+        destination, loci = installed
+        self.populate_schemes()
+        # Followed to where it now is: preparing the library moves a cgMLST scheme
+        # out of the classical folder, and the row is found by where it landed.
+        landed = Path(self.installed_scheme_path(destination)).expanduser().resolve()
+        kind = {"mlst": "classical MLST", "cgmlst": "cgMLST"}.get(
+            next((row.get("kind") for row in self.installed_scheme_rows()
+                  if Path(row.get("path") or "") == landed), ""), "unclassified")
+        self.notify(f"Installed {Path(destination).name} · {loci} loci · into the {kind} library. "
+                    "Nothing was selected for you: choose it on the step that uses it. Results "
+                    "already produced keep their own scheme fingerprint.")
+
+    def attach_dropped_reads(self, sample_id, paths):
+        """Offer dropped FASTQ files as the original reads of the isolate they landed on.
+
+        The same review and the same full validation as the menu route: the pair is
+        shown for confirmation and both files are hashed before anything is
+        recorded. Filename or read-ID agreement is not proof that these reads
+        produced that assembly, which is why a person still confirms it.
+        """
+        from wmlstudio.read_attachment_dialog import AttachReadsDialog
+        try:
+            sample = self.project.get_sample(sample_id)
+        except KeyError:
+            self.notify("That isolate is no longer in this project.")
+            return ""
+        if input_kind(sample) != "assembly":
+            self.notify(f"{sample['name']} is not an assembly, so original reads cannot be attached "
+                        "to it. Drop reads on an assembled isolate, or import them as their own "
+                        "samples.")
+            return ""
+        dialog = AttachReadsDialog([sample], parent=self)
+        for mate, path in zip((1, 2), sorted(paths)[:2], strict=False):
+            combo = dialog.rows[0][mate - 1]
+            combo.addItem(Path(path).name, {"path": path, "sample_id": None})
+            combo.setCurrentIndex(combo.count() - 1)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return ""
+        self.launch_read_validation(dialog.assignments, {sample_id: sample})
+        return "attach_reads"
+
+    def launch_read_validation(self, assignments, snapshots):
+        """Hash and check each proposed read pair in a worker, then record what passed."""
+        from wmlstudio.read_attachments import attach_read_pair, validate_read_attachment
+        from wmlstudio.scheduler import plan_resources, run_bounded
+        project = self.project
+        try:
+            allocation = plan_resources(threads_per_sample=1, memory_gb=1, max_parallel=2)
+        except ValueError as exc:
+            self.error(str(exc))
+            return False
+
+        def operation(cancelled, progress):
+            identifiers = []
+
+            def validate(task, resources, stopped, report):
+                return validate_read_attachment(snapshots[task["sample_id"]], task["read1"],
+                                                task["read2"], read_sample_ids=task["read_sample_ids"],
+                                                cancelled=stopped, progress=report)
+
+            def attach(task, evidence):
+                attach_read_pair(project, task["sample_id"], evidence)
+                identifiers.append(task["sample_id"])
+
+            run_bounded(assignments, validate, allocation, cancelled=cancelled, on_result=attach,
+                        progress=progress)
+            return identifiers
+
+        return self.launch_task(operation, "read_attachment", lambda ids: self.notify(
+            f"Attached fully validated original read pairs to {len(ids)} isolates. Their assembly "
+            "IDs, typing and AMR evidence are unchanged, and the read files were not moved."))
+
+    def review_dropped_table(self, path):
+        """Preview a dropped epidemiology table against this project before anything is saved."""
+        from wmlstudio.metadata_grid import MetadataPreviewDialog
+        from wmlstudio.metadata_ingest import read_metadata_table
+        try:
+            rows = read_metadata_table(path)
+        except (OSError, ValueError) as error:
+            self.error(str(error))
+            return ""
+        dialog = MetadataPreviewDialog(self.project, rows, self)
+        if dialog.exec() == QDialog.DialogCode.Accepted:
+            self.refresh()
+            self.notify(f"{len(dialog.changed_ids)} isolates updated from {Path(path).name}. "
+                        "A spreadsheet is your statement about these isolates, not genomic evidence.")
+        return "metadata"
+
+    # --- clear --------------------------------------------------------------
+
+    #: The Samples step each pipeline station's Clear stands for. A station clear
+    #: and this hub's own Clear must leave the same thing behind, or one tab would
+    #: keep a selection another says it just dropped.
+    STEP_FOR_PAGE = {"isolates": None, "mlst": "st", "cgmlst": "cgmlst"}
+
+    def clear_step(self, key=None, *, announce=True):
+        """Put a tab back to 'nothing chosen' so the next thing can be anything.
+
+        Clearing is about what you are working on at this moment. No isolate,
+        result, allele call, file or history entry is touched, so after a clear the
+        same tab is ready for new samples, old ones, or a mix of both. A step clears
+        the isolates chosen for it and its own options; the hub also clears the
+        search box, the organism filters and the library branch.
+        """
+        key = key if isinstance(key, str) and key in STEP_KEYS else None
+        self.selection_ids.clear()
+        for widget in self.step_tables.values():
+            widget.clearSelection()
+        for name, toggle in self.step_toggles.items():
+            if key in (None, name):
+                toggle.setChecked(False)
+        if key is None:
+            self.library_filter = None
+            self.search.clear()
+            for combo in (self.genus_filter, self.species_filter, self.collection_filter):
+                combo.setCurrentIndex(0)
+        self.focus.clear()
+        self.refresh_tables()
+        if announce:
+            self.notify(CLEAR_NOTE if key is None else
+                        f"{STEP_TITLES[key]} cleared: the isolates chosen for it and this tab's "
+                        "own options. " + CLEAR_KEEPS)
+        return {"page": key or "isolates", "selected": 0, "removed": 0}
+
+    def clear_isolates(self):
+        """The Samples tab's own Clear, under the name a page-level Clear looks for."""
+        return self.clear_step()
+
+    def clear_page_state(self, key):
+        """Extend the window's page-level Clear with the chooser state this hub owns.
+
+        The window clears what it can see. The selection set, the library branch and
+        the organism filters live here, so both halves go together and a tab that
+        says it started again really has.
+        """
+        parent = getattr(super(), "clear_page_state", None)
+        if callable(parent):
+            parent(key)
+        if key in self.STEP_FOR_PAGE and hasattr(self, "sample_table"):
+            self.clear_step(self.STEP_FOR_PAGE[key], announce=False)
 
     @staticmethod
     def sequence_files(paths):
@@ -1439,6 +1857,7 @@ class WorkbenchMixin:
     def intake_completed(self):
         """Say what was loaded, what was already here, and what still needs a person."""
         report, self._intake_report = self._intake_report, None
+        step, self._drop_step = self._drop_step, ""
         if not report or not self._task_succeeded:
             self.notify("Loading stopped. Nothing was imported and your files are unchanged.")
             return
@@ -1447,6 +1866,13 @@ class WorkbenchMixin:
         self.clear_filters()
         self.refresh()
         self.navigate(1)
+        if step in STEP_KEYS and hasattr(self, "sample_tabs"):
+            # Dropped on a step, so the isolates arrive selected on that step, with
+            # its own button and its own gate already saying what they still need.
+            # Found by its title, because a later round adds sub-tabs of its own.
+            self.show_step(step)
+            self.mirror_selection("")
+            self.update_step_gates()
         waiting = list(report.get("needs_review") or ())
         parts = [f"{len(imported)} isolates loaded."]
         # Everything imported is "filed" somewhere; only what left the review tree
@@ -1521,7 +1947,7 @@ class WorkbenchMixin:
             self.error("No supported FASTA or FASTQ files were found.")
             return
         from wmlstudio.workflow_dialogs import ImportSamplesDialog
-        dialog = ImportSamplesDialog(files, self.scheme_entries(), self)
+        dialog = ImportSamplesDialog(files, self.scheme_entries(CLASSICAL_KINDS), self)
         dialog.storage_root.setText(str(self.project_path.with_suffix(".files")))
         if dialog.exec() != QDialog.DialogCode.Accepted:
             return
@@ -1672,13 +2098,16 @@ class WorkbenchMixin:
             message += f" {len(skipped)} were left where they are: {skipped[0][1]}"
         self.notify(message)
 
-    def apply_organism_assignments(self, assignments, *, notice=""):
+    def apply_organism_assignments(self, assignments, *, notice="", surface="Assign organism"):
         """Record corrected organisms, then move the managed copies to match them.
 
-        A corrected label that did not move the file would leave the file sitting
-        in a folder that contradicts it, so the two always travel together.
+        The write goes through the one sample configuration, so an organism or a
+        scheme set here is what every other menu and submenu reads next, and the
+        surface it was set from is stamped on the field. A corrected label that did
+        not move the file would leave the file sitting in a folder that contradicts
+        it, so the two always travel together.
         """
-        from wmlstudio.storage import confirm_organism, refile_samples
+        from wmlstudio.storage import confirm_organism, refile_samples, set_sample_configuration
         assignments = [dict(assignment) for assignment in assignments if assignment.get("sample_id")]
         if not assignments:
             return False
@@ -1688,10 +2117,23 @@ class WorkbenchMixin:
             for index, assignment in enumerate(assignments):
                 progress(index, len(assignments), f"Filing {index + 1} of {len(assignments)}…")
                 sample_id = assignment["sample_id"]
-                confirm_organism(self.project, [sample_id], assignment.get("genus", ""),
-                                 assignment.get("species", ""),
-                                 scheme_path=assignment.get("scheme_path"),
-                                 typing_mode=assignment.get("typing_mode", "manual"))
+                genus, species = assignment.get("genus", ""), assignment.get("species", "")
+                mode = assignment.get("typing_mode", "manual")
+                changes = {"genus": genus, "species": species, "typing_mode": mode,
+                           "scheme_path": assignment.get("scheme_path")}
+                try:
+                    written = set_sample_configuration(self.project, [sample_id], changes,
+                                                       surface=surface)
+                    if genus and not written["applied"].get(sample_id):
+                        # Re-affirming the label a waiting isolate already carries
+                        # changes no field, and is still the decision that takes it
+                        # out of the review tree. Accepting it is that decision.
+                        confirm_organism(self.project, [sample_id], genus, species,
+                                         scheme_path=assignment.get("scheme_path"),
+                                         typing_mode=mode)
+                except ValueError as error:
+                    report["skipped"].append((sample_id, str(error)))
+                    continue
                 # Each sample keeps its own storage location; correcting a label
                 # never moves a managed copy into a different root.
                 outcome = refile_samples(self.project, [sample_id], cancelled=cancelled)
@@ -1712,7 +2154,7 @@ class WorkbenchMixin:
             self.notify("Select one or more sample rows first.")
             return
         from wmlstudio.workflow_dialogs import BatchAssignmentDialog
-        dialog = BatchAssignmentDialog(samples, self.scheme_entries(), self)
+        dialog = BatchAssignmentDialog(samples, self.scheme_entries(CLASSICAL_KINDS), self)
         if dialog.exec() != QDialog.DialogCode.Accepted:
             return
         self.apply_organism_assignments(dialog.assignments)
@@ -1864,11 +2306,18 @@ class WorkbenchMixin:
         scheme is chosen for the step the user asked for, never inherited from the
         other tab's run.
         """
+        from wmlstudio.sample_workflow import sample_configuration
         wanted = "mlst" if key == "st" else "cgmlst"
         prepared, chosen = [], {}
         for sample in samples:
             workflow = (sample.get("metadata") or {}).get("workflow") or {}
-            pinned = workflow.get("scheme_path")
+            configuration = sample_configuration(sample)
+            # The sample's own configuration answers first, and each step reads its
+            # own field: the cgMLST target set the user chose in any menu is what
+            # the cgMLST tab runs, and it is never the classical workflow scheme.
+            pinned = self.installed_scheme_path(
+                (configuration["cgmlst_scheme_path"] if key == "cgmlst" else None)
+                or configuration["scheme_path"])
             entry = self.scheme_organisms().get(str(Path(pinned).name).casefold()) if pinned else None
             if entry is not None and entry.get("kind") == wanted:
                 path = pinned
@@ -1883,6 +2332,10 @@ class WorkbenchMixin:
         plan = self.review_run_plan(prepared)
         if plan is None:
             return
+        if key == "cgmlst":
+            # This tab is the cgMLST run. Chaining the launch flag on top of it
+            # would call the same isolates against the same targets twice.
+            plan = {**plan, "cgmlst": False}
         # Which reference produced a result is part of the result: say it before the
         # run as well, so nobody has to open a record to find out what was used.
         self.notify(f"{STEP_TITLES[key]} on {len(prepared)} isolates using "
@@ -1891,7 +2344,91 @@ class WorkbenchMixin:
         self._run_ids = {sample["id"] for sample in prepared}
         self._run_cancelled = False
         self._typing_override = None
+        toggle = self.step_toggles.get(key)
+        if toggle is not None and not toggle.isChecked():
+            self.check_typing_currency(key, prepared)
+            return
         self.begin_typing(prepared, None, remember=False)
+
+    # --- what a stored result already answers --------------------------------
+    # "Already done, nothing changed" is only honest when the two things an allele
+    # call is made against — the sequence input and the scheme's own fingerprint —
+    # are both still what the stored result was produced from. The fingerprint is
+    # the hash of the scheme's files, so answering the question means reading them;
+    # that happens in a worker, through the same cache the run itself uses, so it
+    # costs the run nothing.
+
+    def check_typing_currency(self, key, prepared):
+        """Ask which of these isolates a stored result already answers, then run the rest."""
+        from wmlstudio.identification import cached_scheme
+        from wmlstudio.sample_workflow import current_input_sha256, rerun_decision
+        kind = "mlst" if key == "st" else "cgmlst"
+        project = self.project
+        samples = list(prepared)
+
+        def operation(cancelled, progress):
+            digests, decisions = {}, {}
+            for index, sample in enumerate(samples):
+                progress(index, len(samples), f"Checking what already stands for {sample['name']}…")
+                path = ((sample.get("metadata") or {}).get("workflow") or {}).get("scheme_path") or ""
+                if path not in digests:
+                    digests[path] = cached_scheme(path, cancelled).digest
+                try:
+                    stored = project.latest_analysis(sample["id"], kind)
+                except (KeyError, ValueError):
+                    stored = None
+                decisions[sample["id"]] = rerun_decision(
+                    stored, {"input_sha256": current_input_sha256(sample),
+                             "scheme_digest": digests[path]})
+            return decisions
+
+        self._pending_typing = {"key": key, "samples": samples}
+        self._typing_currency = None
+        if not self.launch_task(operation, "typing_currency",
+                                lambda result: setattr(self, "_typing_currency", result)):
+            self._pending_typing = None
+            self._run_plan = {}
+
+    def continue_after_currency(self):
+        """Run only what a stored result does not already answer, naming what changed."""
+        pending, self._pending_typing = self._pending_typing, None
+        decisions, self._typing_currency = self._typing_currency or {}, None
+        if not pending or self._run_cancelled or not self._task_succeeded:
+            self._run_plan = {}
+            return
+        key, samples = pending["key"], pending["samples"]
+        for sample_id, decision in decisions.items():
+            self._typing_verdicts[(key, sample_id)] = decision
+        settled = {s["id"] for s in samples
+                   if (decisions.get(s["id"]) or {}).get("status") == "current"}
+        standing = [s for s in samples if s["id"] in settled]
+        changed = [s for s in samples if s["id"] not in settled]
+        title = STEP_TITLES[key]
+        if not changed:
+            plan, self._run_plan = self._run_plan, {}
+            self.last_typing_report = (
+                f"Nothing was run. All {len(standing)} selected isolates already have a {title} "
+                "result and nothing it was made against has changed — same sequence input, same "
+                f"scheme fingerprint. Tick '{RERUN_TOGGLE}' to produce it again.")
+            self.refresh()
+            self.notify(self.last_typing_report)
+            # The stored typing standing does not cancel the rest of the launch: a
+            # cgMLST or HYDRA run this plan also asked for is a different question.
+            self.start_reviewed_plan(samples, plan)
+            return
+        reasons = "; ".join(f"{sample['name']} — "
+                            + ((decisions.get(sample["id"]) or {}).get("summary") or "never typed")
+                            for sample in changed[:3])
+        if len(changed) > 3:
+            reasons += f"; and {len(changed) - 3} more."
+        message = f"Running {title} on {len(changed)} of {len(samples)} isolates. {reasons}"
+        if standing:
+            message += (f" {len(standing)} were left alone: their stored {title} result stands, so "
+                        "repeating it would produce the same answer.")
+        self.last_typing_report = message
+        self.notify(message)
+        self._run_ids = {sample["id"] for sample in changed}
+        self.begin_typing(changed, None, remember=False)
 
     # --- HYDRA organism -----------------------------------------------------
 
@@ -1983,11 +2520,30 @@ class WorkbenchMixin:
                         "unavailable for them.")
 
     def run_hydra_step(self, samples):
-        plan = self.review_run_plan(samples, hydra=True)
-        if not plan or not plan.get("hydra"):
-            return
+        return self.start_reviewed_plan(samples, self.review_run_plan(samples, hydra=True))
+
+    def start_reviewed_plan(self, samples, plan):
+        """Start what one HYDRA-oriented launch asked for, in order, or nothing.
+
+        cgMLST runs first when the plan carries that flag, because HYDRA screens
+        whatever assemblies the launch ends with; the chain is then driven from
+        analysis_finished exactly as an ordinary run is. Returns False when the plan
+        asked for nothing, so the caller never claims a run that did not start.
+        """
+        if not plan:
+            return False
+        identifiers = {sample["id"] for sample in samples}
         self._run_cancelled = False
-        self.run_hydra_plan({sample["id"] for sample in samples}, plan, require_completed=False)
+        self._run_ids = set(identifiers)
+        if plan.get("cgmlst"):
+            self._run_plan = {**plan, "cgmlst": False}
+            if self.run_cgmlst_plan(identifiers, plan):
+                return True
+        self._run_plan = {}
+        if plan.get("hydra"):
+            self.run_hydra_plan(identifiers, plan, require_completed=False)
+            return True
+        return False
 
     def busy(self):
         if self.worker and self.worker.isRunning():
@@ -2194,6 +2750,23 @@ class WorkbenchMixin:
             return identifiers
         self.launch_task(operation, "assembly", lambda ids: self.notify(f"Assembled {len(ids)} read pairs. Starting the assigned typing workflow…"))
 
+    def sample_finished(self, sample_id, result):
+        """Save the result, then let the organism it established fill itself in everywhere.
+
+        This is the user's "the info for the first analysis should autofill
+        everywhere": the moment an analysis establishes an organism it lands on the
+        sample's one configuration, so no later menu asks again. It never overrules
+        a person — their label is kept and the proposal is held — and a scheme match
+        is adopted as panel compatibility, never as an independent identification.
+        """
+        self.project.set_result(sample_id, result)
+        from wmlstudio.storage import adopt_analysis_organism
+        try:
+            adopt_analysis_organism(self.project, sample_id, result)
+        except (KeyError, ValueError):
+            pass  # Recording a label must never lose the result that produced it.
+        self.refresh()
+
     def analysis_finished(self):
         role = self.worker_role
         self.worker_role = ""
@@ -2211,6 +2784,12 @@ class WorkbenchMixin:
         if role == "intake":
             self.intake_completed()
             return
+        if role == "typing_currency":
+            self.continue_after_currency()
+            return
+        if role == "scheme_import":
+            self.dropped_scheme_installed()
+            return
         if role == "practice_cohort":
             self.practice_cohort_ready()
             return
@@ -2222,6 +2801,11 @@ class WorkbenchMixin:
             else:
                 self._run_plan = {}
             return
+        if role == "analysis":
+            # An isolate that has just been typed again is no longer answered by the
+            # verdict that sent it into this run, so that verdict is dropped.
+            self._typing_verdicts = {key: decision for key, decision in self._typing_verdicts.items()
+                                     if key[1] not in self._run_ids}
         if role == "analysis" and not self._run_cancelled:
             managed = [s for s in self.project.samples() if s["id"] in self._run_ids and s["status"] == "completed"
                        and s.get("metadata", {}).get("workflow", {}).get("managed")]
@@ -2236,7 +2820,16 @@ class WorkbenchMixin:
                 self.launch_task(organize, "organize", self.refile_completed)
                 return
         if role in {"analysis", "organize"}:
-            if self._run_plan.get("hydra") and not self._run_cancelled and (role != "organize" or self._task_succeeded):
+            usable = not self._run_cancelled and (role != "organize" or self._task_succeeded)
+            # cgMLST first, because it is a typing run this launch also asked for and
+            # HYDRA screens whatever assemblies the launch ends with. The flag is
+            # taken off the plan before launching so the chain runs once.
+            if usable and self._run_plan.get("cgmlst"):
+                plan = dict(self._run_plan)
+                self._run_plan = {**plan, "cgmlst": False}
+                if self.run_cgmlst_plan(self._run_ids, plan):
+                    return
+            if self._run_plan.get("hydra") and usable:
                 self.run_hydra_plan(self._run_ids, self._run_plan)
             self._run_plan = {}
 
@@ -2253,11 +2846,22 @@ class WorkbenchMixin:
         bundled = getattr(hydra_runtime, "bundled_database_root", lambda: None)()
         return str(bundled or self.root / "references" / "hydra")
 
-    def review_run_plan(self, samples, scheme=None, hydra=False, assemble=False):
+    def review_run_plan(self, samples, scheme=None, hydra=False, assemble=False, cgmlst=False):
+        """The one launch review: what runs, on which isolates, against which references.
+
+        cgMLST sits here beside HYDRA because the user asked for it in the same
+        place: one launch can produce a seven-locus ST and a core-genome profile,
+        and they stay two separate measurements against two separate schemes. The
+        dialog refuses a cgMLST scheme the cohort's organism contradicts, naming
+        the organism the target set was defined on.
+        """
         from wmlstudio.analysis_plan import RunPlanDialog
-        dialog = RunPlanDialog(samples, scheme, self.active_amr_database(), self)
+        dialog = RunPlanDialog(samples, scheme, self.active_amr_database(), self,
+                               data_root=self.root)
         dialog.hydra.setChecked(hydra)
         dialog.assemble.setChecked(assemble)
+        if cgmlst and dialog.cgmlst.isEnabled():
+            dialog.cgmlst.setChecked(True)
         if hydra:
             dialog.assemble.setEnabled(False)
         dialog.manageDatabases.connect(lambda: self.manage_run_databases(dialog))
@@ -2265,7 +2869,32 @@ class WorkbenchMixin:
             return None
         if dialog.plan.get("hydra"):
             self.project.set_setting("hydra_database_root", dialog.plan["db_root"])
+        self.remember_run_flags(samples, dialog.plan)
         return dialog.plan
+
+    def remember_run_flags(self, samples, plan):
+        """Keep the run flags and the chosen cgMLST scheme on the samples themselves.
+
+        These are configuration, not a one-off: a cohort the user decided should be
+        screened for AMR and called against one cgMLST target set arrives at the
+        next launch already saying so, instead of being asked again. They are
+        workflow-only fields, so recording them never invalidates a stored result.
+        """
+        from wmlstudio.storage import set_sample_configuration
+        chosen = plan.get("cgmlst_scheme") or {}
+        changes = {"run_hydra": bool(plan.get("hydra")), "run_cgmlst": bool(plan.get("cgmlst")),
+                   "cgmlst_scheme_key": chosen.get("key") or None,
+                   "cgmlst_scheme_path": chosen.get("path") or None}
+        identifiers = [sample["id"] for sample in samples if sample.get("id")]
+        if not identifiers:
+            return {}
+        try:
+            return set_sample_configuration(self.project, identifiers, changes,
+                                            surface="Run plan")
+        except (KeyError, ValueError) as error:
+            # Remembering a preference must never stop a run the user just approved.
+            self.notify(f"The run starts, but this choice could not be saved on the samples: {error}")
+            return {}
 
     def manage_run_databases(self, plan_dialog):
         from wmlstudio.amr_databases import AMRDatabaseDialog
@@ -2283,10 +2912,41 @@ class WorkbenchMixin:
         if not samples:
             self.notify("Select assembly samples in the Samples menu first.")
             return
-        plan = self.review_run_plan(samples, hydra=True)
-        if plan and plan.get("hydra"):
-            self._run_cancelled = False
-            self.run_hydra_plan({sample["id"] for sample in samples}, plan, require_completed=False)
+        self.start_reviewed_plan(samples, self.review_run_plan(samples, hydra=True))
+
+    def run_cgmlst_plan(self, identifiers, plan):
+        """Call cgMLST on this run's isolates, against the target set the plan named.
+
+        This is the second half of the run-cgMLST flag the user asked for beside
+        run-HYDRA: one launch, two measurements. The profile is stored under its own
+        typing kind against its own scheme, so a core-genome distance and the
+        seven-locus ST this run also produced never share a scale or a threshold.
+        Returns False when there was nothing it could honestly call.
+        """
+        chosen = plan.get("cgmlst_scheme") or {}
+        path = self.installed_scheme_path(chosen.get("path") or "")
+        if not path:
+            self.notify("No installed cgMLST scheme was chosen, so no cgMLST profile was called.")
+            return False
+        samples = [sample for sample in self.project.samples()
+                   if sample["id"] in identifiers and sample.get("input_path")
+                   and input_kind(sample) == "assembly" and not sample.get("missing_input")]
+        if not samples:
+            self.notify("No assembled isolate in this run could be called against the cgMLST "
+                        "scheme. Reads are never typed directly; assemble them first.")
+            return False
+        prepared = [dict(sample, metadata={**(sample.get("metadata") or {}), "workflow": {
+            **((sample.get("metadata") or {}).get("workflow") or {}),
+            "typing_mode": "manual", "scheme_path": path}}) for sample in samples]
+        targets = chosen.get("locus_count")
+        self._run_ids = {sample["id"] for sample in prepared}
+        self.notify(f"cgMLST on {len(prepared)} isolates against "
+                    f"{chosen.get('scheme_name') or Path(path).name}"
+                    + (f" · {targets} targets" if targets else "")
+                    + ". A cgMLST distance and a seven-locus distance are different quantities "
+                      "against different schemes.")
+        self.begin_typing(prepared, None, remember=False)
+        return True
 
     def run_hydra_plan(self, identifiers, plan, require_completed=True):
         from wmlstudio.hydra_runtime import run_assemblies
@@ -2541,7 +3201,7 @@ class WorkbenchMixin:
         if not samples:
             return
         from wmlstudio.workflow_dialogs import BatchAssignmentDialog
-        dialog = BatchAssignmentDialog(samples, self.scheme_entries(), self)
+        dialog = BatchAssignmentDialog(samples, self.scheme_entries(CLASSICAL_KINDS), self)
         if dialog.exec() != QDialog.DialogCode.Accepted:
             return
         self.apply_organism_assignments(dialog.assignments)
@@ -2557,7 +3217,7 @@ class WorkbenchMixin:
     def context_assign_scheme(self, selection):
         if self.busy():
             return
-        entries = self.scheme_entries()
+        entries = self.scheme_entries(CLASSICAL_KINDS)
         samples = self.context_records(selection)
         if not entries or not samples:
             self.notify("No typing schemes are installed. Use Data ▸ Online scheme catalog first.")
@@ -2850,6 +3510,7 @@ class WorkbenchMixin:
         action(samples, "Highlight cluster…", self.highlight_selected)
         action(samples, "Select visible", self.select_visible_samples)
         action(samples, "Clear selection", self.clear_sample_selection)
+        action(samples, "Clear this tab (selection, search and filters)", self.clear_step)
         action(samples, "Relink input (same bytes)…", self.relink_selected_input)
         action(samples, "Re-file managed copies now…", self.refile_selected)
         action(samples, "Attach original reads to assemblies…", self.attach_reads_selected)
@@ -3018,10 +3679,7 @@ class WorkbenchMixin:
         if dialog.exec() != QDialog.DialogCode.Accepted:
             return
         chosen = [sample for sample in samples if sample["id"] in dialog.selected_ids]
-        plan = self.review_run_plan(chosen, hydra=True)
-        if plan and plan.get("hydra"):
-            self._run_cancelled = False
-            self.run_hydra_plan(dialog.selected_ids, plan, require_completed=False)
+        self.start_reviewed_plan(chosen, self.review_run_plan(chosen, hydra=True))
 
     def build_schemes(self):
         super().build_schemes()

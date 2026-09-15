@@ -385,6 +385,18 @@ def isolate_record(identifier='iso-1', name='Isolate 1', genus='Staphylococcus',
             'result': {'kind': 'fasta'}}
 
 
+def test_a_core_genome_profile_is_never_printed_as_a_classical_sequence_type():
+    from wmlstudio.ui_characterization import classical_st
+
+    seven = {"result": {"st": "258", "alleles": dict.fromkeys(
+        ("adk", "fumC", "gyrB", "icd", "mdh", "purA", "recA"), "1")}}
+    core = {"result": {"st": "9001", "alleles": {f"locus{index:04d}": "1" for index in range(40)}}}
+
+    assert classical_st(seven) == "258"
+    assert classical_st(core) == "Not a classical ST — core-genome typing over 40 targets"
+    assert classical_st({}) == ""
+
+
 def test_a_characterization_run_is_refused_when_hydra_has_no_reference_data(qtbot, tmp_path):
     """Refuse up front instead of failing each isolate after its other assays ran."""
     from wmlstudio.ui_characterization import CharacterizationPlanDialog

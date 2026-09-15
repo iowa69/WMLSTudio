@@ -504,6 +504,67 @@ def test_the_summary_falls_back_to_the_focused_isolates_and_names_where_they_cam
     assert window.test_errors == []
 
 
+def test_the_reports_page_names_the_typing_the_report_will_be_about(window, qtbot, tmp_path):
+    """A cgMLST report and an MLST report must never be mistakable for one another."""
+    ids = [add_isolate(window, name, vector) for name, vector in
+           [("ward-A-001", "1111"), ("ward-A-002", "2111")]]
+    build_comparison(window, ids)
+    window.report_ids = set(ids)
+    window._report_investigation_snapshot = window._current_snapshot
+    window.refresh_report_table()
+
+    line = window.report_typing_label.text()
+    assert "classical MLST over 4 loci" in line
+    assert "Ward panel · 4 targets in the reference" in line
+    assert "The threshold in force is a local setting, not a published cutoff" in line
+    assert "they share no scale, no column and no threshold" in line
+    assert window.report_typing_kind() == "mlst"
+    assert window.report_filename("report", "pdf") == "wmlstudio-mlst-report.pdf"
+    assert window.pdf_title_suffix() == " — classical MLST, 4 targets"
+
+    # The same page, a core-genome comparison: a different quantity, said so in
+    # the sentence, in the offered filename and in the PDF's own title.
+    core = [core_record("a", targets=40), core_record("b", targets=40, differences=3)]
+    window._report_investigation_snapshot = snapshot_for(core)
+    window.refresh_report_table()
+
+    assert "core-genome typing over 40 targets" in window.report_typing_label.text()
+    assert window.report_typing_kind() == "cgmlst"
+    assert window.report_filename("report", "pdf") == "wmlstudio-cgmlst-report.pdf"
+    assert window.pdf_title_suffix() == " — cgMLST, 40 targets"
+    assert window.pdf_title_suffix(full_project=True) == "", "a whole-project export states no one scale"
+    assert window.test_errors == []
+
+
+def test_a_report_with_no_comparison_says_so_instead_of_naming_a_typing(window):
+    add_isolate(window, "ward-A-001")
+    window.refresh()
+    window.report_ids = {s["id"] for s in window.project.samples()}
+    window.refresh_report_table()
+
+    assert window.report_typing() is None
+    assert "No comparison is attached to this report" in window.report_typing_label.text()
+    assert "not a statement that the isolates are unrelated" in window.report_typing_label.text()
+    assert window.report_filename("summary", "pdf") == "wmlstudio-summary.pdf"
+    assert window.pdf_title_suffix() == ""
+    assert window.test_errors == []
+
+
+def test_the_simple_summary_offers_a_filename_that_names_its_typing(window, qtbot, monkeypatch):
+    ids = [add_isolate(window, name, vector) for name, vector in
+           [("ward-A-001", "1111"), ("ward-A-002", "2111")]]
+    build_comparison(window, ids)
+    window.report_ids = set(ids)
+    window.refresh_report_table()
+    offered = []
+    monkeypatch.setattr("wmlstudio.ui_reports.QFileDialog.getSaveFileName",
+                        lambda *args: offered.append(args[2]) or ("", ""))
+    window.simple_report(None, build_comparison=False)
+
+    assert offered == ["wmlstudio-mlst-summary.pdf"]
+    assert window.test_errors == []
+
+
 def test_right_click_on_the_report_table_changes_only_this_reports_scope(window, qtbot):
     from wmlstudio.context_menus import SEPARATOR, Selection
     first = add_isolate(window, "ward-A-001")

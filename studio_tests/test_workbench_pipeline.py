@@ -3,6 +3,7 @@
 import hashlib
 import json
 import time
+from pathlib import Path
 
 import pytest
 from PySide6.QtWidgets import QDialog
@@ -254,3 +255,136 @@ def test_stale_amr_is_visible_as_archived_not_current_matrix_or_report(window, t
     html = destination.read_text()
     assert "Archived metadata (old AMR evidence, not current calls)" in html
     assert "earlier or different input" in html
+
+
+# --- run cgMLST beside run HYDRA, from one launch ---------------------------
+
+
+def cg_scheme(window, loci=40):
+    """An installed core-genome scheme: enough targets to be cgMLST, not seven loci.
+
+    Its path is read back after the library has been prepared, because a cgMLST
+    scheme is moved into the cgMLST library and a test must not pin the folder it
+    was staged in.
+    """
+    folder = window.root / "schemes" / "kp_core"
+    folder.mkdir(parents=True)
+    for index in range(loci):
+        (folder / f"core{index:04d}.tfa").write_text(f">core{index:04d}_1\n{ARC}\n")
+    (folder / "scheme.json").write_text(json.dumps(
+        {"name": "kp_core", "type": "cgMLST",
+         "organism": {"genus": "Klebsiella", "species": "pneumoniae"}}))
+    window.populate_schemes()
+    return Path(window.installed_scheme_path(str(folder)))
+
+
+def test_the_launch_plan_refuses_a_cgmlst_scheme_the_cohort_contradicts(qtbot):
+    """A cgMLST target set is defined for one organism; another genus is refused by name."""
+    rows = [{"key": "kp_core", "organism": "Klebsiella pneumoniae", "genus": "Klebsiella",
+             "species": "pneumoniae", "scheme_name": "kp cgMLST", "locus_count": 2358,
+             "path": "/installed/kp_core", "ready": True}]
+    samples = [{"id": "one", "name": "an E. coli isolate",
+                "metadata": {"organism": {"genus": "Escherichia", "species": "coli"}}}]
+    dialog = RunPlanDialog(samples, cgmlst_schemes=rows)
+    qtbot.addWidget(dialog)
+
+    assert dialog.cgmlst.isEnabled(), "an installed cgMLST scheme is offerable"
+    dialog.cgmlst.setChecked(True)
+    dialog.accept()
+
+    assert dialog.result() != QDialog.DialogCode.Accepted
+    refusal = dialog.feedback.text()
+    assert "Klebsiella pneumoniae" in refusal and "an E. coli isolate" in refusal
+    assert "never crosses organisms" in refusal and "Nothing was run" in refusal
+
+    samples[0]["metadata"]["organism"] = {"genus": "Klebsiella", "species": "pneumoniae"}
+    dialog.accept()
+    assert dialog.plan["cgmlst"] is True
+    assert dialog.plan["cgmlst_scheme"]["path"] == "/installed/kp_core"
+    assert dialog.plan["hydra"] is False, "the two flags are independent"
+
+
+def test_one_launch_produces_a_seven_locus_st_and_a_separate_cgmlst_profile(window, qtbot, tmp_path, monkeypatch):
+    import wmlstudio.jobs as jobs
+    source = tmp_path / "isolate.fasta"
+    source.write_text(f">a\n{ARC}\n>b\n{GYR}\n")
+    seven = scheme(window.root)
+    core = cg_scheme(window)
+    window.import_assignments([{"path": str(source), "typing_mode": "manual",
+                                "scheme_path": str(seven), "genus": "Klebsiella",
+                                "species": "pneumoniae"}], {"managed": True})
+    idle(qtbot, window)
+    identifier = window.project.samples()[0]["id"]
+    chosen = {"key": "kp_core", "organism": "Klebsiella pneumoniae", "scheme_name": "kp cgMLST",
+              "locus_count": 40, "path": str(core)}
+
+    def call_core(path, loaded, cancelled=None, progress=None, **options):
+        assert loaded.path == core, "the cgMLST run uses the scheme the plan named"
+        targets = {locus: (str(index + 1) if index < 36 else None)
+                   for index, locus in enumerate(loaded.loci)}
+        return {"kind": "fasta", "status": "complete", "st": None, "scheme": loaded.name,
+                "scheme_digest": loaded.digest, "alleles": targets,
+                "calls": [{"locus": locus, "allele": allele,
+                           "status": "exact" if allele else "missing"}
+                          for locus, allele in targets.items()]}
+
+    monkeypatch.setattr(jobs, "call_cgassembly", call_core)
+    monkeypatch.setattr(window, "review_run_plan",
+                        lambda *args, **kwargs: {"cgmlst": True, "cgmlst_scheme": chosen})
+    window.start_analysis(confirm=True, all_samples=True, sample_ids=[identifier])
+    idle(qtbot, window)
+
+    mlst = window.project.latest_analysis(identifier, "mlst")
+    cgmlst = window.project.latest_analysis(identifier, "cgmlst")
+    assert mlst["st"] == "17" and len(mlst["alleles"]) == 2
+    assert cgmlst["st"] is None and len(cgmlst["alleles"]) == 40
+    assert sum(1 for value in cgmlst["alleles"].values() if value) == 36
+    assert mlst["scheme_digest"] != cgmlst["scheme_digest"]
+    # Two measurements, two typing kinds, two denominators. Neither overwrote the
+    # other, and the seven-locus ST is still readable after the core-genome run.
+    kinds = {row["typing_kind"] for row in window.project.analysis_summaries(identifier)}
+    assert kinds == {"mlst", "cgmlst"}
+    assert window.project.get_sample(identifier)["metadata"]["organism"]["genus"] == "Klebsiella"
+    assert window.test_errors == []
+
+
+def test_the_launch_flags_are_remembered_on_the_samples_they_were_chosen_for(window, tmp_path):
+    from wmlstudio.sample_workflow import sample_configuration
+    source = tmp_path / "isolate.fasta"
+    source.write_text(f">a\n{ARC}\n")
+    identifier = window.project.add_sample(source, "kp")
+    samples = window.project.samples()
+
+    window.remember_run_flags(samples, {"hydra": True, "cgmlst": True,
+                                        "cgmlst_scheme": {"key": "kp_core", "path": "/installed/kp"}})
+
+    configuration = sample_configuration(window.project.get_sample(identifier))
+    assert configuration["run_hydra"] is True and configuration["run_cgmlst"] is True
+    assert configuration["cgmlst_scheme_key"] == "kp_core"
+    assert configuration["set_by"]["run_cgmlst"]["surface"] == "Run plan"
+    # Run flags are workflow choices, so recording one never invalidates a result.
+    assert window.project.get_sample(identifier)["status"] == "queued"
+
+
+def test_one_launch_starts_cgmlst_first_then_hydra_and_claims_nothing_it_did_not_run(window, monkeypatch):
+    """The two flags are independent, ordered, and neither is implied by the other."""
+    started = []
+    monkeypatch.setattr(MainWindow, "run_cgmlst_plan",
+                        lambda self, ids, plan: started.append(("cgmlst", sorted(ids))) or True)
+    monkeypatch.setattr(MainWindow, "run_hydra_plan",
+                        lambda self, ids, plan, require_completed=True: started.append(("hydra", sorted(ids))))
+    samples = [{"id": "one", "name": "one"}, {"id": "two", "name": "two"}]
+
+    assert window.start_reviewed_plan(samples, {}) is False
+    assert window.start_reviewed_plan(samples, {"hydra": False, "cgmlst": False}) is False
+    assert started == [], "a plan that asked for nothing starts nothing"
+
+    assert window.start_reviewed_plan(samples, {"hydra": True}) is True
+    assert started == [("hydra", ["one", "two"])]
+
+    started.clear()
+    assert window.start_reviewed_plan(samples, {"cgmlst": True, "hydra": True}) is True
+    # cgMLST goes first and HYDRA is left on the plan for analysis_finished to pick
+    # up, so the AMR screen sees whatever assemblies the launch ends with.
+    assert started == [("cgmlst", ["one", "two"])]
+    assert window._run_plan == {"cgmlst": False, "hydra": True}

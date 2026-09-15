@@ -20,16 +20,66 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from wmlstudio.sample_workflow import cgmlst_scheme_applies, sample_configuration
 from wmlstudio.scheduler import GIB, detect_hardware
-from wmlstudio.ui_common import cell, make_table, organism_for
+from wmlstudio.ui_common import cell, make_table
 from wmlstudio.widgets import label
+
+# A cgMLST run and a classical MLST run are two different quantities produced in
+# one launch, never one analysis with two labels. The chosen cgMLST scheme travels
+# with the flag so the plan says which target set it would call against.
+CGMLST_SCOPE = (
+    "cgMLST is run against the installed target set you choose here, alongside the MLST scheme "
+    "above. The two distances are different quantities: they never share a scale, an axis or a "
+    "threshold, and neither is a phylogeny.")
+
+
+def _cgmlst_choice(row) -> dict:
+    """One offerable cgMLST scheme, flattened from a cgMLST library or catalogue row.
+
+    Both spellings the library uses are accepted -- a catalogue row names itself
+    'key' and 'scheme_name', an installed row 'catalog_key' and 'name' -- so this
+    dialog does not have to care which listing it was handed.
+    """
+    row = row if isinstance(row, dict) else {}
+    installed = row.get("installed") if isinstance(row.get("installed"), dict) else {}
+    return {"key": row.get("key") or row.get("catalog_key"),
+            "organism": str(row.get("organism") or ""),
+            "genus": str(row.get("genus") or ""), "species": str(row.get("species") or ""),
+            "scheme_name": str(row.get("scheme_name") or row.get("name") or ""),
+            "locus_count": installed.get("locus_count") or row.get("locus_count"),
+            "path": str(installed.get("path") or row.get("path") or ""),
+            "ready": bool(row.get("ready", bool(installed)))}
+
+
+def installed_cgmlst_choices(rows=None, data_root=None) -> list[dict]:
+    """The cgMLST schemes this computer can actually run, in the order they were listed.
+
+    A scheme that is catalogued but not installed is not offered: choosing it would
+    promise a run that has no target set behind it. Reading the library is optional,
+    so a caller that already holds the rows -- the cgMLST schemes tab does -- never
+    pays for a second folder scan.
+    """
+    if rows is None:
+        if not data_root:
+            return []
+        from wmlstudio.cgmlst_schemes import library_status
+        try:
+            rows = library_status(data_root)
+        except (OSError, ValueError):
+            return []
+    choices = [_cgmlst_choice(row) for row in rows]
+    return [choice for choice in choices if choice["path"] and choice["key"]]
 
 
 class RunPlanDialog(QDialog):
     manageDatabases = Signal()
 
-    def __init__(self, samples, scheme=None, db_root=None, parent=None):
+    def __init__(self, samples, scheme=None, db_root=None, parent=None, *,
+                 cgmlst_schemes=None, data_root=None):
         super().__init__(parent)
+        self.samples = list(samples)
+        self.cgmlst_choices = installed_cgmlst_choices(cgmlst_schemes, data_root)
         self.setWindowTitle("Review analysis plan")
         self.resize(850, 670)
         self.plan = {}
@@ -53,13 +103,14 @@ class RunPlanDialog(QDialog):
         table.setSortingEnabled(False)
         table.setRowCount(len(samples))
         for row, sample in enumerate(samples):
-            genus, species, _ = organism_for(sample)
-            workflow = sample.get("metadata", {}).get("workflow", {})
+            # Read from the one sample configuration, so this table shows what the
+            # other menus show rather than a second copy of the same choices.
+            configuration = sample_configuration(sample)
             values = [
                 sample["name"],
-                " ".join([genus, species]).strip() or "Unknown",
-                "Scheme override" if scheme else workflow.get("typing_mode", "QC only"),
-                Path(scheme or workflow.get("scheme_path") or "Automatic / not assigned").name,
+                configuration["organism"] or "Unknown",
+                "Scheme override" if scheme else configuration["typing_mode"] or "QC only",
+                Path(scheme or configuration["scheme_path"] or "Automatic / not assigned").name,
             ]
             for column, value in enumerate(values):
                 table.setItem(row, column, cell(value, sample["id"]))
@@ -76,13 +127,33 @@ class RunPlanDialog(QDialog):
         layout.addWidget(self.fastqc)
         layout.addWidget(
             label(
-                "Assemblies follow the assigned MLST workflow; additional cgMLST/wgMLST schemes are selected in Compare. FASTQ inputs receive quality checks unless assembled first.",
+                "Assemblies follow the assigned MLST workflow, and a cgMLST run can be added to the same launch below. FASTQ inputs receive quality checks unless assembled first.",
                 "small",
                 True,
             )
         )
         self.hydra = QCheckBox("Also run HYDRA AMR analysis on the selected assemblies")
         layout.addWidget(self.hydra)
+        self.cgmlst = QCheckBox("Also run cgMLST on the selected assemblies")
+        layout.addWidget(self.cgmlst)
+        self.cgmlst_choice = QComboBox()
+        for choice in self.cgmlst_choices:
+            targets = f"{choice['locus_count']} targets" if choice["locus_count"] else "installed"
+            self.cgmlst_choice.addItem(
+                f"{choice['organism'] or 'Unknown organism'} · {choice['scheme_name']} ({targets})",
+                choice)
+        self.cgmlst.setEnabled(bool(self.cgmlst_choices))
+        if not self.cgmlst_choices:
+            self.cgmlst.setToolTip("No cgMLST scheme is installed yet. Install or download one in "
+                                   "the cgMLST schemes tab, then run it from here.")
+        cgmlst_row = QHBoxLayout()
+        cgmlst_row.addWidget(label("cgMLST scheme", "small", True))
+        cgmlst_row.addWidget(self.cgmlst_choice, 1)
+        layout.addLayout(cgmlst_row)
+        self.cgmlst_choice.setEnabled(False)
+        self.cgmlst.toggled.connect(self.cgmlst_choice.setEnabled)
+        layout.addWidget(label(CGMLST_SCOPE, "small", True))
+        self.restore_sample_flags()
         self.resource_summary = label("", "small", True)
         layout.addWidget(self.resource_summary)
         self.advanced_button = QPushButton("Advanced settings…")
@@ -172,6 +243,31 @@ class RunPlanDialog(QDialog):
         actions.rejected.connect(self.reject)
         outer.addWidget(actions)
 
+    def restore_sample_flags(self):
+        """Open with what the samples themselves already say they want run.
+
+        The flags are part of the one sample configuration, so a cohort that was
+        configured to run cgMLST arrives here already ticked instead of asking again.
+        A flag is honoured only when every selected sample carries it; a mixed
+        selection is left for the person to decide.
+        """
+        configurations = [sample_configuration(sample) for sample in self.samples]
+        if configurations and all(config["run_hydra"] for config in configurations):
+            self.hydra.setChecked(True)
+        keys = {config["cgmlst_scheme_key"] for config in configurations}
+        if not configurations or len(keys) != 1 or not all(config["run_cgmlst"] for config in configurations):
+            return
+        wanted = next(iter(keys))
+        for row in range(self.cgmlst_choice.count()):
+            if (self.cgmlst_choice.itemData(row) or {}).get("key") == wanted:
+                self.cgmlst_choice.setCurrentIndex(row)
+                self.cgmlst.setChecked(self.cgmlst.isEnabled())
+                return
+
+    def selected_cgmlst_scheme(self):
+        """The cgMLST scheme this plan would call against, or None when none is chosen."""
+        return self.cgmlst_choice.currentData() if self.cgmlst.isChecked() else None
+
     def browse_database(self):
         path = QFileDialog.getExistingDirectory(self, "Select HYDRA reference snapshot")
         if path:
@@ -244,10 +340,26 @@ class RunPlanDialog(QDialog):
             except (OSError, ValueError) as exc:
                 self.feedback.setText(str(exc))
                 return
+        cgmlst_scheme = self.selected_cgmlst_scheme()
+        if self.cgmlst.isChecked():
+            # Refuse here, naming the organism the scheme is for, rather than calling
+            # a genome against a target set that was never defined for it.
+            if cgmlst_scheme is None:
+                self.feedback.setText("Choose an installed cgMLST scheme, or clear the cgMLST "
+                                      "option. Nothing was run.")
+                return
+            verdict = cgmlst_scheme_applies(self.samples, cgmlst_scheme)
+            if not verdict["applies"]:
+                self.feedback.setText(verdict["message"] + " Nothing was run.")
+                return
+            if verdict["warnings"]:
+                self.feedback.setText(" ".join([verdict["message"], *verdict["warnings"]]))
         choice = self.database_choice.currentData()
         self.plan = {
             "fastqc": self.fastqc.isChecked(),
             "hydra": self.hydra.isChecked(),
+            "cgmlst": self.cgmlst.isChecked(),
+            "cgmlst_scheme": cgmlst_scheme,
             "assemble": self.assemble.isChecked(),
             "memory_gb": self.memory.value(),
             "db_root": self.database.text(),

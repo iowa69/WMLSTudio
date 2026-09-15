@@ -605,17 +605,27 @@ class PracticeCohortDialog(QDialog):
 
 
 class BatchAssignmentDialog(ImportSamplesDialog):
+    """Edit the organism and typing workflow of samples that are already imported.
+
+    It opens on the one sample configuration — the same values every other menu and
+    submenu shows — rather than on its own reading of the metadata, so a change made
+    anywhere is what this form starts from. An organism only an analysis detected is
+    offered as the current value and becomes an assignment only if the user accepts
+    it here; reading it through never promotes it.
+    """
+
     def __init__(self, samples, scheme_entries=(), parent=None):
+        from wmlstudio.sample_workflow import assigned_organism, sample_configuration
         samples = list(samples)
         super().__init__([sample.get("input_path", "") for sample in samples], scheme_entries, parent)
         self.setWindowTitle("Assign organisms to selected samples")
         self.managed.setChecked(False)
         for assignment, sample in zip(self.assignments, samples, strict=True):
-            metadata = sample.get("metadata", {})
-            workflow = metadata.get("workflow", {})
-            organism = metadata.get("organism", {})
+            configuration = sample_configuration(sample)
+            stored = assigned_organism(sample)
             assignment.update({"sample_id": sample["id"], "name": sample["name"],
-                               "typing_mode": workflow.get("typing_mode", "auto"),
-                               "genus": organism.get("genus", ""), "species": organism.get("species", ""),
-                               "scheme_path": workflow.get("scheme_path")})
+                               "typing_mode": configuration["typing_mode"] or "auto",
+                               "genus": str(stored.get("genus") or ""),
+                               "species": str(stored.get("species") or ""),
+                               "scheme_path": configuration["scheme_path"]})
         self.refresh_table()
