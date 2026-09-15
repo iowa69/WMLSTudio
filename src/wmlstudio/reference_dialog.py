@@ -517,6 +517,10 @@ class ReferenceManagerDialog(QDialog):
         self.catalog_errors = []
         self._close_pending = False
         self._started = time.monotonic()
+        # Where the stage now counting has got to, so a stage that restarts its
+        # count is recognised as a new one and timed from its own start.
+        self._progress_at = 0
+        self._progress_total = 0
         self.setWindowTitle("Scheme libraries — classical MLST and cgMLST")
         self.resize(1080, 760)
         layout = QVBoxLayout(self)
@@ -666,6 +670,7 @@ class ReferenceManagerDialog(QDialog):
         self.refresh_button.setEnabled(False)
         self.cancel_button.setEnabled(True)
         self._started = time.monotonic()
+        self._progress_at, self._progress_total = 0, 0
         self.progress.setRange(0, 0)
         self.worker.start()
 
@@ -674,6 +679,13 @@ class ReferenceManagerDialog(QDialog):
         # naming only the locus it just finished gives no sense of position. Say
         # how far through it is and how long is left, because the difference
         # between "working" and "stuck" is the whole question a user has here.
+        if total != self._progress_total or current < self._progress_at:
+            # A new counted stage. A download that has just spent twenty minutes
+            # extracting must not divide that time by this stage's first locus
+            # and promise hours: each stage is timed from its own start.
+            self._started = time.monotonic()
+            self._progress_total = total
+        self._progress_at = current
         self.progress.setRange(0, max(1, total))
         self.progress.setValue(current)
         self.status.setText(describe_progress(current, total, text,
