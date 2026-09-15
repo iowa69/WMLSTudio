@@ -151,11 +151,20 @@ def test_a_library_lifted_out_of_a_tool_tree_is_not_shipped_beside_the_executabl
     elsewhere.mkdir()
     (elsewhere / "qt6core.dll").write_bytes(b"MZ")
 
-    entries = [("java.dll", str(jre / "java.dll"), "BINARY"),
-               ("jvm.dll", str(jre / "server" / "jvm.dll"), "BINARY"),
-               ("qt6core.dll", str(elsewhere / "qt6core.dll"), "BINARY")]
+    entries = [
+        # The tool's own entries, which must survive: they carry the tool's layout.
+        ("Tools/fastqc/jre/bin/java.dll", str(jre / "java.dll"), "BINARY"),
+        ("Tools/fastqc/jre/bin/server/jvm.dll", str(jre / "server" / "jvm.dll"), "BINARY"),
+        # The lifted copies, at the application root, which could never load.
+        ("java.dll", str(jre / "java.dll"), "BINARY"),
+        ("awt.dll", str(jre / "java.dll"), "BINARY"),
+        # An unrelated library that happens to sit at the root and belongs there.
+        ("qt6core.dll", str(elsewhere / "qt6core.dll"), "BINARY"),
+    ]
     kept = filter_hoisted_tool_binaries(entries, (tmp_path / "fastqc",))
-    assert [entry[0] for entry in kept] == ["qt6core.dll"], "only the tool's own copies are dropped"
+    assert [entry[0] for entry in kept] == [
+        "Tools/fastqc/jre/bin/java.dll", "Tools/fastqc/jre/bin/server/jvm.dll", "qt6core.dll"], \
+        "the tool keeps its own tree; only the root-level duplicates are dropped"
     # The tool tree itself is untouched: it still ships as data, intact.
     assert (jre / "java.dll").is_file() and (jre / "server" / "jvm.dll").is_file()
     # A missing or unreadable source path must not take the whole build down.

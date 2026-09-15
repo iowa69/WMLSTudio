@@ -52,7 +52,14 @@ def filter_hoisted_tool_binaries(entries, tool_roots):
     roots = [Path(root).resolve() for root in tool_roots if root]
     kept = []
     for entry in entries:
+        destination = str(entry[0]).replace("\\", "/")
         source = entry[1] if len(entry) > 1 else None
+        # Only the lifted copy is dropped. The tool's own entry keeps its place
+        # inside the tree (Tools/ska2/ska.exe); the lifted one lands at the
+        # application root with a bare name, which is how the two are told apart.
+        if "/" in destination:
+            kept.append(entry)
+            continue
         try:
             resolved = Path(source).resolve() if source else None
         except (OSError, ValueError):
