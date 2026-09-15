@@ -138,6 +138,8 @@ class SnpTreePanel(QWidget):
         # already reported, never a second pass over the sequences.
         self.result = None
         self.payload = None
+        # True only while a kept arrangement is being put back on the tree.
+        self._restoring = False
         self.cohort = []
         # The cohort alignment this run wrote, when it wrote one: the file a
         # reader takes to a tree builder, since nothing here infers a phylogeny.
@@ -297,6 +299,14 @@ class SnpTreePanel(QWidget):
         self.tree = TreeView()
         self.tree.setMinimumHeight(240)
         self.tree.show_contents({"scale": dict(EMPTY_SCALE)})
+        # Connected after the empty view is drawn, not before: showing contents is
+        # itself a layout change, and saving that one would have overwritten a
+        # reader's kept arrangement with an empty forest every time the page was
+        # built. Without these three the page's own tree emitted its changes into
+        # nothing, so dragging, recolouring or renaming a node survived only until
+        # the forest was next drawn.
+        for signal in ("layoutChanged", "colorsChanged", "labelsChanged"):
+            getattr(self.tree, signal).connect(lambda *_ignored: self.store_arrangement())
         column.addWidget(self.tree, 1)
         column.addWidget(label(NOT_A_PHYLOGENY, "small", True))
         column.addWidget(label(NOT_A_MAXIMUM_LIKELIHOOD_TREE, "small", True))
@@ -651,7 +661,15 @@ class SnpTreePanel(QWidget):
     def _draw_forest(self, payload):
         graph = payload.get("graph") or {}
         records = graph.get("results") or []
-        self.tree.show_contents(graph)
+        # Drawing lays the forest out automatically, which the tree reports as a
+        # layout change like any other. Saving that would overwrite the reader's
+        # own arrangement with the automatic one a moment before it is read back,
+        # so nothing is saved until the kept arrangement is in place.
+        self._restoring = True
+        try:
+            self.tree.show_contents(graph)
+        finally:
+            self._restoring = False
         self._restore_arrangement()
         # "ST unassigned" under every node of a cohort nobody has typed classically
         # reads as a failed typing run. The line is shown only where an ST exists.
@@ -687,16 +705,27 @@ class SnpTreePanel(QWidget):
         count, denominator, edge or group comes back this way, so a rearranged
         picture is the same measurement in a different place on the screen.
         """
+        self._restoring = True
         try:
             self.tree.restore_state(state)
         except ValueError:
             # Presentation state this build does not understand is not evidence;
             # the drawn forest stays exactly as it is rather than half-applying it.
             return None
+        finally:
+            self._restoring = False
         return self.store_arrangement(state)
 
     def store_arrangement(self, state=None):
-        """Remember this page's arrangement in the project, under its own key."""
+        """Remember this page's arrangement in the project, under its own key.
+
+        Silent while an arrangement is being put back, because restoring one
+        makes the tree emit the very signals that ask for it to be saved: the
+        arrangement a reader made was read back, re-exported mid-restore, and
+        overwritten with the automatic layout it was replacing.
+        """
+        if self._restoring:
+            return None
         state = self.tree.export_state() if state is None else state
         project = getattr(self.host, "project", None)
         if project is not None and hasattr(project, "set_setting"):
@@ -714,10 +743,13 @@ class SnpTreePanel(QWidget):
         stored = project.get_setting(GRAPH_STYLE_SETTING, None) if project is not None else None
         if not isinstance(stored, dict) or not stored:
             return None
+        self._restoring = True
         try:
             self.tree.restore_state(stored)
         except ValueError:
             return None
+        finally:
+            self._restoring = False
         return stored
 
     # --- a window of its own -------------------------------------------------

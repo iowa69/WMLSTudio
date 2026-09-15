@@ -1487,6 +1487,10 @@ class ComparisonWorkspaceMixin:
         """Wire one tree, remembering which snapshot its signals speak for."""
         for name, callback in [("colorsChanged", self.persist_graph_style),
                                ("layoutChanged", self.persist_graph_style),
+                               # Renaming a node was the one presentation change
+                               # that was not kept: it survived until the tree was
+                               # next drawn and then reverted, with no sign why.
+                               ("labelsChanged", self.persist_graph_style),
                                ("legendChanged", self.update_graph_legend),
                                ("selectionChanged", self.graph_selection_changed),
                                ("reportRequested", self.report_graph_selection),

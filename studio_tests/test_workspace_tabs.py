@@ -58,7 +58,8 @@ def test_the_bar_reads_as_the_users_own_workflow(tabs):
     shown = [tabs.tabText(position) for position in range(tabs.count())]
     assert shown == [
         "Overview", "Samples", "Read QC", "Assembly", "MLST", "MLST tree", "cgMLST",
-        "cgMLST tree", "SNP tree", "HYDRA", "Report", "Update", "Schemes", "Settings"]
+        "cgMLST tree", "SNP tree", "HYDRA", "Plasmids", "Report", "Update", "Schemes",
+        "Settings"]
     # A seven-locus tree and a cgMLST tree are different quantities, so they are
     # different tabs and neither label can be mistaken for the other.
     assert shown.index("MLST tree") < shown.index("cgMLST") < shown.index("cgMLST tree")
@@ -658,21 +659,34 @@ def test_the_scheme_library_names_each_scheme_and_says_which_kind_it_is(window):
             assert kind in title or " · " in title, title
 
 
-def test_the_tab_bar_reaches_every_page_on_the_narrowest_supported_window(window, qtbot):
-    """Thirteen tabs must stay readable, and every page reachable, at 1000x680."""
+def test_there_is_always_exactly_one_navigation_on_screen(window, qtbot):
+    """A narrow window once had none at all, which is worse than either.
+
+    The workflow down the side stands down below 1180 px to give a small screen
+    its whole width. The tab bar was hidden behind it. Together that left a
+    1000 px window with no way to reach any page but the one already open.
+    """
     window.resize(1000, 680)
     # Hiding the sidebar happens in resizeEvent; the layout that gives its width
     # to the tabs runs on the next pass, so wait for the settled geometry.
     qtbot.waitUntil(lambda: not window.sidebar.isVisible()
                     and window.pages.width() >= 940, timeout=5000)
-    assert window.pages.tabBar().sizeHint().width() <= window.pages.width()
+    assert window.pages.tabBar().isVisible(), "a narrow window still has to navigate"
     for position, key in enumerate(PIPELINE):
-        assert "…" not in window.pages.tabText(position)
         window.pages.tabBar().setCurrentIndex(position)
         assert window.pages.current_key() == key
+
     window.resize(1380, 940)
     qtbot.waitUntil(lambda: window.sidebar.isVisible(), timeout=5000)
-    assert window.pages.tabBar().sizeHint().width() <= window.pages.width()
+    # Wide again: the workflow is on the left, and the bar stands down rather
+    # than offering the same fifteen pages twice.
+    assert not window.pages.tabBar().isVisible()
+    assert window.navigator.isVisible()
+    for key, entry in window.nav_entries.items():
+        if ":" in key:
+            continue
+        entry.click()
+        assert window.pages.current_key() == key
 
 
 def test_the_sidebar_stands_down_before_a_tab_goes_behind_a_scroll_arrow(window, qtbot):
