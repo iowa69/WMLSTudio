@@ -16,7 +16,13 @@ import threading
 from pathlib import Path
 
 from .characterization_refs import validate_characterization_references
-from .organism_modules import OrganismMatch, OrganismModule, register
+from .organism_modules import (
+    OrganismMatch,
+    OrganismModule,
+    blank_sentence,
+    blank_summary,
+    register,
+)
 from .sequence import AnalysisCancelled, SequenceError, check_cancelled, file_sha256, file_signature
 from .typing import SchemeError, call_assembly, load_scheme
 
@@ -95,7 +101,7 @@ def type_virulence_loci(path, reference_root, cancelled=None, progress=None, *, 
     manifest = validate_characterization_references(root, cancelled=cancelled)
     section = manifest.get('locus_profiles') or {}
     if not section:
-        return {'status': 'not_run',
+        return {'status': 'not_run', 'not_run_kind': 'reference_missing',
                 'reason': 'This reference snapshot carries no Kleborate locus-ST profile tables. Install an '
                           'updated characterization snapshot.'}
     path = Path(path).resolve()
@@ -160,7 +166,7 @@ def type_capsule_markers(path, reference_root, cancelled=None, progress=None, *,
     section = manifest.get('capsule') or {}
     entries = section.get('loci') or []
     if not entries:
-        return {'status': 'not_run',
+        return {'status': 'not_run', 'not_run_kind': 'reference_missing',
                 'reason': 'This reference snapshot carries no wzi/wzc capsule marker panel. Install an '
                           'updated characterization snapshot.'}
     directories = {(root / entry['path']).parent for entry in entries}
@@ -200,23 +206,27 @@ def _escape(value):
 
 
 def summarize_locus_sts(evidence):
-    status = (evidence or {}).get('status')
-    if status in (None, 'not_run'):
-        return 'not_run'
-    if status == 'failed':
+    """One cell: the locus STs, or which kind of blank this is, never both meanings."""
+    blank = blank_summary(evidence)
+    if blank:
+        return blank
+    if (evidence or {}).get('status') == 'failed':
         return 'failed'
     parts = [f'{locus} {entry["locus_st"]}' for locus, entry in sorted((evidence.get('loci') or {}).items())
              if entry.get('locus_st')]
     if parts:
         return '; '.join(parts)
-    return 'no locus ST assigned'
+    # The assay ran over every locus and assigned none. That is a result, and it
+    # must not read like the assay that was never offered.
+    return 'screened; no locus ST assigned'
 
 
 def summarize_capsule(evidence):
-    status = (evidence or {}).get('status')
-    if status in (None, 'not_run'):
-        return 'not_run'
-    if status == 'failed':
+    """One cell: the wzi and wzc allele numbers, or which kind of blank this is."""
+    blank = blank_summary(evidence)
+    if blank:
+        return blank
+    if (evidence or {}).get('status') == 'failed':
         return 'failed'
     parts = []
     for gene in ('wzi', 'wzc'):
@@ -231,7 +241,9 @@ def locus_st_html(evidence):
     parts = ['<h4>Klebsiella virulence locus STs (Kleborate reference data)</h4>',
              '<p><b>Result:</b> ' + _escape(summarize_locus_sts(evidence)) + ' &middot; status ' + _escape(status) + '</p>']
     if status in {'not_run', 'failed'}:
-        parts.append('<p>' + _escape(evidence.get('reason') or 'This assay was not run for this isolate.') + '</p>')
+        parts.append('<p>' + _escape(blank_sentence(evidence)
+                                     or evidence.get('reason')
+                                     or 'This assay was not run for this isolate.') + '</p>')
     else:
         parts.append('<p><b>Applicability:</b> ' + _escape(evidence.get('applicability') or 'unknown_organism') +
                      ' &middot; ' + _escape(evidence.get('applicability_reason') or '') + '</p>')
@@ -252,7 +264,9 @@ def capsule_html(evidence):
     parts = ['<h4>Klebsiella wzi / wzc capsule markers (Kaptive reference data)</h4>',
              '<p><b>Result:</b> ' + _escape(summarize_capsule(evidence)) + ' &middot; status ' + _escape(status) + '</p>']
     if status in {'not_run', 'failed'}:
-        parts.append('<p>' + _escape(evidence.get('reason') or 'This assay was not run for this isolate.') + '</p>')
+        parts.append('<p>' + _escape(blank_sentence(evidence)
+                                     or evidence.get('reason')
+                                     or 'This assay was not run for this isolate.') + '</p>')
     else:
         parts.append('<p><b>Applicability:</b> ' + _escape(evidence.get('applicability') or 'unknown_organism') +
                      ' &middot; ' + _escape(evidence.get('applicability_reason') or '') + '</p>')

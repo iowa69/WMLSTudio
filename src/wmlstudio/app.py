@@ -61,6 +61,11 @@ from wmlstudio.ui_tabs import (
 from wmlstudio.widgets import DropZone, Helix, Metric, TreeView, button, card, label
 from wmlstudio.workspace_focus import CohortLedger, FocusBar, FocusBus
 
+#: The gap between the workspace and each edge of the window. Read by the sidebar
+#: decision as well, so the two can never disagree about how much room the tab bar
+#: actually has.
+WORKSPACE_GUTTER = 16
+
 FILE_FILTER = "Sequence files (*.fasta *.fa *.fna *.fastq *.fq *.gz *.bz2);;All files (*)"
 STATUS_TEXT = {
     "queued": "Ready", "running": "Analysing", "completed": "Complete",
@@ -124,7 +129,10 @@ class BaseWindow(QMainWindow):
         body = QVBoxLayout()
         # The tab bar and the per-tab orientation strip both cost vertical space;
         # the margins pay for them so the comparison graph keeps its usable height.
-        body.setContentsMargins(24, 12, 24, 10)
+        # The side gutter is WORKSPACE_GUTTER rather than the old 24: fourteen tabs
+        # have to be drawn whole in a 1000 px window, and 16 px of empty margin is
+        # a cheaper thing to give the bar than a tab behind a scroll arrow.
+        body.setContentsMargins(WORKSPACE_GUTTER, 12, WORKSPACE_GUTTER, 10)
         body.setSpacing(12)
         outer.addLayout(body, 1)
         top = QHBoxLayout()
@@ -158,6 +166,10 @@ class BaseWindow(QMainWindow):
         self.build_reports()
         self.build_settings()
         self.build_stations()
+        # Appended after the stations, so the update page takes the next build
+        # number rather than displacing one: every `navigate(<int>)` in this
+        # application still means the page it has always meant.
+        self.build_update()
         self.install_pipeline_pages()
         self.install_workspace_headers()
         self.fold_duplicate_pages()
@@ -167,6 +179,9 @@ class BaseWindow(QMainWindow):
             ("compare", getattr(self, "refresh_comparison", None)),
             ("reads", getattr(getattr(self, "read_trimming_page", None), "refresh", None)),
             ("assembly", getattr(getattr(self, "assembly_page", None), "refresh", None)),
+            # The first time only, and it reads this computer's folders: opening
+            # the Update tab must never contact a server or look like an analysis.
+            ("update", getattr(getattr(self, "update_center", None), "first_look", None)),
         ) if callable(hook)}
         # The tab widget reports a tab position; navigate speaks keys and
         # build-order numbers, so the bar hands it the key it just showed.
@@ -262,7 +277,7 @@ class BaseWindow(QMainWindow):
         try:
             if not hasattr(self, "sidebar") or not hasattr(self, "pages"):
                 return None
-            room = self.width() - 48 - self.sidebar.width()
+            room = self.width() - 2 * WORKSPACE_GUTTER - self.sidebar.width()
             afford = self.width() >= 1180 and room >= self.pages.minimum_bar_width()
             self.sidebar.setVisible(afford)
             return afford
@@ -475,13 +490,14 @@ class BaseWindow(QMainWindow):
 
     def build_schemes(self):
         _, layout = self.page()
-        self.heading(layout, "Update: schemes and reference databases",
-                     "Local, versioned allele collections for MLST and cgMLST, and the reference "
-                     "snapshots this workspace types and screens against. Each analysis records "
-                     "the database fingerprint it used.")
+        self.heading(layout, "Scheme library",
+                     "The local, versioned allele collections this workspace types against, for "
+                     "MLST and for cgMLST. Every analysis records the scheme fingerprint it used. "
+                     "What is installed, what is published and what an update costs is the Update "
+                     "tab; nothing here contacts a server.")
         row = QHBoxLayout()
         row.addWidget(button("Import a scheme folder", self.import_scheme, True))
-        row.addWidget(button("What is installed, and what can be updated…",
+        row.addWidget(button("What is installed, and what can be updated  →",
                              self.open_update_center))
         row.addStretch()
         row.addWidget(label("No automatic database updates", "badge"))
@@ -580,8 +596,9 @@ class BaseWindow(QMainWindow):
                 content.addWidget(button(text, handler))
         content.addWidget(label("Updates create immutable reference snapshots; results you already have keep their original provenance.", "small", True))
         # One list of everything installable, so a person never has to know which
-        # menu owns which download. The Update menu opens the same page.
-        content.addWidget(button("What is installed, and what can be updated…",
+        # menu owns which download. The Update tab and the Update menu are the same
+        # page; this takes you there rather than opening a second one.
+        content.addWidget(button("What is installed, and what can be updated  →",
                                  self.open_update_center))
         content.addWidget(button("Problem → solution guide", self.open_workflow_guide, True))
         content.addStretch()
@@ -601,6 +618,30 @@ class BaseWindow(QMainWindow):
         self.settings_guide = guide
         self.settings_tabs.addTab(guide, "What this version can and cannot do")
         layout.addWidget(self.settings_tabs, 1)
+
+    def build_update(self):
+        """The Update tab: the update centre itself, not a second copy of it.
+
+        For several releases this tab was the scheme library, so the one button
+        that looked like an update rescanned this computer's scheme folders and no
+        provider was ever asked anything. The page here is the update centre that
+        already existed behind a menu (update_center.UpdateCenter): what is
+        installed, what is published, what an update costs, and one button each.
+        """
+        _, layout = self.page()
+        self.heading(layout, "Updates and installed reference data",
+                     "What is installed here, what each provider publishes today, how much room "
+                     "it takes, and what an update would cost.")
+        from wmlstudio.update_center import UpdateCenter
+        self.update_center = UpdateCenter(self)
+        layout.addWidget(self.update_center, 1)
+        return self.update_center
+
+    def check_for_updates(self):
+        """The Update tab's next step: ask the providers, from wherever it was pressed."""
+        self.navigate("update")
+        centre = getattr(self, "update_center", None)
+        return centre.check_online() if centre is not None else False
 
     # --- the pipeline stations this layout owns ------------------------------
     def build_stations(self):
@@ -906,6 +947,13 @@ class BaseWindow(QMainWindow):
                 table_widget.clearSelection()
         if key == "schemes":
             self.populate_schemes()
+        if key == "update":
+            # Forgets the list and the last check, then reads this computer again.
+            # The record of when a check last reached a provider is kept: it is the
+            # only thing a failed check has left to tell anybody.
+            centre = getattr(self, "update_center", None)
+            if centre is not None:
+                centre.clear()
         if key == "settings":
             tabs = getattr(self, "settings_tabs", None)
             if tabs is not None:
@@ -967,7 +1015,12 @@ class BaseWindow(QMainWindow):
         return menu
 
     def open_update_center(self):
-        """The one page listing everything installable and its installed version."""
+        """The Update tab, from a menu, the command search or another page.
+
+        There is one update centre and it is a tab, so a menu entry takes you to
+        it rather than opening a second copy in a dialog that could disagree with
+        what the tab says.
+        """
         from wmlstudio.update_center import open_update_center
         return open_update_center(self)
 
@@ -976,8 +1029,8 @@ class BaseWindow(QMainWindow):
         from wmlstudio.update_center import MENU_ENTRIES, ROUTES
         bar = self.menuBar()
         menu = QMenu("&Update", self)
-        self.register_command(menu.addAction("What is installed, and what can be updated…",
-                                             self.open_update_center))
+        self.register_command(menu.addAction(
+            "What is installed, and what can be updated (Update tab)", self.open_update_center))
         menu.addSeparator()
         for key, title in MENU_ENTRIES:
             handler = next((getattr(self, name) for name in ROUTES.get(key, ())
@@ -1792,6 +1845,12 @@ class BaseWindow(QMainWindow):
                 self.error(exc)
 
     def closeEvent(self, event):
+        # The Update tab's own probe only reads folders, so it never blocks a
+        # close; it is asked to stop and waited for, so no thread outlives the
+        # window. Anything that downloads runs on the window's worker, below.
+        centre = getattr(self, "update_center", None)
+        if centre is not None:
+            centre.stop()
         if self.worker and self.worker.isRunning():
             self.closing_after_cancel = True
             self.cancel_analysis()

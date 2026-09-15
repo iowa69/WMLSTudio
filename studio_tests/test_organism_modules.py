@@ -63,7 +63,10 @@ def registered():
             summary=lambda evidence: f'{key}:{evidence.get("status")}',
             detail_html=lambda evidence: f'<p>{key}</p>', locus_st_provider=locus_st_provider)
         organism_modules._load()
-        organism_modules.register(module)
+        # Registration returns the module the registry actually holds, whose
+        # summary answers blanks; handing back the unwrapped original would test
+        # something no caller ever sees.
+        module = organism_modules.register(module)
         added.append(key)
         return module
 
@@ -139,6 +142,7 @@ def test_an_unselected_module_reports_not_run_rather_than_being_absent(tmp_path,
     result = characterize_assembly(assembly_at(tmp_path), reference_root=module_panel(tmp_path),
                                    species=False, virulence=False)
     assert result['probe'] == {'status': 'not_run', 'reason': 'Assay not selected.',
+                               'not_run_kind': 'not_selected',
                                'applicability': 'unknown_organism',
                                'applicability_reason': result['probe']['applicability_reason']}
 
@@ -394,7 +398,7 @@ def characterized(window, name, evidence, *, stored='a' * 64):
          'characterization': dict(evidence, input_sha256=stored)})
 
 
-def test_module_columns_read_not_run_and_stale_module_evidence_is_never_shown_as_current(window):
+def test_module_columns_say_which_kind_of_blank_and_stale_evidence_is_never_shown_as_current(window):
     call = {'status': 'completed', 'type': 'IV', 'candidate_types': ['IV'],
             'ccr_complexes': [{'name': 'ccr Type 2', 'state': 'present', 'kind': 'ccr', 'targets': {}}],
             'mec_classes': [{'name': 'mec Class B', 'state': 'present', 'kind': 'mec', 'targets': {}}]}
@@ -412,10 +416,12 @@ def test_module_columns_read_not_run_and_stale_module_evidence_is_never_shown_as
     column = headers.index('SCCmec')
     values = {table.item(row, 0).text(): table.item(row, column).text() for row in range(table.rowCount())}
     assert values['SA-1'] == 'IV (candidate) - ccr2 + mec B'
-    assert values['SA-2'] == 'not_run'
+    # Stale evidence is withheld and the cell says there is nothing current to
+    # show, rather than reusing the word an unselected assay uses.
+    assert values['SA-2'] == 'not recorded'
     # A cassette split across contigs reads as withheld, never as the nearest type.
     assert values['SA-3'] == 'ambiguous - IV withheld'
-    assert values['SA-4'] == 'not_run'
+    assert values['SA-4'] == 'not recorded'
     assert table.horizontalHeaderItem(column).toolTip().startswith('Looks for the ccr and mec marker genes')
 
 
@@ -563,3 +569,59 @@ def test_module_order_does_not_depend_on_which_assay_was_imported_first():
                               cwd=str(Path(importlib.util.find_spec("wmlstudio").origin).parents[2]))
     assert finished.returncode == 0, finished.stderr
     assert finished.stdout.splitlines() == expected
+
+
+def test_the_four_ways_a_result_can_be_absent_are_never_shown_alike(tmp_path, registered):
+    """A blank column is the one place an unasked question looks like a clean isolate."""
+    registered(key='probe', manifest_sections=('sccmec.targets',))
+    module = registered_modules()['probe']
+    root, path = module_panel(tmp_path), assembly_at(tmp_path)
+    unselected = characterize_assembly(path, reference_root=root, species=False, virulence=False)
+    unstocked = characterize_assembly(path, reference_root=root, species=False, virulence=False,
+                                      modules={'probe': True})
+    unchosen = characterize_assembly(path, reference_root=None, species=False, virulence=False,
+                                     modules={'probe': True})
+    klebsiella = {'metadata': {'organism': {'genus': 'Klebsiella', 'species': 'pneumoniae'}}}
+    running, skipped = selection_for_record(klebsiella, {'probe': True})
+    off_panel = record_skipped(characterize_assembly(path, reference_root=root, species=False,
+                                                    virulence=False, modules=running,
+                                                    organism=('Klebsiella', 'pneumoniae')), skipped)
+    answers = {'unselected': module.summary(unselected['probe']),
+               'unstocked': module.summary(unstocked['probe']),
+               'unchosen': module.summary(unchosen['probe']),
+               'off_panel': module.summary(off_panel['probe']),
+               'unrecorded': module.summary({})}
+    assert answers['unselected'] == 'not run: not selected'
+    assert answers['unstocked'] == 'not run: reference not installed'
+    assert answers['unchosen'] == 'not run: reference not installed'
+    assert answers['off_panel'] == 'not run: outside these taxa'
+    assert answers['unrecorded'] == 'not recorded'
+    assert len({answers['unselected'], answers['off_panel'], answers['unrecorded'],
+                answers['unstocked']}) == 4
+    # None of them may read as a screen that ran and found nothing.
+    assert all('not detect' not in answer and 'negative' not in answer
+               for answer in answers.values())
+
+
+def test_a_blank_explains_itself_in_a_sentence_a_reader_can_act_on(tmp_path, registered):
+    registered(key='probe', manifest_sections=('sccmec.targets',))
+    root, path = module_panel(tmp_path), assembly_at(tmp_path)
+    unstocked = characterize_assembly(path, reference_root=root, species=False, virulence=False,
+                                      modules={'probe': True})['probe']
+    sentence = organism_modules.blank_sentence(unstocked)
+    assert 'reference data it needs is not installed' in sentence
+    assert 'sccmec.targets' in sentence and 'not a negative result' in sentence
+    assert organism_modules.blank_sentence({'status': 'completed'}) == ''
+    assert organism_modules.blank_kind({'status': 'completed'}) is None
+    assert 'never run' in organism_modules.blank_sentence({})
+
+
+def test_a_module_summary_never_has_to_answer_for_a_blank_itself(registered):
+    """Registration answers blanks, so every assay gives the same answer to one."""
+    module = registered(key='probe')
+    assert module.summary({}) == 'not recorded'
+    assert module.summary({'status': 'not_run', 'reason': organism_modules.NOT_SELECTED}) == \
+        'not run: not selected'
+    # Results still come from the module's own summary, untouched.
+    assert module.summary({'status': 'completed'}) == 'probe:completed'
+    assert registered_modules()['probe'].summary({'status': 'completed'}) == 'probe:completed'

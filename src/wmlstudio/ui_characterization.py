@@ -6,6 +6,7 @@ import html
 from pathlib import Path
 
 from PySide6.QtCore import Qt, Signal
+from PySide6.QtGui import QColor
 from PySide6.QtWidgets import (
     QCheckBox,
     QComboBox,
@@ -25,6 +26,12 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from wmlstudio.amr_matrix import (
+    NOT_A_PHENOTYPE,
+    build_determinant_matrix,
+    build_mutation_matrix,
+    write_matrix,
+)
 from wmlstudio.context_menus import install_context_menu
 from wmlstudio.journey import characterization_state, isolate_records
 from wmlstudio.organism_modules import (
@@ -42,6 +49,43 @@ from wmlstudio.ui_workbench import CLASSICAL_KINDS
 from wmlstudio.widgets import button, label
 
 HIT_LIMIT = 40
+
+# One background per cell state, dark enough for this theme and separable enough to scan
+# a cohort along. Colour is only a second carrier: every cell also holds the state's own
+# words as its text, so a printed page and a colour-blind reading lose nothing. The
+# ordinary answer of a screen that ran -- not detected -- deliberately has none, and the
+# states that are unknown rather than negative are tinted apart from the ones that are
+# findings.
+DETERMINANT_TINTS = {
+    "detected": "#1D3D33",
+    "detected_partial": "#3A2E1C",
+    "detected_disrupted": "#3B2334",
+    "detected_unclassified": "#2C2440",
+    "not_detected": "",
+    "not_searched": "#25303F",
+    "no_report": "#25303F",
+    "report_not_current": "#3A2230",
+}
+MUTATION_TINTS = {
+    "detected": "#1D3D33",
+    "not_detected": "",
+    "no_catalogue": "#3A2230",
+    "not_searched": "#25303F",
+    "target_not_assessed": "#332A1E",
+    "catalogue_not_recorded": "#25303F",
+    "no_report": "#25303F",
+    "report_not_current": "#3A2230",
+}
+# What each of the two cohort tables is for, above the table rather than in a docstring.
+DETERMINANT_PURPOSE = (
+    "Acquired resistance determinants across the chosen isolates, grouped by the antimicrobial "
+    "class the reference curates each one under. Point mutations are not here: they are separate "
+    "evidence and have their own tab.")
+MUTATION_PURPOSE = (
+    "Catalogued resistance point mutations: the gene, the substitution, and the organism "
+    "catalogue it was read from. A catalogue is curated for one organism, so an isolate whose "
+    "organism has none in the installed release was not screened for mutations at all and says "
+    "so instead of showing a blank.")
 
 
 def organism_line(sample):
@@ -709,6 +753,258 @@ class CharacterizationWorkspaceMixin:
         layout.addWidget(splitter, 1)
         tabs.insertTab(0, panel, "Identity / virulence / plasmid evidence")
         tabs.insertTab(1, self.build_plasmid_cohort(), "Plasmid evidence across the cohort")
+        # The two cohort AMR tables sit beside the existing per-gene matrix rather than
+        # in front of it: one asks which determinants a group of isolates shares, the
+        # other what a single report held.
+        index = next((position for position in range(tabs.count())
+                      if tabs.tabText(position) == "AMR gene matrix"), tabs.count() - 1)
+        tabs.insertTab(index + 1, self.build_determinant_cohort(),
+                       "AMR determinants by class")
+        tabs.insertTab(index + 2, self.build_mutation_cohort(), "Resistance point mutations")
+
+    def build_determinant_cohort(self):
+        """Acquired determinants as one grid: isolates across, determinants down, by class.
+
+        The class column is the axis a microbiologist reads a shared pattern along, so
+        the rows are grouped by it by default and the grouping can be turned off rather
+        than being the only order available. Filtering hides rows and never changes a
+        number: the denominator beside the grid stays the whole cohort.
+        """
+        self.amr_matrices = {}
+        panel = QWidget()
+        layout = QVBoxLayout(panel)
+        layout.addWidget(label(DETERMINANT_PURPOSE, "small", True))
+        layout.addWidget(label(NOT_A_PHENOTYPE, "small", True))
+        controls = FlowLayout()
+        self.determinant_filter = QLineEdit()
+        self.determinant_filter.setPlaceholderText("Find a determinant or a class…")
+        self.determinant_filter.setMinimumWidth(220)
+        self.determinant_filter.textChanged.connect(self.refresh_determinant_rows)
+        controls.addWidget(self.determinant_filter)
+        self.determinant_grouping = QCheckBox("Group rows by antimicrobial class")
+        self.determinant_grouping.setChecked(True)
+        self.determinant_grouping.setToolTip(
+            "Off, the rows are one alphabetical list of determinants. Either way every row "
+            "keeps its class, and no count changes with the order.")
+        self.determinant_grouping.stateChanged.connect(self.refresh_determinant_rows)
+        controls.addWidget(self.determinant_grouping)
+        controls.addWidget(button("Export this matrix…",
+                                  lambda: self.export_amr_matrix("determinants")))
+        layout.addLayout(controls)
+        self.determinant_table = make_table(["Antimicrobial class", "Determinant"])
+        # Deliberately unsortable: a column here is an isolate, and ordering determinants
+        # by one isolate's cell text would sort the rows by a word, not by evidence.
+        self.determinant_table.setSortingEnabled(False)
+        layout.addWidget(self.determinant_table, 1)
+        self.determinant_legend = label("", "small", True)
+        layout.addWidget(self.determinant_legend)
+        self.determinant_scope = label(
+            "Choose evidence isolates to build this matrix.", "small", True)
+        layout.addWidget(self.determinant_scope)
+        return panel
+
+    def build_mutation_cohort(self):
+        """Point mutations, and the plain statement of who has no catalogue to be read from.
+
+        Two tables, never one: the grid is what was found, and the table beneath it is
+        which isolates could be asked at all. An isolate with no curated catalogue for
+        its organism appears in the second table with the reason, so an empty grid is
+        never read as "no mutations in this cohort".
+        """
+        panel = QWidget()
+        layout = QVBoxLayout(panel)
+        layout.addWidget(label(MUTATION_PURPOSE, "small", True))
+        layout.addWidget(label(NOT_A_PHENOTYPE, "small", True))
+        controls = FlowLayout()
+        self.mutation_filter = QLineEdit()
+        self.mutation_filter.setPlaceholderText("Find a gene, a substitution or a class…")
+        self.mutation_filter.setMinimumWidth(220)
+        self.mutation_filter.textChanged.connect(self.refresh_mutation_rows)
+        controls.addWidget(self.mutation_filter)
+        controls.addWidget(button("Export these mutations…",
+                                  lambda: self.export_amr_matrix("point_mutations")))
+        layout.addLayout(controls)
+        splitter = QSplitter(Qt.Orientation.Vertical)
+        grid = QWidget()
+        grid_layout = QVBoxLayout(grid)
+        grid_layout.setContentsMargins(0, 0, 0, 0)
+        self.mutation_table = make_table(["Antimicrobial class", "Gene", "Substitution"])
+        self.mutation_table.setSortingEnabled(False)
+        grid_layout.addWidget(self.mutation_table, 1)
+        self.mutation_legend = label("", "small", True)
+        grid_layout.addWidget(self.mutation_legend)
+        splitter.addWidget(grid)
+        catalogue = QWidget()
+        catalogue_layout = QVBoxLayout(catalogue)
+        catalogue_layout.setContentsMargins(0, 0, 0, 0)
+        catalogue_layout.addWidget(label("Which catalogue each isolate was screened against",
+                                         "cardTitle"))
+        self.mutation_catalogue_note = label("", "small", True)
+        catalogue_layout.addWidget(self.mutation_catalogue_note)
+        self.mutation_catalogue_table = make_table(
+            ["Isolate", "Organism", "Catalogue searched", "What was searched",
+             "AMR evidence state", "Why"])
+        self.mutation_catalogue_table.setSortingEnabled(False)
+        catalogue_layout.addWidget(self.mutation_catalogue_table, 1)
+        splitter.addWidget(catalogue)
+        splitter.setSizes([340, 220])
+        layout.addWidget(splitter, 1)
+        self.mutation_scope = label("Choose evidence isolates to build this table.", "small", True)
+        layout.addWidget(self.mutation_scope)
+        return panel
+
+    def refresh_amr_matrices(self, samples):
+        """Rebuild both cohort tables from the evidence cohort, or empty them honestly."""
+        if not hasattr(self, "determinant_table"):
+            return
+        self.amr_matrices = {}
+        if samples:
+            self.amr_matrices["determinants"] = build_determinant_matrix(samples)
+            self.amr_matrices["point_mutations"] = build_mutation_matrix(samples)
+        self.refresh_determinant_rows()
+        self.refresh_mutation_rows()
+        self.fill_mutation_catalogue()
+
+    def fill_matrix_table(self, widget, table, rows, tints):
+        """Render one built matrix into a widget table: leading columns, then one per isolate."""
+        columns = table["samples"] if table else []
+        headers = [entry["title"] for entry in (table["leading"] if table else ())]
+        widget.setRowCount(0)
+        widget.setColumnCount(len(headers) + len(columns))
+        widget.setHorizontalHeaderLabels(headers + [column["column_title"]
+                                                    for column in columns])
+        for offset, column in enumerate(columns):
+            header = widget.horizontalHeaderItem(len(headers) + offset)
+            if header is not None:
+                scope = column["scope"]
+                header.setToolTip(
+                    f"{column['sample_name']} · {column['organism']}\n"
+                    f"AMR evidence: {scope['status']}. {scope['reason']}\n"
+                    + ("Reference sets searched: " + ", ".join(scope["databases"])
+                       if scope["databases"] else "This report records no reference sets."))
+        widget.setRowCount(len(rows))
+        for index, row in enumerate(rows):
+            values = [row.get(entry["key"], "") for entry in table["leading"]]
+            for position, value in enumerate(values):
+                widget.setItem(index, position, cell(value))
+            for offset, column in enumerate(columns):
+                state = row["cells"][column["sample_id"]]
+                words = table["states"][state["state"]]
+                item = cell(state["display"])
+                item.setToolTip("\n".join(filter(None, [
+                    f"{row['label']} · {column['sample_name']} · {words['label']}",
+                    state["reason"], words["meaning"]])))
+                tint = tints.get(state["state"]) or ""
+                if tint:
+                    item.setBackground(QColor(tint))
+                widget.setItem(index, len(headers) + offset, item)
+
+    @staticmethod
+    def legend_text(table):
+        """The legend is the matrix module's own wording; this page invents no label.
+
+        Written out in words rather than as coloured squares, because the cells
+        themselves are read in words: a legend nobody can read in greyscale would be
+        describing a distinction the table does not depend on.
+        """
+        if not table:
+            return ""
+        return "Cell states · " + " · ".join(
+            f"{table['states'][state]['label']}: {table['state_totals'][state]}"
+            for state in table["state_order"])
+
+    def apply_legend(self, widget, table):
+        widget.setText(self.legend_text(table))
+        widget.setToolTip("\n\n".join(f"{table['states'][state]['label']}: "
+                                      f"{table['states'][state]['meaning']}"
+                                      for state in table["state_order"]) if table else "")
+
+    def visible_matrix_rows(self, table, query):
+        """The rows a filter leaves on screen. Filtering changes no count on the page."""
+        if not table:
+            return []
+        text = str(query or "").strip().casefold()
+        if not text:
+            return list(table["rows"])
+        return [row for row in table["rows"]
+                if any(text in str(row.get(entry["key"], "")).casefold()
+                       for entry in table["leading"])]
+
+    def refresh_determinant_rows(self):
+        table = getattr(self, "amr_matrices", {}).get("determinants")
+        rows = self.visible_matrix_rows(table, self.determinant_filter.text())
+        if table and not self.determinant_grouping.isChecked():
+            rows = sorted(rows, key=lambda row: row["label"].casefold())
+        self.fill_matrix_table(self.determinant_table, table, rows, DETERMINANT_TINTS)
+        self.apply_legend(self.determinant_legend, table)
+        if not table:
+            self.determinant_scope.setText(
+                "No evidence isolate is chosen, so there is nothing to compare. An isolate "
+                "with no AMR report is unknown evidence, not an isolate carrying nothing.")
+            return
+        self.determinant_scope.setText(
+            f"{table['row_count']} determinant(s) across {table['isolate_count']} isolate(s); "
+            f"showing {len(rows)}. {table['denominator_note']} {NOT_A_PHENOTYPE}")
+
+    def refresh_mutation_rows(self):
+        table = getattr(self, "amr_matrices", {}).get("point_mutations")
+        rows = self.visible_matrix_rows(table, self.mutation_filter.text())
+        self.fill_matrix_table(self.mutation_table, table, rows, MUTATION_TINTS)
+        self.apply_legend(self.mutation_legend, table)
+        if not table:
+            self.mutation_scope.setText(
+                "No evidence isolate is chosen, so no point-mutation catalogue was read.")
+            return
+        self.mutation_scope.setText(
+            f"{table['row_count']} catalogued mutation(s) across {table['isolate_count']} "
+            f"isolate(s); showing {len(rows)}. {table['denominator_note']}")
+
+    def fill_mutation_catalogue(self):
+        """Name every isolate's catalogue, including the isolates that have none.
+
+        This table is the reason an empty grid above it cannot be read as a clean
+        cohort: an isolate whose organism the installed release has no catalogue for
+        was never asked the question, and it is listed here saying exactly that.
+        """
+        table = getattr(self, "amr_matrices", {}).get("point_mutations")
+        widget = self.mutation_catalogue_table
+        rows = table["catalogue_coverage"] if table else []
+        self.mutation_catalogue_note.setText(
+            table["catalogue_note"] if table else
+            "Choose evidence isolates to see which of them have a point-mutation catalogue.")
+        widget.setRowCount(len(rows))
+        for index, row in enumerate(rows):
+            values = [row["sample_name"], f"{row['organism']} ({row['organism_source']})",
+                      row["catalogue"], row["level_words"], row["evidence_state"], row["reason"]]
+            for position, value in enumerate(values):
+                item = cell(value, row["sample_id"])
+                if not row["searched"]:
+                    item.setBackground(QColor(MUTATION_TINTS["no_catalogue"]))
+                widget.setItem(index, position, item)
+
+    def write_amr_matrix(self, path, kind="determinants"):
+        """Write one cohort table to a file, with every cell state still in words."""
+        table = getattr(self, "amr_matrices", {}).get(kind)
+        if not table:
+            raise ValueError("Choose evidence isolates before exporting this table; an empty "
+                             "file would read as a cohort with nothing in it.")
+        return write_matrix(table, path)
+
+    def export_amr_matrix(self, kind="determinants"):
+        title = ("Export the AMR determinant matrix" if kind == "determinants"
+                 else "Export the point-mutation table")
+        path, _ = QFileDialog.getSaveFileName(self, title, f"amr-{kind}.tsv",
+                                              "TSV (*.tsv);;CSV (*.csv)")
+        if not path:
+            return
+        try:
+            self.check_output(path)
+            self.write_amr_matrix(path, kind)
+        except Exception as error:
+            self.error(error)
+            return
+        self.notify("Exported the cohort table exactly as it is shown, every cell state in "
+                    "words. Detected, not detected and not asked stay distinct in the file.")
 
     def build_plasmid_cohort(self):
         """Which replicon markers, and which replicon/determinant pairs, recur here.
@@ -827,6 +1123,7 @@ class CharacterizationWorkspaceMixin:
         table.blockSignals(False)
         self.show_characterization_detail()
         self.refresh_plasmid_cohort(samples)
+        self.refresh_amr_matrices(samples)
 
     def show_characterization_detail(self):
         if not hasattr(self, "characterization_table"):

@@ -106,6 +106,47 @@ def current_hydra_evidence(record):
     return evidence if isinstance(evidence, dict) else {}
 
 
+def amr_search_scope(record) -> dict:
+    """What one isolate's stored AMR report was actually able to report, from its own provenance.
+
+    A determinant list means nothing without the question it answered. Which
+    reference sets were read, which release they were, whether point mutations
+    were searched at all and which organism catalogue was chosen are all recorded
+    by the run itself, so they are read back rather than inferred: an older or
+    imported report that recorded none of it says "unrecorded" instead of
+    borrowing the settings of today's run.
+
+    ``point_mutation_level`` is the engine's own answer -- dna_and_protein,
+    protein_only, dna_only, none -- and 'none' is not 'no mutations'. It means
+    the installed release holds no catalogue this isolate could be screened
+    against, which is unknown evidence, not a clean result.
+    """
+    state = hydra_evidence_status(record)
+    evidence = current_hydra_evidence(record)
+    execution = evidence.get('execution_provenance') or {}
+    organism = execution.get('organism') if isinstance(execution.get('organism'), dict) else {}
+    virulence = execution.get('virulence') if isinstance(execution.get('virulence'), dict) else {}
+    release = execution.get('reference_release') if isinstance(execution.get('reference_release'), dict) else {}
+    names = evidence.get('databases')
+    if not isinstance(names, (list, tuple)):
+        snapshot = execution.get('reference_snapshot') or {}
+        names = list((snapshot.get('databases') or {})) if isinstance(snapshot, dict) else []
+    requested = organism.get('point_mutations')
+    return {
+        'status': state['status'], 'reason': state['reason'],
+        'has_evidence': bool(evidence),
+        'databases': sorted({str(name) for name in names if str(name)}),
+        'release': str(release.get('release') or ''),
+        'organism': str(organism.get('resolved') or ''),
+        'organism_requested': str(organism.get('requested') or ''),
+        'point_mutations': bool(requested) if isinstance(requested, bool) else None,
+        'point_mutation_level': str(organism.get('point_mutation_level') or '') or 'unrecorded',
+        'point_mutation_reason': str(organism.get('reason') or ''),
+        'virulence_enabled': bool(virulence['enabled']) if 'enabled' in virulence else None,
+        'virulence_curated': bool(virulence.get('organism_curated')) if virulence else None,
+    }
+
+
 def select_records(records, selected_ids=None):
     records = list(records)
     if selected_ids is None:

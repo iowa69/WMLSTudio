@@ -658,3 +658,252 @@ def test_a_named_database_that_is_absent_stops_the_run_rather_than_quietly_narro
     # The same store, with nothing named, runs on what it has and says what it lost.
     defaulted = runtime.preflight(partial)
     assert defaulted["ready"] is True and defaulted["databases"] == ["ncbi"]
+
+
+# --- what a run could report, and what it could not ---------------------------
+
+def screened(hits, *, databases=("ncbi", "protein"), organism="Klebsiella_pneumoniae",
+             virulence=True, point_mutations=True, level="dna_and_protein"):
+    """One isolate's stored HYDRA evidence, in the shape link_hydra writes it."""
+    return {"hits": list(hits), "databases": list(databases), "execution_provenance": {
+        "organism": {"requested": organism, "resolved": organism, "reason": "",
+                     "point_mutations": point_mutations, "point_mutation_level": level},
+        "virulence": {"requested": "auto", "enabled": virulence, "reason": "",
+                      "organism_curated": bool(organism), "available": True,
+                      "virulence_elements": 1025, "stress_elements": 259}}}
+
+
+def hit(gene, element_type, **extra):
+    return {"gene": gene, "element_type": element_type, "database": "ncbi", "method": "BLASTN",
+            "resolution": "COMPLETE", "primary": True, **extra}
+
+
+def test_every_element_type_is_listed_with_the_reference_sets_that_report_it(tmp_path):
+    """A store that can report nothing about plasmids must say so, not report nothing."""
+    support = runtime.element_type_support(complete_database(tmp_path / "store"))
+    assert sorted(support) == sorted(runtime.ELEMENT_TYPES)
+    assert support["VIRULENCE"]["available"] is True
+    assert support["VIRULENCE"]["searched"] == ["ncbi", "protein"]
+    assert support["PLASMID"]["available"] is False
+    assert support["PLASMID"]["searched"] == []
+    absent = [entry["name"] for entry in support["PLASMID"]["not_installed"]]
+    assert absent == ["plasmidfinder"]
+    assert "plasmidfinder" in support["PLASMID"]["reason"]
+    assert "not a negative result" in support["PLASMID"]["reason"]
+    assert support["PLASMID"]["not_installed"][0]["purpose"]
+    # A widening set that is absent is named beside the type it would have widened.
+    assert "vfdb" in support["VIRULENCE"]["reason"]
+
+
+def test_a_set_that_is_here_but_unselected_is_not_reported_as_missing(tmp_path):
+    store = complete_database(tmp_path / "store")
+    support = runtime.element_type_support(store, databases=["ncbi"])
+    assert support["VIRULENCE"]["searched"] == ["ncbi"]
+    assert support["AMR"]["installed_not_selected"] == ["protein"]
+    narrowed = runtime.element_type_support(store, databases=["protein"])
+    assert narrowed["AMR"]["installed_not_selected"] == ["ncbi"]
+
+
+def test_the_element_source_map_matches_the_engines_own_registry():
+    """Every set is credited only with the element type its own registry declares."""
+    specs, _, error = runtime._registry_specs()
+    if not specs:
+        pytest.skip(error)
+    for name, spec in specs.items():
+        declared = getattr(spec, "element_type", "")
+        listed = {kind for kind, names in runtime.ELEMENT_SOURCES.items() if name in names}
+        if declared in runtime.ELEMENT_SOURCES:
+            assert declared in listed, name
+        else:
+            assert not listed, name
+    # The two AMRFinderPlus catalogues carry more than their registry headline.
+    for name in ("ncbi", "protein"):
+        assert {"AMR", "VIRULENCE", "STRESS"} <= {
+            kind for kind, names in runtime.ELEMENT_SOURCES.items() if name in names}
+
+
+def test_virulence_and_stress_hits_are_surfaced_beside_the_resistance_ones():
+    """The engine returns four kinds of element; reading only one is the bug."""
+    evidence = screened([hit("blaSHV-1", "AMR"), hit("ybtS", "VIRULENCE"),
+                         hit("iucA", "VIRULENCE"), hit("arsB", "STRESS")])
+    result = runtime.element_evidence(evidence)
+    rows = {row["element_type"]: row for row in result["elements"]}
+    assert [row["element_type"] for row in result["elements"]] == list(runtime.ELEMENT_TYPES)
+    assert rows["VIRULENCE"]["status"] == "detected"
+    assert rows["VIRULENCE"]["genes"] == ["iucA", "ybtS"]
+    assert rows["STRESS"]["status"] == "detected" and rows["STRESS"]["genes"] == ["arsB"]
+    assert "not a measured phenotype" in rows["VIRULENCE"]["reason"]
+    assert len(rows["VIRULENCE"]["hits"]) == 2
+
+
+def test_an_element_type_no_searched_set_reports_is_never_shown_as_finding_nothing():
+    evidence = screened([hit("blaSHV-1", "AMR")])
+    rows = {row["element_type"]: row
+            for row in runtime.element_evidence(evidence)["elements"]}
+    assert rows["AMR"]["status"] == "detected"
+    assert rows["VIRULENCE"]["status"] == "none_detected"
+    assert "not proof of absence" in rows["VIRULENCE"]["reason"]
+    # Nothing installed reports replicons, so the blank is explained, not counted.
+    assert rows["PLASMID"]["status"] == "not_searched"
+    assert "plasmidfinder" in rows["PLASMID"]["reason"]
+    assert "not a negative result" in rows["PLASMID"]["reason"]
+    assert rows["PLASMID"]["genes"] == []
+
+
+def test_an_installed_set_that_this_run_skipped_is_distinguished_from_an_absent_one():
+    evidence = screened([hit("blaSHV-1", "AMR")], databases=["ncbi", "protein"])
+    rows = {row["element_type"]: row for row in runtime.element_evidence(
+        evidence, installed=["ncbi", "protein", "plasmidfinder"])["elements"]}
+    assert rows["PLASMID"]["not_installed"] == []
+    assert rows["PLASMID"]["status"] == "not_searched"
+    absent = {row["element_type"]: row
+              for row in runtime.element_evidence(evidence, installed=["ncbi"])["elements"]}
+    assert [entry["name"] for entry in absent["PLASMID"]["not_installed"]] == ["plasmidfinder"]
+
+
+def test_an_isolate_with_no_hydra_result_is_unknown_rather_than_clean():
+    result = runtime.element_evidence({})
+    assert result["linked"] is False
+    assert {row["status"] for row in result["elements"]} == {"no_report"}
+    for row in result["elements"]:
+        assert "unknown, not absent" in row["reason"]
+    assert result["point_mutations"]["status"] == "no_report"
+
+
+def test_limiting_the_protein_search_is_recorded_beside_the_virulence_result():
+    """--no-plus narrows the translated search; the nucleotide genes still count."""
+    evidence = screened([hit("stxA2b", "VIRULENCE")], virulence=False)
+    evidence["execution_provenance"]["virulence"]["reason"] = (
+        "The translated protein search was limited to acquired resistance.")
+    rows = {row["element_type"]: row
+            for row in runtime.element_evidence(evidence)["elements"]}
+    assert rows["VIRULENCE"]["status"] == "detected"
+    assert any("nucleotide catalogue only" in note for note in rows["VIRULENCE"]["caveats"])
+    assert any("limited to acquired resistance" in note for note in rows["VIRULENCE"]["caveats"])
+    curated = runtime.element_evidence(screened([hit("stxA2b", "VIRULENCE")]))
+    virulence = next(row for row in curated["elements"] if row["element_type"] == "VIRULENCE")
+    assert any("curated for 'Klebsiella_pneumoniae'" in note for note in virulence["caveats"])
+    uncurated = runtime.element_evidence(screened([hit("stxA2b", "VIRULENCE")], organism=""))
+    row = next(entry for entry in uncurated["elements"] if entry["element_type"] == "VIRULENCE")
+    assert any("no organism curation" in note for note in row["caveats"])
+
+
+def test_point_mutations_are_reported_apart_from_the_genes_and_name_the_catalogue():
+    mutation = hit("gyrA", "AMR", resolution="POINT", method="POINTX")
+    found = runtime.element_evidence(screened([mutation]))["point_mutations"]
+    assert found["status"] == "detected" and found["genes"] == ["gyrA"]
+    assert found["organism"] == "Klebsiella_pneumoniae"
+    assert "not a susceptibility result" in found["reason"]
+    # A gene-only screen is not an isolate without mutations.
+    none = screened([hit("blaSHV-1", "AMR")], organism="Listeria_monocytogenes", level="none")
+    none["execution_provenance"]["organism"]["reason"] = (
+        "The installed reference release has no catalogue for 'Listeria monocytogenes'.")
+    blank = runtime.element_evidence(none)["point_mutations"]
+    assert blank["status"] == "not_searched"
+    assert "no catalogue" in blank["reason"] and blank["genes"] == []
+    switched_off = runtime.element_evidence(
+        screened([], point_mutations=False, level="none"))["point_mutations"]
+    assert switched_off["status"] == "not_searched"
+    assert "switched off" in switched_off["reason"]
+
+
+def test_point_mutations_without_the_protein_set_say_where_they_would_have_been_read():
+    evidence = screened([hit("blaSHV-1", "AMR")], databases=["ncbi"])
+    mutations = runtime.element_evidence(evidence)["point_mutations"]
+    assert mutations["status"] == "not_searched"
+    assert "protein reference set was not searched" in mutations["reason"]
+
+
+def test_a_searched_catalogue_that_found_no_mutation_is_a_result_not_a_blank():
+    mutations = runtime.element_evidence(screened([hit("blaSHV-1", "AMR")]))["point_mutations"]
+    assert mutations["status"] == "none_detected"
+    assert "Klebsiella_pneumoniae" in mutations["reason"]
+    assert "outside that catalogue are not assessed" in mutations["reason"]
+
+
+def test_element_evidence_reads_the_databases_from_the_recorded_snapshot(tmp_path, monkeypatch):
+    """A stored block with no database list still knows what the run searched."""
+    monkeypatch.setattr(runtime, "runtime_capabilities", lambda db_root=None: capabilities())
+    store = complete_database(tmp_path / "store")
+    assembly = tmp_path / "isolate.fasta"
+    assembly.write_text(">contig\nACGTACGT\n")
+
+    def child(arguments, directory, cancelled=None, progress=None):
+        output = Path(arguments[arguments.index("--outdir") + 1])
+        output.mkdir()
+        (output / "hydra.json").write_text(json.dumps({
+            "hydra_version": "1.4.0", "command": "hydra run", "parameters": {},
+            "samples": [{"sample": "iso", "hits": [hit("ybtS", "VIRULENCE")]}]}))
+        return ["worker", *arguments], "done"
+
+    monkeypatch.setattr(runtime, "_run_child", child)
+    report = runtime.run_assemblies([assembly], store, sample_names=["iso"],
+                                    organism="Klebsiella pneumoniae")
+    stored = {"hits": report["samples"][0]["hits"],
+              "execution_provenance": report["execution_provenance"]}
+    rows = {row["element_type"]: row for row in runtime.element_evidence(stored)["elements"]}
+    assert rows["VIRULENCE"]["searched"] == ["ncbi", "protein"]
+    assert rows["VIRULENCE"]["status"] == "detected"
+
+
+def test_the_drill_down_shows_every_element_type_and_escapes_what_it_was_given():
+    evidence = screened([hit("bla<script>", "AMR", identity_pct=100.0, coverage_pct=100.0),
+                         hit("ybtS", "VIRULENCE", identity_pct=99.4, coverage_pct=100.0)])
+    body = runtime.element_evidence_html(evidence)
+    assert "<script>" not in body and "bla&lt;script&gt;" in body
+    for title in runtime.ELEMENT_TITLES.values():
+        assert title.capitalize() in body
+    assert "Resistance point mutations" in body
+    assert "plasmidfinder" in body and "not a negative result" in body
+    assert "is not AMRFinderPlus, Kleborate, Kaptive or MOB-suite" in body
+    assert "never a measured susceptibility, a virulence phenotype or a plasmid" in body
+    # An isolate with no screen is said to be unknown, not rendered as an empty table.
+    blank = runtime.element_evidence_html({})
+    assert "unknown, not absent" in blank and "<table" not in blank
+
+
+def test_the_drill_down_truncates_a_long_hit_list_and_states_the_total():
+    many = [hit(f"vir{index:03}", "VIRULENCE", identity_pct=90.0 + index / 100,
+                coverage_pct=100.0) for index in range(runtime.HIT_LIMIT + 5)]
+    body = runtime.element_evidence_html(screened(many), limit=runtime.HIT_LIMIT)
+    assert f"highest-identity matches of {runtime.HIT_LIMIT + 5}" in body
+    assert body.count("<tr>") <= runtime.HIT_LIMIT + 4
+
+
+def test_an_imported_report_that_names_no_reference_set_still_reports_its_own_hits():
+    """A hit is decisive; it must never be turned into 'nothing was searched for'."""
+    evidence = {"hits": [hit("ybtS", "VIRULENCE")], "databases": []}
+    rows = {row["element_type"]: row
+            for row in runtime.element_evidence(evidence)["elements"]}
+    assert rows["VIRULENCE"]["status"] == "detected"
+    assert rows["VIRULENCE"]["genes"] == ["ybtS"]
+    assert "this screen's reference data" in rows["VIRULENCE"]["reason"]
+    assert rows["AMR"]["status"] == "not_searched"
+
+
+def test_a_set_is_called_absent_only_when_the_store_was_actually_asked():
+    """Not read is not the same claim as not here, and only one of them is checkable."""
+    evidence = screened([hit("blaSHV-1", "AMR")])
+    unasked = next(row for row in runtime.element_evidence(evidence)["elements"]
+                   if row["element_type"] == "AMR")
+    assert any(note.startswith("Not searched:") for note in unasked["caveats"])
+    asked = next(row for row in runtime.element_evidence(
+        evidence, installed=["ncbi", "protein"])["elements"] if row["element_type"] == "AMR")
+    assert any(note.startswith("Not installed, so not searched:") for note in asked["caveats"])
+
+
+def test_a_protein_only_run_with_the_plus_search_off_looked_for_no_virulence_at_all():
+    """--no-plus makes the protein set report acquired resistance only."""
+    evidence = screened([hit("blaSHV-1", "AMR")], databases=["protein"], virulence=False)
+    rows = {row["element_type"]: row
+            for row in runtime.element_evidence(evidence)["elements"]}
+    assert rows["AMR"]["status"] == "detected"
+    for element_type in ("VIRULENCE", "STRESS"):
+        row = rows[element_type]
+        assert row["status"] == "not_searched", element_type
+        assert row["searched"] == []
+        assert any("none could be reported at all" in note for note in row["caveats"])
+    # With a nucleotide set in the run they are still reported, from that set.
+    both = runtime.element_evidence(screened([hit("stxA2b", "VIRULENCE")], virulence=False))
+    virulence = next(row for row in both["elements"] if row["element_type"] == "VIRULENCE")
+    assert virulence["searched"] == ["ncbi"] and virulence["status"] == "detected"

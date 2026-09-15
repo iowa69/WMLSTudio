@@ -181,6 +181,154 @@ def test_the_evidence_summary_names_the_reference_sets_and_searches_behind_each_
     assert row['Virulence elements searched'] == 'yes, curated for Escherichia'
 
 
+def screened(window, name, *, hits=(), databases=('ncbi', 'protein'), catalogue='Escherichia',
+             level='dna_and_protein', linked=True, current=True):
+    """An isolate carrying a linked AMR report that records what its run could search."""
+    digest = 'a' * 64
+    evidence = {'evidence_input_sha256': digest if current else 'b' * 64, 'source_sample': name,
+                'databases': list(databases), 'hits': list(hits),
+                'execution_provenance': {
+                    'organism': {'requested': 'Escherichia coli', 'resolved': catalogue,
+                                 'point_mutations': True, 'point_mutation_level': level,
+                                 'reason': ''},
+                    'virulence': {'enabled': True, 'organism_curated': True},
+                    'reference_release': {'release': '2026-01-01.1'}}}
+    metadata = {'organism': {'genus': 'Escherichia', 'species': 'coli'}}
+    if linked:
+        metadata['hydra'] = evidence
+    return window.project.add_profile(name, {
+        'sample_name': name, 'st': '20', 'input_sha256': digest, 'scheme': 'MLST',
+        'scheme_digest': 'reference', 'status': 'profile_imported', 'alleles': {'a': '1'}}, metadata)
+
+
+def acquired(gene='blaKPC-2', drug_class='BETA-LACTAM', **changes):
+    return dict({'gene': gene, 'element_type': 'AMR', 'element_subtype': 'AMR', 'primary': True,
+                 'database': 'ncbi', 'class': drug_class, 'subclass': drug_class,
+                 'method': 'BLASTN', 'resolution': 'COMPLETE', 'identity_pct': 100.0,
+                 'coverage_pct': 100.0}, **changes)
+
+
+def mutation(gene='gyrA', note='gyrA_S83L (L)', **changes):
+    return acquired(gene, 'QUINOLONE', element_subtype='POINT', resolution='POINT',
+                    method='POINTX', database='protein', note=note, **changes)
+
+
+def test_the_cohort_matrix_shows_determinants_by_class_with_each_cell_state_in_words(window):
+    """Colour is never the only carrier: the cell text alone has to survive printing."""
+    carrier = screened(window, 'A', hits=[acquired(), acquired('tet(A)', 'TETRACYCLINE')])
+    partial = screened(window, 'B', hits=[acquired(resolution='PARTIAL', method='PARTIALN')])
+    unscreened = screened(window, 'C', linked=False)
+    window.feature_ids = {carrier, partial, unscreened}
+    window.refresh_features()
+
+    tabs = window.evidence_tabs
+    assert any(tabs.tabText(index) == 'AMR determinants by class' for index in range(tabs.count()))
+    table = window.determinant_table
+    headers = [table.horizontalHeaderItem(column).text() for column in range(table.columnCount())]
+    assert headers == ['Antimicrobial class', 'Determinant', 'Reference subclass', 'Detected in',
+                       'A', 'B', 'C']
+    assert table_rows(table) == [
+        ['BETA-LACTAM', 'blaKPC-2', 'BETA-LACTAM', '2 of 2 screened · 1 unknown',
+         'Detected', 'Detected · partial', 'No report'],
+        ['TETRACYCLINE', 'tet(A)', 'TETRACYCLINE', '1 of 2 screened · 1 unknown',
+         'Detected', 'Not detected', 'No report']]
+    # The distinction is carried by the words in the cell, and the tooltip says why.
+    assert 'never an absence' in table.item(0, 6).toolTip()
+    assert 'No linked HYDRA report' in table.item(0, 6).toolTip()
+    assert 'Not a susceptibility result' in window.determinant_scope.text()
+    assert 'Not detected: 1' in window.determinant_legend.text()
+    assert 'No report: 2' in window.determinant_legend.text()
+
+
+def test_filtering_and_ungrouping_the_matrix_changes_no_count_on_the_page(window):
+    window.feature_ids = {screened(window, 'A', hits=[acquired(), acquired('tet(A)',
+                                                                          'TETRACYCLINE')])}
+    window.refresh_features()
+    before = window.determinant_scope.text()
+
+    window.determinant_grouping.setChecked(False)
+    assert [row[1] for row in table_rows(window.determinant_table)] == ['blaKPC-2', 'tet(A)']
+    assert [row[0] for row in table_rows(window.determinant_table)] == ['BETA-LACTAM',
+                                                                       'TETRACYCLINE']
+    window.determinant_filter.setText('tetra')
+    assert [row[1] for row in table_rows(window.determinant_table)] == ['tet(A)']
+    # Only the "showing" count moves: the cohort, the rows and the cell denominator
+    # beside them are what was screened, not what is on screen.
+    after = window.determinant_scope.text()
+    assert '2 determinant(s) across 1 isolate(s); showing 1.' in after
+    assert before.split('showing')[0] == after.split('showing')[0]
+    assert '2 row(s) × 1 isolate(s)' in after and '0 of 2 cells are unknown' in after
+
+
+def test_the_point_mutation_tab_names_the_gene_the_substitution_and_the_catalogue(window):
+    found = screened(window, 'A', hits=[acquired(), mutation()])
+    without = screened(window, 'B', hits=[acquired()], catalogue='', level='none')
+    window.feature_ids = {found, without}
+    window.refresh_features()
+
+    tabs = window.evidence_tabs
+    assert any(tabs.tabText(index) == 'Resistance point mutations' for index in range(tabs.count()))
+    table = window.mutation_table
+    headers = [table.horizontalHeaderItem(column).text() for column in range(table.columnCount())]
+    assert headers == ['Antimicrobial class', 'Gene', 'Substitution', 'Organism catalogue',
+                       'Read from', 'Detected in', 'A', 'B']
+    assert table_rows(table) == [['QUINOLONE', 'gyrA', 'S83L', 'Escherichia',
+                                  'the protein catalogue', '1 of 1 screened · 1 unknown',
+                                  'Detected', 'No catalogue for this organism']]
+    # The acquired gene is not repeated here: the two are different evidence.
+    assert 'blaKPC-2' not in [row[1] for row in table_rows(table)]
+    assert 'No other organism' in table.item(0, 7).toolTip()
+
+
+def test_an_isolate_with_no_curated_catalogue_is_listed_rather_than_left_looking_clean(window):
+    window.feature_ids = {screened(window, 'A', hits=[mutation()]),
+                          screened(window, 'B', catalogue='', level='none'),
+                          screened(window, 'C', linked=False)}
+    window.refresh_features()
+
+    assert '2 of 3 isolate(s) were not screened for point mutations at all' in \
+        window.mutation_catalogue_note.text()
+    rows = table_rows(window.mutation_catalogue_table)
+    assert [row[0] for row in rows] == ['A', 'B', 'C']
+    assert rows[0][2] == 'Escherichia' and 'protein and DNA' in rows[0][3]
+    assert rows[1][2] == 'none chosen' and 'no point-mutation catalogue' in rows[1][3]
+    assert rows[2][4] == 'missing' and 'No linked HYDRA report' in rows[2][5]
+
+
+def test_an_empty_evidence_cohort_says_unknown_rather_than_showing_an_empty_matrix(window):
+    window.feature_ids = set()
+    window.refresh_features()
+
+    assert window.determinant_table.rowCount() == 0
+    assert 'unknown evidence, not an isolate carrying nothing' in window.determinant_scope.text()
+    assert 'no point-mutation catalogue was read' in window.mutation_scope.text()
+    assert 'Choose evidence isolates' in window.mutation_catalogue_note.text()
+    with pytest.raises(ValueError, match='would read as a cohort with nothing in it'):
+        window.write_amr_matrix('unused.tsv', 'determinants')
+
+
+def test_both_cohort_tables_export_with_their_distinctions_intact(window, tmp_path):
+    window.feature_ids = {screened(window, 'A', hits=[acquired(), mutation()]),
+                          screened(window, 'B', linked=False)}
+    window.refresh_features()
+
+    path = tmp_path / 'determinants.tsv'
+    window.write_amr_matrix(path, 'determinants')
+    with path.open(encoding='utf-8-sig') as handle:
+        rows = list(csv.reader(handle, delimiter='\t'))
+    assert rows[0][:2] == ['Antimicrobial class', 'Determinant'] and rows[0][-2:] == ['A', 'B']
+    assert rows[1][:2] == ['BETA-LACTAM', 'blaKPC-2'] and rows[1][-2:] == ['Detected', 'No report']
+    assert 'Not a susceptibility result.' in path.read_text(encoding='utf-8-sig')
+
+    path = tmp_path / 'mutations.tsv'
+    window.write_amr_matrix(path, 'point_mutations')
+    with path.open(encoding='utf-8-sig') as handle:
+        rows = list(csv.reader(handle, delimiter='\t'))
+    assert rows[1][:3] == ['QUINOLONE', 'gyrA', 'S83L']
+    assert rows[1][-2:] == ['Detected', 'No report']
+    assert 'no other organism' in path.read_text(encoding='utf-8-sig').casefold()
+
+
 def test_an_isolate_with_no_current_amr_evidence_says_so_in_every_method_column(window):
     sample_id = sample(window, 'A', 'blaA')
     window.project.set_metadata(sample_id, {'hydra': {'evidence_input_sha256': 'c' * 64,

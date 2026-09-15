@@ -3,7 +3,13 @@ import json
 
 import pytest
 
-from wmlstudio.hydra import HydraImportError, load_hydra_report
+from wmlstudio.hydra import (
+    ELEMENT_TITLES,
+    ELEMENT_TYPES,
+    HydraImportError,
+    is_point_mutation,
+    load_hydra_report,
+)
 
 
 def payload():
@@ -71,6 +77,24 @@ def test_catalogued_heteroresistance_is_distinguished_from_other_variants(tmp_pa
     summary = load_hydra_report(write_report(tmp_path, report))["samples"][0]["summary"]
     assert summary["point_mutations"] == 1
     assert summary["heteroresistant_sites"] == 1
+
+
+def test_the_mutation_predicate_and_the_summary_count_cannot_disagree(tmp_path):
+    report = payload()
+    catalogued = {**report["samples"][0]["hits"][0], "method": "POINTX", "resolution": "POINT"}
+    uncatalogued = {**catalogued, "method": "VARIANTR", "gene": "gyrA"}
+    gene = {**report["samples"][0]["hits"][0], "resolution": "COMPLETE"}
+    report["samples"][0]["hits"] = [catalogued, uncatalogued, gene]
+    sample = load_hydra_report(write_report(tmp_path, report))["samples"][0]
+    assert [is_point_mutation(hit) for hit in sample["hits"]] == [True, False, False]
+    assert sample["summary"]["point_mutations"] == sum(map(is_point_mutation, sample["hits"]))
+
+
+def test_every_element_type_the_engine_reports_is_named_in_plain_words():
+    assert set(ELEMENT_TITLES) == set(ELEMENT_TYPES)
+    assert ELEMENT_TYPES[0] == "AMR" and "PLASMID" in ELEMENT_TYPES
+    for element_type, title in ELEMENT_TITLES.items():
+        assert title and title == title.lower(), element_type
 
 
 @pytest.mark.parametrize("field,value", [
