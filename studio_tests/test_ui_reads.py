@@ -144,6 +144,19 @@ def unavailable(monkeypatch, reason="Native fastp is not staged in this package,
     return reason
 
 
+def available(monkeypatch):
+    """Force fastp present, so a test about trimming behaviour is not about staging.
+
+    fastp has no official Windows binary, so on a Windows package the panel
+    correctly refuses before reaching the logic these tests exercise. Whether the
+    tool is staged is its own question, covered by the tests that call
+    unavailable(); pinning it implicitly makes a test pass on one platform only.
+    """
+    monkeypatch.setattr(read_tools, "runtime_capabilities", lambda root=None: {
+        "available": True, "binary": "/test-only/fastp", "version": read_tools.VERSION,
+        "platform": "test-only", "reason": ""})
+
+
 def buttons(page):
     return [child.text() for child in page.findChildren(QPushButton)]
 
@@ -277,10 +290,10 @@ def test_the_report_button_opens_the_file_fastp_wrote_or_says_there_is_none(
     panel = window.read_trimming_page
     panel.refresh()
     opened = []
-    monkeypatch.setattr(QDesktopServices, "openUrl", lambda url: opened.append(url.toLocalFile()))
+    monkeypatch.setattr(QDesktopServices, "openUrl", lambda url: opened.append(Path(url.toLocalFile())))
     panel.table.selectRow(0)
     panel.open_report()
-    assert opened == [str(tmp_path / "trimmed/fastp.html")]
+    assert opened == [tmp_path / "trimmed" / "fastp.html"]
     # A report that is no longer on this computer is said to be missing, not opened.
     (tmp_path / "trimmed/fastp.html").unlink()
     message = panel.open_report()
@@ -289,6 +302,7 @@ def test_the_report_button_opens_the_file_fastp_wrote_or_says_there_is_none(
 
 
 def test_an_unconfirmed_pairing_runs_nothing_at_all(window, tmp_path, monkeypatch):
+    available(monkeypatch)
     read_pair(window, tmp_path)
 
     class Refused(QDialog):
@@ -307,7 +321,8 @@ def test_an_unconfirmed_pairing_runs_nothing_at_all(window, tmp_path, monkeypatc
     assert window.worker is None or not window.worker.isRunning()
 
 
-def test_one_read_file_on_its_own_is_not_treated_as_a_pair(window, tmp_path):
+def test_one_read_file_on_its_own_is_not_treated_as_a_pair(window, tmp_path, monkeypatch):
+    available(monkeypatch)
     paths, _identifiers = read_pair(window, tmp_path)
     panel = window.read_trimming_page
     panel.refresh()
@@ -324,6 +339,7 @@ def test_one_read_file_on_its_own_is_not_treated_as_a_pair(window, tmp_path):
 def test_trimming_records_every_confirmed_pair_and_then_shows_it(window, tmp_path,
                                                                  qtbot, monkeypatch):
     """The wiring, with a stub engine: a stub never proves that fastp trims."""
+    available(monkeypatch)
     paths, identifiers = read_pair(window, tmp_path)
     report = fastp_report(tmp_path)
     recorded = []
