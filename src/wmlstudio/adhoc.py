@@ -170,7 +170,7 @@ def create_adhoc_scheme(assemblies, library_root, name, *, organism='',
                     'source_sha256': [source['sha256'] for source in sources],
                     'access_notice': 'Local cohort-defined reference-anchored scheme; not a validated public cgMLST nomenclature. No registered STs or transmission threshold.'}
         (stage / 'scheme.json').write_text(json.dumps(metadata, sort_keys=True, indent=2), encoding='utf-8')
-        scheme = load_scheme(stage, cancelled=cancelled)
+        scheme = load_scheme(stage, cancelled=cancelled, sequences=False)
         manifest = {'schema_version': 1, 'created_utc': datetime.now(timezone.utc).isoformat(),
                     'scheme_digest': scheme.digest, 'parameters': parameters, 'sources': sources,
                     'reference_anchor': sources[0], 'locus_count': scheme.locus_count,
@@ -186,7 +186,7 @@ def create_adhoc_scheme(assemblies, library_root, name, *, organism='',
         if created:
             check_cancelled(cancelled)
             os.rename(stage, destination)
-        elif destination.is_symlink() or load_scheme(destination, cancelled=cancelled).digest != scheme.digest:
+        elif destination.is_symlink() or load_scheme(destination, cancelled=cancelled, sequences=False).digest != scheme.digest:
             raise CGTypingError('Existing local snapshot was modified; it will not be overwritten.')
         return {'path': str(destination), 'scheme_digest': scheme.digest,
                 'locus_count': scheme.locus_count, 'excluded_loci': excluded,

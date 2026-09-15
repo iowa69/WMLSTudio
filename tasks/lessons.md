@@ -12,3 +12,11 @@
 - Bundle a core reference whole or not at all: shipping the genes without the
   point mutations makes an unperformed search read like a negative result.
 - An automatic "install everything" must not accept a licence for the user.
+- A dialog says what its own task is. Reusing the analysis wording for a download
+  was reported twice as "the update button performs analysis".
+- Work that finishes must change what the page shows. Telling someone to press
+  Rescan makes a download that worked look like a button that does nothing.
+- Every stage of a long task reports, including the last one. A bar left at 100%
+  while gigabytes are re-read is indistinguishable from a freeze.
+- Verifying a downloaded scheme is not loading one: keep the identifiers, drop
+  the bases. Holding a cgMLST scheme to check it cost ~1.5× its size in RAM.

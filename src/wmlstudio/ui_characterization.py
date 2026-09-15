@@ -1160,13 +1160,16 @@ class CharacterizationWorkspaceMixin:
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No, QMessageBox.StandardButton.No)
         if answer != QMessageBox.StandardButton.Yes:
             return
+        from wmlstudio.analysis_progress import installing
         from wmlstudio.characterization_refs import provision_characterization_references
         root = self.root / "characterization-references"
         project = self.project
         def finished(result):
             project.set_setting("characterization_reference", result["path"])
             self.notify(f"Characterization snapshot installed: {result['species_count']} references. Review characterization to select and run assays.")
-        self.launch_task(lambda cancelled, progress: provision_characterization_references(root, cancelled=cancelled, progress=progress), "characterization_references", finished)
+            self.refresh_update_center()
+        self.launch_task(lambda cancelled, progress: provision_characterization_references(root, cancelled=cancelled, progress=progress), "characterization_references", finished,
+                         caption=installing("the characterization reference snapshot"))
 
     def manage_characterization_databases(self, plan_dialog):
         """Show the whole reference-database list over the plan, then re-read the store.

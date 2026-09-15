@@ -50,18 +50,36 @@ class CatalogError(ValueError):
     """A reference could not be fetched or validated without an unsafe assumption."""
 
 
-def _validated_scheme(path, *, cancelled=None):
+def _validated_scheme(path, *, cancelled=None, progress=None, sequences=False):
     """load_scheme, with its errors reported as catalog errors the caller expects.
 
     A scheme failure during a download is a download failure: callers documented to
     catch CatalogError must not have to catch SchemeError from a lower layer too.
+
+    This is always a check and never a load for typing, so the allele sequences
+    are discarded as they are read. Keeping them made confirming a multi-gigabyte
+    cgMLST download cost about 1.5 times the scheme's own size in memory, with no
+    progress reported for either of the two passes it makes over the files — the
+    downloads that "finish at 100% and then hang" were sitting here.
     """
     try:
-        return load_scheme(path, cancelled=cancelled)
+        return load_scheme(path, cancelled=cancelled, progress=progress, sequences=sequences)
     except (SchemeError, SequenceError) as error:
         raise CatalogError(
             f"The downloaded reference could not be read as a scheme: {error} "
             "Nothing was installed.") from error
+
+
+def _phase(progress, phase):
+    """Prefix a lower layer's progress with the stage of the download it belongs to.
+
+    Both remaining stages count to the same total as the extraction that preceded
+    them, so without the stage named, a bar that has just reached 2,358 of 2,358
+    restarts at 1 of 2,358 with no explanation.
+    """
+    if progress is None:
+        return None
+    return lambda done, total, message: progress(done, total, f"{phase}: {message}")
 
 
 def screen_allele_file(path, locus, *, cancelled=None) -> list[str]:
@@ -553,7 +571,8 @@ class PubMLSTCatalog:
                 "authenticated": False,
             }
             (staging / "scheme.json").write_text(json.dumps(metadata, ensure_ascii=False, sort_keys=True, indent=2), encoding="utf-8")
-            checked = _validated_scheme(staging, cancelled=cancelled)
+            checked = _validated_scheme(staging, cancelled=cancelled,
+                                        progress=_phase(progress, "Checking what was downloaded"))
             if checked.locus_count != current["locus_count"]:
                 raise CatalogError("Downloaded reference loci do not match the online scheme.")
             after = self._json(current["url"], cancelled=cancelled, refresh=True)
@@ -578,7 +597,10 @@ class PubMLSTCatalog:
             occupied = destination.is_dir() and cgmlst_schemes.has_alleles(destination)
             created = not occupied
             if occupied:
-                if _validated_scheme(destination, cancelled=cancelled).digest != checked.digest:
+                existing = _validated_scheme(
+                    destination, cancelled=cancelled,
+                    progress=_phase(progress, "Comparing with the scheme already installed"))
+                if existing.digest != checked.digest:
                     raise CatalogError("Existing reference snapshot was modified; it will not be overwritten.")
                 shutil.rmtree(staging)
             else:
@@ -586,7 +608,8 @@ class PubMLSTCatalog:
                 destination.parent.mkdir(parents=True, exist_ok=True)
                 # The partial folder sits beside the library, so a library root
                 # that is itself a mount point needs a copying move.
-                cgmlst_schemes.install_into(staging, destination)
+                cgmlst_schemes.install_into(staging, destination,
+                                            progress=_phase(progress, "Filing it in your library"))
             staging = None
             notes = list(checked.notes) + _exclusion_notes(excluded_alleles)
             if current["access_notice"] and current["access_notice"] not in notes:
@@ -883,7 +906,15 @@ class CGMLSTOrgCatalog(PubMLSTCatalog):
             # The original archive is redundant after extraction; all its bytes
             # remain auditable through the source hash in the snapshot manifest.
             archive.unlink()
-            checked = _validated_scheme(staging, cancelled=cancelled)
+            if progress:
+                # Extraction has just reported 100%, and what follows reads every
+                # allele file twice more. Said plainly, because a bar sitting full
+                # while gigabytes are re-read is exactly what "it hangs" meant.
+                progress(0, len(expected),
+                         "Every allele file is now read back and fingerprinted before anything "
+                         "is installed")
+            checked = _validated_scheme(staging, cancelled=cancelled,
+                                        progress=_phase(progress, "Checking what was downloaded"))
             source_digest = hashlib.sha256(json.dumps(sources, sort_keys=True).encode()).hexdigest()
             manifest = {"format_version": 1, "provider": "cgMLST.org", "entry": entry,
                         'terms_url': self.TERMS_URL, 'terms_notice': self.TERMS_NOTICE,
@@ -901,10 +932,14 @@ class CGMLSTOrgCatalog(PubMLSTCatalog):
             occupied = destination.is_dir() and cgmlst_schemes.has_alleles(destination)
             created = not occupied
             if occupied:
-                if _validated_scheme(destination, cancelled=cancelled).digest != checked.digest:
+                existing = _validated_scheme(
+                    destination, cancelled=cancelled,
+                    progress=_phase(progress, "Comparing with the scheme already installed"))
+                if existing.digest != checked.digest:
                     raise CatalogError("The existing reference snapshot was modified and will not be overwritten.")
             else:
-                cgmlst_schemes.install_into(staging, destination)
+                cgmlst_schemes.install_into(staging, destination,
+                                            progress=_phase(progress, "Filing it in your library"))
                 staging = None
             return {"path": str(destination), "scheme_digest": checked.digest,
                     "source_digest": source_digest, "created": created,

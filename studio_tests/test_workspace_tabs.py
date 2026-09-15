@@ -904,13 +904,91 @@ def test_a_plan_from_a_failed_check_says_it_is_not_a_clean_bill_of_health(window
 
 def test_an_update_row_uses_the_installer_the_application_already_has(window, qtbot,
                                                                      monkeypatch):
+    """And says which of the two things happened, rather than assuming the good one."""
     centre = update_centre(window, qtbot)
     called = []
     monkeypatch.setattr(type(window), "install_species_panel",
                         lambda self: called.append("species"))
     assert centre.start("species_panel") is True
     assert called == ["species"]
-    assert "Rescan what is installed here" in centre.status.text()
+    # This installer asked and was answered no — nothing started — so the page
+    # says so rather than reporting an install that is not running.
+    assert "Nothing has been installed yet" in centre.status.text()
+    assert centre.working == "", "no row is mid-install when nothing was started"
+
+    # The same press, with the installer actually starting work on the window's
+    # own worker: now the page says what is being installed and locks the rows.
+    def launches(self):
+        called.append("launched")
+        self.launch_task(lambda cancelled, progress: {"species_count": 18}, "species_panel")
+
+    monkeypatch.setattr(type(window), "install_species_panel", launches)
+    assert centre.start("species_panel") is True
+    assert "Installing Species reference panel" in centre.status.text()
+    qtbot.waitUntil(lambda: not window.worker.isRunning(), timeout=60000)
+    settled(window, qtbot)
+    # Finishing re-reads this computer by itself. The reported bug was a species
+    # panel that really did install while its row went on saying "Install…".
+    qtbot.waitUntil(lambda: centre.working == "", timeout=60000)
+
+
+def test_installing_a_reference_set_is_never_announced_as_an_analysis(window, qtbot,
+                                                                     monkeypatch):
+    """The reported bug, on the page it was reported from.
+
+    Pressing Install raised a dialog headed "Your analysis is running" over a
+    download, which is how "when I update it performs analysis instead of looking
+    online" survived the Update tab getting its own page.
+    """
+    centre = update_centre(window, qtbot)
+    row = next((entry for entry in centre.catalogue["entries"]
+                if entry.get("open_licence") and not entry.get("installed")
+                and entry.get("download") == "automatic"), None)
+    assert row is not None, "the catalogue lists a set this engine may fetch without asking"
+    launched = []
+    monkeypatch.setattr(
+        type(window), "launch_task",
+        lambda self, operation, role, completed=None, *, caption=None:
+            bool(launched.append((role, caption))) or True)
+    assert centre.start("database:" + row["name"]) is True
+    role, caption = launched[0]
+    assert role == "update:database:" + row["name"]
+    assert caption is not None, "a download must not borrow the analysis wording"
+    assert caption.title == "Installing reference data"
+    assert row["title"] in caption.heading
+    assert "not an analysis" in caption.note
+    # While it runs, its own row says so and no other row can be pressed: two
+    # downloads into the same store would not both survive.
+    assert centre.working == "database:" + row["name"]
+    installing_row = next(index for index, entry in enumerate(centre.rows())
+                          if entry["key"] == centre.working)
+    assert centre.table.cellWidget(installing_row, 5).text() == "Installing…"
+    assert not any(centre.table.cellWidget(index, 5).isEnabled()
+                   for index in range(centre.table.rowCount()))
+    assert "re-reads itself" in centre.status.text()
+
+
+def test_an_install_that_fails_hands_its_own_button_back(window, qtbot):
+    """Clearing the flag only on success disabled the button for the whole session.
+
+    "Install and update everything" records each step's failure rather than
+    raising, but the call around them can still fail — and that path never
+    reached the handler that re-enables the button, so the one control a person
+    would press again was the one thing the failure took away.
+    """
+    centre = update_centre(window, qtbot)
+    centre.installing = True
+    centre.working = "everything"
+    centre.everything_button.setEnabled(False)
+    assert window.refresh_update_center() is True
+    qtbot.waitUntil(lambda: centre.worker is None or not centre.worker.isRunning(), timeout=60000)
+    settled(window, qtbot)
+    assert centre.installing is False
+    assert centre.working == ""
+    assert centre.everything_button.isEnabled()
+    assert all(centre.table.cellWidget(index, 5).isEnabled()
+               for index in range(centre.table.rowCount())
+               if centre.rows()[index]["enabled"])
 
 
 def test_an_item_with_no_installer_here_explains_how_it_is_installed(window, qtbot,

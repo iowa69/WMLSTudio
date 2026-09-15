@@ -167,7 +167,7 @@ class SchemeImportWorker(QThread):
         staging = None
         try:
             self.progress.emit(0, "Checking allele scheme…")
-            scheme = load_scheme(self.source, cancelled=self.cancel_event.is_set)
+            scheme = load_scheme(self.source, cancelled=self.cancel_event.is_set, sequences=False)
             destination = self.root / "schemes" / (self.source.name + "_" + scheme.digest[:8])
             if not destination.exists():
                 staging = Path(tempfile.mkdtemp(prefix="scheme-", dir=self.root))
@@ -179,14 +179,14 @@ class SchemeImportWorker(QThread):
                         raise ValueError("Scheme files must be regular files, not symbolic links.")
                     shutil.copy2(path, staging / path.name)
                     self.progress.emit(int((index + 1) / len(files) * 90), "Copying validated scheme files…")
-                checked = load_scheme(staging, cancelled=self.cancel_event.is_set)
+                checked = load_scheme(staging, cancelled=self.cancel_event.is_set, sequences=False)
                 if checked.digest != scheme.digest:
                     raise ValueError("The source scheme changed during import. Try again after the files stop changing.")
                 destination.parent.mkdir(parents=True, exist_ok=True)
                 staging.rename(destination)
                 staging = None
             else:
-                checked = load_scheme(destination, cancelled=self.cancel_event.is_set)
+                checked = load_scheme(destination, cancelled=self.cancel_event.is_set, sequences=False)
                 if checked.digest != scheme.digest:
                     raise ValueError("The existing imported scheme has changed. Move that modified copy out of the scheme library before importing this snapshot again.")
             self.imported.emit(str(destination), len(scheme.loci))
