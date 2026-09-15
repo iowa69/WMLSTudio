@@ -679,12 +679,14 @@ def test_a_replicon_free_isolate_is_not_reported_as_having_a_chromosomal_gene():
     assert "does not place those genes on the chromosome" in page
 
 
-def test_the_summary_names_snp_distance_as_a_third_quantity_it_does_not_report():
+def test_the_summary_keeps_snp_distance_on_its_own_scale_in_its_own_section():
+    """Prevents a SNP count being read against the allele threshold printed above it."""
     records = [record("ward-A-001", "1111"), record("ward-A-002", "2111")]
     page = render(records, snapshot_for(records))
 
     assert "three different quantities" in page
-    assert "SNP distances are not reported here at all" in page
+    assert "SNP distances appear only in the SNP section, on their own scale" in page
+    assert "SNP distances · SKA2 split k-mers" in page
     assert "evidence about the assembled contig it was found on" in page
 
 
@@ -699,5 +701,8 @@ def test_the_reports_page_says_where_the_third_quantity_is(window, qtbot, tmp_pa
     line = window.report_typing_label.text()
     assert "classical MLST over 4 loci" in line
     assert "SNP distances from the SNP tree are a third quantity" in line
-    assert "never comparable with the figures above" in line
+    assert "never comparable with the allele figures above" in line
+    # The sentence says where SNP distances are, not that they are absent: the
+    # report now carries them, and a page promising otherwise would be a lie.
+    assert "carries them in their own section, on their own scale" in line
     assert window.test_errors == []

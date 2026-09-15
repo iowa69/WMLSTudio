@@ -560,11 +560,39 @@ def test_a_gene_by_gene_scheme_installs_into_the_one_cgmlst_library(tmp_path):
 
 # ------------------------------------------------------------- core vs accessory
 
-def test_every_catalogued_scheme_is_declared_a_core_target_set():
+def test_every_catalogued_scheme_says_which_target_set_it_is():
+    """A row that named no target set would be a scheme of unknown meaning.
+
+    Nothing may be inferred from a target count: a distance is a core-genome
+    distance, an accessory one or a pan-genome one because the pin says so.
+    """
     rows = catalog_entries()
-    assert {row["target_set"] for row in rows} == {TARGET_SET_CORE}
+    assert {row["target_set"] for row in rows} <= set(cgmlst_schemes.TARGET_SETS)
+    assert {row["target_set_detail"] for row in rows} <= set(cgmlst_schemes.TARGET_SET_DETAILS)
+    assert all(row["target_set"] == TARGET_SET_CORE
+               for row in rows if row["target_set_detail"] == TARGET_SET_CORE)
+    # Every set that is not the core set falls in the one bucket the rest of the
+    # application renders, so no row can be shown as a core set by omission.
+    assert all(row["target_set"] == cgmlst_schemes.TARGET_SET_ACCESSORY
+               for row in rows if row["target_set_detail"] != TARGET_SET_CORE)
     assert all(row["scheme_group"].startswith(("pubmlst:", "pasteur:", "cgmlst_org:"))
                for row in rows)
+
+
+def test_a_target_set_the_catalogue_does_not_know_is_refused_rather_than_read_as_core(monkeypatch):
+    """Prevents a typo in a future pin from silently becoming a core-genome scheme.
+
+    A row whose target set defaulted to "core" on an unrecognised value would let a
+    cutoff published for a core set be offered for something that is not one.
+    """
+    key = "pubmlst:banthracis-accessory-1263"
+    monkeypatch.setattr(cgmlst_schemes, "_SCHEMES", tuple(
+        row if row.get("key") != key else {**row, "target_set": "acessory"}
+        for row in cgmlst_schemes._SCHEMES))
+    with pytest.raises(SchemeCatalogError) as refused:
+        catalog_entries()
+    assert "acessory" in str(refused.value)
+    assert "guessing" in str(refused.value)
 
 
 def test_an_organism_with_only_a_core_set_says_so_instead_of_offering_an_empty_choice():
@@ -581,6 +609,174 @@ def test_an_organism_with_only_a_core_set_says_so_instead_of_offering_an_empty_c
     aureus = scheme_variants("Staphylococcus aureus")
     assert {row["provider"] for row in aureus["core"]} == {"cgmlst.org", "pubmlst"}
     assert aureus["has_accessory"] is False
+
+
+def test_the_anthracis_core_and_accessory_sets_are_both_offered_as_an_explicit_choice():
+    """The reported bug: the target-set chooser had nothing to choose between.
+
+    PubMLST publishes 3,803 core targets and 1,263 accessory targets for
+    B. anthracis. Without both pinned, a user who wants core-plus-accessory has no
+    way to ask for it and no way to see that the two are different runs.
+    """
+    variants = scheme_variants("Bacillus anthracis")
+    assert [row["key"] for row in variants["core"]] == ["pubmlst:banthracis-cgmlst-3803"]
+    assert [row["key"] for row in variants["accessory"]] == ["pubmlst:banthracis-accessory-1263"]
+    assert variants["has_accessory"] is True and variants["has_whole_genome"] is False
+    assert "1 core and 1 accessory target set(s)" in variants["message"]
+    assert "never shares a scale, an axis or a threshold" in variants["message"]
+    core, accessory = variants["core"][0], variants["accessory"][0]
+    # One provider, one database, two schemes: they are told apart by the provider's
+    # own scheme id and by the digest of the target list, never by organism or size.
+    assert core["database"] == accessory["database"] == "pubmlst_bcereus_seqdef"
+    assert (core["scheme_id"], accessory["scheme_id"]) == ("2", "3")
+    assert core["target_list_sha256"] != accessory["target_list_sha256"]
+    assert core["slot"] != accessory["slot"]
+    assert core["scheme_group"] == accessory["scheme_group"] == "pubmlst:bacillus_anthracis"
+
+
+def test_the_gonococcal_pan_genome_set_is_named_a_whole_genome_set_and_not_an_accessory_one():
+    """A 251-target accessory set and a 1,907-target pan-genome set are not one thing.
+
+    Both are offered as the alternative to a core run, but a report that called the
+    pan-genome set "accessory" would misdescribe what its distances were measured on.
+    """
+    variants = scheme_variants("Neisseria gonorrhoeae")
+    assert [row["key"] for row in variants["core"]] == ["pubmlst:ngonorrhoeae-cgmlst-1430",
+                                                        "pubmlst:ngonorrhoeae-cgmlst-1649"]
+    assert [row["key"] for row in variants["accessory_only"]] == \
+        ["pubmlst:ngonorrhoeae-accessory-251"]
+    assert [row["key"] for row in variants["whole_genome"]] == ["pubmlst:ngonorrhoeae-pgmlst-1907"]
+    # The menu of everything that is not the core set holds both of them.
+    assert len(variants["accessory"]) == 2
+    assert "2 core, 1 accessory and 1 whole-genome target set(s)" in variants["message"]
+    pan = entry_for("pubmlst:ngonorrhoeae-pgmlst-1907")
+    assert pan["target_set"] == "accessory" and pan["target_set_detail"] == "whole_genome"
+    assert cgmlst_schemes.target_set_label(pan) == "Whole genome"
+    assert cgmlst_schemes.target_set_label(entry_for("pubmlst:ngonorrhoeae-accessory-251")) == \
+        "Accessory"
+    assert "whole-genome (pan-genome) target set" in pan["title"]
+    assert "1907 targets" in pan["title"]
+
+
+def test_a_non_core_target_set_never_inherits_a_cutoff_published_for_a_core_set():
+    """The core cutoff must not follow the organism name onto a bigger target set.
+
+    Abdel-Glil et al. published five allele differences on the 3,803-target
+    B. anthracis core set. Offering that number for a 1,263-target accessory run, or
+    for a 1,907-target pan-genome run, would present a threshold as applying to a
+    quantity it was never measured on.
+    """
+    for key in ("pubmlst:banthracis-accessory-1263", "pubmlst:ngonorrhoeae-accessory-251",
+                "pubmlst:ngonorrhoeae-pgmlst-1907"):
+        entry = entry_for(key)
+        assert entry["threshold_scheme_key"] is None
+        guidance = threshold_for(key, locus_count=entry["locus_count"])
+        assert guidance["status"] == "no_bound_cutoff"
+        assert guidance["threshold"] is None
+        assert guidance["entries"] == []
+        assert guidance["target_set"] == "accessory"
+    assert "5,066" in " ".join(entry_for("pubmlst:banthracis-accessory-1263")["notes"])
+    assert "different quantity" in entry_for("pubmlst:banthracis-accessory-1263")["binding_basis"]
+    # The interpretation sentence a report carries says the same thing in words.
+    assert "core-plus-accessory" in cgmlst_schemes.INTERPRETATION
+
+
+def test_a_publication_with_no_stated_target_count_binds_only_to_a_core_set(monkeypatch):
+    """A number published without a target count cannot be claimed for a non-core set.
+
+    It is read as a cutoff on the pinned core set, which is what an unqualified
+    cgMLST cutoff means; read the same way for an accessory or pan-genome set it
+    would silently move a core threshold onto a different quantity.
+    """
+    key = "cgmlst.org:efaecalis-1972"
+    template = next(row for row in publication_entries()
+                    if row["scheme_key"] == key and row["method"] == "cgmlst")
+    # Every curated publication states its target count today, so the case is built
+    # here rather than waiting for a future entry that does not.
+    monkeypatch.setattr(cgmlst_schemes, "_threshold_guidance_entries",
+                        lambda: [{**template, "locus_count": None}])
+    assert threshold_for(key, locus_count=1972)["status"] == "threshold_offerable"
+    declared_accessory = tuple(
+        row if row.get("key") != key else {**row, "target_set": cgmlst_schemes.TARGET_SET_ACCESSORY}
+        for row in cgmlst_schemes._SCHEMES)
+    monkeypatch.setattr(cgmlst_schemes, "_SCHEMES", declared_accessory)
+    guidance = threshold_for(key, locus_count=1972)
+    assert guidance["status"] == "citation_only"
+    assert guidance["threshold"] is None
+    assert "not a core genome scheme" in guidance["reason"]
+
+
+def test_a_slot_for_a_non_core_set_says_in_words_that_it_is_not_a_cgmlst_distance(tmp_path):
+    """A folder labelled only "cgMLST" would mislabel an accessory download.
+
+    The slot description is what a person reads months later to find out what the
+    numbers in it were measured on.
+    """
+    prepare_library(tmp_path, keys=["pubmlst:banthracis-accessory-1263",
+                                    "pubmlst:ngonorrhoeae-pgmlst-1907",
+                                    "pubmlst:banthracis-cgmlst-3803"])
+    base = library_root(tmp_path)
+    accessory = (base / entry_for("pubmlst:banthracis-accessory-1263")["slot"]
+                 / "README.txt").read_text(encoding="utf-8")
+    assert "Target set : Accessory" in accessory
+    assert "ACCESSORY target set, not a cgMLST scheme" in accessory
+    assert "reported as not assayed" in accessory
+    pan = (base / entry_for("pubmlst:ngonorrhoeae-pgmlst-1907")["slot"]
+           / "README.txt").read_text(encoding="utf-8")
+    assert "Target set : Whole genome" in pan
+    assert "Run it INSTEAD of a core scheme" in pan
+    core = (base / entry_for("pubmlst:banthracis-cgmlst-3803")["slot"]
+            / "README.txt").read_text(encoding="utf-8")
+    assert "Target set : Core" in core
+    assert "ACCESSORY target set" not in core
+    slot = json.loads((base / entry_for("pubmlst:banthracis-accessory-1263")["slot"]
+                       / "scheme_slot.json").read_text(encoding="utf-8"))
+    assert slot["target_set_detail"] == "accessory" and slot["target_set_label"] == "Accessory"
+
+
+def test_a_download_of_a_non_core_set_says_what_it_is_before_any_byte_moves():
+    """The download button is the last moment before the run's meaning is fixed."""
+    plan = download_plan("pubmlst:ngonorrhoeae-pgmlst-1907")
+    assert plan["target_set_label"] == "Whole genome"
+    assert "Run it INSTEAD of a core scheme" in plan["target_set_notice"]
+    assert plan["destination_slot"] == "Neisseria_gonorrhoeae__pubmlst_1907"
+    assert "1907 separate requests" in plan["method"]
+    core = download_plan("pubmlst:ngonorrhoeae-cgmlst-1430")
+    assert core["target_set_label"] == "Core"
+    assert "not a seven-locus MLST distance" in core["target_set_notice"]
+    assert "Run it INSTEAD" not in core["target_set_notice"]
+    assert core["destination_slot"] != plan["destination_slot"]
+
+
+def test_each_pinned_target_set_carries_the_identity_a_download_is_verified_against():
+    """A wrong scheme id, database or target count makes a download fail verification.
+
+    These six rows were read from the live PubMLST API on 2026-09-15; the test pins
+    what was read so a later edit cannot quietly change one of them.
+    """
+    expected = {
+        "pubmlst:banthracis-cgmlst-3803": ("pubmlst_bcereus_seqdef", "2", 3803, True),
+        "pubmlst:banthracis-accessory-1263": ("pubmlst_bcereus_seqdef", "3", 1263, False),
+        "pubmlst:ngonorrhoeae-cgmlst-1430": ("pubmlst_neisseria_seqdef", "89", 1430, True),
+        "pubmlst:ngonorrhoeae-cgmlst-1649": ("pubmlst_neisseria_seqdef", "62", 1649, True),
+        "pubmlst:ngonorrhoeae-accessory-251": ("pubmlst_neisseria_seqdef", "80", 251, False),
+        "pubmlst:ngonorrhoeae-pgmlst-1907": ("pubmlst_neisseria_seqdef", "81", 1907, False),
+    }
+    for key, (database, scheme_id, count, profiles) in expected.items():
+        entry = entry_for(key)
+        assert (entry["database"], entry["scheme_id"]) == (database, scheme_id)
+        assert entry["locus_count"] == count
+        assert entry["has_profiles"] is profiles
+        assert entry["profile_field"] == ("cgST" if profiles else "")
+        assert entry["provider"] == "pubmlst"
+        assert entry["source_url"] == \
+            f"https://rest.pubmlst.org/db/{database}/schemes/{scheme_id}"
+        assert len(entry["target_list_sha256"]) == 64
+        assert entry["locus_count"] > CGMLST_TARGET_FLOOR
+    # Six new target sets, six distinct pins: nothing is shared by accident.
+    digests = {entry_for(key)["target_list_sha256"] for key in expected}
+    slots = {entry_for(key)["slot"] for key in expected}
+    assert len(digests) == len(slots) == len(expected)
 
 
 # -------------------------------------------------------- what the cgMLST tab lists

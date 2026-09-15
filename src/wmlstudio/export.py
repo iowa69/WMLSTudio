@@ -526,8 +526,9 @@ def investigation_html(snapshot, selected_ids=None, sections=None):
             reasons = sorted({row['reason'] for row in focal['excluded']})
             parts.append('<p><b>Exclusions:</b> ' + _escape('; '.join(reasons)) + '</p>')
     parts.append('<h3>Core and accessory evidence are separate</h3><p>The distances above use only the pinned allele-profile scheme. '
-                 'AMR, virulence, plasmid markers and custom annotations are context, not extra distance loci. '
-                 'Identical AMR or replicon names do not establish identical plasmids or transfer; genomic drug associations are not susceptibility testing.</p></section>')
+                 'AMR determinants, resistance point mutations, virulence loci, plasmid markers and custom annotations are context, not extra distance loci. '
+                 'Identical AMR or replicon names do not establish identical plasmids or transfer; genomic drug associations are not susceptibility testing. '
+                 'Any SNP distances this report carries are reported in their own section, on their own scale, and are never read against the threshold above.</p></section>')
     return ''.join(parts)
 
 
@@ -561,45 +562,491 @@ def characterization_html(record, sections=None):
     return ''.join(parts)
 
 
+# ---------------------------------------------------------------------------
+# Evidence sections: one table per assay, and a named refusal where none ran.
+#
+# Every section below answers two questions before it answers any other: was
+# this assay run for this isolate at all, and which reference snapshot produced
+# what it reports. A section whose assay did not run says so in the isolate's
+# own row and never renders as an empty table, because an empty table is read as
+# "nothing was found" and "we did not look" is not a negative result.
+# ---------------------------------------------------------------------------
+
+SNP_NOT_RUN = (
+    'No SNP analysis was run for these isolates, so this report carries no SNP distance. The '
+    'question was never asked, and that is not a statement that the isolates are identical, close '
+    'or unrelated. SNP distances are measured on the SNP tab by SKA2, over the split k-mers two '
+    'assemblies actually share.')
+
+POINT_MUTATIONS_NOT_ASSAYED = (
+    'A genome screened without an organism-specific mutation catalogue has had no point-mutation '
+    'search at all. Its row says so. No other organism’s catalogue is substituted for a missing '
+    'one, and a blank is never a clean result.')
+
+VIRULENCE_SCOPE = (
+    'This is a local BLAST+ screen over a pinned panel of defined virulence loci. It is not '
+    'Kleborate and assigns no virulence-locus lineage, no hypervirulence call and no phenotype. A '
+    'locus not detected by this assay is not proof that the genome lacks it.')
+
+PLASMID_BOUNDARY = (
+    'A replicon marker sitting on an assembled contig is evidence about that contig. No plasmid was '
+    'reconstructed, no plasmid was counted, no relaxase or mate-pair-formation type was assigned and no '
+    'mobility was predicted: this is not MOB-suite and is not equivalent to it. Two isolates carrying the '
+    'same replicon name are not thereby carrying the same plasmid.')
+
+
+def _muted(text: Any) -> str:
+    """A second, quieter line inside a cell, in the markup every report prints with."""
+    return '<br><span class="muted">' + _escape(text) + '</span>'
+
+
+def _html_table(headers, rows) -> str:
+    """A printable table whose cells are markup the caller has already escaped."""
+    parts = ['<table border="1" cellpadding="5" cellspacing="0"><tr>'
+             + ''.join('<th>' + _escape(header) + '</th>' for header in headers) + '</tr>']
+    for row in rows:
+        parts.append('<tr>' + ''.join('<td>' + cell + '</td>' for cell in row) + '</tr>')
+    parts.append('</table>')
+    return ''.join(parts)
+
+
+def _bullets(items) -> str:
+    items = [str(item) for item in items if str(item or '').strip()]
+    if not items:
+        return ''
+    return '<ul>' + ''.join('<li>' + _escape(item) + '</li>' for item in items) + '</ul>'
+
+
+def _record_name(record) -> str:
+    result = record.get('result') if isinstance(record.get('result'), Mapping) else {}
+    return str(record.get('name') or record.get('sample_name') or result.get('sample_name')
+               or record.get('id') or record.get('sample_id') or 'Unnamed isolate')
+
+
+def snp_section_html(payload, *, sample_ids=None):
+    """SNP distances for these isolates, or the plain statement that none were measured.
+
+    ``payload`` is what :func:`wmlstudio.snp_tree.snp_payload` returned for the
+    run the reader has in front of them. There is no fallback and no empty
+    table: a report without a SNP run prints that no SNP search was performed,
+    because a distance table with no rows reads as isolates separated by nothing.
+    """
+    from wmlstudio.snp_tree import SEPARATION as SNP_SEPARATION
+
+    parts = ['<h2>SNP distances · SKA2 split k-mers</h2>',
+             '<p>' + _escape(SNP_SEPARATION) + '</p>']
+    if not payload:
+        parts.append('<p class="notice"><b>Not run.</b> ' + _escape(SNP_NOT_RUN) + '</p>')
+        return ''.join(parts)
+    protocol = payload.get('protocol') or {}
+    cohort = {str(row.get('sample_id')): str(row.get('sample_name') or row.get('sample_id'))
+              for row in payload.get('cohort') or ()}
+    wanted = None if sample_ids is None else {str(value) for value in sample_ids}
+    floor = protocol.get('minimum_shared_fraction')
+    parts.append('<p><b>Measured by:</b> ' + _escape(payload.get('engine') or 'an unnamed engine')
+                 + ' · ' + _escape(payload.get('method') or 'method not recorded')
+                 + '<br><b>Protocol:</b> ' + _escape(protocol.get('description') or 'not recorded')
+                 + '<br><b>Run:</b> ' + _escape(payload.get('run_id') or 'not recorded') + ' · '
+                 + _escape(payload.get('created_at') or 'time not recorded')
+                 + '<br><b>Comparability floor:</b> ' + _escape(floor if floor is not None else 'not recorded')
+                 + ' of the shared split k-mer fraction. A pair below it has an unknown distance, never a '
+                   'small one.</p>')
+    rows = []
+    for pair in payload.get('pairs') or ():
+        source, target = str(pair.get('source')), str(pair.get('target'))
+        if wanted is not None and not (source in wanted and target in wanted):
+            continue
+        if pair.get('comparable'):
+            distance = '<b>' + _escape(_count_words(pair.get('distance'), 'SNPs')) + '</b>'
+        else:
+            distance = ('<b>Not comparable</b>' + _muted(
+                (pair.get('reason') or 'The pair shared too little sequence for a distance to be accepted.')
+                + ' An unknown distance is never a distance of zero.'))
+        rows.append([_escape(cohort.get(source, source)), _escape(cohort.get(target, target)), distance,
+                     _escape(pair.get('denominator_label') or 'denominators not recorded')])
+    outside = sorted(wanted - set(cohort)) if wanted is not None else []
+    for sample_id in outside:
+        rows.append([_escape(sample_id), '—',
+                     '<b>Not in this SNP run</b>' + _muted(
+                         'No split k-mer comparison exists for this isolate, so it has no SNP distance to '
+                         'anything here.'), '—'])
+    if rows:
+        parts.append(_html_table(
+            ['Isolate', 'Compared with', 'SNP distance', 'Sequence the two isolates shared'], rows))
+    else:
+        parts.append('<p class="notice">None of the isolates in this report form a pair in this SNP run, '
+                     'so no SNP distance is reported for them. That is a gap in what was measured, not a '
+                     'finding about how close they are.</p>')
+    binding = payload.get('threshold') or {}
+    parts.append('<p><b>Published SNP cutoff:</b> ' + _escape(binding.get('message') or 'none considered')
+                 + '<br><b>Applied to this report:</b> none. No SNP threshold groups, colours or '
+                   'highlights anything in this document.</p>')
+    if binding.get('link_threshold_warning'):
+        parts.append('<p class="notice"><b>Grouping chosen in the SNP view:</b> '
+                     + _escape(binding['link_threshold_warning']) + '</p>')
+    parts.append(_bullets(payload.get('limitations') or ()))
+    return ''.join(parts)
+
+
+def mutation_section_html(records):
+    """Resistance point mutations, with the isolates nobody searched named first.
+
+    The per-isolate coverage table is printed before any finding, so an isolate
+    screened without an organism catalogue can never be read off the second table
+    as an isolate that carries no catalogued mutation.
+    """
+    from wmlstudio.amr_matrix import MUTATION_LIMITATIONS, build_mutation_matrix
+
+    parts = ['<h2>Resistance point mutations</h2>',
+             '<p>A resistance point mutation is one catalogued change at one position of one gene, read '
+             'from a catalogue curated for one organism. It is separate evidence from an acquired '
+             'resistance gene and is never counted with one.</p>',
+             '<p class="notice"><b>' + _escape(POINT_MUTATIONS_NOT_ASSAYED) + '</b></p>']
+    try:
+        table = build_mutation_matrix(list(records))
+    except ValueError as error:
+        parts.append('<p class="notice"><b>No point-mutation table was built.</b> ' + _escape(error)
+                     + ' Nothing is claimed about mutations in either direction.</p>')
+        return ''.join(parts)
+    scopes = {row['sample_id']: row for row in table['samples']}
+    coverage = []
+    for entry in table['catalogue_coverage']:
+        scope = (scopes.get(entry['sample_id']) or {}).get('scope') or {}
+        found = (scopes.get(entry['sample_id']) or {}).get('detected', 0)
+        if entry['searched']:
+            searched = '<b>Yes</b>' + _muted(entry['level_words'])
+            reported = (_escape(_count_words(found, 'catalogued mutations'))
+                        if found else _escape('None reported by the catalogue that was searched'))
+        else:
+            searched = '<b>No — not searched</b>' + _muted(entry['reason'])
+            reported = ('<b>Not assayed</b>'
+                        + _muted('This genome had no point-mutation search, so nothing below is an '
+                                 'absence for it.'))
+        coverage.append([_escape(entry['sample_name']), _escape(entry['organism']), searched, reported,
+                         _escape('; '.join(scope.get('databases') or ()) or 'reference sets not recorded')
+                         + _muted('Reference release: ' + (scope.get('release') or 'not recorded')
+                                  + ' · organism catalogue: ' + (entry['catalogue'] or 'none chosen'))])
+    parts.append('<h3>Was this genome searched for point mutations at all?</h3>')
+    parts.append(_html_table(['Isolate', 'Organism', 'Catalogue searched',
+                              'Catalogued mutations reported', 'Reference sets and release'], coverage))
+    parts.append('<p class="muted">' + _escape(table['catalogue_note']) + '</p>')
+    findings = []
+    for row in table['rows']:
+        for entry in table['samples']:
+            cell = row['cells'][entry['sample_id']]
+            if table['states'][cell['state']]['evidence'] != 'detected':
+                continue
+            findings.append([_escape(entry['sample_name']), _escape(row['gene']),
+                             _escape(row['substitution'] or row['finding']),
+                             _escape(row['group']), _escape(row['catalogue']), _escape(row['target']),
+                             _escape(cell['display']) + _muted(cell['reason'])])
+    parts.append('<h3>Catalogued point mutations reported</h3>')
+    if findings:
+        parts.append(_html_table(['Isolate', 'Gene', 'Catalogued change', 'Antimicrobial class',
+                                  'Organism catalogue', 'Read from', 'What the report recorded'], findings))
+    else:
+        parts.append('<p>No catalogued point mutation was reported for any isolate that was searched. '
+                     'Read that together with the table above: it says nothing at all about the '
+                     'isolate(s) whose search never ran.</p>')
+    parts.append('<p class="muted">' + _escape(table['denominator_note']) + '</p>')
+    parts.append(_bullets(MUTATION_LIMITATIONS))
+    return ''.join(parts)
+
+
+def _virulence_rows(record):
+    """One isolate's virulence loci, or the single row saying the screen never ran."""
+    from wmlstudio.characterization import current_characterization
+
+    name = _escape(_record_name(record))
+    state = current_characterization(record)
+    evidence = (state.get('evidence') or {}).get('virulence') or {}
+    status = str(evidence.get('status') or '')
+    if state['status'] != 'current' or status != 'completed':
+        reason = (evidence.get('reason') or state['reason']
+                  or 'No virulence screen is attached to this isolate.')
+        words = 'Screen failed' if status == 'failed' and state['status'] == 'current' else 'Not assayed'
+        return [[name, '—', '<b>' + _escape(words) + '</b>' + _muted(reason), '—', '—',
+                 _escape('No virulence reference snapshot produced a result for this isolate.')]]
+    assay = evidence.get('assay') or {}
+    provenance = evidence.get('provenance') or {}
+    source = (_escape(assay.get('name') or 'Virulence marker screen')
+              + _muted('Reference snapshot ' + str(evidence.get('reference_digest') or 'not recorded')[:12]
+                       + ' · ' + str(provenance.get('engine') or 'engine not recorded') + ' '
+                       + str(provenance.get('version') or '')))
+    loci = evidence.get('loci') or []
+    if not loci:
+        return [[name, '—', '<b>Screened, no locus defined</b>'
+                 + _muted('This reference snapshot defines no virulence locus, so the screen could '
+                          'report none.'), '—', '—', source]]
+    rows = []
+    for locus in loci:
+        call = str(locus.get('status') or 'not recorded')
+        if call == 'detected':
+            words = '<b>Detected</b>' + _muted('Sequence carriage only. No expression and no virulence '
+                                               'phenotype is inferred.')
+        elif call == 'not_detected':
+            words = 'Not detected by this assay' + _muted('No hit met this assay’s own thresholds. That '
+                                                          'is not proof of genomic absence.')
+        else:
+            words = ('<b>Ambiguous — needs review</b>'
+                     + _muted('Partial or sub-threshold evidence, or assembly quality below the gate this '
+                              'assay requires before it will report a negative.'))
+        if not assay.get('adequate_negative_assay', True):
+            words += _muted('This assembly failed the assay’s negative-result quality gate, so negatives '
+                            'are withheld rather than reported.')
+        rows.append([name, _escape(locus.get('locus')), words,
+                     _escape(f"{locus.get('genes_detected', 0)} of {locus.get('genes_total', 0)}"),
+                     _escape(locus.get('intact_genes_detected', 0)), source])
+    return rows
+
+
+def virulence_section_html(records):
+    """Virulence loci as a table, with every unscreened isolate named in it."""
+    from wmlstudio.virulence_evidence import LIMITATIONS as VIRULENCE_LIMITATIONS
+
+    parts = ['<h2>Virulence factors</h2>', '<p>' + _escape(VIRULENCE_SCOPE) + '</p>']
+    rows = [row for record in records for row in _virulence_rows(record)]
+    if not rows:
+        parts.append('<p class="notice">No isolate in this report has a virulence screen, so none is '
+                     'reported. Not assayed is not an absence of virulence loci.</p>')
+        return ''.join(parts)
+    parts.append(_html_table(['Isolate', 'Virulence locus', 'Call', 'Genes detected / screened',
+                              'Intact coding sequences', 'Assay and reference snapshot'], rows))
+    parts.append(_bullets(VIRULENCE_LIMITATIONS))
+    return ''.join(parts)
+
+
+# How an AMR/plasmid evidence state reads to somebody deciding what a blank cell
+# means. "Not run" is the only honest word for a missing report; none of these is
+# ever "nothing found".
+_EVIDENCE_STATE_WORDS = {
+    'current': 'Checked against this exact sequence file',
+    'unverified': 'Linked by name, not verified',
+    'stale': 'Out of date',
+    'missing': 'Not run',
+}
+
+
+def _plasmid_cells(row) -> list[str]:
+    """One isolate's replicon markers and same-contig co-locations, each with its own gate.
+
+    The markers come from the AMR/plasmid assay and the co-locations from the
+    characterization, so the two are gated separately: evidence belonging to an
+    earlier assembly is withheld and named, never printed as this one's.
+    """
+    from wmlstudio.characterization import current_characterization
+
+    status = row.get('hydra_evidence_status') or 'missing'
+    replicons = [str(name) for name in (row.get('plasmid_replicons') or [])]
+    if status == 'stale':
+        markers = _escape('Not shown — the saved plasmid result belongs to a different sequence file')
+    elif status == 'missing':
+        markers = _escape('Not assessed')
+    elif replicons:
+        markers = _escape(', '.join(replicons))
+        if status == 'unverified':
+            markers += _muted('The source report’s identity was not confirmed.')
+    else:
+        markers = _escape('No replicon marker reported by the reference database used')
+    state = current_characterization(row)
+    evidence = (state.get('evidence') or {}).get('plasmid_hypotheses') or {}
+    links = evidence.get('contig_associations') or []
+    if state['status'] != 'current':
+        shared = _escape('Not assessed') + _muted(state['reason'])
+    elif links:
+        shared = _escape('; '.join(sorted({f"{link['marker']} with {link['replicon']} on "
+                                           f"{link['contig']}" for link in links})))
+        shared += _muted('Same assembled contig only — a hypothesis, not a plasmid-borne gene.')
+    else:
+        shared = _escape('No resistance or virulence gene shared a contig with a replicon marker')
+        shared += _muted('A plasmid contig can assemble without its replicon, so this does not place '
+                         'those genes on the chromosome.')
+    return [_escape(row.get('sample_name') or row.get('sample_id')), markers, shared,
+            _escape(_EVIDENCE_STATE_WORDS.get(status, status))]
+
+
+def _plasmid_provenance(row) -> str:
+    """Which reference sets and which characterization snapshot produced this row."""
+    from wmlstudio.characterization import current_characterization
+    from wmlstudio.sample_workflow import amr_search_scope
+
+    scope = amr_search_scope(row)
+    state = current_characterization(row)
+    evidence = (state.get('evidence') or {}) if state['status'] == 'current' else {}
+    digest = str((evidence.get('plasmid_hypotheses') or {}).get('source', {}).get('input_sha256')
+                 or evidence.get('input_sha256') or '')
+    return (_escape('; '.join(scope['databases']) or 'reference sets not recorded')
+            + _muted('Reference release: ' + (scope['release'] or 'not recorded')
+                     + ' · contig evidence from assembly ' + (digest[:12] or 'not recorded')))
+
+
+def plasmid_section_html(rows):
+    """Replicon markers and same-contig co-locations, each with its own evidence gate."""
+    parts = ['<h2>Plasmid evidence · replicon markers on assembled contigs</h2>',
+             '<p>This lists the plasmid replicon markers found in each genome, and any resistance or '
+             'virulence gene that sat on the same assembled contig as one of them.</p>']
+    table = [[*_plasmid_cells(row), _plasmid_provenance(row)] for row in rows]
+    parts.append(_html_table(['Isolate', 'Replicon markers found',
+                              'Genes on the same contig as a replicon', 'Evidence state',
+                              'Reference sets and snapshot'], table))
+    # The boundary closes the table in one string, so no option can separate them.
+    parts.append('<p class="notice"><b>' + _escape(PLASMID_BOUNDARY) + '</b></p>')
+    return ''.join(parts)
+
+
+# The typings a view can actually name. Anything else -- 'unclassified' above
+# all -- is a gap in what the drawing view recorded, not a contradiction of the
+# snapshot beside it.
+_NAMED_TYPINGS = frozenset({'mlst', 'cgmlst', 'snp'})
+
+
+def picture_typing_conflict(graph_typing, kind) -> bool:
+    """Whether a picture was drawn on a different quantity from the one reported.
+
+    Two *named* typings that disagree is a conflict and the picture is refused.
+    An unnamed one is not: a comparison whose typing kind was never declared
+    leaves the view saying 'unclassified', and suppressing a picture the snapshot
+    can still name in full would hide evidence rather than protect a reader.
+    """
+    drawn = str(graph_typing or '').strip().casefold()
+    return drawn in _NAMED_TYPINGS and kind in {'mlst', 'cgmlst'} and drawn != kind
+
+
+# A group state in the words a reader needs beside a highlighted picture. A
+# singleton is "nothing else came within the threshold", which is a statement
+# about this threshold and this reference, never about relatedness.
+_GROUP_STATE_WORDS = {
+    'cluster': 'Linked at this threshold',
+    'singleton': 'No other isolate came within the threshold',
+    'not_comparable': 'No usable comparison',
+}
+
+
+def cohort_picture_html(investigation, graph_png, *, graph_mime='image/png', graph_typing=None,
+                        sample_ids=None):
+    """The tree for this report's typing, with the threshold in force stated beside it.
+
+    A picture carries no scale once it is on a page, so it is embedded only when
+    the typing it was drawn on is the typing this report is about: an MLST forest
+    never appears in a cgMLST report and a cgMLST forest never in an MLST one.
+    ``graph_typing`` is the drawing view's own answer, so the check compares two
+    independent statements rather than one restated.
+    """
+    import base64
+
+    parts = ['<h2>Comparison-cohort picture</h2>']
+    if not investigation:
+        parts.append('<p class="notice">No comparison snapshot is attached to this report, so it '
+                     'carries no picture, no clusters and no threshold. Nothing here says these '
+                     'isolates are unrelated.</p>')
+        return ''.join(parts)
+    provenance = threshold_provenance(investigation)
+    kind = provenance['typing']['kind']
+    if picture_typing_conflict(graph_typing, kind):
+        parts.append('<p class="notice"><b>No picture is shown.</b> The tree available to this report was '
+                     'drawn on ' + _escape(graph_typing) + ' distances and this report is about '
+                     + _escape(provenance['typing']['label']) + '. A tree of one typing is never printed '
+                     'in a report about the other, because the two are different quantities.</p>')
+    elif graph_png:
+        encoded = base64.b64encode(graph_png).decode('ascii')
+        parts.append('<img width="920" src="data:' + _escape(graph_mime or 'image/png') + ';base64,'
+                     + encoded + '" alt="Minimum spanning forest of '
+                     + _escape(provenance['typing']['label']) + ' distances, clusters highlighted at the '
+                     'threshold in force">')
+    else:
+        parts.append('<p class="muted">No picture is included here. The numbers below still describe the '
+                     'comparison; a missing picture is not a statement about relatedness.</p>')
+    # Joined to the picture in one block: the scale and the threshold a reader
+    # needs in order to read it must not end up on another printed sheet.
+    parts.extend([
+        '<p><b>Drawn on:</b> ' + _escape(provenance['scheme']) + ' · '
+        + _escape(provenance['total_loci']) + ' targets in the scheme · '
+        + _escape(provenance['typing']['label'])
+        + '<br><b>Clusters are highlighted at the threshold in force:</b> at most '
+        + _escape(_count_words(provenance['threshold'])) + ' — <b>'
+        + ('a published cutoff, reviewed and adopted here'
+           if provenance['source'] == 'adopted_publication'
+           else 'your own setting, not a published cutoff') + '.</b></p>',
+        '<p>' + _escape(provenance['statement']) + '</p>',
+        '<p class="muted">Selected focal isolates are highlighted. Other nodes are comparison-cohort '
+        'context, not additional reported sample records. The layout is a minimum spanning forest '
+        'of the distances named above: it is not a phylogeny and not a transmission tree, and the '
+        'position of a node carries no meaning.</p>'])
+    focus = None if sample_ids is None else {str(value) for value in sample_ids}
+    groups = [group for group in investigation.get('groups') or ()
+              if focus is None or focus.intersection(group.get('members') or ())]
+    if groups:
+        rows = []
+        for group in groups:
+            members = [str(member) for member in group.get('members') or ()]
+            distance = group.get('max_direct_distance')
+            rows.append([_escape(group.get('name')) + _muted(group.get('id')),
+                         _escape(_GROUP_STATE_WORDS.get(group.get('status'), group.get('status'))),
+                         _escape(len(members) if focus is None else len(focus.intersection(members))),
+                         _escape(len(members)),
+                         (_escape(_count_words(distance)) if distance is not None else
+                          _escape('Not measured')) +
+                         _muted('Single linkage: two members can differ by more than the threshold when '
+                                'an intermediate isolate links them.' if group.get('chained') else
+                                'No pair inside this group carries an accepted distance.'
+                                if distance is None else
+                                'Largest direct distance measured inside this group.')])
+        parts.append('<h3>Clusters at this threshold</h3>')
+        parts.append(_html_table(['Group · stable ID', 'State', 'Isolates in this report',
+                                  'Members in the cohort', 'Largest direct distance'], rows))
+    else:
+        parts.append('<p class="muted">Single linkage at this threshold put no isolate from this report in '
+                     'a group with another. That describes this threshold and this reference only; it is '
+                     'not a finding that the isolates are unrelated.</p>')
+    return ''.join(parts)
+
+
 REPORT_PRESETS = {
     'isolate': {'title': 'Isolate evidence review', 'investigation': False, 'qc': True, 'amr': True,
                 'virulence': True, 'plasmid_hypotheses': True, 'drug_associations': True, 'graph': False,
-                'provenance': False, 'graph_jpeg': False},
+                'provenance': False, 'graph_jpeg': False, 'snp': True, 'point_mutations': True},
     'cohort': {'title': 'Selected cohort review', 'investigation': True, 'qc': True, 'amr': True,
                'virulence': True, 'plasmid_hypotheses': True, 'drug_associations': True, 'graph': True,
-               'provenance': False, 'graph_jpeg': False},
+               'provenance': False, 'graph_jpeg': False, 'snp': True, 'point_mutations': True},
     'ipc': {'title': 'IPC cluster review', 'investigation': True, 'qc': True, 'amr': True,
             'virulence': True, 'plasmid_hypotheses': True, 'drug_associations': True, 'graph': True,
-            'provenance': False, 'graph_jpeg': False},
+            'provenance': False, 'graph_jpeg': False, 'snp': True, 'point_mutations': True},
     'proximity': {'title': 'Isolate proximity review', 'investigation': True, 'qc': True, 'amr': True,
                   'virulence': False, 'plasmid_hypotheses': False, 'drug_associations': False, 'graph': True,
-                  'provenance': False, 'graph_jpeg': False},
+                  'provenance': False, 'graph_jpeg': False, 'snp': True, 'point_mutations': False},
     # A different document shape, not a different set of facts: one short page in
     # plain words for a reader who is not a bioinformatician. Kept last so no
     # preset that a saved template or a combo index already names can move.
     'simple': {'title': 'Simple outbreak summary', 'investigation': True, 'qc': False, 'amr': True,
                'virulence': False, 'plasmid_hypotheses': False, 'drug_associations': False, 'graph': True,
-               'provenance': False, 'layout': 'one_page', 'graph_jpeg': True},
+               'provenance': False, 'layout': 'one_page', 'graph_jpeg': True,
+               'snp': True, 'point_mutations': True},
 }
 
 
 def review_report_html(records, *, selected_ids, investigation=None, options=None, graph_png=None,
-                       graph_mime='image/png', scope_note=None, scope_implicit=False):
+                       graph_mime='image/png', scope_note=None, scope_implicit=False,
+                       graph_typing=None, snp=None):
     """Readable research/IPC report with explicit scope and opt-in raw appendix.
 
     ``graph_png`` is raw image bytes whose type ``graph_mime`` states, so a
-    caller may embed JPEG or PNG without changing this signature. ``scope_note``
+    caller may embed JPEG or PNG without changing this signature, and
+    ``graph_typing`` is the drawing view's own word for the typing it drew, so a
+    tree is never printed in a report about the other quantity. ``snp`` is the
+    SNP payload the reader has on screen; without one the SNP section says the
+    analysis was not run rather than printing an empty table. ``scope_note``
     replaces the default header scope sentence, and ``scope_implicit`` marks a
     scope the user did not choose so the document says so itself.
     """
-    import base64
     settings = {**REPORT_PRESETS['cohort'], **(options or {})}
     if settings.get('layout') == 'one_page':
         # Lazy on purpose: simple_report imports this module at module level.
         from wmlstudio.simple_report import simple_report_html
         return simple_report_html(records, selected_ids=selected_ids, investigation=investigation,
                                   settings=settings, graph_png=graph_png, graph_mime=graph_mime,
-                                  scope_note=scope_note, scope_implicit=scope_implicit)
+                                  scope_note=scope_note, scope_implicit=scope_implicit,
+                                  graph_typing=graph_typing, snp=snp)
+    chosen = select_records(records, selected_ids)
     rows = _snapshot(records, selected_ids, investigation=investigation)
     parts = ['<!doctype html><html><head><meta charset="utf-8">',
              '<meta http-equiv="Content-Security-Policy" content="default-src \'none\'; style-src \'unsafe-inline\'; img-src data:">',
@@ -635,15 +1082,22 @@ def review_report_html(records, *, selected_ids, investigation=None, options=Non
         parts.append('<tr>' + ''.join('<td>' + _escape(value) + '</td>' for value in values) + '</tr>')
     parts.append('</table>')
     if settings['graph']:
-        if graph_png:
-            encoded = base64.b64encode(graph_png).decode('ascii')
-            parts.append('<h2>Comparison-cohort context</h2><p>Selected focal isolates are highlighted. Other nodes are context only, not additional reported sample records. Layout is not a transmission tree.</p>'
-                         '<img width="920" src="data:' + _escape(graph_mime or 'image/png') + ';base64,' + encoded + '" alt="Allele-distance graph with focal isolates highlighted">')
-        else:
-            parts.append('<p class="muted">Graph omitted: no matching comparison snapshot is currently available.</p>')
+        # The picture, the scale it was drawn on and the threshold its clusters
+        # were highlighted at are one block: none of the three is readable alone.
+        parts.append(cohort_picture_html(investigation, graph_png, graph_mime=graph_mime,
+                                         graph_typing=graph_typing,
+                                         sample_ids=[r['sample_id'] for r in rows]))
     if settings['investigation']:
         parts.append(investigation_html(investigation, [r['sample_id'] for r in rows], settings) if investigation else
                      '<p class="notice">No comparison snapshot selected. No proximity or cluster inference was made.</p>')
+    if settings.get('snp', True):
+        parts.append(snp_section_html(snp, sample_ids=[r['sample_id'] for r in rows]))
+    if settings.get('point_mutations', True):
+        parts.append(mutation_section_html(chosen))
+    if settings['virulence']:
+        parts.append(virulence_section_html(chosen))
+    if settings['plasmid_hypotheses']:
+        parts.append(plasmid_section_html(rows))
     for row in rows:
         parts.append('<section><h2>' + _escape(row.get('sample_name')) + '</h2>')
         if row.get('cluster_label'):
@@ -678,17 +1132,22 @@ def review_report_html(records, *, selected_ids, investigation=None, options=Non
         if settings['provenance']:
             parts.append('<h3>Provenance appendix</h3><p>Full stored evidence below is archival; current/stale assessment above controls interpretation.</p><pre>' + _escape(row) + '</pre>')
         parts.append('</section>')
-    parts.append('<footer>Core allele differences, AMR, virulence and plasmid hypotheses are separate evidence domains. Report sections are customizable; omitted assays must not be interpreted as absent.</footer></body></html>')
+    parts.append('<footer>Classical MLST allele differences, cgMLST target differences and SNP distances are '
+                 'three separate quantities on three separate scales; AMR determinants, resistance point '
+                 'mutations, virulence loci and plasmid-marker hypotheses are four further evidence domains '
+                 'and none of them is a distance. Report sections are customizable; an omitted section and '
+                 'an assay that was not run must never be interpreted as an absent finding.</footer></body></html>')
     return ''.join(parts)
 
 
 def write_review_report(records, path, *, selected_ids, investigation=None, options=None, graph_png=None,
-                        graph_mime='image/png', scope_note=None, scope_implicit=False):
+                        graph_mime='image/png', scope_note=None, scope_implicit=False,
+                        graph_typing=None, snp=None):
     records = list(records)
     ensure_separate_destination(path, _protected_paths(records))
     markup = review_report_html(records, selected_ids=selected_ids, investigation=investigation, options=options,
                                 graph_png=graph_png, graph_mime=graph_mime, scope_note=scope_note,
-                                scope_implicit=scope_implicit)
+                                scope_implicit=scope_implicit, graph_typing=graph_typing, snp=snp)
     with _atomic_text(path) as handle:
         handle.write(markup)
     return Path(path).expanduser().resolve()

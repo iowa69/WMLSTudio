@@ -4,6 +4,7 @@ import re
 
 from PySide6.QtCore import QSettings, Qt, Signal
 from PySide6.QtWidgets import (
+    QApplication,
     QCheckBox,
     QComboBox,
     QDialog,
@@ -18,8 +19,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from wmlstudio import __version__, display, scheduler
-from wmlstudio.theme import STYLE
+from wmlstudio import __version__, display, scheduler, theme, ui_common
 from wmlstudio.widgets import button, label
 
 RESOURCE_HONESTY = ("The memory figure is an admission estimate, not a limit the operating "
@@ -161,9 +161,31 @@ def scaled_style_fragment(text, percent):
 
 
 def scaled_style(percent):
+    """The active theme's sheet at the chosen text size.
+
+    It reads the theme rather than the frozen STYLE so that one entry point —
+    the window's `set_ui_scale` — re-applies whatever theme and density are in
+    force. With the shipped defaults this is still exactly STYLE at 100 %.
+    """
     if isinstance(percent, bool) or not isinstance(percent, int) or not 80 <= percent <= 150:
         raise ValueError("Interface scale must be between 80% and 150%")
-    return scaled_style_fragment(STYLE, percent)
+    return scaled_style_fragment(theme.active_style(), percent)
+
+
+def saved_appearance(display_root=None) -> dict:
+    """The saved theme and density names, each filled in with the shipped default."""
+    saved = display.read_appearance(display_root)
+    return {"theme": saved["theme"] if saved["theme"] in theme.THEMES else theme.active_theme(),
+            "density": (saved["density"] if saved["density"] in theme.TABLE_DENSITY
+                        else ui_common.table_density())}
+
+
+def restore_appearance(display_root=None) -> dict:
+    """Put the saved theme and density in force. Call this before any page is built."""
+    chosen = saved_appearance(display_root)
+    theme.set_active_theme(chosen["theme"], chosen["density"])
+    ui_common.set_table_density(chosen["density"])
+    return chosen
 
 
 class InterfaceSettingsPanel(QWidget):
@@ -202,6 +224,27 @@ class InterfaceSettingsPanel(QWidget):
             display.window_size_token(*saved) if saved else "")))
         self.window_size.currentIndexChanged.connect(self.apply_window_size)
         form.addRow("Window size", self.window_size)
+        # Theme and density sit above the size controls because they are the two
+        # the user asked for by name: the workspace read as too dark and the
+        # tables as too loose to hold a screen's worth of evidence.
+        chosen = saved_appearance(self.display_root)
+        self.theme = QComboBox()
+        for key, title in theme.THEME_LABELS.items():
+            self.theme.addItem(title, key)
+            self.theme.setItemData(self.theme.count() - 1, theme.THEME_NOTES.get(key, ""),
+                                   Qt.ItemDataRole.ToolTipRole)
+        self.theme.setCurrentIndex(max(0, self.theme.findData(chosen["theme"])))
+        self.theme.currentIndexChanged.connect(self.apply_appearance)
+        form.addRow("Theme (applies at once)", self.theme)
+        self.density = QComboBox()
+        for key, title in theme.DENSITY_LABELS.items():
+            rows = theme.density_metrics(key)["row_height"]
+            self.density.addItem(title, key)
+            self.density.setItemData(self.density.count() - 1, f"{rows} pixel rows",
+                                     Qt.ItemDataRole.ToolTipRole)
+        self.density.setCurrentIndex(max(0, self.density.findData(chosen["density"])))
+        self.density.currentIndexChanged.connect(self.apply_appearance)
+        form.addRow("Table density", self.density)
         self.scale = QComboBox()
         for value in display.TEXT_SCALE_CHOICES:
             self.scale.addItem(f"{value}%" + (" · recommended" if value == 100 else ""), value)
@@ -229,6 +272,7 @@ class InterfaceSettingsPanel(QWidget):
         form.addRow("Motion", self.motion)
         layout.addLayout(form)
         layout.addWidget(label(display.WINDOW_SIZE_NOTICE, "small", True))
+        layout.addWidget(label(display.APPEARANCE_NOTICE, "small", True))
         # Shown before anything is changed, because the restart is the reason a
         # person gives up on the whole-interface size and never finds it again.
         self.scale_explainer = label(
@@ -322,9 +366,11 @@ class InterfaceSettingsPanel(QWidget):
         return frame
 
     def refresh_preview(self):
+        rows = theme.density_metrics(self.density.currentData())["row_height"]
         self.preview_note.setText(
             f"Text {self.window_ref.ui_scale}% · graph text {self.graph_scale.currentData()}% · "
-            f"{self.display_scale.currentText()} · window {self.window_size.currentText()}")
+            f"{self.display_scale.currentText()} · window {self.window_size.currentText()} · "
+            f"{self.theme.currentData()} theme · {rows} px rows")
 
     # --- the controls -------------------------------------------------------
     def apply_window_size(self):
@@ -341,6 +387,31 @@ class InterfaceSettingsPanel(QWidget):
 
     def apply_scale(self):
         self.window_ref.set_ui_scale(self.scale.currentData())
+        self.refresh_preview()
+
+    def apply_appearance(self):
+        """Save the theme and density, then put them on the running window.
+
+        The sheet is re-applied through the window's own text-size entry point:
+        it is the one place that calls `apply_application_style`, which skips an
+        assignment that would not change the string. A different theme or density
+        does change it, so the new sheet lands.
+        """
+        name, density = self.theme.currentData(), self.density.currentData()
+        display.write_appearance(theme=name, density=density, root=self.display_root)
+        theme.set_active_theme(name, density)
+        ui_common.set_table_density(density)
+        application = QApplication.instance()
+        if application is not None:
+            # Qt draws its own file and message dialogs from the palette, not the
+            # sheet, so a theme that changed only the sheet would leave them behind.
+            theme.apply_palette(application, theme.theme_tokens(name))
+        setter = getattr(self.window_ref, "set_ui_scale", None)
+        if callable(setter):
+            setter(getattr(self.window_ref, "ui_scale", 100))
+        # Tables already on screen keep the row height they were built with, so
+        # the change has to be pushed into them or it looks like it did nothing.
+        ui_common.restyle_tables(self.window_ref, density)
         self.refresh_preview()
 
     def apply_display_scale(self):
@@ -396,6 +467,14 @@ class InterfaceSettingsDialog(QDialog):
     @property
     def window_size(self):
         return self.panel.window_size
+
+    @property
+    def theme(self):
+        return self.panel.theme
+
+    @property
+    def density(self):
+        return self.panel.density
 
     @property
     def resources(self):

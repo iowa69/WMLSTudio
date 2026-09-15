@@ -9,17 +9,20 @@ not SKA2 is staged on the machine running them.
 
 import json
 import random
+from pathlib import Path
 
 import pytest
 
 from wmlstudio.sequence import file_sha256
 from wmlstudio.ska_runtime import runtime_capabilities
 from wmlstudio.snp_tree import (
+    DRAWN_TREE,
     KIND,
     LIMITATIONS,
     NO_LINK_THRESHOLD,
     PUBLISHED_PROTOCOLS,
     SEPARATION,
+    alignment_handoff,
     at_minimum_shared_fraction,
     build_snp_tree,
     protocol,
@@ -339,3 +342,57 @@ def test_native_ska2_alignment_is_refused_rather_than_truncated(tmp_path):
     # Refusing the cohort alignment never touches the pairwise distances.
     assert payload['summary']['comparable_pairs'] == 3
     assert all(row['cohort_alignment'] is None for row in payload['pairs'])
+
+
+def test_the_cohort_alignment_is_handed_over_by_name_and_is_never_called_a_phylogeny():
+    """A request for "an ML tree" must not be answered by renaming the drawn picture.
+
+    The alignment is the only file in a SKA2 run a maximum-likelihood tree can be
+    inferred from, and before this it had no path anywhere in the interface. This
+    checks that the path is offered, that the programs that would use it are
+    named, and that nothing in the hand-off claims a tree was inferred here.
+    """
+    run = fake_run([pair('iso-a', 'iso-b', 3)])
+    run['alignment'] = dict(run['alignment'], file='alignment.fasta', min_freq=0.9,
+                            sha256='b' * 64,
+                            method='cohort-variable-site-split-kmer-alignment')
+    handoff = alignment_handoff(run)
+    assert handoff['status'] == 'completed'
+    assert handoff['path'] == str(Path('/read-only/run') / 'alignment.fasta')
+    assert handoff['columns'] == 20 and handoff['minimum_kmer_frequency'] == 0.9
+    assert handoff['tree_builders'] == ['IQ-TREE', 'FastTree', 'RAxML-NG']
+    assert handoff['tree_built_here'] is False
+    assert 'not a maximum-likelihood phylogeny' in handoff['drawn_tree']
+    assert 'no branch lengths were estimated' in handoff['drawn_tree']
+    assert 'none of them is part of this application' in handoff['maximum_likelihood_route']
+    # The alignment column count is not the pairwise denominator and says so.
+    assert 'not the pairwise shared split k-mer denominator' in handoff['column_meaning']
+    payload = snp_payload(run)
+    assert payload['alignment_handoff'] == handoff and payload['drawn_tree'] == DRAWN_TREE
+    assert any('not a maximum-likelihood tree' in line for line in payload['limitations'])
+
+
+def test_an_alignment_that_was_refused_or_never_run_offers_no_path_to_build_a_tree_from():
+    """An unwritten alignment must read as absent, never as a file waiting on disk.
+
+    A refused alignment is one this run declined to describe as a cohort
+    alignment; offering its path would invite a tree to be built from it anyway.
+    """
+    refused = fake_run([pair('iso-a', 'iso-b', 3)])
+    refused['alignment'] = dict(refused['alignment'], status='refused', file='alignment.fasta',
+                                reason='The cohort alignment is 300,000,000 bytes, above the bound.')
+    handoff = alignment_handoff(refused)
+    assert handoff['path'] is None and handoff['status'] == 'refused'
+    assert 'refused by this run' in handoff['message'] and 'above the bound' in handoff['message']
+    absent = fake_run([pair('iso-a', 'iso-b', 3)])
+    absent['alignment'] = {'status': 'not_run', 'rows': [],
+                           'reason': 'No cohort alignment was requested.'}
+    missing = alignment_handoff(absent)
+    assert missing['path'] is None and missing['file'] is None
+    assert 'nothing to take to a tree builder' in missing['message']
+    assert 'No cohort alignment was requested.' in missing['message']
+    # A run that recorded nothing at all is unrecorded, not empty.
+    silent = fake_run([pair('iso-a', 'iso-b', 3)])
+    silent['alignment'] = {}
+    assert alignment_handoff(silent)['status'] == 'unknown'
+    assert 'not an absent one' in alignment_handoff(silent)['message']

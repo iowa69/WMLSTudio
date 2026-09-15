@@ -2,8 +2,11 @@
 
 A window draws a *copy* of a panel's forest — the same records, edges, threshold,
 groups and scale in a view of its own — so dragging, recoloring or relabelling
-here never moves a node on the page behind it, and closing a window leaves that
-page exactly as it was. Several windows can stand side by side, which is why each
+here never moves a node on the page behind it while the window is open. What
+happens to that arrangement afterwards is the host's decision: the window hands
+it out on :attr:`GraphWindow.stateChanged` and a host that keeps it says so
+through :meth:`GraphWindow.keep_arrangement_in`, so the window never implies a
+save nobody is performing. Several windows can stand side by side, which is why each
 one states its own typing kind, reference, target count, cohort, link threshold
 and the time it was opened: a "3" on an edge of a classical MLST forest, a "3" on
 an edge of a cgMLST forest and a "3" on an edge of a SKA2 split k-mer SNP forest
@@ -74,6 +77,16 @@ def honesty_lines(identity=None):
             "transmission chain, and line length carries no meaning.")
 EDIT_NOTE = ("Arranging, coloring and renaming change this picture only. Allele calls, distances "
              "and group membership are untouched.")
+# Said only by a host that has connected stateChanged and really does keep what it is
+# handed. The signal is emitted whether or not anything listens, so a window that
+# promised "kept" on its own would be claiming a save that may never happen. The
+# sentence names what travels and what does not, because a reader who has carefully
+# zoomed in would otherwise expect the zoom back.
+KEEP_NOTE = ("Arranging, coloring and renaming are kept: they are applied to {where} as you make "
+             "them and once more when this window closes, and saved with the project. Node "
+             "positions, colors, display labels and which details are shown travel back; this "
+             "window's own zoom and pan do not. Allele calls, distances and group membership are "
+             "untouched.")
 EXPORT_FORMATS = (("PNG image", "png"), ("JPEG image", "jpg"), ("SVG vector", "svg"),
                   ("GraphML nodes and edges", "graphml"), ("Newick topology", "nwk"))
 
@@ -245,8 +258,8 @@ class GraphWindow(QMainWindow):
 
     The window owns its view and its copy of the data, so opening two windows on
     one comparison — at two thresholds, or one baseline beside one current tree —
-    gives two pictures that cannot overwrite each other's layout, and closing
-    either one changes nothing on the page it came from.
+    gives two pictures that cannot overwrite each other's layout, and no evidence
+    on the page it came from is changed by anything done here.
     """
 
     closed = Signal()
@@ -268,6 +281,9 @@ class GraphWindow(QMainWindow):
         # view themselves; their own zoom or pan ends that, and "Fit" resumes it.
         self.follow_window = True
         self._contents = {"results": [], "edges": []}
+        # What the status bar falls back to between messages. A host that keeps this
+        # window's arrangement replaces it through keep_arrangement_in().
+        self._edit_note = EDIT_NOTE
         self.setWindowFlag(Qt.WindowType.Window, True)
         self.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, False)
         self.setMinimumSize(QSize(*MINIMUM_SIZE))
@@ -302,7 +318,7 @@ class GraphWindow(QMainWindow):
             signal.connect(lambda _value: self._state_timer.start(120))
         self.apply_identity(self.identity)
         self.refresh_controls()
-        self.say(EDIT_NOTE)
+        self.say(self._edit_note)
 
     # --- construction --------------------------------------------------------
     def _build_header(self, layout):
@@ -320,6 +336,11 @@ class GraphWindow(QMainWindow):
         self.separation = label(self.identity.separation, "small", wrap=True)
         self.separation.setVisible(bool(self.identity.separation))
         inner.addWidget(self.separation)
+        # Where an arrangement made here ends up, in the window rather than only in
+        # a status message a later click would replace. Hidden until a host says so.
+        self.keep_note = label("", "small", wrap=True)
+        self.keep_note.setVisible(False)
+        inner.addWidget(self.keep_note)
         layout.addWidget(frame)
 
     def _build_controls(self, layout):
@@ -386,7 +407,7 @@ class GraphWindow(QMainWindow):
         self.follow_window = True
         self.view.show_contents(contents)
         self.refresh_controls()
-        self.say(EDIT_NOTE)
+        self.say(self._edit_note)
         return self
 
     def apply_identity(self, identity):
@@ -473,7 +494,7 @@ class GraphWindow(QMainWindow):
 
     def _selection_changed(self, ids):
         self.selectionChanged.emit(list(ids))
-        self.say((f"{len(ids)} isolate(s) selected. " + EDIT_NOTE) if ids else EDIT_NOTE)
+        self.say((f"{len(ids)} isolate(s) selected. " + self._edit_note) if ids else self._edit_note)
 
     def _chosen_color(self):
         color = QColorDialog.getColor(QColor(PALETTE[0]), self, "Node color",
@@ -533,6 +554,19 @@ class GraphWindow(QMainWindow):
 
     def _emit_state(self):
         self.stateChanged.emit(self.view.export_state())
+
+    def keep_arrangement_in(self, where):
+        """Say in the window that a host is keeping what is arranged here.
+
+        Only the host that connected :attr:`stateChanged` knows whether the state it
+        is handed is actually applied and stored, so the promise is the host's to
+        make and its words for where the arrangement lands go in the sentence.
+        """
+        self._edit_note = KEEP_NOTE.format(where=str(where).strip() or "the page it came from")
+        self.keep_note.setText(self._edit_note)
+        self.keep_note.setVisible(True)
+        self.say(self._edit_note)
+        return self._edit_note
 
     # --- exports -------------------------------------------------------------
     def export_dialog(self):

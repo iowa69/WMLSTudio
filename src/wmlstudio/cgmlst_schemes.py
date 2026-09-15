@@ -20,6 +20,16 @@ A 7-locus MLST distance and a 2,000-target cgMLST distance are different
 quantities. Nothing in this module will return a cgMLST threshold for an MLST
 scheme, and a cutoff is offerable only when the bound scheme key AND the full
 published target count both match the installed scheme.
+
+TARGET SETS. A cgMLST scheme is a CORE set. PubMLST publishes an accessory set
+beside the core one for Bacillus anthracis, and an accessory and a pan-genome set
+beside the two gonococcal core schemes; those are pinned here as separate rows so
+"core" and "core plus accessory" are an explicit choice rather than one silently
+standing in for the other. A core-set distance and a core-plus-accessory distance
+are different quantities for the same reason MLST and cgMLST are: they count
+differences over different numbers of different targets. They are separate rows,
+separate keys, separate library folders and separate SHA-256 pins, and a cutoff
+published on a core set is never offered for a run on any other set.
 """
 
 from __future__ import annotations
@@ -36,7 +46,7 @@ from pathlib import Path
 from .threshold_guidance import SOURCES
 from .threshold_guidance import catalog_entries as _threshold_guidance_entries
 
-CATALOG_VERSION = "2026-09-14.1"
+CATALOG_VERSION = "2026-09-15.1"
 LICENCE_REVIEWED_ON = "2026-09-14"
 LIBRARY_DIRNAME = "cgmlst"
 SCHEME_DIRNAME = "schemes"
@@ -55,7 +65,21 @@ CGMLST_TARGET_FLOOR = 30
 # axis, so which one a scheme is is recorded on the row rather than inferred.
 TARGET_SET_CORE = "core"
 TARGET_SET_ACCESSORY = "accessory"
+# A pan-genome (wgMLST) set is core and accessory targets in ONE set, which is not
+# the same thing as an accessory set: 251 accessory targets and 1,907 pan-genome
+# targets are themselves two different quantities. The rest of the application
+# stores and renders the two-valued bucket in TARGET_SETS -- a set either IS the
+# core set or is not -- so the finer name is carried beside it, never instead of it.
+TARGET_SET_WHOLE_GENOME = "whole_genome"
 TARGET_SETS = (TARGET_SET_CORE, TARGET_SET_ACCESSORY)
+TARGET_SET_DETAILS = (TARGET_SET_CORE, TARGET_SET_ACCESSORY, TARGET_SET_WHOLE_GENOME)
+_TARGET_SET_LABELS = {TARGET_SET_CORE: "Core", TARGET_SET_ACCESSORY: "Accessory",
+                      TARGET_SET_WHOLE_GENOME: "Whole genome"}
+_TARGET_SET_PHRASES = {
+    TARGET_SET_CORE: "cgMLST core target set",
+    TARGET_SET_ACCESSORY: "accessory target set",
+    TARGET_SET_WHOLE_GENOME: "whole-genome (pan-genome) target set",
+}
 _ALLELE_SUFFIXES = {".tfa", ".fasta", ".fa", ".fna"}
 # Provider spellings differ between the pinned catalogue ("pasteur") and the
 # download clients ("BIGSdb-Pasteur"); both name one provider and must resolve to
@@ -71,7 +95,8 @@ INTERPRETATION = (
     "An installed cgMLST scheme is a target set and an allele nomenclature. Two profiles are "
     "comparable only when both were called against the same installed scheme; a distance never "
     "crosses schemes, providers or revisions, and never shares a scale with a seven-locus MLST "
-    "distance."
+    "distance. A core target set and a core-plus-accessory set are two such schemes: their "
+    "distances never share a scale, an axis or a threshold either."
 )
 
 PROVIDERS = {
@@ -279,6 +304,116 @@ _SCHEMES = (
      "notes": ("Unlike the 3,002-target v2 scheme this one carries cgST profiles, so a cgMLST "
                "sequence type can be assigned -- but no curated cutoff applies to it.",)},
 
+    # --- Core and accessory sets published side by side, so the choice is explicit ---
+    # These are the only two organisms for which any provider this catalogue supports
+    # publishes a non-core target set. Every PubMLST and every Institut Pasteur
+    # seqdef database was listed on 2026-09-15 and searched for a scheme describing
+    # itself as accessory, pan-genome or whole-genome; cgMLST.org publishes core
+    # schemes only. C. chauvoei has such a pair too and is left out as veterinary.
+    {"key": "pubmlst:banthracis-cgmlst-3803", "genus": "Bacillus", "species": "anthracis",
+     "provider": "pubmlst", "database": "pubmlst_bcereus_seqdef", "scheme_id": "2",
+     "scheme_name": "B. anthracis cgMLST", "revision": "last_updated 2026-09-07",
+     "locus_count": 3803,
+     "target_list_sha256": "e4a911b675778ede04da21b3aad4adde951d4f6e1ccb1df5cdb55440aa6da5f2",
+     "has_profiles": True, "profile_field": "cgST",
+     "threshold_scheme_key": None,
+     "binding_basis": ("No threshold is bound. Abdel-Glil et al. 2021 propose five differing "
+                       "alleles on this 3,803-target core set to trace epidemiologically linked "
+                       "strains, but that number is not curated in this application's publication "
+                       "catalogue, so no number is offered. Read the paper before using it."),
+     "notes": ("Abdel-Glil et al. 2021 (J Clin Microbiol 59:e02889-20) defined this scheme on 57 "
+               "B. anthracis genomes spanning the phylogeny and evaluated it on 584 genomes from "
+               "50 countries.",
+               "The same PubMLST database also hosts a 1,568-target B. cereus cgMLST scheme. It "
+               "shares 1,225 targets with this one, verified on 2026-09-15, and is a different "
+               "scheme: the two are not comparable and are not two versions of one thing.")},
+    {"key": "pubmlst:banthracis-accessory-1263", "genus": "Bacillus", "species": "anthracis",
+     "provider": "pubmlst", "database": "pubmlst_bcereus_seqdef", "scheme_id": "3",
+     "scheme_name": "B. anthracis accessory genes", "target_set": TARGET_SET_ACCESSORY,
+     "revision": "read 2026-09-15; PubMLST lists no last_updated date for this definition-only "
+     "scheme", "locus_count": 1263,
+     "target_list_sha256": "9001693fde7ce0eb6095349244877fe3fe2ea6a00ad27eea237ad39a941ccc9a",
+     "has_profiles": False, "profile_field": "",
+     "threshold_scheme_key": None,
+     "binding_basis": ("No threshold is bound and none can be. The only published B. anthracis "
+                       "cutoff -- five alleles, Abdel-Glil et al. 2021 -- was derived on the "
+                       "3,803-target CORE set. A distance over these 1,263 accessory targets is a "
+                       "different quantity: the core cutoff is not offered for it, and the two "
+                       "distances are never added together into one number."),
+     "notes": ("These are the 1,263 accessory targets Abdel-Glil et al. 2021 host at PubMLST "
+               "beside the core scheme; their wgMLST is the two sets run together, 3,803 + 1,263 "
+               "= 5,066 targets. Verified on 2026-09-15: the two sets share no target name.",
+               "An accessory target is absent from some B. anthracis isolates by design, so an "
+               "uncalled target here is biology and not a failed call. It is reported as not "
+               "assayed, never as a difference.",
+               "PubMLST assigns no cgST for this set, so no sequence type is produced; allelic "
+               "distances within this set are still computed.")},
+    {"key": "pubmlst:ngonorrhoeae-cgmlst-1430", "genus": "Neisseria", "species": "gonorrhoeae",
+     "provider": "pubmlst", "database": "pubmlst_neisseria_seqdef", "scheme_id": "89",
+     "scheme_name": "N. gonorrhoeae cgMLST v2", "revision": "last_updated 2026-09-15",
+     "locus_count": 1430,
+     "target_list_sha256": "9f50a56e0c826d398b98ed9cba20225a0563cf80499a0fb9aa9e8e52da340582",
+     "has_profiles": True, "profile_field": "cgST",
+     "threshold_scheme_key": None,
+     "binding_basis": "No cutoff for N. gonorrhoeae is curated in the threshold catalogue.",
+     "notes": ("Unitt et al. 2025 (eLife 14) describe this refined scheme and the LIN code "
+               "nomenclature PubMLST publishes on it. LIN code bin thresholds are a nomenclature "
+               "for naming lineages, not an outbreak cutoff, and none is applied here.",
+               "Verified on 2026-09-15: 12 of these 1,430 targets are in neither the 1,649-target "
+               "cgMLST v1.0 set nor the 1,907-target pgMLST v1.0 set, so this scheme is NOT the "
+               "core half of that pan-genome set.")},
+    {"key": "pubmlst:ngonorrhoeae-cgmlst-1649", "genus": "Neisseria", "species": "gonorrhoeae",
+     "provider": "pubmlst", "database": "pubmlst_neisseria_seqdef", "scheme_id": "62",
+     "scheme_name": "N. gonorrhoeae cgMLST v1.0", "revision": "last_updated 2026-09-15",
+     "locus_count": 1649,
+     "target_list_sha256": "e99d48e926952cb8c6a00ad9ab60348c18e1320ad2d414d27140fb2d7799dbd2",
+     "has_profiles": True, "profile_field": "cgST",
+     "threshold_scheme_key": None,
+     "binding_basis": "No cutoff for N. gonorrhoeae is curated in the threshold catalogue.",
+     "notes": ("Harrison et al. 2020 (J Infect Dis 222:1816-1825) defined this gonococcal core "
+               "genome. It is the core set the accessory and pan-genome v1.0 schemes are built "
+               "around: verified on 2026-09-15, these 1,649 targets and the 251 accessory targets "
+               "are disjoint and together account for 1,900 of the 1,907 pgMLST targets.",
+               "PubMLST curates cgMLST v2 as the typing scheme now. v1.0 and v2 are different "
+               "target sets, not two revisions of one, and their distances never share a scale.")},
+    {"key": "pubmlst:ngonorrhoeae-accessory-251", "genus": "Neisseria", "species": "gonorrhoeae",
+     "provider": "pubmlst", "database": "pubmlst_neisseria_seqdef", "scheme_id": "80",
+     "scheme_name": "N. gonorrhoeae agMLST v1.0", "target_set": TARGET_SET_ACCESSORY,
+     "revision": "read 2026-09-15; PubMLST lists no last_updated date and flags this scheme as in "
+     "development", "locus_count": 251,
+     "target_list_sha256": "d6ee3dc3344878a4953def93ae358b56f68c3246eefe97d3a86018a8bb31cb6a",
+     "has_profiles": False, "profile_field": "",
+     "threshold_scheme_key": None,
+     "binding_basis": ("No threshold is bound and none can be. No cutoff for N. gonorrhoeae is "
+                       "curated at all, and a cutoff published on a core set would not carry over "
+                       "to a 251-target accessory set in any case."),
+     "notes": ("PubMLST describes this scheme as the gonococcal accessory genome and labels it "
+               "'in development' and 'unpublished'. It downloads and it is usable within itself, "
+               "but the target set may be redefined without notice; the pinned SHA-256 is what "
+               "detects that instead of silently adopting it.",
+               "Verified on 2026-09-15: none of these 251 targets appears in either gonococcal "
+               "core scheme. An accessory target is absent from some isolates by design, so an "
+               "uncalled target is biology and not a failed call.")},
+    {"key": "pubmlst:ngonorrhoeae-pgmlst-1907", "genus": "Neisseria", "species": "gonorrhoeae",
+     "provider": "pubmlst", "database": "pubmlst_neisseria_seqdef", "scheme_id": "81",
+     "scheme_name": "N. gonorrhoeae pgMLST v1.0", "target_set": TARGET_SET_WHOLE_GENOME,
+     "revision": "read 2026-09-15; PubMLST lists no last_updated date and flags this scheme as in "
+     "development", "locus_count": 1907,
+     "target_list_sha256": "22f8f05e2c648b530c7f12ce96128ba6c6b67fa867ccaa9cf2970ae6f2d5e049",
+     "has_profiles": False, "profile_field": "",
+     "threshold_scheme_key": None,
+     "binding_basis": ("No threshold is bound. A pan-genome distance over 1,907 targets is not a "
+                       "cgMLST distance; no cutoff is published for it, and none from a core "
+                       "scheme is offered in its place."),
+     "notes": ("This is the 'cgMLST plus accessory genes' set for N. gonorrhoeae. Run it INSTEAD "
+               "of a core scheme, never beside one as something added to a core distance.",
+               "Verified on 2026-09-15: it contains all 1,649 cgMLST v1.0 targets and all 251 "
+               "agMLST v1.0 targets, plus 7 further targets in neither (NEIS1391, NEIS3185, "
+               "NEIS3191, NEIS3199, NEIS3201, NEIS3235, NEIS3236), so it is not the arithmetic "
+               "union of those two schemes.",
+               "PubMLST labels this scheme 'in development' and 'unpublished'; the target set may "
+               "be redefined without notice, and the pinned SHA-256 is what detects that.")},
+
     # --- Download-only: licence does not permit packing, directory is pre-created ---
     {"key": "cgmlst.org:lmonocytogenes-1701", "genus": "Listeria", "species": "monocytogenes",
      "provider": "cgmlst.org", "database": "", "scheme_id": "Lmonocytogenes",
@@ -436,11 +571,24 @@ def catalog_entries() -> list[dict]:
         entry["licence_restriction"] = provider["restriction"]
         entry["licence_reviewed_on"] = provider["reviewed_on"]
         entry["kind"] = "cgmlst"
-        # Every pinned row is a core target set. A curator who pins a provider's
-        # accessory or whole-genome set sets this to "accessory" on that row; the
-        # two then appear as an explicit choice instead of one silently standing
-        # in for the other.
-        entry.setdefault("target_set", TARGET_SET_CORE)
+        # A row that says nothing is a core set, because that is what a cgMLST
+        # scheme is; a row pinning a provider's accessory or pan-genome set names
+        # it, so the two appear as an explicit choice instead of one silently
+        # standing in for the other. Two fields carry one fact on purpose:
+        # target_set is the two-valued bucket the rest of the application stores
+        # and renders -- a set either IS the core set or is not -- and
+        # target_set_detail says which kind of not-core set it is, because an
+        # accessory distance and a pan-genome distance are themselves different
+        # quantities and must not be read as one.
+        detail = str(entry.get("target_set") or TARGET_SET_CORE)
+        if detail not in TARGET_SET_DETAILS:
+            raise SchemeCatalogError(
+                f"{entry['key']} declares the target set {detail!r}, which this catalogue does not "
+                f"know. It must be one of {', '.join(TARGET_SET_DETAILS)}: guessing would be "
+                "guessing what a distance measured on it means.")
+        entry["target_set_detail"] = detail
+        entry["target_set"] = (TARGET_SET_CORE if detail == TARGET_SET_CORE
+                               else TARGET_SET_ACCESSORY)
         entry["scheme_group"] = scheme_group(entry)
         entry["slot"] = slot_name(entry)
         entry["source_url"] = source_url(entry)
@@ -451,13 +599,36 @@ def catalog_entries() -> list[dict]:
     return rows
 
 
+def target_set_detail(entry) -> str:
+    """Which of the three target sets a row is, defaulting to core for a row that
+    says nothing -- because a cgMLST scheme with nothing said about it is the core
+    set. An unrecognised value is returned as-is so a caller renders the words the
+    row actually carries rather than quietly calling an unknown set a core one."""
+    if not isinstance(entry, dict):
+        return str(entry or TARGET_SET_CORE)
+    return str(entry.get("target_set_detail") or entry.get("target_set") or TARGET_SET_CORE)
+
+
+def target_set_label(entry) -> str:
+    """'Core', 'Accessory' or 'Whole genome' -- one column's worth of the truth.
+
+    A row whose target set this catalogue does not recognise reads 'Not recorded',
+    never 'Core': an unlabelled set is an unknown quantity, not a core genome.
+    """
+    return _TARGET_SET_LABELS.get(target_set_detail(entry), "Not recorded")
+
+
 def scheme_title(entry: dict) -> str:
     """One readable row title for a catalogued scheme, never a folder name.
 
     The unit is spelled out because it is the point: 'targets' here and 'loci' on a
-    classical scheme are different quantities that must never share a scale.
+    classical scheme are different quantities that must never share a scale. A set
+    that is not the core set says so in the title as well, so a person choosing
+    between two rows of a menu cannot mistake one for the other.
     """
+    detail = target_set_detail(entry)
     parts = [_organism(entry), str(entry.get("scheme_name") or ""),
+             _TARGET_SET_PHRASES.get(detail, "") if detail != TARGET_SET_CORE else "",
              f"{entry['locus_count']} targets",
              PROVIDERS[entry["provider"]]["name"] if entry.get("provider") in PROVIDERS else "",
              f"updated {_version_of(entry)}" if _version_of(entry) else ""]
@@ -589,12 +760,18 @@ def slot_for(descriptor) -> str:
 
 
 def scheme_variants(organism=None, *, group=None) -> dict:
-    """The core and accessory target sets catalogued for one organism.
+    """The core, accessory and whole-genome target sets catalogued for one organism.
 
     A cgMLST scheme is a core set. Where a provider also publishes an accessory or
-    whole-genome set, both are returned so the choice can be offered explicitly.
-    Where only the core set is catalogued this says so in words, because an empty
-    "accessory" list on its own reads as a broken menu rather than as an answer.
+    pan-genome set, all of them are returned so the choice can be offered
+    explicitly. Where only the core set is catalogued this says so in words,
+    because an empty "accessory" list on its own reads as a broken menu rather than
+    as an answer.
+
+    "accessory" is every set that is not the core set, which is what a menu offering
+    the alternative to a core run needs. "accessory_only" and "whole_genome" split
+    it, because 251 accessory targets and 1,907 pan-genome targets are not one
+    quantity either.
     """
     wanted = str(organism or "").strip().casefold()
     rows = [entry for entry in catalog_entries()
@@ -603,6 +780,10 @@ def scheme_variants(organism=None, *, group=None) -> dict:
                  or entry["genus"].casefold() == wanted)]
     core = [entry for entry in rows if entry["target_set"] == TARGET_SET_CORE]
     accessory = [entry for entry in rows if entry["target_set"] == TARGET_SET_ACCESSORY]
+    accessory_only = [entry for entry in accessory
+                      if entry["target_set_detail"] == TARGET_SET_ACCESSORY]
+    whole_genome = [entry for entry in accessory
+                    if entry["target_set_detail"] == TARGET_SET_WHOLE_GENOME]
     if not rows:
         message = (f"No cgMLST scheme is catalogued for {organism or group}. That is a gap in this "
                    "catalogue, not proof that no scheme exists.")
@@ -611,14 +792,24 @@ def scheme_variants(organism=None, *, group=None) -> dict:
                    "whole-genome set is pinned, so there is nothing to choose between: the core "
                    "set is the scheme.")
     elif not core:
-        message = ("Only an accessory target set is catalogued for this organism. An accessory "
-                   "set is not a core genome scheme and its distances are a different quantity.")
+        message = ("Only an accessory or whole-genome target set is catalogued for this organism. "
+                   "Neither is a core genome scheme and neither measures the same quantity one "
+                   "would.")
     else:
-        message = (f"{len(core)} core and {len(accessory)} accessory target set(s) are catalogued. "
-                   "They are different quantities: a distance from one never shares a scale, an "
-                   "axis or a threshold with a distance from the other.")
+        counts = [f"{len(core)} core"]
+        if accessory_only:
+            counts.append(f"{len(accessory_only)} accessory")
+        if whole_genome:
+            counts.append(f"{len(whole_genome)} whole-genome")
+        counted = (", ".join(counts[:-1]) + " and " + counts[-1]) if len(counts) > 1 else counts[0]
+        message = (f"{counted} target set(s) are catalogued for this organism. They are different "
+                   "quantities: a distance from one never shares a scale, an axis or a threshold "
+                   "with a distance from another, and a cutoff published on the core set is not "
+                   "offered for a core-plus-accessory run. Choose one and record which you chose.")
     return {"organism": str(organism or ""), "group": group, "core": core,
-            "accessory": accessory, "has_core": bool(core), "has_accessory": bool(accessory),
+            "accessory": accessory, "accessory_only": accessory_only,
+            "whole_genome": whole_genome, "has_core": bool(core),
+            "has_accessory": bool(accessory), "has_whole_genome": bool(whole_genome),
             "message": message}
 
 
@@ -626,7 +817,7 @@ def catalog_digest() -> str:
     """A fingerprint of the pinned catalogue, for staging manifests and tests."""
     pinned = [{key: entry[key] for key in
                ("key", "provider", "database", "scheme_id", "locus_count",
-                "target_list_sha256", "threshold_scheme_key")}
+                "target_list_sha256", "threshold_scheme_key", "target_set_detail")}
               for entry in catalog_entries()]
     return hashlib.sha256(json.dumps(pinned, sort_keys=True).encode()).hexdigest()
 
@@ -667,6 +858,7 @@ def threshold_for(key, *, locus_count=None, method="cgmlst") -> dict:
     entry = entry_for(key)
     result = {"key": entry["key"], "organism": entry["organism"], "method": "cgmlst",
               "scheme_key": entry["threshold_scheme_key"],
+              "target_set": entry["target_set"], "target_set_detail": entry["target_set_detail"],
               "catalogue_locus_count": entry["locus_count"], "installed_locus_count": locus_count,
               "binding_basis": entry["binding_basis"], "catalog_version": CATALOG_VERSION,
               "interpretation": INTERPRETATION, "entries": [], "threshold": None,
@@ -696,12 +888,26 @@ def threshold_for(key, *, locus_count=None, method="cgmlst") -> dict:
                             f"{entry['locus_count']}. A cutoff derived on the full published target "
                             "set is not offered for a different one; no scaling is applied.")
         return result
+    # A publication that states no target count is read as having been derived on
+    # the pinned CORE set, because that is what an unqualified cgMLST cutoff means.
+    # It is never read that way for an accessory or pan-genome set: a number with no
+    # stated target count cannot be shown to have been measured on that set, and a
+    # core cutoff quietly offered for a core-plus-accessory run is precisely the
+    # mistake this catalogue exists to prevent.
     numeric = [row for row in rows if row["published_threshold"] is not None
-               and (row["locus_count"] is None or row["locus_count"] == entry["locus_count"])]
+               and (row["locus_count"] == entry["locus_count"]
+                    or (row["locus_count"] is None
+                        and entry["target_set"] == TARGET_SET_CORE))]
     if not numeric:
         result["status"] = "citation_only"
         result["reason"] = ("The bound publication supplies scope and citation but no transferable "
                             "number for this target set.")
+        if entry["target_set"] != TARGET_SET_CORE:
+            result["reason"] += (
+                " This is not a core genome scheme: it is the "
+                f"{_TARGET_SET_PHRASES.get(entry['target_set_detail'], 'non-core target set')} of "
+                f"{entry['locus_count']} targets, so a cutoff is offered only by a publication "
+                "that states this exact target count.")
         return result
     result["status"] = "threshold_offerable"
     result["suggestion"] = numeric[0]
@@ -735,14 +941,15 @@ def threshold_citations(key) -> list[dict]:
 
 SLOT_README = """{organism} -- {scheme_name}
 
-Put the {locus_count}-target {provider_name} cgMLST scheme in THIS folder.
+Put the {locus_count}-target {provider_name} {set_phrase} in THIS folder.
 
 {state_line}
 
-Provider : {provider_name}
-Scheme   : {source_url}
-Targets  : {locus_count}
-Terms    : {terms_url}
+Provider   : {provider_name}
+Scheme     : {source_url}
+Targets    : {locus_count}
+Target set : {set_label}
+Terms      : {terms_url}
 
 {restriction}
 
@@ -751,10 +958,29 @@ download of this scheme installs into THIS folder rather than somewhere else.
 Deleting it removes these description files and whatever scheme you installed
 here; the app recreates the empty, labelled folder on the next run.
 
-A cgMLST distance from this scheme is a number of differing targets out of the
+{set_note}"""
+
+# What a distance from this folder means depends on which target set is in it, so
+# each set gets the closing paragraph it actually needs rather than one written for
+# a core scheme and then contradicted.
+_SET_NOTES = {
+    TARGET_SET_CORE: """A cgMLST distance from this scheme is a number of differing targets out of the
 targets called in BOTH isolates. It is not a seven-locus MLST distance, it is not
 a SNP count, and it is never proof of transmission.
-"""
+""",
+    TARGET_SET_ACCESSORY: """This is an ACCESSORY target set, not a cgMLST scheme. Its targets are absent from
+some isolates of this organism by design, so a target that is not called here is
+biology and not a failed call: it is reported as not assayed, never as a
+difference. A distance measured on this set never shares a scale, an axis or a
+published cutoff with a core-genome distance, the two are never added together
+into one number, and neither is proof of transmission.
+""",
+    TARGET_SET_WHOLE_GENOME: """This is a WHOLE-GENOME (pan-genome) target set: core and accessory targets in one
+set. Run it INSTEAD of a core scheme, never beside one as something added to a
+core distance. A distance measured on it is not a cgMLST distance, never shares a
+scale, an axis or a published cutoff with one, and is never proof of transmission.
+""",
+}
 
 _BUNDLED_STATE = ("This scheme's provider permits redistribution, so the release may already "
                   "carry it. If the folder is empty, use Reference data > Install cgMLST scheme.")
@@ -866,6 +1092,8 @@ def slot_payload(entry: dict) -> dict:
     return {"format_version": SLOT_FORMAT_VERSION, "catalog_version": CATALOG_VERSION,
             "key": entry["key"], "organism": entry["organism"], "genus": entry["genus"],
             "species": entry["species"], "kind": "cgmlst", "target_set": entry["target_set"],
+            "target_set_detail": entry["target_set_detail"],
+            "target_set_label": target_set_label(entry),
             "scheme_group": entry["scheme_group"], "title": entry["title"],
             "provider": entry["provider"], "provider_name": entry["provider_name"],
             "database": entry["database"], "scheme_id": entry["scheme_id"],
@@ -1064,11 +1292,14 @@ def prepare_library(root, *, keys=None, targets=None, migrate=True) -> dict:
             state_line = _INSTALLED_STATE
         else:
             state_line = _BUNDLED_STATE if entry["bundled"] else _DOWNLOAD_STATE
+        detail = entry["target_set_detail"]
         readme = SLOT_README.format(
             organism=entry["organism"], scheme_name=entry["scheme_name"],
             locus_count=entry["locus_count"], provider_name=entry["provider_name"],
             source_url=entry["source_url"], terms_url=entry["terms_url"],
-            restriction=entry["licence_restriction"], state_line=state_line)
+            restriction=entry["licence_restriction"], state_line=state_line,
+            set_phrase=_TARGET_SET_PHRASES.get(detail, "target set"),
+            set_label=target_set_label(entry), set_note=_SET_NOTES.get(detail, ""))
         payload = json.dumps(slot_payload(entry), indent=2, sort_keys=True) + "\n"
         for name, text in ((README_FILENAME, readme), (SLOT_FILENAME, payload)):
             path = folder / name
@@ -1099,6 +1330,12 @@ the same way.
 These are cgMLST schemes: hundreds to thousands of targets. Classical seven-locus
 MLST schemes live in the separate schemes folder. Distances from the two are
 different quantities and are never mixed, compared or thresholded together.
+
+Each folder's own README names its target set: Core, Accessory or Whole genome.
+A core set is expected in every isolate; an accessory set is not, and a
+whole-genome set is the two together. They too are different quantities. A
+distance from one never shares a scale, an axis or a published cutoff with a
+distance from another, and they are never added together into one number.
 
 migrations.json, if present, records schemes moved here from the classical
 schemes folder by an earlier release, so a saved project that stored the old
@@ -1190,7 +1427,9 @@ def _installed_row(entry: dict, row: dict, *, identity_matched: bool) -> dict:
             "count_matched": count == entry["locus_count"],
             "identity_matched": identity_matched,
             "organism": entry["organism"], "scheme_name": entry["scheme_name"],
-            "provider_name": entry["provider_name"], "target_set": entry["target_set"]}
+            "provider_name": entry["provider_name"], "target_set": entry["target_set"],
+            "target_set_detail": entry["target_set_detail"],
+            "target_set_label": target_set_label(entry)}
 
 
 def _identity_matches(entry: dict, metadata: dict) -> bool:
@@ -1236,10 +1475,13 @@ def installed_entries(root, *, extra_paths=(), cancelled=None) -> list[dict]:
     for row in rows:
         identified = identify_installed(row["path"])
         guidance = threshold_for_installed(row["path"])
+        detail = (identified["target_set_detail"] if identified else "") or row["target_set"]
         listed.append({**row, "catalog_key": identified["key"] if identified else None,
                        "catalogued": identified is not None,
                        "target_set": row["target_set"] or (
                            identified["target_set"] if identified else ""),
+                       "target_set_detail": detail,
+                       "target_set_label": target_set_label(detail) if detail else "Not recorded",
                        "expected_locus_count": identified["locus_count"] if identified else None,
                        "count_matched": bool(identified)
                        and row["locus_count"] == identified["locus_count"],
@@ -1300,7 +1542,12 @@ def download_plan(key) -> dict:
     return {"key": entry["key"], "organism": entry["organism"], "title": entry["title"],
             "scheme_name": entry["scheme_name"], "locus_count": entry["locus_count"],
             "provider": entry["provider"], "provider_name": entry["provider_name"],
-            "target_set": entry["target_set"], "scheme_group": entry["scheme_group"],
+            "target_set": entry["target_set"], "target_set_detail": entry["target_set_detail"],
+            "target_set_label": target_set_label(entry), "scheme_group": entry["scheme_group"],
+            # What the person is about to download decides what the numbers it
+            # produces mean, so the download button says it before the first byte
+            # rather than the report saying it afterwards.
+            "target_set_notice": _SET_NOTES.get(entry["target_set_detail"], "").strip(),
             "source_url": entry["source_url"], "terms_url": provider["terms_url"],
             "terms_notice": provider["restriction"], "licence_quote": provider["quote"],
             "requires_acknowledgement": bool(provider["requires_acknowledgement"]),

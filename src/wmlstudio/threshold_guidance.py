@@ -3,6 +3,12 @@
 The catalog is deliberately separate from allele databases and contains no
 licensed scheme contents. A matching taxon or locus count does not validate a
 caller, missing-data policy, or clustering threshold.
+
+A laboratory's own operational cutoffs live in a second, separate registry
+(``operational_cutoffs``). They are numbers someone runs on their own authority
+with no publication behind them, so they are kept out of the catalog entirely
+rather than mixed into it with a weaker label: everything downstream prints a
+catalog row as evidence, and a local rule has none to print.
 """
 
 from __future__ import annotations
@@ -37,6 +43,50 @@ SUGGESTION_NOTICE = (
     "This is a suggestion to read, not a setting that is in use. WMLSTudio has not applied it, and it "
     "becomes a local threshold only after the exact scheme, its full target count, the reference "
     "fingerprint, the caller and the missing-data policy are bound and justified in writing."
+)
+
+# A cutoff a laboratory runs on its own authority, with no publication behind it.
+# These rows are deliberately kept out of SOURCES and out of catalog_entries():
+# every consumer of a catalog row prints it as published evidence, with a DOI
+# beside the number, and there is no publication here to print. They travel in
+# their own list, they name the number in their own field so a row that ever
+# leaked into publication code would read as "no cutoff" rather than as a
+# published one, and record_decision refuses them outright.
+OPERATIONAL_NOTICE = (
+    "A locally declared operational cutoff, not a published one. No publication reviewed here establishes "
+    "this number for this scheme, so it may be reported as this laboratory's own cutoff and never as a "
+    "published one. It is offered only against the exact scheme and the full target count it was declared "
+    "for, and it is not applied until someone sets it."
+)
+# The honest reading of a cutoff that is stricter than every published one. It
+# belongs beside the number because "stricter" is routinely misread as "safer".
+OPERATIONAL_TRADE_OFF = (
+    "A stricter cutoff is not automatically the safer one. It links fewer unrelated isolates and, by the "
+    "same movement, splits real transmission chains: an isolate outside it has not been shown to be "
+    "unrelated, only to be outside this cutoff. Report which isolates fall just outside it."
+)
+_OPERATIONAL = (
+    {"id": "klebsiella-pneumoniae-operational-5", "organism": "Klebsiella pneumoniae", "method": "cgmlst",
+     "operational_threshold": 5, "operator": "<=", "unit": "allele differences",
+     "scheme_key": "cgmlst.org:kpneumoniae-2358", "locus_count": 2358,
+     "declared_by": "This installation's user, as their laboratory's operational rule for K. pneumoniae cgMLST.",
+     "declared_on": "2026-09-15",
+     "provenance": (
+         "Supplied by the user of this installation, who states that only an allelic distance of 5 should "
+         "count as a cluster for Klebsiella pneumoniae cgMLST. No citation was supplied with it. A targeted "
+         "search of the primary literature on 2026-09-15 found no publication establishing 5 allele "
+         "differences for the 2,358-target cgmlst.org K. pneumoniae scheme, so it is recorded here as an "
+         "operational rule and not as evidence. If the laboratory holds the validation behind it, record "
+         "that document; until then its whole provenance is that the user stated it."),
+     "review_note": (
+         "Locally validated species-specific criteria that depart from the public recommendation do exist "
+         "and are ordinary practice: Mayo Clinic's published criteria (Siddall et al. 2025) set S. aureus "
+         "at 8 where cgMLST.org recommends 24. A local criterion is still local, and this one carries no "
+         "validation document here."),
+     # False for the same reason a citation-only row is false: nothing here can
+     # be recorded as publication evidence. record_decision refuses this id.
+     "bindable": False, "published_threshold": None, "auto_apply": False,
+     "evidence_class": "user_supplied_operational"},
 )
 
 SOURCES = {
@@ -156,8 +206,8 @@ def _entry(organism, value, source, *, suffix="", scheme_key=None, loci=None,
 
 def catalog_entries():
     entries = [_entry(organism, value, "glasgow2025", scheme_key=key, loci=loci,
-        scope="SeqSphere+ public-scheme comparison in a selected hospital isolate cohort; not WMLSTudio calibration.",
-        note="Selection was based on prior clustering; pipeline agreement is not an independent proof of transmission. Exact snapshot/caller settings still require review.")
+        scope="SeqSphere+ public-scheme comparison in a selected hospital isolate cohort; the numbers are cgMLST.org's own recommended clustering thresholds as applied by this study, not values derived in it. Not WMLSTudio calibration.",
+        note="Selection was based on prior clustering; pipeline agreement is not an independent proof of transmission. Exact snapshot/caller settings still require review. The authors state that published cgMLST thresholds differ and, when set using epidemiologically confirmed outbreaks, often simply reflect the maximum allelic distance observed among outbreak isolates.")
         for organism, value, loci, key in _STANDARD]
     entries.extend(_entry(organism, value, "siddall2025", suffix="-local",
         scope="Mayo Clinic local related-isolate criterion; SeqSphere+ 10.0.5 / SKESA 2.3.0.",
@@ -262,6 +312,65 @@ def guidance_for(organism, method=None):
             "review_scope": "Targeted primary-source review, including 2025 literature; not a systematic or continuously updated review."}
 
 
+def operational_cutoffs(organism=None, method="cgmlst", *, locus_count=None, scheme_key=None):
+    """Locally declared cutoffs bound to this exact scheme; never publication evidence.
+
+    The binding rule is the publication catalog's rule, for the same reason: a
+    number declared on one target set and a distance measured on another are
+    different quantities, so a mismatching scheme key or target count drops the
+    row instead of rescaling it. An unreadable target count is a failed check,
+    not a pass, so it drops the row too.
+    """
+    text = " ".join(str(organism).split()).casefold() if organism is not None else None
+    count = None
+    if locus_count is not None:
+        try:
+            count = int(locus_count)
+        except (TypeError, ValueError):
+            return []
+    rows = []
+    for row in _OPERATIONAL:
+        if text is not None and row["organism"].casefold() != text:
+            continue
+        if method is not None and row["method"] != method:
+            continue
+        if count is not None and count != row["locus_count"]:
+            continue
+        if scheme_key and str(scheme_key) != row["scheme_key"]:
+            continue
+        row = deepcopy(row)
+        row["binding_checked"] = count is not None or bool(scheme_key)
+        row["notice"], row["trade_off"] = OPERATIONAL_NOTICE, OPERATIONAL_TRADE_OFF
+        rows.append(row)
+    return rows
+
+
+def _operational_notice(rows, published_entries):
+    """One paragraph per local cutoff, with the published numbers it departs from.
+
+    The comparison is read off the catalog rather than curated beside the local
+    number, so it cannot drift away from what the catalog actually says once a
+    source is added, revised or withdrawn.
+    """
+    parts = []
+    for row in rows:
+        bound = [entry for entry in published_entries
+                 if entry["scheme_key"] == row["scheme_key"] and entry["published_threshold"] is not None]
+        comparison = ("Reviewed publications bound to the same scheme give "
+                      + "; ".join("at most " + str(entry["published_threshold"]) + " " + entry["unit"]
+                                  + " from " + short_citation(entry["source"]) for entry in bound)
+                      + ". This local cutoff is not one of them."
+                      if bound else
+                      "No reviewed publication in this catalog is bound to that scheme at all, so this local "
+                      "cutoff has nothing to be compared against here.")
+        parts.append(" ".join((
+            "Your own operational cutoff for " + row["organism"] + ": at most "
+            + str(row["operational_threshold"]) + " " + row["unit"] + " on " + row["scheme_key"]
+            + " over " + str(row["locus_count"]) + " targets. " + OPERATIONAL_NOTICE + " "
+            + row["provenance"] + " " + comparison + " " + OPERATIONAL_TRADE_OFF).split()))
+    return " ".join(parts)
+
+
 def suggested_threshold(organism, method="cgmlst", *, locus_count=None, scheme_key=None):
     """The catalog's suggestion for one organism, always labelled as a suggestion.
 
@@ -273,6 +382,12 @@ def suggested_threshold(organism, method="cgmlst", *, locus_count=None, scheme_k
     the others stay in ``alternatives`` and their disagreement is stated, because
     picking whichever number is most convenient is the mistake this catalog
     exists to prevent.
+
+    A locally declared operational cutoff for the same scheme travels in
+    ``operational``, separately from ``suggestion`` and ``alternatives``, which
+    hold published entries only. It is never promoted into either: a laboratory's
+    own number is not evidence, and a caller that wants to show it must say whose
+    number it is.
     """
     guidance = guidance_for(organism, method)
     entries = guidance["entries"]
@@ -282,6 +397,7 @@ def suggested_threshold(organism, method="cgmlst", *, locus_count=None, scheme_k
                "status": "no_curated_transferable_cutoff", "suggestion": None, "newest": None,
                "alternatives": [], "disagreement": "", "headline": "", "notice": SUGGESTION_NOTICE,
                "scheme_match": {"checked": False, "matches": None, "reason": ""},
+               "operational": [], "operational_notice": "",
                "interpretation": INTERPRETATION, "message": guidance["message"]}
     if scale is not None and scale["kind"] == "mlst" and method == "cgmlst":
         # Refused before the catalog is even consulted: offering a core-genome
@@ -290,6 +406,11 @@ def suggested_threshold(organism, method="cgmlst", *, locus_count=None, scheme_k
         payload["headline"] = ("This comparison is " + scale["label"] + ", so this catalog suggests no cutoff "
                                "for it. " + SCALE_SEPARATION)
         return payload
+    # After the scale guard and before any early return: a local cutoff obeys the
+    # same separation as a published one, and it must still be visible for an
+    # organism this catalog has no publication for.
+    payload["operational"] = operational_cutoffs(organism, method, locus_count=locus_count, scheme_key=scheme_key)
+    payload["operational_notice"] = _operational_notice(payload["operational"], entries)
     if not entries:
         payload["headline"] = ("No reviewed transferable cutoff for " + payload["organism"]
                                + " in this catalog. This is an evidence gap, not proof that no publications exist.")
@@ -367,6 +488,14 @@ def record_decision(entry_id, context, *, selected_threshold=None, justification
     """
     entry = next((entry for entry in catalog_entries() if entry["id"] == entry_id), None)
     if entry is None:
+        if any(row["id"] == entry_id for row in _OPERATIONAL):
+            # Everything this function returns is read downstream as an adopted
+            # publication, citation and DOI included. A local cutoff has none of
+            # that, so it must stay what it is: the user's own setting, printed
+            # as their own setting.
+            raise ValueError("This is a locally declared operational cutoff, not publication evidence, so it "
+                             "cannot be recorded as a citation. Set it as your own threshold; a report must "
+                             "show it as this laboratory's cutoff, never as a published one.")
         raise ValueError("Unknown publication-guidance entry.")
     context = deepcopy(context)
     source = deepcopy(SOURCES[entry["source_id"]])

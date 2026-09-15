@@ -15,6 +15,12 @@ window and export opened from it come from :mod:`wmlstudio.snp_tree`, and no
 published SNP cutoff is offered unless the protocol it was measured on matches
 the run in front of the reader.
 
+The picture this page draws is a minimum spanning tree of those distances. It is
+not a maximum-likelihood phylogeny, nothing here infers one, and the page says so
+beside the picture rather than in a help file. What it does hand over is the
+cohort alignment SKA2 wrote, named with its full path, because that is the file a
+tree-building program needs and this application ships none.
+
 All of the science is in :mod:`wmlstudio.snp_tree` and :mod:`wmlstudio.ska_runtime`.
 This module arranges what they return and re-words none of it.
 """
@@ -24,10 +30,12 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-from PySide6.QtCore import Qt
+from PySide6.QtCore import QBuffer, QByteArray, QIODevice, Qt
+from PySide6.QtGui import QColor, QGuiApplication, QImage, QPainter
 from PySide6.QtWidgets import (
     QComboBox,
     QDoubleSpinBox,
+    QFileDialog,
     QHeaderView,
     QSizePolicy,
     QSpinBox,
@@ -40,9 +48,10 @@ from PySide6.QtWidgets import (
 
 from wmlstudio import snp_tree
 from wmlstudio.assembly import assembly_view
-from wmlstudio.graph_window import GraphWindow
+from wmlstudio.graph_window import EXPORT_FORMATS, GraphIdentity, GraphWindow
 from wmlstudio.sample_workflow import current_input_sha256
 from wmlstudio.ska_runtime import runtime_capabilities
+from wmlstudio.theme import BACKGROUND
 from wmlstudio.ui_common import FlowLayout, cell, make_table, organism_for
 from wmlstudio.widgets import TreeView, button, card, label
 
@@ -76,6 +85,23 @@ PURPOSE = ("Single-nucleotide differences between assemblies, counted by SKA2 ov
 NOT_A_PHYLOGENY = ("A minimum spanning forest is a layout of pairwise SNP distances. It is not a "
                    "phylogeny, not a time line and not a transmission chain, and the length of a "
                    "line on the screen carries no meaning at all.")
+
+#: The project setting holding this page's arrangement. It follows the key shape
+#: the comparison page uses for its own trees, and it is a key of its own: a SNP
+#: forest and an allele forest hold different isolates in different places, and
+#: one must never be laid out on the other's saved coordinates.
+GRAPH_STYLE_SETTING = "graph_style.snp"
+
+#: Said where the tree is drawn, beside the picture rather than in a help page.
+#: A reader who wants a maximum-likelihood tree is told here what this is not and
+#: exactly which file to take elsewhere to get one.
+NOT_A_MAXIMUM_LIKELIHOOD_TREE = snp_tree.DRAWN_TREE + " " + snp_tree.ML_TREE_ROUTE
+
+#: What the alignment line says before any run has produced one. It states the
+#: absence as an absence: no run, therefore no file, never "no alignment exists".
+NO_ALIGNMENT_YET = ("No cohort alignment has been written yet. Run the SNP cohort and the file SKA2 "
+                    "writes will be named here, with its full path, so it can be taken to a "
+                    "tree-building program.")
 
 CLEARED = ("Cleared. The SKA2 run's own output files are still on disk where they were written; "
            "every sample, assembly and stored result in this project is untouched.")
@@ -113,6 +139,9 @@ class SnpTreePanel(QWidget):
         self.result = None
         self.payload = None
         self.cohort = []
+        # The cohort alignment this run wrote, when it wrote one: the file a
+        # reader takes to a tree builder, since nothing here infers a phylogeny.
+        self.alignment_path = None
         self._windows = []
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
@@ -155,6 +184,13 @@ class SnpTreePanel(QWidget):
                                       "method, cohort and link threshold.")
         self.window_button.setEnabled(False)
         strip.addWidget(self.window_button)
+        # A figure for a report should not require a second window to be opened
+        # and arranged first: the picture on this page is already the evidence.
+        self.picture_button = button("Export picture…", self.export_picture)
+        self.picture_button.setToolTip("Save this forest as a picture or a graph file, with the "
+                                       "method, cohort and grouping printed on it.")
+        self.picture_button.setEnabled(False)
+        strip.addWidget(self.picture_button)
         strip.addWidget(button("Clear", self.clear))
         layout.addLayout(strip)
         settings = FlowLayout()
@@ -263,6 +299,18 @@ class SnpTreePanel(QWidget):
         self.tree.show_contents({"scale": dict(EMPTY_SCALE)})
         column.addWidget(self.tree, 1)
         column.addWidget(label(NOT_A_PHYLOGENY, "small", True))
+        column.addWidget(label(NOT_A_MAXIMUM_LIKELIHOOD_TREE, "small", True))
+        self.alignment_note = label(NO_ALIGNMENT_YET, "small", True)
+        # The path is worth selecting with the mouse: it is meant to be pasted
+        # into the command line of a tree builder this application does not run.
+        self.alignment_note.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        column.addWidget(self.alignment_note)
+        self.alignment_button = button("Copy the alignment file path", self.copy_alignment_path)
+        self.alignment_button.setToolTip("Copies the path of the cohort alignment SKA2 wrote. That "
+                                         "file is the input a maximum-likelihood tree is built "
+                                         "from; this page draws no such tree.")
+        self.alignment_button.setEnabled(False)
+        column.addWidget(self.alignment_button)
         return page
 
     def _build_footer(self, layout):
@@ -512,9 +560,25 @@ class SnpTreePanel(QWidget):
             binding.get("message", ""), binding.get("link_threshold_warning", ""),
             binding.get("notice", "")])))
         self.limitations.setText("\n".join(payload.get("limitations") or ()))
+        self._show_alignment(payload.get("alignment_handoff") or {})
         self.reread_button.setEnabled(self.result is not None)
         self.window_button.setEnabled(bool(self.tree.nodes))
+        self.picture_button.setEnabled(bool(self.tree.nodes))
         return payload
+
+    def _show_alignment(self, handoff):
+        """Name the alignment file SKA2 wrote, or say plainly that there is none.
+
+        This is the only file in the run a phylogenetics program can be fed, and
+        it is the whole of this application's answer to "where is the ML tree":
+        the input is handed over, and no tree is drawn from it here.
+        """
+        path = handoff.get("path")
+        message = str(handoff.get("message") or "")
+        self.alignment_path = path
+        self.alignment_note.setText(
+            f"Cohort alignment: {path}\n{message}" if path else message or NO_ALIGNMENT_YET)
+        self.alignment_button.setEnabled(bool(path))
 
     def _fill_matrix(self, matrix):
         """The square matrix, each cell carrying what it was measured over.
@@ -587,17 +651,74 @@ class SnpTreePanel(QWidget):
     def _draw_forest(self, payload):
         graph = payload.get("graph") or {}
         records = graph.get("results") or []
+        self.tree.show_contents(graph)
+        self._restore_arrangement()
         # "ST unassigned" under every node of a cohort nobody has typed classically
         # reads as a failed typing run. The line is shown only where an ST exists.
+        # Applied after the stored arrangement, because a saved state carries its
+        # own label fields and they may have been saved on a cohort that had STs.
         self.tree.set_label_fields(["sample_name", "primary_st"]
                                    if any(row.get("st") for row in records) else ["sample_name"])
-        self.tree.show_contents(graph)
         summary = payload.get("summary") or {}
         self.tree_caption.setText(" · ".join(filter(None, [
             (graph.get("scale") or {}).get("caption", ""),
             f"{summary.get('edges', 0)} edge(s) between {summary.get('isolates', 0)} isolate(s)",
             f"{summary.get('excluded_pairs', 0)} pair(s) too little compared to be drawn"
             if summary.get("excluded_pairs") else ""])) or "No SNP forest is drawn yet.")
+
+    # --- the arrangement this reader made ------------------------------------
+    def graph_identity(self):
+        """What this forest is, in the words every window and every export uses.
+
+        One identity for the page, the window and the saved picture: a figure
+        that reached a report must carry the same method, cohort and grouping as
+        the window it was arranged in, or the two are separate claims.
+        """
+        contents = self.tree.graph_contents()
+        return GraphIdentity.from_scale(
+            contents.get("scale"), threshold=contents.get("cluster_threshold"),
+            cohort=self.cohort_name(), created=(self.payload or {}).get("created_at"),
+            note="SKA2 split k-mer SNPs; not allele differences and not a transmission chain")
+
+    def _window_arranged(self, state):
+        """Take an arrangement made in a detached window and keep it.
+
+        Only presentation crosses: positions, colors and display labels. No SNP
+        count, denominator, edge or group comes back this way, so a rearranged
+        picture is the same measurement in a different place on the screen.
+        """
+        try:
+            self.tree.restore_state(state)
+        except ValueError:
+            # Presentation state this build does not understand is not evidence;
+            # the drawn forest stays exactly as it is rather than half-applying it.
+            return None
+        return self.store_arrangement(state)
+
+    def store_arrangement(self, state=None):
+        """Remember this page's arrangement in the project, under its own key."""
+        state = self.tree.export_state() if state is None else state
+        project = getattr(self.host, "project", None)
+        if project is not None and hasattr(project, "set_setting"):
+            project.set_setting(GRAPH_STYLE_SETTING, state)
+        return state
+
+    def _restore_arrangement(self):
+        """Put a kept arrangement back onto a freshly drawn forest.
+
+        Isolates the stored state does not name keep the automatic layout, and a
+        state from another version is dropped whole: an arrangement is
+        presentation, and a broken one must never stop a measurement being drawn.
+        """
+        project = getattr(self.host, "project", None)
+        stored = project.get_setting(GRAPH_STYLE_SETTING, None) if project is not None else None
+        if not isinstance(stored, dict) or not stored:
+            return None
+        try:
+            self.tree.restore_state(stored)
+        except ValueError:
+            return None
+        return stored
 
     # --- a window of its own -------------------------------------------------
     def open_window(self):
@@ -610,19 +731,116 @@ class SnpTreePanel(QWidget):
         if not self.tree.nodes:
             return self.say("Run a cohort first: there is nothing drawn to open in a window.")
         from wmlstudio.interface_settings import interface_preferences
-        payload = self.payload or {}
         root = getattr(self.host, "root", None)
         window = GraphWindow.from_view(
-            self.tree, parent=self, preferences=interface_preferences(root) if root else None,
-            cohort=self.cohort_name(),
-            created=payload.get("created_at"),
-            note="SKA2 split k-mer SNPs; not allele differences and not a transmission chain")
+            self.tree, self.graph_identity(), parent=self,
+            preferences=interface_preferences(root) if root else None)
         window.check_output = getattr(self.host, "check_output", None)
+        # An arrangement made in the window is the arrangement the reader wants:
+        # it comes back to the page and is kept, so closing the window does not
+        # throw the layout away and re-running the cohort does not undo it.
+        window.stateChanged.connect(self._window_arranged)
         self._windows.append(window)
         window.closed.connect(lambda: self._windows.remove(window)
                               if window in self._windows else None)
         window.show()
         return window
+
+    # --- a picture of this forest --------------------------------------------
+    def copy_alignment_path(self):
+        """Put the cohort alignment's path on the clipboard, for a tree builder."""
+        path = getattr(self, "alignment_path", None)
+        if not path:
+            return self.say("This run wrote no cohort alignment, so there is no path to copy. "
+                            "Nothing was inferred in its place.")
+        clipboard = QGuiApplication.clipboard()
+        if clipboard is not None:
+            clipboard.setText(str(path))
+        return self.say(f"Copied {path}. It is a cohort variable-site alignment, the input a "
+                        "maximum-likelihood tree is built from by IQ-TREE, FastTree or RAxML-NG. "
+                        "No tree was built here and the picture on this page is not one.")
+
+    def export_picture(self):
+        """Ask where to save a figure of this forest, and write it with its own words."""
+        if not self.tree.nodes:
+            return self.say("Run a cohort first: there is nothing drawn to save as a picture.")
+        filters = ";;".join(f"{name} (*.{suffix})" for name, suffix in EXPORT_FORMATS)
+        path, chosen = QFileDialog.getSaveFileName(self, "Save this SNP forest",
+                                                   f"{snp_tree.KIND}-forest.png", filters)
+        if not path:
+            return None
+        # A typed name without an extension gets the format the dialog was on,
+        # rather than a file the computer cannot open again.
+        picked = next((suffix for name, suffix in EXPORT_FORMATS
+                       if chosen and chosen.startswith(name)), "png")
+        target = Path(path)
+        target = target if target.suffix else target.with_suffix("." + picked)
+        try:
+            return self.save_picture(target)
+        except Exception as error:  # a full disk or a read-only folder, said plainly
+            return self.say(f"Could not save: {error}")
+
+    def save_picture(self, path, *, suffix=None):
+        """Write the drawn forest to a file, carrying what it measures with it.
+
+        The same formats and the same title and subtitle as a detached window
+        writes, so a figure saved from the page and one saved from a window of it
+        are the same picture of the same measurement, not two different claims.
+        """
+        path = Path(path)
+        suffix = str(suffix or path.suffix.lstrip(".")).lower()
+        check = getattr(self.host, "check_output", None)
+        if callable(check):
+            check(path)
+        identity = self.graph_identity()
+        if suffix in {"png", "jpg", "jpeg"}:
+            self.tree.save_image(path, title=identity.export_title(),
+                                 subtitle=identity.export_subtitle())
+        elif suffix == "svg":
+            self.tree.save_svg(path, title=identity.export_title(),
+                               subtitle=identity.export_subtitle())
+        elif suffix == "graphml":
+            self.tree.save_graphml(path)
+        elif suffix == "nwk":
+            # A Newick file of a minimum spanning tree is a topology, not a
+            # phylogram: it carries no inferred branch lengths, because none
+            # were estimated.
+            self.tree.save_newick(path)
+        else:
+            raise ValueError(f"Unsupported graph export format: {suffix or 'none given'}")
+        self.say(f"Saved {path.name} · {identity.caption()} · {identity.threshold_words()}. "
+                 "It is a minimum spanning tree of SNP distances, not a phylogeny.")
+        return path
+
+    def snp_graph_image(self, fmt="PNG"):
+        """This forest as image bytes, for a report that prints the picture.
+
+        Returns ``None`` when nothing is drawn, so a report can say that no
+        picture was produced rather than printing an empty frame that a reader
+        could take for a cohort with nothing in it.
+        """
+        if not self.tree.nodes:
+            return None
+        identity = self.graph_identity()
+        # JPEG carries no alpha channel, so the canvas is opaque from the start;
+        # the renderer fills the same background over it either way.
+        picture = QImage(1800, 1200, QImage.Format.Format_RGB32)
+        picture.fill(QColor(BACKGROUND))
+        painter = QPainter(picture)
+        try:
+            self.tree._render(painter, 1800, 1200, title=identity.export_title(),
+                              subtitle=identity.export_subtitle())
+        finally:
+            painter.end()
+        data = QByteArray()
+        buffer = QBuffer(data)
+        buffer.open(QIODevice.OpenModeFlag.WriteOnly)
+        if not picture.save(buffer, fmt, 92 if fmt == "JPEG" else -1):
+            raise OSError("Could not render the SNP forest picture.")
+        return bytes(data)
+
+    def snp_graph_png(self):
+        return self.snp_graph_image("PNG")
 
     # --- clearing ------------------------------------------------------------
     def clear(self):
@@ -638,9 +856,13 @@ class SnpTreePanel(QWidget):
             widget.setText("")
         self.matrix_note.setText("Run a cohort to see its SNP distances.")
         self.tree_caption.setText("No SNP forest is drawn yet.")
+        self.alignment_path = None
+        self.alignment_note.setText(NO_ALIGNMENT_YET)
+        self.alignment_button.setEnabled(False)
         self.link.setValue(snp_tree.NO_LINK_THRESHOLD)
         self.reread_button.setEnabled(False)
         self.window_button.setEnabled(False)
+        self.picture_button.setEnabled(False)
         self.refresh_cohort()
         return self.say(CLEARED)
 

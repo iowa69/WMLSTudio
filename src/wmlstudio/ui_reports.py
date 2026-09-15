@@ -2,6 +2,7 @@
 
 
 import os
+import re
 import tempfile
 from pathlib import Path
 
@@ -49,13 +50,16 @@ from wmlstudio.widgets import button, card, label
 _COMPARISON_WAIT_STEP_MS = 250
 _COMPARISON_WAIT_LIMIT_MS = 120_000
 
-# Three quantities, three methods, never one axis. A report built on allele
-# distances says where the third one is rather than leaving a reader to assume
-# every number in the workspace belongs on the same scale.
+# Three quantities, three methods, never one axis. The report now carries SNP
+# distances in a section of their own, so this sentence says where they are and
+# that they stay there, rather than saying they are absent — which stopped being
+# true when the SNP section was added and would have read as an assurance no
+# SNP number could reach this page.
 METHOD_SEPARATION = (
     "SNP distances from the SNP tree are a third quantity, produced by a different method over the "
-    "split k-mers two isolates share rather than over loci. They are not in this report and are "
-    "never comparable with the figures above.")
+    "split k-mers two isolates share rather than over loci. This report carries them in their own "
+    "section, on their own scale, and they are never comparable with the allele figures above: no "
+    "axis, no column and no threshold is shared between them.")
 
 PLASMID_SCOPE = (
     "Plasmid evidence in a report is a screen over replicon markers on assembled contigs: a marker "
@@ -71,6 +75,16 @@ MUTATION_WORDS = {
     "none": "no catalogue for this organism — genes only, which is not an absence of mutations",
     "unknown": "not recorded by this run",
 }
+
+
+def _file_stem(name):
+    """An isolate name reduced to something every filesystem will accept.
+
+    Only the filename is sanitised; the document itself always prints the
+    isolate's own name, so nothing a reader reads is altered by this.
+    """
+    stem = re.sub(r'[^A-Za-z0-9._-]+', '-', str(name)).strip('-.') or 'isolate'
+    return stem[:80]
 
 
 def amr_method_fields(sample):
@@ -167,6 +181,9 @@ class ReportWorkspaceMixin:
         row = FlowLayout()
         for title, fmt in [("PDF report…", "pdf"), ("HTML report…", "html"), ("CSV…", "csv"), ("TSV…", "tsv"), ("JSON…", "json")]:
             row.addWidget(button(title, lambda checked=False, f=fmt: self.export_report(f), fmt == "pdf"))
+        # The two shapes a reader actually asks for: one document covering the
+        # cohort, and one document per isolate to file with that isolate.
+        row.addWidget(button("One PDF per isolate…", self.export_report_per_isolate))
         content.addLayout(row)
         row = FlowLayout()
         row.addWidget(button("Export profile table…", self.export_profile_table))
@@ -175,6 +192,12 @@ class ReportWorkspaceMixin:
         row.addWidget(button('Graph PNG / JPEG…', self.export_report_graph))
         content.addLayout(row)
         content.addWidget(label("Reports describe sequence evidence, not measured susceptibility or proof of transmission. Profile bundles carry results and metadata without sequence files.", "small", True))
+        content.addWidget(label("Each report tabulates MLST and cgMLST typing, SNP distances, AMR determinants, "
+                                "resistance point mutations, virulence loci and plasmid replicon markers, every "
+                                "section naming the reference snapshot it was read from. A section whose assay was "
+                                "not run says it was not run: a genome screened without an organism mutation "
+                                "catalogue had no point-mutation search at all and is named as such, never shown "
+                                "as an empty table.", "small", True))
         # Stated on the page as well as in the document, so a reader knows what
         # to look for before they open the PDF.
         content.addWidget(label("Every report that shows a tree, a cluster or a distance names the reference and its "
@@ -214,13 +237,15 @@ class ReportWorkspaceMixin:
         checks = {}
         for key, text in [('investigation', 'Groups and nearest-neighbour comparisons'), ('qc', 'Input quality evidence'),
                           ('amr', 'AMR determinants'), ('virulence', 'Virulence assay'),
+                          ('point_mutations', 'Resistance point mutations, with the genomes that were never searched named'),
+                          ('snp', 'SNP distances from the SNP tree, on their own scale'),
                           ('plasmid_hypotheses', 'Plasmid evidence: replicon markers on assembled contigs'),
                           ('drug_associations', 'Reference-reported drug classes'),
                           ('graph', 'Graph with focal isolates highlighted'),
                           ('graph_jpeg', 'Embed the picture as JPEG (smaller file, slightly softer text)'),
                           ('provenance', 'Full technical provenance appendix')]:
             check = QCheckBox(text)
-            check.setChecked(options[key])
+            check.setChecked(bool(options.get(key)))
             checks[key] = check
             layout.addWidget(check)
         layout.addWidget(label('Omitted or unassessed assays are not negative results. Genomic drug annotations do not replace measured susceptibility.', 'small', True))
@@ -289,6 +314,29 @@ class ReportWorkspaceMixin:
         """A default filename that names the typing, so the two cannot be swapped."""
         kind = self.report_typing_kind()
         return f"wmlstudio-{kind}-{stem}.{suffix}" if kind else f"wmlstudio-{stem}.{suffix}"
+
+    def report_snp_payload(self):
+        """The SNP run the reader has on screen, or None when none has been made.
+
+        Read from the SNP page rather than stored on the report: a SNP payload
+        belongs to one SKA2 run over one cohort, and a report that quietly reused
+        an older one would print distances measured on isolates it is not about.
+        ``None`` is a complete answer here — the SNP section prints that no SNP
+        analysis was run, which is never the same as no SNP differences.
+        """
+        page = getattr(self, 'snp_tree_page', None)
+        payload = getattr(page, 'payload', None) if page is not None else None
+        return payload if isinstance(payload, dict) and payload else None
+
+    def report_graph_typing(self):
+        """The drawing view's own word for the typing it drew, or ''.
+
+        Taken from the tree's scale rather than from the report's provenance, so
+        the document compares two independent statements and can refuse to print
+        an MLST forest in a cgMLST report instead of restating one of them.
+        """
+        kind = ((getattr(getattr(self, 'tree', None), 'scale', None) or {}).get('kind') or '')
+        return str(kind)
 
     def report_graph_available(self):
         """Whether a picture would describe the same snapshot as the numbers."""
@@ -434,7 +482,8 @@ class ReportWorkspaceMixin:
                     self.report_preview.setHtml(review_report_html(self.report_records(), selected_ids=chosen,
                         investigation=self.report_context(), options=options,
                         graph_png=self.report_graph_image(chosen, fmt='JPEG' if jpeg else 'PNG'),
-                        graph_mime='image/jpeg' if jpeg else 'image/png'))
+                        graph_mime='image/jpeg' if jpeg else 'image/png',
+                        graph_typing=self.report_graph_typing(), snp=self.report_snp_payload()))
                 else:
                     self.report_preview.setHtml('<h2>Start a focused report</h2><p>Choose a template above, then choose this report’s isolates. No sample is silently included from a library filter.</p>')
         finally:
@@ -537,12 +586,50 @@ class ReportWorkspaceMixin:
                 write_review_report(self.report_records(), path, selected_ids=ids, investigation=self.report_context(),
                                     options=options, graph_png=self.report_graph_image(ids, fmt='JPEG' if jpeg else 'PNG'),
                                     graph_mime='image/jpeg' if jpeg else 'image/png',
-                                    scope_note=scope['note'], scope_implicit=scope['implicit'])
+                                    scope_note=scope['note'], scope_implicit=scope['implicit'],
+                                    graph_typing=self.report_graph_typing(), snp=self.report_snp_payload())
             else:
                 export_results(self.report_records(), path, fmt, selected_ids=ids, investigation=self.report_context())
             self.notify(f"Exported {len(ids)} samples with their linked metadata and highlights. " + scope['note'])
         except Exception as exc:
             self.error(exc)
+
+    def export_report_per_isolate(self, directory=None):
+        """One PDF per isolate, into one folder, each document scoped to that isolate.
+
+        The same sections and the same evidence gates as the cohort document:
+        only the scope narrows. Each file names the isolate and the typing it was
+        built on, and a failure on one isolate never leaves the rest unwritten —
+        the isolates that failed are reported by name instead.
+        """
+        try:
+            scope = self.resolve_report_scope()
+        except ValueError as error:
+            self.notify(str(error))
+            return []
+        if directory is None:
+            directory = QFileDialog.getExistingDirectory(self, 'Choose a folder for one PDF per isolate')
+            if not directory:
+                return []
+        folder = Path(directory).expanduser()
+        records = {sample['id']: sample for sample in self.report_records()}
+        written, failed = [], []
+        for sample_id in sorted(scope['ids'], key=lambda value: str(records.get(value, {}).get('name') or value)):
+            sample = records.get(sample_id) or {}
+            path = folder / self.report_filename(
+                _file_stem(sample.get('name') or sample_id) + '-report', 'pdf')
+            note = (f'This report covers one isolate, {sample.get("name") or sample_id}, out of the '
+                    f'{len(scope["ids"])} isolate(s) in this report selection. Evidence for the other '
+                    'isolates is in their own documents; it is not summarised here.')
+            try:
+                self.check_output(str(path))
+                self.write_pdf_report(str(path), selected_ids={sample_id}, scope_note=note)
+                written.append(path)
+            except Exception as error:  # one bad isolate must not lose the rest
+                failed.append(f'{sample.get("name") or sample_id}: {error}')
+        self.notify(f'Wrote {len(written)} isolate report(s) into {folder}. ' + self.report_typing_line()
+                    + (' These isolates produced no document: ' + '; '.join(failed) if failed else ''))
+        return written
 
     def write_pdf_report(self, path, selected_ids=None, *, full_project=False, options=None, graph=None,
                          scope_note=None, scope_implicit=False):
@@ -570,7 +657,9 @@ class ReportWorkspaceMixin:
                                            investigation=None if full_project else self.report_context(),
                                            options=settings, graph_png=image, graph_mime=mime,
                                            scope_note=scope_note or scope['note'],
-                                           scope_implicit=scope_implicit or (scope['implicit'] and scope_note is None)))
+                                           scope_implicit=scope_implicit or (scope['implicit'] and scope_note is None),
+                                           graph_typing=self.report_graph_typing(),
+                                           snp=None if full_project else self.report_snp_payload()))
         with tempfile.TemporaryDirectory(prefix='.wmlstudio-pdf-', dir=Path(path).resolve().parent) as directory:
             output = Path(directory) / 'report.pdf'
             writer = QPdfWriter(str(output))
@@ -691,7 +780,8 @@ class ReportWorkspaceMixin:
                 records = [s for s in self.report_records() if s['id'] in scope['ids']]
                 write_review_report(records, path, selected_ids=scope['ids'], investigation=investigation,
                                     options=options, graph_png=image, graph_mime='image/jpeg',
-                                    scope_note=scope['note'], scope_implicit=scope['implicit'])
+                                    scope_note=scope['note'], scope_implicit=scope['implicit'],
+                                    graph_typing=self.report_graph_typing(), snp=self.report_snp_payload())
         except Exception as error:
             self.error(error)
             return
