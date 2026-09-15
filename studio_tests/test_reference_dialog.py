@@ -1,5 +1,6 @@
 import json
 import threading
+import time
 
 from PySide6.QtCore import QThread
 from PySide6.QtTest import QSignalSpy
@@ -361,3 +362,27 @@ def test_the_stop_question_names_what_happens_to_what_was_already_downloaded(qtb
     monkeypatch.setattr(QMessageBox, "question", question)
     assert dialog.confirm_stop() is False, "the safe answer is the default"
     assert "kept" in shown["text"] and "continues from where it stopped" in shown["text"]
+
+
+def test_each_stage_of_a_download_is_timed_from_its_own_start(qtbot, tmp_path):
+    """A stage restarting its count must not inherit the previous stage's clock.
+
+    Extraction reports 2,358 loci over twenty minutes; the check that follows
+    counts the same 2,358 again. Dividing twenty minutes by that stage's first
+    locus would promise hours left on work that takes a couple of minutes — a
+    wrong number, which is worse than the silence it replaced.
+    """
+    dialog = ReferenceManagerDialog(tmp_path)
+    qtbot.addWidget(dialog)
+    dialog._started = time.monotonic() - 1200
+    dialog._progress_at, dialog._progress_total = 2358, 2358
+    # The message that announces the next stage restarts the count at zero.
+    dialog._progress(0, 2358, "Every allele file is now read back")
+    assert time.monotonic() - dialog._started < 5, "the new stage starts its own clock"
+    dialog._progress(600, 2358, "Checking what was downloaded: Reading locus KP1_RS00100")
+    assert "600 of 2,358" in dialog.status.text()
+    assert "2 h" not in dialog.status.text()
+    # A stage with a different total is a different stage too.
+    dialog._started = time.monotonic() - 1200
+    dialog._progress(1, 2360, "Checking what was downloaded: Fingerprinting arc.fasta")
+    assert time.monotonic() - dialog._started < 5
