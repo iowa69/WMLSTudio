@@ -71,8 +71,11 @@ surface; **open** — not started. An engine-only capability is not a delivered 
 - [ ] Eleven listed organisms still have no cutoff, now including *S. pneumoniae*
       and *S. capitis*. *N. meningitidis*, *H. influenzae* and *C. jejuni* remain
       off the work-list entirely.
-- [ ] Guard the per-window `setStyleSheet` re-polish that makes repeated window
-      construction grow superlinearly in one process.
+- [x] Guard the per-window `setStyleSheet` re-polish that makes repeated window
+      construction grow superlinearly in one process. Measured before the guard:
+      2.0 s for the first window, 36.3 s for the twelfth. After: a flat 0.7 s.
+      This was 63 of the 91 minutes of the Windows test run, and it is why the
+      build kept hitting its timeout.
 - [ ] Run the frozen SCCmec self-comparison for real: it needs a format 2 bundled
       panel, which only a fresh CI build currently produces.
 - [ ] Clean Windows 11 acceptance, now including high-DPI and per-monitor scaling.

@@ -8,6 +8,7 @@ import time
 
 import pytest
 from PySide6.QtGui import QImage
+from PySide6.QtWidgets import QApplication
 
 from wmlstudio import jobs
 from wmlstudio.app import MainWindow
@@ -322,3 +323,30 @@ def test_motion_preference_is_restored_when_switching_projects(window, tmp_path)
     assert window.motion.isChecked() is False
     assert window.motion_enabled is False
     assert not window.helix.timer.isActive()
+
+
+def test_opening_windows_one_after_another_does_not_get_slower(qtbot, tmp_path):
+    """Reassigning the application stylesheet re-polishes every open window.
+
+    Doing it unconditionally per window made each new one cost more than the last:
+    construction grew from 2s to 36s by the twelfth window, which is why the
+    comparison tests took an hour of CI, and why opening projects one after
+    another degraded for a user in one sitting.
+    """
+    import time
+
+    from wmlstudio.ui_workbench import apply_application_style
+
+    durations = []
+    for index in range(6):
+        started = time.perf_counter()
+        window = MainWindow(storage_root=tmp_path / f"workspace{index}")
+        durations.append(time.perf_counter() - started)
+        qtbot.addWidget(window)
+    # The last window must not cost dramatically more than the first. The bound is
+    # loose because a loaded machine is noisy; the defect was a 15-fold growth.
+    assert durations[-1] < max(durations[0] * 4, 2.0), (
+        f"window construction grew: {[round(d, 2) for d in durations]}")
+    # The guard reports whether it actually wrote, so the saving is observable.
+    assert apply_application_style(QApplication.instance().styleSheet()) is False
+    assert apply_application_style("QWidget { color: palette(text); }") is True

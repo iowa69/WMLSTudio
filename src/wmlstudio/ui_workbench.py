@@ -273,6 +273,20 @@ def organism_evidence_note(sample):
     return "\n".join(line for line in lines if line)
 
 
+def apply_application_style(style):
+    """Set the application stylesheet only when it would actually change.
+
+    Qt re-polishes every widget of every open window on each assignment, so
+    reassigning the same sheet per window costs more the more windows are open.
+    Opening projects one after another slowed down for the same reason.
+    """
+    application = QApplication.instance()
+    if application is None or application.styleSheet() == style:
+        return False
+    application.setStyleSheet(style)
+    return True
+
+
 class WorkbenchMixin:
     def __init__(self, *args, **kwargs):
         self.selection_ids = set()
@@ -310,9 +324,13 @@ class WorkbenchMixin:
         self.ui_scale = 100
         super().__init__(*args, **kwargs)
         from wmlstudio import theme
+        application = QApplication.instance()
         if hasattr(theme, "apply_dark_palette"):
-            theme.apply_dark_palette(QApplication.instance())
-        QApplication.instance().setStyleSheet(theme.STYLE)
+            theme.apply_dark_palette(application)
+        # Setting the application stylesheet re-polishes every widget of every
+        # open window, so doing it unconditionally per window costs more the more
+        # windows exist. Apply it only when it would actually change.
+        apply_application_style(theme.STYLE)
         from wmlstudio.interface_settings import interface_preferences
         preferences = interface_preferences(self.root)
         try:
@@ -2903,7 +2921,7 @@ class WorkbenchMixin:
         from wmlstudio.interface_settings import interface_preferences, scaled_style
         percent = max(80, min(150, int(percent)))
         self.ui_scale = percent
-        QApplication.instance().setStyleSheet(scaled_style(percent))
+        apply_application_style(scaled_style(percent))
         interface_preferences(self.root).setValue("scale", percent)
         self.updateGeometry()
 
