@@ -10,18 +10,44 @@ from __future__ import annotations
 
 import csv
 import hashlib
+import http.client
 import io
 import json
 import os
 import re
 import sys
 import tempfile
+import time
+import urllib.error
 import urllib.request
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 
 from .sequence import check_cancelled, file_sha256
+
+#: A reference fetch is retried this many times before the staging run gives up.
+FETCH_ATTEMPTS = 4
+#: Replies worth retrying: rate limiting and the transient server-side failures.
+RETRYABLE_STATUS = frozenset({408, 425, 429, 500, 502, 503, 504})
+
+
+def _wait_before_retry(attempt, retry_after, cancelled=None):
+    """Back off, honouring the server's own Retry-After when it sends one.
+
+    The wait is bounded so a provider asking for an hour cannot stall a build, and
+    it is broken into short sleeps so cancelling stays responsive.
+    """
+    delay = min(2.0 * (2 ** attempt), 30.0)
+    if retry_after:
+        try:
+            delay = max(delay, min(float(retry_after), 60.0))
+        except (TypeError, ValueError):
+            pass
+    deadline = time.monotonic() + delay
+    while time.monotonic() < deadline:
+        check_cancelled(cancelled)
+        time.sleep(0.25)
 
 
 @dataclass(frozen=True)
@@ -127,9 +153,38 @@ def _fetch(source_key, relative, target, cancelled=None, *, source_roots=None):
         if original.is_symlink() or not original.is_file():
             raise ValueError(f'Reference source must be a regular file: {original}')
         handle = original.open('rb')
-    else:
-        request = urllib.request.Request(url, headers={'User-Agent': 'WMLSTudio-reference-provisioning'})
-        handle = urllib.request.urlopen(request, timeout=30)
+        return _write(handle, url, source_key, relative, target, cancelled)
+    # Staging fetches hundreds of files in a row, so a single dropped connection
+    # or rate-limit reply used to lose the whole snapshot. Retry a transient
+    # failure a few times; a refusal that will not change is raised immediately.
+    request = urllib.request.Request(url, headers={'User-Agent': 'WMLSTudio-reference-provisioning'})
+    for attempt in range(FETCH_ATTEMPTS):
+        check_cancelled(cancelled)
+        try:
+            handle = urllib.request.urlopen(request, timeout=30)
+        except urllib.error.HTTPError as error:
+            if error.code not in RETRYABLE_STATUS or attempt == FETCH_ATTEMPTS - 1:
+                raise
+            _wait_before_retry(attempt, error.headers.get('Retry-After'), cancelled)
+            continue
+        except (urllib.error.URLError, TimeoutError, ConnectionError, OSError):
+            if attempt == FETCH_ATTEMPTS - 1:
+                raise
+            _wait_before_retry(attempt, None, cancelled)
+            continue
+        try:
+            return _write(handle, url, source_key, relative, target, cancelled)
+        except (TimeoutError, ConnectionError, http.client.IncompleteRead) as error:
+            # A short read leaves a partial file, and the writer creates the target
+            # exclusively, so the attempt must be cleared before the next one.
+            target.unlink(missing_ok=True)
+            if attempt == FETCH_ATTEMPTS - 1:
+                raise ValueError(f'Reference download was cut short: {relative} ({error})') from error
+            _wait_before_retry(attempt, None, cancelled)
+    raise ValueError(f'Reference file could not be downloaded: {relative}')
+
+
+def _write(handle, url, source_key, relative, target, cancelled):
     target.parent.mkdir(parents=True, exist_ok=True)
     total = 0
     with handle, target.open('xb') as output:

@@ -442,3 +442,56 @@ def test_an_isolate_outside_every_installed_catalogue_is_named_before_the_run(tm
         isolate_record(genus='', species=''), accepted)
     assert covered is True and genus_level is True
     assert outside is False and unknown is False
+
+
+def test_a_transient_download_failure_does_not_lose_the_whole_snapshot(tmp_path, monkeypatch):
+    """Staging fetches hundreds of files, so one dropped connection cost everything.
+
+    A rate-limit reply or a short read is worth retrying; a 404 is not, and
+    retrying it would only delay an answer the user needs. A retried attempt must
+    also clear the partial file, because the writer creates its target exclusively.
+    """
+    import http.client
+    import io
+    import urllib.error
+
+    from wmlstudio import characterization_refs as refs
+
+    monkeypatch.setattr(refs, "_wait_before_retry", lambda *args, **kwargs: None)
+    attempts = {"count": 0}
+
+    def rate_limited_once(request, timeout=None):
+        attempts["count"] += 1
+        if attempts["count"] == 1:
+            raise urllib.error.HTTPError(request.full_url, 429, "Too Many Requests",
+                                         {"Retry-After": "1"}, None)
+        return io.BytesIO(b">seq\nACGT\n")
+
+    monkeypatch.setattr(refs.urllib.request, "urlopen", rate_limited_once)
+    record = refs._fetch("kleborate", "x.fasta", tmp_path / "a.fasta")
+    assert attempts["count"] == 2 and record["bytes"] == 10
+    assert (tmp_path / "a.fasta").is_file()
+
+    class Truncated(io.BytesIO):
+        def read(self, size=-1):
+            raise http.client.IncompleteRead(b"partial")
+
+    attempts["count"] = 0
+
+    def cut_then_complete(request, timeout=None):
+        attempts["count"] += 1
+        return Truncated(b"") if attempts["count"] == 1 else io.BytesIO(b">seq\nTTTT\n")
+
+    monkeypatch.setattr(refs.urllib.request, "urlopen", cut_then_complete)
+    assert refs._fetch("kleborate", "y.fasta", tmp_path / "b.fasta")["bytes"] == 10
+
+    attempts["count"] = 0
+
+    def missing(request, timeout=None):
+        attempts["count"] += 1
+        raise urllib.error.HTTPError(request.full_url, 404, "Not Found", {}, None)
+
+    monkeypatch.setattr(refs.urllib.request, "urlopen", missing)
+    with pytest.raises(urllib.error.HTTPError):
+        refs._fetch("kleborate", "z.fasta", tmp_path / "c.fasta")
+    assert attempts["count"] == 1, "a permanent refusal must not be retried"
