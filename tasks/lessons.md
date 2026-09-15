@@ -20,3 +20,14 @@
   while gigabytes are re-read is indistinguishable from a freeze.
 - Verifying a downloaded scheme is not loading one: keep the identifiers, drop
   the bases. Holding a cgMLST scheme to check it cost ~1.5× its size in RAM.
+- Finished code that nothing connects to is the defect of this codebase. A panel
+  built and not mounted, a signal emitted with no listener, a sub-tab past the
+  edge of the window: each was reported by the user as a missing feature.
+- Padding, not font size, is what makes a table look crowded. Measure the drawn
+  window before changing type.
+- A truncated column heading is not cosmetic: a reader who cannot tell which
+  column they are looking at cannot use the table.
+- Restoring a saved arrangement emits the signals that ask for it to be saved.
+  Guard the restore, or the automatic layout overwrites the reader's own.
+- Never let two navigations both stand down. A narrow window with no way to
+  reach another page is worse than either one alone.
