@@ -25,7 +25,8 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from wmlstudio.theme import BACKGROUND, INK, MUTED, PALETTE
+from wmlstudio import theme
+from wmlstudio.theme import PALETTE
 
 # Printed under every exported forest, including each half of a side-by-side pair.
 GRAPH_SUBTITLE = ("Not a phylogeny or transmission tree · positions are editable "
@@ -241,6 +242,97 @@ def forest_layout(keys, edges):
     return positions
 
 
+# ---------------------------------------------------------------------------
+# The colours a forest draws itself in. The ground, the ink and the muted ink
+# come from whichever theme is active; the rest are colours no Qt control draws,
+# so the stylesheet palette has no name for them: the line of an edge, the dotted
+# guide from a node to its display label, the ring around a selected node, the
+# ring around a search match, the outline that keeps a node from bleeding into
+# the canvas, and the grey of a group of one.
+#
+# They are written out per theme rather than derived from the ground by
+# arithmetic. An edge that a formula dims into the background is the kind of
+# mistake nobody notices until an outbreak picture is unreadable, so each colour
+# below was checked against its own theme's ground, and the dark entries are the
+# exact colours this view has always drawn.
+# ---------------------------------------------------------------------------
+
+_GRAPH_INK = {
+    "dark": {"edge": "#5F819B", "edge_ink": "#C7D8E8", "guide": "#36516C",
+             "selected": "#E9F7FF", "found": "#FFD58A", "singleton": "#73869A",
+             "node_edge": "#0B1220", "halo_fill_alpha": 15, "halo_border_alpha": 65,
+             "halo_deepen": False},
+    "slate": {"edge": "#6B8CA6", "edge_ink": "#CEDDEB", "guide": "#3F5A75",
+              "selected": "#EAF7FF", "found": "#FFD58A", "singleton": "#7A8CA0",
+              "node_edge": "#1A2230", "halo_fill_alpha": 18, "halo_border_alpha": 75,
+              "halo_deepen": False},
+    # On paper the pale washes and pale rings of the dark themes vanish, so the
+    # light theme states its own: dark ink for the edge numbers, a deep amber for
+    # a search match, a deep blue for a selection, a visible outline on every node
+    # so a pale category colour cannot disappear into white, and a group outline
+    # deepened and carried at a higher opacity.
+    "light": {"edge": "#5A7085", "edge_ink": "#22303F", "guide": "#9AAABC",
+              "selected": "#12587A", "found": "#A8600A", "singleton": "#5B6E82",
+              "node_edge": "#46586B", "halo_fill_alpha": 28, "halo_border_alpha": 150,
+              "halo_deepen": True},
+}
+
+_GRAPH_COLORS = {}
+
+
+def graph_colors():
+    """Every colour this forest draws with, for the theme in force right now.
+
+    Read at draw time rather than bound once at import. A reader who switches to
+    the light theme gets a light canvas under the tree already on screen, and a
+    picture exported from it is light too, instead of a black rectangle dropped
+    onto a white report page.
+    """
+    name = theme.active_theme()
+    if name not in _GRAPH_COLORS:
+        tokens = theme.theme_tokens(name)
+        colors = dict(_GRAPH_INK.get(name, _GRAPH_INK["dark"]))
+        colors.update({"ground": tokens["ground"], "ink": tokens["ink"],
+                       "muted": tokens["muted"]})
+        _GRAPH_COLORS[name] = colors
+    return _GRAPH_COLORS[name]
+
+
+def _relative_luminance(color):
+    channels = []
+    for value in (color.redF(), color.greenF(), color.blueF()):
+        channels.append(value / 12.92 if value <= 0.03928 else ((value + 0.055) / 1.055) ** 2.4)
+    return 0.2126 * channels[0] + 0.7152 * channels[1] + 0.0722 * channels[2]
+
+
+def contrast_ratio(one, other):
+    """The WCAG contrast of two colours: 1 is invisible, 21 is black on white."""
+    darker, lighter = sorted((_relative_luminance(QColor(one)), _relative_luminance(QColor(other))))
+    return (lighter + 0.05) / (darker + 0.05)
+
+
+def readable_ink(fill):
+    """Whichever of the theme's ink and its ground can be read on this fill.
+
+    The count inside a merged node sits on the node, not on the canvas, so it has
+    to contrast with the category colour: the same pale mint that carries the dark
+    ground as a numeral under the dark theme needs the dark ink under the light one.
+    """
+    colors = graph_colors()
+    return max((colors["ground"], colors["ink"]), key=lambda ink: contrast_ratio(ink, fill))
+
+
+def halo_colors(color):
+    """The translucent fill and the border of one group outline, for this theme."""
+    colors = graph_colors()
+    fill, border = QColor(color), QColor(color)
+    if colors["halo_deepen"]:
+        fill, border = fill.darker(115), border.darker(140)
+    fill.setAlpha(colors["halo_fill_alpha"])
+    border.setAlpha(colors["halo_border_alpha"])
+    return fill, border
+
+
 _GRAPH_TEXT_SCALE = 100
 
 
@@ -269,20 +361,33 @@ def _graph_font(size, weight=QFont.Weight.DemiBold):
 
 
 class GraphLabel(QGraphicsSimpleTextItem):
-    def __init__(self, text, edge=False, callback=None):
+    def __init__(self, text, edge=False, callback=None, role=None):
         super().__init__(text)
         self.edge = edge
         self.callback = callback
         self.node_key = None
+        # An edge number, an isolate label and the sentence shown when there is
+        # nothing to draw are three different inks. The role is kept so the label
+        # can be repainted in another theme's ink without being rebuilt.
+        self.role = str(role or ("edge" if edge else "node"))
         self.setFont(_graph_font(11 if edge else 14))
-        self.setBrush(QColor("#C7D8E8" if edge else INK))
+        self.apply_theme()
         self.setAcceptedMouseButtons(Qt.MouseButton.LeftButton if callback else Qt.MouseButton.NoButton)
         self.setZValue(1 if edge else 3)
 
+    def apply_theme(self):
+        """Take this label's ink from the theme that is active now."""
+        colors = graph_colors()
+        self.setBrush(QColor(colors["edge_ink"] if self.role == "edge"
+                             else colors["muted"] if self.role == "message"
+                             else colors["ink"]))
+
     def paint(self, painter, option, widget=None):
         if self.edge:
+            # An edge number is legible only because it sits on its own patch of
+            # ground, so that patch is the ground of the theme being drawn now.
             painter.setPen(Qt.PenStyle.NoPen)
-            painter.setBrush(QColor(BACKGROUND))
+            painter.setBrush(QColor(graph_colors()["ground"]))
             painter.drawRoundedRect(self.boundingRect(), 5, 5)
         super().paint(painter, option, widget)
 
@@ -307,7 +412,7 @@ class TreeNode(QGraphicsEllipseItem):
         self.highlighted = False
         self.slices = [(str(color), count)]
         self.setBrush(QColor(color))
-        self.setPen(QPen(QColor("#0B1220"), 3))
+        self.setPen(QPen(QColor(graph_colors()["node_edge"]), 3))
         self.setFlags(QGraphicsItem.GraphicsItemFlag.ItemIsMovable |
                       QGraphicsItem.GraphicsItemFlag.ItemIsSelectable |
                       QGraphicsItem.GraphicsItemFlag.ItemIsFocusable |
@@ -322,12 +427,14 @@ class TreeNode(QGraphicsEllipseItem):
         return super().boundingRect().adjusted(-8, -8, 8, 8)
 
     def paint(self, painter, option, widget=None):
+        colors = graph_colors()
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
         if self.isSelected() or self.highlighted:
             painter.setBrush(Qt.BrushStyle.NoBrush)
-            painter.setPen(QPen(QColor("#FFD58A" if self.highlighted else "#E9F7FF"), 2.5))
+            painter.setPen(QPen(QColor(colors["found"] if self.highlighted
+                                       else colors["selected"]), 2.5))
             painter.drawEllipse(self.rect().adjusted(-5, -5, 5, 5))
-        painter.setPen(QPen(QColor(BACKGROUND), 2))
+        painter.setPen(QPen(QColor(colors["node_edge"]), 2))
         start = 90 * 16
         for color, count in self.slices:
             span = round(count / self.count * 360 * 16)
@@ -338,7 +445,9 @@ class TreeNode(QGraphicsEllipseItem):
                 painter.drawPie(self.rect(), start, span)
             start += span
         if self.count > 1:
-            painter.setPen(QColor(BACKGROUND))
+            # The number is read against the node it sits on, and the first slice
+            # is the colour under the middle of the disc.
+            painter.setPen(QColor(readable_ink(self.slices[0][0])))
             painter.setFont(_graph_font(10, QFont.Weight.Bold))
             painter.drawText(self.rect(), Qt.AlignmentFlag.AlignCenter, str(self.count))
 
@@ -379,8 +488,11 @@ class TreeView(QGraphicsView):
         super().__init__(self.canvas, parent)
         self.canvas.setParent(self)
         self.setRenderHints(QPainter.RenderHint.Antialiasing | QPainter.RenderHint.TextAntialiasing)
-        self.setBackgroundBrush(QColor(BACKGROUND))
-        self.canvas.setBackgroundBrush(QColor(BACKGROUND))
+        # Which theme these items were last painted in, so a repaint can notice
+        # that the reader has chosen another one.
+        self._themed = theme.active_theme()
+        self.setBackgroundBrush(QColor(graph_colors()["ground"]))
+        self.canvas.setBackgroundBrush(QColor(graph_colors()["ground"]))
         self.setFrameShape(QFrame.Shape.NoFrame)
         # Native Windows redraws must invalidate the opaque viewport, including after navigation.
         self.setViewportUpdateMode(QGraphicsView.ViewportUpdateMode.FullViewportUpdate)
@@ -412,8 +524,15 @@ class TreeView(QGraphicsView):
         self.show_halos = True
         self.cluster_threshold = 1
         self._highlight = ""
+        self._message = None
         self._drawing = False
         self._panning = None
+        # A theme chosen while this forest is on screen is noticed by the next
+        # repaint, which cannot change a pen while Qt is painting: the repaint
+        # asks for the rest of the work on the next turn of the event loop.
+        self._theme_timer = QTimer(self)
+        self._theme_timer.setSingleShot(True)
+        self._theme_timer.timeout.connect(self.refresh_theme)
         self.set_interaction_mode("select")
         self.canvas.selectionChanged.connect(self._emit_selection)
         self.setToolTip(self._view_tooltip())
@@ -440,6 +559,60 @@ class TreeView(QGraphicsView):
         self.interaction_mode = mode
         self.setDragMode(QGraphicsView.DragMode.RubberBandDrag if mode == "select"
                          else QGraphicsView.DragMode.ScrollHandDrag)
+
+    def drawBackground(self, painter, rect):
+        # The ground is read here, not bound once at import, so the canvas is the
+        # colour of the theme in force at the moment it is painted.
+        painter.fillRect(rect, QColor(graph_colors()["ground"]))
+        # Only refresh_theme() may record which theme the items carry: a repaint
+        # that claimed it here would leave stale pens looking up to date, and an
+        # export taken before the timer fired would go out in the old colours.
+        if self._themed != theme.active_theme():
+            self._theme_timer.start(0)
+
+    def _edge_pen(self, edge):
+        """One edge line: dashed above this forest's link threshold, as before."""
+        pen = QPen(QColor(graph_colors()["edge"]), 2)
+        pen.setCosmetic(True)
+        if edge["distance"] > self.cluster_threshold:
+            pen.setStyle(Qt.PenStyle.DashLine)
+        return pen
+
+    def _guide_pen(self):
+        pen = QPen(QColor(graph_colors()["guide"]), 0.8, Qt.PenStyle.DotLine)
+        pen.setCosmetic(True)
+        return pen
+
+    def refresh_theme(self):
+        """Repaint this forest in the theme that is active now, without redrawing it.
+
+        Nodes, edges and labels keep their positions, their colours and every
+        number on them: only the ground they sit on and the inks that have to be
+        read against it change, so switching theme is never mistaken for a
+        recalculation.
+        """
+        colors = graph_colors()
+        self._themed = theme.active_theme()
+        ground = QColor(colors["ground"])
+        self.setBackgroundBrush(ground)
+        self.canvas.setBackgroundBrush(ground)
+        node_edge = QColor(colors["node_edge"])
+        for node in self.nodes.values():
+            node.setPen(QPen(node_edge, 3))
+            node.update()
+        for item in list(self.labels.values()) + list(self._halo_labels.values()):
+            item.apply_theme()
+        if self._message is not None:
+            self._message.apply_theme()
+        for guide in self._label_guides.values():
+            guide.setPen(self._guide_pen())
+        for (_a, _b, line, text), edge in zip(self.edges, self._display_edges):
+            line.setPen(self._edge_pen(edge))
+            text.apply_theme()
+        # Halo washes and the grey of a group of one are weighted for the ground
+        # they lie on, so they are recomputed rather than merely repainted.
+        self._apply_colors()
+        self.viewport().update()
 
     def wheelEvent(self, event):
         factor = 1.12 if event.angleDelta().y() > 0 else 1 / 1.12
@@ -653,6 +826,7 @@ class TreeView(QGraphicsView):
         self.canvas.blockSignals(True)
         self.nodes, self.edges, self.labels, self._halos, self._label_guides = {}, [], {}, [], {}
         self._halo_labels = {}
+        self._message = None
         self.canvas.clear()
         self._members = {}
         signatures = {}
@@ -704,20 +878,14 @@ class TreeView(QGraphicsView):
             title.node_key = key
             self.canvas.addItem(title)
             self.labels[key] = title
-            guide_pen = QPen(QColor("#36516C"), 0.8, Qt.PenStyle.DotLine)
-            guide_pen.setCosmetic(True)
-            guide = self.canvas.addLine(0, 0, 0, 0, guide_pen)
+            guide = self.canvas.addLine(0, 0, 0, 0, self._guide_pen())
             guide.setZValue(0.1)
             guide.setAcceptedMouseButtons(Qt.MouseButton.NoButton)
             guide.setToolTip("Display-label guide, not an allele-distance edge.")
             guide.hide()
             self._label_guides[key] = guide
         for edge in self._display_edges:
-            pen = QPen(QColor("#5F819B"), 2)
-            pen.setCosmetic(True)
-            if edge["distance"] > cluster_threshold:
-                pen.setStyle(Qt.PenStyle.DashLine)
-            line = self.canvas.addLine(0, 0, 0, 0, pen)
+            line = self.canvas.addLine(0, 0, 0, 0, self._edge_pen(edge))
             text = GraphLabel(str(edge["distance"]), edge=True)
             tooltip = self._edge_tooltip(edge)
             text.setToolTip(tooltip)
@@ -729,10 +897,7 @@ class TreeView(QGraphicsView):
         # halo around every isolate reads as a page of one-isolate clusters.
         for index, group in (enumerate(self._cluster_groups) if cluster_threshold >= 0 else ()):
             definition = self._group_definitions[index]
-            fill = QColor(self._palette[index % len(self._palette)])
-            border = QColor(fill)
-            fill.setAlpha(15)
-            border.setAlpha(65)
+            fill, border = halo_colors(self._palette[index % len(self._palette)])
             halo = self.canvas.addEllipse(QRectF(), QPen(border, 1), fill)
             halo.setZValue(-2)
             halo.setAcceptedMouseButtons(Qt.MouseButton.NoButton)
@@ -755,16 +920,20 @@ class TreeView(QGraphicsView):
             kind = (self.scale or {}).get("title")
             message = GraphLabel(
                 f"No {kind} comparison is drawn yet." if kind else
-                "Analyse at least two assemblies with the same scheme to compare profiles.")
-            message.setBrush(QColor(MUTED))
+                "Analyse at least two assemblies with the same scheme to compare profiles.",
+                role="message")
             self.canvas.addItem(message)
+            self._message = message
         self.setToolTip(self._view_tooltip())
         self._drawing = False
         self.canvas.blockSignals(False)
         if self.color_by not in self.available_color_fields():
             self.color_by = "cluster"
         self._refresh_labels()
-        self._apply_colors()
+        # Colours and the ground together, so a forest drawn after the reader
+        # changed theme is drawn in that theme rather than in the one it was last
+        # painted in. This also applies the node and halo colours.
+        self.refresh_theme()
         self.highlight(self._highlight)
         self.select_ids(selected)
         self.update_edges()
@@ -917,13 +1086,16 @@ class TreeView(QGraphicsView):
         return True
 
     def _apply_colors(self):
+        # A group of one is deliberately colourless, and "colourless" is a
+        # different grey on a near-black ground than on paper.
+        singleton = graph_colors()["singleton"]
         clusters = {member: group["name"] for group in self._group_definitions for member in group["members"]}
         categories = {key: self._category(key, clusters) for key in self._results}
         self._legend = {category: self._palette[index % len(self._palette)]
                         for index, category in enumerate(sorted(set(categories.values())))}
         if self.color_by == "cluster":
             self._legend = {g["name"]: (self._palette[((g.get("number") or 1) - 1) % len(self._palette)]
-                                       if g.get("status") == "cluster" else "#73869A")
+                                       if g.get("status") == "cluster" else singleton)
                             for g in self._group_definitions}
         if self._pinned_legend:
             self._legend = {category: self._pinned_legend.get(category, color)
@@ -935,12 +1107,10 @@ class TreeView(QGraphicsView):
             self.nodes[key].update()
         for index, (group, halo) in enumerate(self._halos):
             definition = self._group_definitions[index]
-            color = QColor(self._palette[((definition.get("number") or 1) - 1) % len(self._palette)]
-                           if definition.get("status") == "cluster" else "#73869A")
-            border = QColor(color)
-            color.setAlpha(15)
-            border.setAlpha(65)
-            halo.setBrush(color)
+            fill, border = halo_colors(
+                self._palette[((definition.get("number") or 1) - 1) % len(self._palette)]
+                if definition.get("status") == "cluster" else singleton)
+            halo.setBrush(fill)
             halo.setPen(QPen(border, 1))
         self.legendChanged.emit(self.legend())
         self.viewport().update()
@@ -1194,21 +1364,26 @@ class TreeView(QGraphicsView):
             finally:
                 set_graph_text_scale(reader_scale)
                 self._redraw()
+        # An exported picture is the theme the reader is looking at: a dark tree on
+        # a light report page, or a light one in a dark room, is the wrong picture.
+        if self._themed != theme.active_theme():
+            self.refresh_theme()
+        colors = graph_colors()
         bounds = self.canvas.itemsBoundingRect().adjusted(-35, -35, 35, 35)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
-        painter.fillRect(QRectF(0, 0, width, height), QColor(BACKGROUND))
-        painter.setPen(QColor(INK))
+        painter.fillRect(QRectF(0, 0, width, height), QColor(colors["ground"]))
+        painter.setPen(QColor(colors["ink"]))
         painter.setFont(_graph_font(16))
         caption, phrase = self.scale_caption(), self._distance_phrase()
         painter.drawText(QPointF(35, 38), title or (
             f"{caption} · {phrase} minimum spanning forest" if caption
             else f"{phrase[:1].upper()}{phrase[1:]} minimum spanning forest"))
-        painter.setPen(QColor(MUTED))
+        painter.setPen(QColor(colors["muted"]))
         painter.setFont(_graph_font(10, QFont.Weight.Normal))
         painter.drawText(QPointF(35, 63), subtitle or self.graph_subtitle())
         self.canvas.render(painter, QRectF(0, 90, width, height - 205), bounds)
         painter.setFont(_graph_font(10))
-        painter.setPen(QColor(MUTED))
+        painter.setPen(QColor(colors["muted"]))
         targets = (self.scale or {}).get("targets")
         # A threshold nobody justified is "none set", never a number printed under
         # the picture as though a cutoff had been applied.
@@ -1225,13 +1400,17 @@ class TreeView(QGraphicsView):
             if x + space > width - 35:
                 x, y = 35, y + 25
             if y > height - 10:
-                painter.setPen(QColor(MUTED))
+                painter.setPen(QColor(colors["muted"]))
                 painter.drawText(QPointF(width - 270, height - 8), "More categories in GraphML export")
                 break
-            painter.setPen(Qt.PenStyle.NoPen)
+            # On paper a pale category colour needs an outline or the swatch is
+            # not there at all; on a dark ground the outline is the ground itself
+            # and the swatch is drawn exactly as it always was.
+            painter.setPen(Qt.PenStyle.NoPen if colors["node_edge"] == colors["ground"]
+                           else QPen(QColor(colors["node_edge"]), 1))
             painter.setBrush(QColor(color))
             painter.drawEllipse(QPointF(x + 6, y - 5), 6, 6)
-            painter.setPen(QColor(INK))
+            painter.setPen(QColor(colors["ink"]))
             painter.drawText(QPointF(x + 21, y), text)
             x += space
 
@@ -1240,7 +1419,7 @@ class TreeView(QGraphicsView):
 
     def save_image(self, path, *, format=None, title=None, subtitle=None):
         image = QImage(1800, 1200, QImage.Format.Format_ARGB32)
-        image.fill(QColor(BACKGROUND))
+        image.fill(QColor(graph_colors()["ground"]))
         painter = QPainter(image)
         self._render(painter, 1800, 1200, title=title, subtitle=subtitle)
         painter.end()
@@ -1352,15 +1531,16 @@ def render_side_by_side(left, right, *, left_title, right_title, left_subtitle=N
     limit into the picture itself, where it cannot be cropped away from the trees
     the way a surrounding caption can.
     """
+    colors = graph_colors()
     image = QImage(int(width) * 2, int(height) + int(header), QImage.Format.Format_ARGB32)
-    image.fill(QColor(BACKGROUND))
+    image.fill(QColor(colors["ground"]))
     painter = QPainter(image)
     try:
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
-        painter.setPen(QColor(INK))
+        painter.setPen(QColor(colors["ink"]))
         painter.setFont(_graph_font(18))
         painter.drawText(QPointF(35, 34), str(headline))
-        painter.setPen(QColor(MUTED))
+        painter.setPen(QColor(colors["muted"]))
         painter.setFont(_graph_font(10, QFont.Weight.Normal))
         painter.drawText(QPointF(35, 58), str(note or SIDE_BY_SIDE_NOTE))
         for index, (view, title, subtitle) in enumerate(
@@ -1369,7 +1549,7 @@ def render_side_by_side(left, right, *, left_title, right_title, left_subtitle=N
             painter.translate(index * width, header)
             view._render(painter, width, height, title=title, subtitle=subtitle)
             painter.restore()
-        painter.setPen(QPen(QColor(MUTED), 2))
+        painter.setPen(QPen(QColor(colors["muted"]), 2))
         painter.drawLine(int(width), int(header), int(width), int(header) + int(height))
     finally:
         painter.end()

@@ -46,6 +46,39 @@ UNIT = {"cgmlst": "targets", "mlst": "loci"}
 SEPARATION = ("A classical seven-locus MLST distance and a 2,000-target cgMLST distance are different "
               "quantities: they never share a scale, an axis, a column or a threshold. That is why these "
               "are two libraries and two tabs, not one list.")
+# The three target sets a provider may publish for one organism, named where the
+# choice between them is made. The keys are cgmlst_schemes' own target_set_detail
+# values, so a set this dialog has no words for is labelled as unrecorded rather
+# than quietly described as a core genome.
+TARGET_SET_PREFIXES = {"core": "Core target set",
+                       "accessory": "Accessory target set",
+                       "whole_genome": "Whole-genome set (core + accessory)"}
+TARGET_SET_PURPOSE = {
+    "core": ("Core: the targets expected in every isolate of this organism. This is what cgMLST "
+             "means, and a published outbreak cutoff is derived on a set of this kind."),
+    "accessory": ("Accessory: targets that some isolates of this organism carry and others do not, "
+                  "by design. A target not called here is biology and not a failed call, so it is "
+                  "reported as not assayed and never counted as a difference."),
+    "whole_genome": ("Whole genome: core and accessory targets in ONE set, which is sometimes "
+                     "called cgMLST plus accessory genes. Run it instead of a core scheme, never "
+                     "beside one as something added to a core distance."),
+}
+# The point of offering the choice at all, and what the catalogue's own sentence
+# about scales and cutoffs does not say: the consequence for the isolates. Shown
+# wherever more than one target set is on offer, because choosing between them is
+# exactly the moment at which two different quantities can be taken for two
+# versions of one.
+TARGET_SET_SEPARATION = (
+    "These are DIFFERENT QUANTITIES, not versions of one measurement: two isolates typed against "
+    "different target sets are not comparable at all. Type every isolate of one comparison against "
+    "the set you choose here.")
+TARGET_SET_NOT_RECORDED = (
+    "Target set: not recorded. This folder does not say whether it holds a core target set, an "
+    "accessory one or both, so a distance measured on it cannot be read as a cgMLST core distance "
+    "and no published cutoff is offered for it.")
+# Core first, then accessory, then the pan-genome set: the order in which a person
+# decides, from the set a cgMLST scheme IS outwards.
+_TARGET_SET_ORDER = {"core": 0, "accessory": 1, "whole_genome": 2}
 # cgMLST.org publishes allele nomenclature but no central profile table, so a
 # snapshot taken from it assigns no cgST. The same sentence the online catalog
 # records on a searched entry is recorded on a catalogued one.
@@ -85,6 +118,25 @@ def _count_words(count, kind):
     return f"{count} {UNIT[kind]}" if count else f"no {UNIT[kind]} installed"
 
 
+def _row_target_set(row) -> str:
+    """Which target set a row records, preferring the finer of the two fields.
+
+    ``target_set`` says core or not-core, which is what most of the application
+    stores; ``target_set_detail`` separates an accessory set from a pan-genome one,
+    because 251 accessory targets and 1,907 pan-genome targets are themselves two
+    different quantities. A row that records neither returns '' and is labelled as
+    unrecorded — never as core, which is what an empty value would otherwise be
+    read as.
+    """
+    return str(row.get("target_set_detail") or row.get("target_set") or "")
+
+
+def _target_set_words(row) -> str:
+    """'Core', 'Accessory', 'Whole genome' or 'Not recorded' for one row."""
+    detail = _row_target_set(row)
+    return cgmlst_schemes.target_set_label(detail) if detail else "Not recorded"
+
+
 def download_entry(entry) -> dict:
     """The catalog-client entry that installs one pinned cgMLST scheme.
 
@@ -103,6 +155,40 @@ def download_entry(entry) -> dict:
     if token == "cgmlst_org":
         return {**common, "slug": entry["scheme_id"], "access_notice": CGMLST_ORG_ACCESS}
     return {**common, "database": entry["database"], "scheme_id": entry["scheme_id"]}
+
+
+def _scheme_group(key) -> str:
+    """The provider-and-organism family of a catalogue key, or '' when it has none.
+
+    A key this catalogue does not pin resolves to no family rather than to a
+    guessed one, because the family is what decides which target sets are offered
+    beside each other as a choice.
+    """
+    if not key:
+        return ""
+    try:
+        return cgmlst_schemes.entry_for(key)["scheme_group"]
+    except cgmlst_schemes.SchemeCatalogError:
+        return ""
+
+
+def multi_set_organisms() -> list[str]:
+    """Organisms whose catalogued schemes are not all the same kind of target set.
+
+    Named in the library summary because the choice between running cgMLST and
+    running cgMLST plus accessory genes is otherwise invisible until a row that
+    has one happens to be selected, and a choice nobody can find is a choice
+    nobody makes. Two core schemes from one provider are not such a pair: they are
+    two schemes, and choosing between them is a different question.
+    """
+    families: dict[str, list[dict]] = {}
+    try:
+        for entry in cgmlst_schemes.catalog_entries():
+            families.setdefault(entry["scheme_group"], []).append(entry)
+    except (OSError, ValueError):
+        return []
+    return sorted({rows[0]["organism"] for rows in families.values()
+                   if len({cgmlst_schemes.target_set_detail(row) for row in rows}) > 1})
 
 
 def _installed_detail(row, source) -> str:
@@ -125,6 +211,15 @@ def _installed_detail(row, source) -> str:
                      f"this folder holds {source['locus_count']}. A cutoff published for the complete "
                      "set is not offered for a partial one.")
     if row["kind"] == "cgmlst":
+        # Which target set is in this folder decides what a distance from it means,
+        # so it is stated on the folder rather than left to the catalogue row a
+        # person may never open.
+        detail = _row_target_set(source)
+        if detail:
+            lines.append(f"Target set: {cgmlst_schemes.target_set_label(detail)}. "
+                         + TARGET_SET_PURPOSE.get(detail, ""))
+        else:
+            lines.append(TARGET_SET_NOT_RECORDED)
         lines.append(cgmlst_schemes.INTERPRETATION)
     return "\n\n".join(lines)
 
@@ -132,7 +227,12 @@ def _installed_detail(row, source) -> str:
 def _catalogued_detail(entry) -> str:
     """Everything the download button must show before a byte is transferred."""
     plan = cgmlst_schemes.download_plan(entry["key"])
+    # What this scheme measures comes before how it is fetched: a person about to
+    # spend an hour downloading a 1,907-target pan-genome set must read that it is
+    # not a core cgMLST scheme before the first byte moves, not afterwards.
     lines = [plan["title"],
+             f"Target set: {plan['target_set_label']} · {plan['locus_count']} targets. "
+             + " ".join(plan["target_set_notice"].split()),
              f"Not installed. It will install into your cgMLST library, in the folder "
              f"{entry['folder']}.",
              "How it downloads: " + plan["method"],
@@ -183,14 +283,22 @@ def installed_rows(root, *, cancelled=None) -> dict:
             resolved = Path(entry["path"]).resolve()
             source = {**entry, **catalogued.get(str(resolved), {})}
             packed = bundled in resolved.parents
+            key = source.get("catalog_key") or ""
             row = {"row_id": "path:" + str(resolved), "kind": kind, "state": "installed",
                    "status": "Installed · bundled" if packed else "Installed · your library",
                    "organism": entry["organism_label"], "scheme": entry["scheme_label"],
                    "count": entry["locus_count"], "target_set": source.get("target_set") or "",
+                   "target_set_detail": source.get("target_set_detail") or "",
                    "provider": entry["provider"], "version": entry["version"],
                    "title": entry["title"], "location": entry["path"], "path": entry["path"],
-                   "key": source.get("catalog_key") or "", "entry": None,
-                   "scheme_group": "", "requires_terms": False, "downloadable": False,
+                   "key": key, "entry": None,
+                   # An installed scheme this catalogue recognises carries its
+                   # provider-and-organism family, so the target-set menu offers the
+                   # core and accessory sets of THIS scheme rather than a different
+                   # provider's scheme for the same organism, which is not the
+                   # accessory half of anything.
+                   "scheme_group": _scheme_group(key),
+                   "requires_terms": False, "downloadable": False,
                    "provider_key": ""}
             row["detail"] = _installed_detail(row, source)
             rows[kind].append(row)
@@ -217,6 +325,7 @@ def catalogued_rows(root, *, installed_paths=()) -> list[dict]:
                        if entry["requires_terms_acknowledgement"] else "Not installed · download"),
             "organism": entry["organism"], "scheme": entry["scheme_name"],
             "count": entry["locus_count"], "target_set": entry["target_set"],
+            "target_set_detail": entry["target_set_detail"],
             "provider": entry["provider_name"], "version": entry["version"],
             "title": entry["title"], "location": entry["folder"], "path": "",
             "key": entry["key"], "entry": download_entry(entry),
@@ -236,7 +345,10 @@ def online_row(entry, kind, provider_key) -> dict:
     return {"row_id": "online:" + str(entry.get("id") or entry.get("url") or scheme),
             "kind": kind, "state": "online", "status": "Found online · not installed",
             "organism": str(entry.get("organism") or ""), "scheme": scheme,
-            "count": count, "target_set": "", "provider": str(entry.get("provider") or provider_key),
+            # An online search result says nothing about which target set it is, and
+            # an unlabelled set is an unknown quantity rather than a core genome.
+            "count": count, "target_set": "", "target_set_detail": "",
+            "provider": str(entry.get("provider") or provider_key),
             "version": str(entry.get("last_updated") or ""),
             "title": f"{organism} · {scheme} · {_count_words(count, kind)}",
             "location": "Not installed", "path": "", "key": "", "entry": dict(entry),
@@ -264,6 +376,8 @@ class SchemeLibraryPage(QWidget):
         self.online = []
         self.unreadable = 0
         self.entries = []  # the download descriptors of the rows currently shown
+        # Read once: the pinned catalogue does not change while the dialog is open.
+        self.multi_set = multi_set_organisms() if kind == "cgmlst" else []
         layout = QVBoxLayout(self)
         layout.addWidget(self._wrapped(
             f"Every {LIBRARY_NAMES[kind]} scheme this computer has, plus the ones WMLSTudio knows how "
@@ -303,16 +417,21 @@ class SchemeLibraryPage(QWidget):
         self.table.itemSelectionChanged.connect(self.selectionChanged.emit)
         layout.addWidget(self.table, 1)
         if kind == "cgmlst":
-            # Requirement of the science, not of the layout: a core target set and an
-            # accessory set are different quantities, so where a provider publishes
-            # both the choice is explicit, and where it publishes one that is said in
-            # words instead of shown as an empty menu.
+            # Requirement of the science, not of the layout: a core target set, an
+            # accessory set and a whole-genome set are different quantities, so where
+            # a provider publishes more than one the choice is explicit, and where it
+            # publishes one that is said in words instead of shown as an empty menu.
+            # It is a titled block of its own because choosing the target set is the
+            # cgMLST decision, and it was reported as impossible to find.
+            heading = self._wrapped("Target set to run — core, accessory, or core plus accessory")
+            heading.setStyleSheet("font-weight: 600;")
+            layout.addWidget(heading)
             variants = QHBoxLayout()
             variants.addWidget(QLabel("Target set:"))
             self.variant = QComboBox()
-            self.variant.setMinimumWidth(320)
+            self.variant.setMinimumWidth(460)
             self.variant.activated.connect(self.choose_variant)
-            variants.addWidget(self.variant)
+            variants.addWidget(self.variant, 1)
             variants.addStretch()
             layout.addLayout(variants)
             self.variant_note = self._wrapped("")
@@ -377,8 +496,7 @@ class SchemeLibraryPage(QWidget):
         for index, row in enumerate(self.visible):
             values = [row["organism"] or "Organism not recorded", row["scheme"], row["count"]]
             if self.kind == "cgmlst":
-                values.append({"core": "Core", "accessory": "Accessory"}.get(row["target_set"],
-                                                                            "Not recorded"))
+                values.append(_target_set_words(row))
             values += [row["provider"] or "Not recorded", row["version"] or "Not recorded",
                        row["status"], row["location"]]
             for column, value in enumerate(values):
@@ -405,6 +523,11 @@ class SchemeLibraryPage(QWidget):
         if self.unreadable:
             text += (f" · {self.unreadable} installed folder(s) record no readable typing kind and are "
                      "offered by neither library.")
+        if self.multi_set:
+            text += (" · More than one target set is catalogued for "
+                     + ", ".join(self.multi_set)
+                     + ": select one of their rows to choose between the core set and the "
+                       "accessory or whole-genome set beside it.")
         self.summary.setText(text)
 
     # -- selection -------------------------------------------------------------
@@ -430,16 +553,21 @@ class SchemeLibraryPage(QWidget):
                                  "installs. Nothing is downloaded until you choose it.")
         self.refresh_variants(row)
 
-    # -- core versus accessory -------------------------------------------------
+    # -- which target set to run -----------------------------------------------
 
     def refresh_variants(self, row):
-        """Offer the core/accessory choice where both exist; say so plainly where not.
+        """Offer every target set catalogued for this scheme; say plainly when one is.
 
-        The choice is scoped to ONE provider's scheme family, because core and
-        accessory are two target sets one provider publishes for one organism.
-        Another provider's scheme for the same organism is a different scheme
-        altogether, not the accessory half of this one, so it is named in words
-        rather than dropped into the same menu.
+        Core, accessory and whole-genome sets are offered together, each with the
+        number of targets it holds and what it is for, because "run cgMLST" and
+        "run cgMLST plus accessory genes" are two different runs producing two
+        quantities that are never compared.
+
+        The choice is scoped to ONE provider's scheme family, because those sets
+        are what one provider publishes for one organism. Another provider's
+        scheme for the same organism is a different scheme altogether, not the
+        accessory half of this one, so it is named in words rather than dropped
+        into the same menu.
         """
         if self.variant is None:
             return
@@ -448,18 +576,29 @@ class SchemeLibraryPage(QWidget):
         if row is None or not (row["scheme_group"] or row["organism"]):
             self.variant.setEnabled(False)
             self.variant_note.setText(
-                "Select a scheme to see whether a core and an accessory target set are both "
-                "catalogued for it." if row is None else
+                "Select a scheme to see which target sets are catalogued for it: a core set, an "
+                "accessory set, a whole-genome set, or only one of them." if row is None else
                 "This scheme records no organism, so no core or accessory pairing can be looked up "
                 "for it. That is a gap in what the scheme records, not proof that none exists.")
             self.variant.blockSignals(False)
             return
         group = row["scheme_group"] or None
         variants = cgmlst_schemes.scheme_variants(row["organism"] or None, group=group)
-        choices = [("Core target set", entry) for entry in variants["core"]]
-        choices += [("Accessory / whole-genome set", entry) for entry in variants["accessory"]]
-        for prefix, entry in choices:
-            self.variant.addItem(f"{prefix} — {entry['title']}", entry["key"])
+        # Built from the union rather than from the three split lists, so a target
+        # set this dialog has no name for is still offered — labelled as unrecorded
+        # — instead of disappearing from a menu that claims to hold every set.
+        choices = sorted(((cgmlst_schemes.target_set_detail(entry), entry)
+                          for entry in variants["core"] + variants["accessory"]),
+                         key=lambda item: (_TARGET_SET_ORDER.get(item[0], 3),
+                                           item[1]["locus_count"]))
+        for position, (detail, entry) in enumerate(choices):
+            self.variant.addItem(self._variant_text(detail, entry), entry["key"])
+            self.variant.setItemData(position, f"{entry['title']}\n\n"
+                                     + TARGET_SET_PURPOSE.get(detail, ""),
+                                     Qt.ItemDataRole.ToolTipRole)
+        # Enabled the moment there is something to choose between. Several organisms
+        # now have two or three catalogued sets, and a menu that stays greyed out on
+        # all of them is a choice a person cannot reach.
         self.variant.setEnabled(len(choices) > 1)
         index = self.variant.findData(row["key"])
         self.variant.setCurrentIndex(index if index >= 0 else 0)
@@ -469,8 +608,29 @@ class SchemeLibraryPage(QWidget):
             note = ("This scheme is not in the pinned catalogue, so no core or accessory pairing is "
                     "known for it. " + note)
         elif len(choices) == 1:
-            note = f"{choices[0][0]} only. {note}"
-        self.variant_note.setText(note + self._other_schemes(row, choices))
+            note = f"{self._set_prefix(choices[0][0])} only. {note}"
+        # What each set on offer is for, once each, in the order they are listed;
+        # and, where there is a choice at all, why the numbers they produce cannot
+        # be read against one another.
+        said = [TARGET_SET_PURPOSE[detail] for detail in dict.fromkeys(item[0] for item in choices)
+                if detail in TARGET_SET_PURPOSE]
+        if len(choices) > 1:
+            said.append(TARGET_SET_SEPARATION)
+        self.variant_note.setText(" ".join([note, *said]) + self._other_schemes(row, choices))
+
+    @staticmethod
+    def _set_prefix(detail) -> str:
+        return TARGET_SET_PREFIXES.get(detail, "Target set not recorded")
+
+    def _variant_text(self, detail, entry) -> str:
+        """One menu line: which set it is, how many targets it holds, whose it is.
+
+        The target count is on the line because it is the difference between the
+        sets as well as the reason their distances are not comparable: 1,649 core
+        targets and 1,907 pan-genome targets are two counts of two different things.
+        """
+        return (f"{self._set_prefix(detail)} — {entry['locus_count']} targets — "
+                f"{entry['scheme_name']} · {entry['provider_name']}")
 
     def _other_schemes(self, row, choices) -> str:
         """Name the other catalogued schemes for this organism, without offering them."""
@@ -483,7 +643,8 @@ class SchemeLibraryPage(QWidget):
             return ""
         return (f" {len(others)} other cgMLST scheme(s) are catalogued for this organism: "
                 + "; ".join(f"{entry['scheme_name']} · {entry['locus_count']} targets · "
-                            f"{entry['provider_name']}" for entry in others)
+                            f"{cgmlst_schemes.target_set_label(entry)} · {entry['provider_name']}"
+                            for entry in others)
                 + ". They are different target sets, not the accessory half of this one, and they "
                   "never share a distance, an axis or a cutoff with it.")
 

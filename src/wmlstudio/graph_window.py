@@ -449,6 +449,16 @@ class GraphWindow(QMainWindow):
         self.mode_button.setText("Select isolates" if self.view.interaction_mode == "pan"
                                  else "Pan with the mouse")
 
+    def refresh_theme(self):
+        """Repaint the forest in the theme that is active now.
+
+        The view notices a new theme by itself on its next repaint; this is for a
+        host that has just changed the theme and wants every open window to follow
+        at once, including one that is behind another and not repainting. Nothing
+        is recalculated: the same nodes, edges and numbers on another ground.
+        """
+        self.view.refresh_theme()
+
     # --- arrangement ---------------------------------------------------------
     def fit(self):
         self.follow_window = True

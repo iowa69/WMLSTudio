@@ -36,10 +36,12 @@ from wmlstudio.export import (
     _muted,
     _plasmid_cells,
     _snapshot,
+    cluster_section_html,
     investigation_document,
     mutation_section_html,
     picture_typing_conflict,
     snp_section_html,
+    threshold_origin_html,
     threshold_provenance,
 )
 from wmlstudio.sample_workflow import select_records
@@ -227,8 +229,14 @@ def _threshold_lines(provenance) -> list[str]:
         stated = 'no published cutoff is attached to it. ' + own
     else:
         stated = (_escape(provenance['reason']) + ' Citation retained: ' + citation + ' (' + doi + '). ' + own)
+    lines = ['<p><b>Where this threshold comes from:</b> ' + stated + '</p>']
+    if provenance.get('operational_match'):
+        # The number in force is one this laboratory declared for itself, which
+        # is neither a publication nor an anonymous local setting. It is printed
+        # in the detailed report's own words so the two cannot drift apart.
+        lines.append(threshold_origin_html(provenance))
     # A catalog entry is context that exists, never a rule that was applied here.
-    return ['<p><b>Where this threshold comes from:</b> ' + stated + '</p>'] + _suggestion_lines(provenance)
+    return lines + _suggestion_lines(provenance)
 
 
 def _comparison_section(snapshot, options, graph_png, graph_mime, provenance, graph_typing=None) -> list[str]:
@@ -439,6 +447,11 @@ def simple_report_html(records, *, selected_ids, investigation=None, settings=No
         parts.append('<h2>How close are these isolates?</h2><p class="notice">' + absent + '</p>')
     else:
         parts.extend(_comparison_section(snapshot, options, graph_png, graph_mime, provenance, graph_typing))
+        # The picture shows the groups; this says which isolates are in them and
+        # how many there are, because neither can be counted off a drawing.
+        parts.append(cluster_section_html(
+            snapshot, sample_ids=[row.get('sample_id') for row in rows],
+            heading='<h2>Which isolates group together at this threshold?</h2>'))
     parts.extend(_resistance_section(rows, options))
     # A SNP distance is a third quantity, so it gets its own section on its own
     # scale. Printed whether or not a run exists, because the answer "no SNP
