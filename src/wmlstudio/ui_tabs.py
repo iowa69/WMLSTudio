@@ -48,6 +48,9 @@ PAGE_KEYS = (
     # of its own and showed the scheme library instead, so pressing Update rescanned
     # this computer's scheme folders rather than asking anyone what is published.
     "update",
+    # Appended once more. Plasmid evidence was a sub-tab of the HYDRA page and was
+    # reported, twice, as not existing at all.
+    "plasmids",
 )
 
 #: Display order: one dedicated tab per task, in the order the tasks happen.
@@ -62,6 +65,7 @@ PIPELINE = (
     "cgmlst_tree",  # the cgMLST minimum spanning tree -- its own scale, always
     "snp",          # reference-free SNP distances (SKA2), on their own scale
     "evidence",     # HYDRA: resistance, virulence and lineage evidence
+    "plasmids",     # replicon evidence and what it does and does not establish
     "reports",      # the report
     "update",       # what is installed, what is published, what an update costs
     "schemes",      # the scheme library itself: what is installed and where from
@@ -96,7 +100,7 @@ NAV_GROUPS = (
         ("evidence", "by class", "AMR by drug class"),
         ("evidence", "point mutation", "Point mutations"),
         ("evidence", "virulence", "Virulence"),
-        ("evidence", "plasmid evidence across", "Plasmids"),
+        "plasmids",
     )),
     ("Deliver", ("reports",)),
     ("Set up", ("update", "schemes", "settings")),
@@ -121,6 +125,7 @@ TAB_LABELS = {
     "cgmlst": "cgMLST",
     "cgmlst_tree": "cgMLST tree",
     "snp": "SNP tree",
+    "plasmids": "Plasmids",
     "evidence": "HYDRA",
     "reports": "Report",
     # Update is the update centre: what is installed, what a provider publishes
@@ -161,6 +166,9 @@ PAGE_PURPOSE = {
            "different questions and never share a scale.",
     "evidence": "Review identity, resistance and virulence evidence for isolates you choose. "
                 "Genotype is not measured susceptibility.",
+    "plasmids": "Replicon evidence for the isolates you choose, and the contigs it sits on. A "
+                "replicon marker is not a plasmid, and co-location on a contig is not proof a "
+                "resistance gene is plasmid-borne.",
     "reports": "Turn reviewed evidence into a document you can share.",
     "update": "What is installed here, what each provider publishes today, and what an update "
               "would cost. Checking asks a provider over the internet; nothing is downloaded "
@@ -180,8 +188,9 @@ NEXT_STEP = {
     "mlst": ("Type selected isolates…", "run_mlst_station"),
     "compare": ("Choose cohort…", "choose_comparison_cohort"),
     "cgmlst": ("Call cgMLST on selected…", "run_cgmlst_station"),
-    "cgmlst_tree": ("Call cgMLST first →", "goto_cgmlst_station"),
-    "snp": ("Compare allele differences instead →", "goto_mlst_tree"),
+    "cgmlst_tree": ("Choose cohort…", "choose_comparison_cohort"),
+    "snp": ("Choose isolates…", "choose_comparison_cohort"),
+    "plasmids": ("Choose isolates…", "choose_feature_cohort"),
     "evidence": ("Choose isolates…", "choose_feature_cohort"),
     "reports": ("Choose report isolates…", "choose_report_cohort"),
     # A network check, named as one. The word nobody could find before was
@@ -228,8 +237,13 @@ CLEAR_ACTIONS = {
         "keeps": "every cgMLST profile and saved investigation",
     },
     "snp": {
-        "clears": "nothing — no SNP work runs on this tab yet",
-        "keeps": "every sample and every file exactly as it is",
+        "clears": "the drawn SNP forest, the distance matrix, the pairs table and this tab's "
+                  "cohort",
+        "keeps": "every assembly, every SKA2 output file and every saved run on disk",
+    },
+    "plasmids": {
+        "clears": "this tab's cohort and the tables built from it",
+        "keeps": "every stored screening result; nothing is re-run and nothing is removed",
     },
     "evidence": {
         "clears": "this tab's cohort and its table selection",

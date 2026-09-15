@@ -264,6 +264,19 @@ def characterization_html(sample):
             body += "<tr>" + "".join(f"<td>{escape(entry.get(key) or '—')}</td>" for key in ("gene", "class", "subclass", "method")) + "</tr>"
         body += "</table>"
     body += "<p>Not an AST result. No determinant detected does not mean susceptible.</p>"
+    # All four element types the screen reports — resistance, virulence, stress
+    # and plasmid — with each blank explained as a negative or as an unasked
+    # question. This was written, tested and then never called from anywhere, so
+    # a screen that found twenty-three stress genes and four point mutations
+    # showed only its AMR genes, and the rest was reported as not existing.
+    try:
+        from wmlstudio.hydra_runtime import element_evidence_html
+        body += element_evidence_html(evidence, execution=evidence.get("execution"))
+    except (ImportError, KeyError, TypeError, ValueError):
+        # A drill-down that cannot be rendered must not take the rest of the
+        # record with it; the sections above are what this pane exists for.
+        body += ("<p>The per-element drill-down could not be rendered for this isolate. This "
+                 "says nothing about what the screen found.</p>")
     body += plasmid_html(evidence.get("plasmid_hypotheses") or {})
     body += f"<h3>Provenance</h3><p>Assembly SHA-256: {escape(evidence.get('input_sha256'))}</p>"
     for section in (species, virulence):

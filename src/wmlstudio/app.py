@@ -170,6 +170,9 @@ class BaseWindow(QMainWindow):
         # number rather than displacing one: every `navigate(<int>)` in this
         # application still means the page it has always meant.
         self.build_update()
+        # Appended after Update, so its build-order number is new and no existing
+        # navigate(<int>) call site is displaced.
+        self.build_plasmids()
         self.install_pipeline_pages()
         self.build_navigator()
         self.install_tree_station()
@@ -186,6 +189,7 @@ class BaseWindow(QMainWindow):
             ("cgmlst_tree", getattr(self, "show_cgmlst_tree_tab", None)),
             ("cgmlst", getattr(getattr(self, "cgmlst_calls", None), "refresh", None)),
             ("snp", getattr(getattr(self, "snp_tree_page", None), "refresh_cohort", None)),
+            ("plasmids", getattr(getattr(self, "plasmid_page", None), "refresh", None)),
             ("reads", getattr(getattr(self, "read_trimming_page", None), "refresh", None)),
             ("assembly", getattr(getattr(self, "assembly_page", None), "refresh", None)),
             # The first time only, and it reads this computer's folders: opening
@@ -282,12 +286,16 @@ class BaseWindow(QMainWindow):
             QTimer.singleShot(0, self.update_workspace_room)
 
     def update_workspace_room(self):
-        """Decide whether this window can afford the sidebar beside the tab bar.
+        """Keep exactly one navigation on screen, whatever the window is worth.
 
-        The tab bar is the navigation, and a tab hidden behind a scroll arrow is a
-        tab nobody finds. The sidebar is only afforded when every label can still be
-        drawn whole beside it; below that it stands down, as it always did below
-        1180 px. Nothing here changes a page, a cohort or a preference.
+        The sidebar carries the workflow and stands down below 1180 px, as it
+        always has, to give a narrow window its whole width for the data. What
+        must never happen is what happened when the navigator arrived and the tab
+        bar was hidden behind it: at 1000 px the sidebar stood down as usual, the
+        bar was already hidden, and the window had no navigation at all.
+
+        So the bar comes back exactly when the sidebar goes away, unless someone
+        asked to see both. Nothing here changes a page, a cohort or a preference.
         """
         try:
             if not hasattr(self, "sidebar") or not hasattr(self, "pages"):
@@ -295,6 +303,8 @@ class BaseWindow(QMainWindow):
             room = self.width() - 2 * WORKSPACE_GUTTER - self.sidebar.width()
             afford = self.width() >= 1180 and room >= self.pages.minimum_bar_width()
             self.sidebar.setVisible(afford)
+            wanted = bool(self.project.get_setting("workspace.tab_bar", False))
+            self.pages.tabBar().setVisible(wanted or not afford)
             return afford
         except RuntimeError:  # The window was closed before the queued call ran.
             return None
@@ -789,6 +799,39 @@ class BaseWindow(QMainWindow):
         self.update_center = UpdateCenter(self)
         layout.addWidget(self.update_center, 1)
         return self.update_center
+
+    def build_plasmids(self):
+        """The Plasmids tab, which was reported twice as not existing at all.
+
+        The evidence was there the whole time — replicon markers from the HYDRA
+        screen, and the contigs they sit on — as the second of seven sub-tabs on
+        the HYDRA page, in a strip that ran off the edge of the window. Evidence
+        nobody can find is evidence nobody has.
+
+        It is a page of its own because the reading it invites is the dangerous
+        one: a replicon marker is not a plasmid, and a resistance gene on the same
+        contig as a replicon is not thereby plasmid-borne. Those limits belong
+        beside the numbers, which needs room.
+        """
+        _, layout = self.page()
+        self.heading(layout, "Plasmid evidence",
+                     "Replicon markers for the isolates you choose, and the contigs they sit on. "
+                     "A marker is not a plasmid and co-location is not proof of carriage.")
+        self.plasmid_page = None
+        try:
+            from wmlstudio.ui_plasmids import PlasmidPanel
+            self.plasmid_page = PlasmidPanel(self)
+        except (ImportError, TypeError) as error:
+            # A page that cannot be built says so rather than showing an empty
+            # tab, because an empty plasmid tab reads as "no plasmids found".
+            layout.addWidget(label(
+                "The plasmid page could not be built in this installation, so no replicon "
+                f"evidence is shown here. This is not a finding about your isolates: {error}",
+                "muted", True))
+            layout.addStretch()
+            return None
+        layout.addWidget(self.plasmid_page, 1)
+        return self.plasmid_page
 
     def check_for_updates(self):
         """The Update tab's next step: ask the providers, from wherever it was pressed."""
