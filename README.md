@@ -11,25 +11,25 @@ installation for the portable package.
 
 ## Download and retest
 
-### [⬇ Download WMLSTudio — Windows portable ZIP](https://github.com/iowa69/WMLSTudio/releases/download/v0.3.1/WMLSTudio-0.3.1-Windows-x64.zip)
+### [⬇ Download WMLSTudio — Windows portable ZIP](https://github.com/iowa69/WMLSTudio/releases/download/v0.3.2/WMLSTudio-0.3.2-Windows-x64.zip)
 
-**v0.3.1 · Windows x64 · 372 MB ZIP · Non-commercial research**
+**v0.3.2 · Windows x64 · 390 MB ZIP · Non-commercial research**
 
 Unzip and run `WMLSTudio.exe`. No installer, no Python, no WSL, no Docker.
-SHA-256 `f246240e5fd0ee16478db8d1a09897b8da774ecb3484e2bc0704af0520418270`.
+SHA-256 `7f0bb081e216bcd108a662ded08f42c777262b06c4bf61997b15d5fac4fa5020`.
 
-[Release notes](https://github.com/iowa69/WMLSTudio/releases/tag/v0.3.1)
-· [SHA-256 checksum](https://github.com/iowa69/WMLSTudio/releases/download/v0.3.1/WMLSTudio-0.3.1-Windows-x64.zip.sha256)
+[Release notes](https://github.com/iowa69/WMLSTudio/releases/tag/v0.3.2)
+· [SHA-256 checksum](https://github.com/iowa69/WMLSTudio/releases/download/v0.3.2/WMLSTudio-0.3.2-Windows-x64.zip.sha256)
 · [Previous 0.2 release](https://github.com/iowa69/WMLSTudio/releases/tag/v0.2.0-workbench.1)
 · [Build/test results](https://github.com/iowa69/WMLSTudio/actions/workflows/studio.yml)
 · [Previous 0.1 release](https://github.com/iowa69/WMLSTudio/releases/tag/v0.1.0-preview.1)
 
 The release notes distinguish observed Linux, native Windows CI and Wine checks
 from the still-required clean Windows 11 desktop acceptance test.
-The published binary was built from `c31b5b1`: **1,536 tests passed on each
-hosted platform**, followed by the frozen-build, app-local Windows dependency
-and bundled-reference checks in
-[this successful build](https://github.com/iowa69/WMLSTudio/actions/runs/34948774268).
+The published binary was built from `ab6c0c9`: **1,722 tests passed on each
+hosted platform**, followed by the frozen-build, app-local Windows dependency,
+size-budget and bundled-reference checks in
+[this successful build](https://github.com/iowa69/WMLSTudio/actions/runs/34960189871).
 Clean Windows 11 desktop acceptance has still not been done.
 
 > Research software, not a validated diagnostic device or an established
