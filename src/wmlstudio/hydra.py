@@ -15,6 +15,17 @@ from pathlib import Path
 
 UPSTREAM_SCHEMA_REVISION = "6d36c109491c16544e8919fe6962b4b62e97d3d7"
 MAX_REPORT_BYTES = 64 * 1024 * 1024
+# Every element type the engine puts in a hit row, in the order a reader is
+# shown them. An element type absent from a report is either an element type
+# nothing searched for or one nothing was found for, and those are different
+# answers; keeping the whole list here is what lets a caller say which.
+ELEMENT_TYPES = ("AMR", "VIRULENCE", "STRESS", "PLASMID")
+ELEMENT_TITLES = {
+    "AMR": "acquired resistance genes",
+    "VIRULENCE": "virulence genes",
+    "STRESS": "biocide, metal and other stress-response genes",
+    "PLASMID": "plasmid replicon types",
+}
 
 
 class HydraImportError(ValueError):
@@ -64,6 +75,18 @@ def _finite_float(value: str) -> float:
     if not math.isfinite(result):
         raise HydraImportError("JSON number is outside the supported finite range.")
     return result
+
+
+def is_point_mutation(hit: dict) -> bool:
+    """A catalogued resistance point mutation, as the summary counts one.
+
+    ``VARIANTR`` is the engine's label for a read-level variant it could not
+    match to a catalogue entry, so it is not a catalogued mutation and is
+    excluded here. One predicate, used by the summary and by every caller that
+    shows mutations, so the count and the list can never disagree.
+    """
+    return (hit.get("element_type") == "AMR" and hit.get("resolution") == "POINT"
+            and hit.get("method") != "VARIANTR")
 
 
 def _validate_sample(value: object, index: int, warnings: list[str]) -> dict:
@@ -120,9 +143,7 @@ def _validate_sample(value: object, index: int, warnings: list[str]) -> dict:
         for name, kind in (("amr_genes", "AMR"), ("virulence_genes", "VIRULENCE"),
                            ("plasmid_replicons", "PLASMID"), ("stress_genes", "STRESS"))
     }
-    summary["point_mutations"] = sum(
-        hit.get("resolution") == "POINT" and hit["element_type"] == "AMR"
-        and hit["method"] != "VARIANTR" for hit in primary)
+    summary["point_mutations"] = sum(is_point_mutation(hit) for hit in primary)
     summary["heteroresistant_sites"] = sum(
         hit["method"] == "POINTR" and hit["element_type"] == "AMR"
         and "HETERORESISTANT" in str(hit.get("note", "")).upper() for hit in hits)

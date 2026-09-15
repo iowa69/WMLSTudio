@@ -3,10 +3,18 @@
 The wrapper does not reimplement any scientific calling logic. It runs HYDRA
 in a dedicated child process, never auto-downloads databases during analysis,
 and imports the engine's JSON with execution and reference provenance.
+
+It also answers what a finished run could and could not report: which reference
+sets supply which kind of element, what each element type found for one isolate,
+and which of those blanks are unasked questions rather than clean results. That
+last part lives here rather than in a view because it is a statement about the
+reference data, and because every view that showed only the resistance genes was
+showing an isolate's virulence, stress and plasmid evidence as nothing at all.
 """
 
 from __future__ import annotations
 
+import html
 import importlib.metadata
 import json
 import math
@@ -23,7 +31,7 @@ import uuid
 from datetime import UTC, datetime
 from pathlib import Path
 
-from wmlstudio.hydra import load_hydra_report
+from wmlstudio.hydra import ELEMENT_TITLES, ELEMENT_TYPES, is_point_mutation, load_hydra_report
 from wmlstudio.sequence import (
     AnalysisCancelled,
     SequenceReader,
@@ -95,6 +103,26 @@ DATABASE_PROVIDER = {
     "lineage": "Kleborate, Holt laboratory",
     "sccmec": "Center for Genomic Epidemiology, DTU",
     "species": "Kleborate, Holt laboratory",
+}
+# Which reference sets can report which kind of element. Without this the
+# application cannot tell a clean isolate from an unasked question: a store
+# holding only the two core sets reports no plasmid replicon for any isolate on
+# earth, and "0 plasmids" is what the reader sees.
+#
+# The engine's registry records one headline element type per set and that is
+# where every row below comes from, with one measured exception: the two
+# AMRFinderPlus catalogues are registered as AMR but their meta tables carry
+# virulence and stress rows as well (8794 AMR, 1025 VIRULENCE and 259 STRESS in
+# the bundled 2026-08-07.1 protein snapshot, and the same 1025/259 in the
+# nucleotide one). The nucleotide engine applies no element-type filter, so
+# those virulence and stress genes are reported whatever --plus is set to; only
+# the translated protein search is gated by it. Nothing is credited with an
+# element type nobody here has counted.
+ELEMENT_SOURCES = {
+    "AMR": ("ncbi", "protein", "card", "resfinder", "argannot", "megares"),
+    "VIRULENCE": ("ncbi", "protein", "vfdb", "vfdb_full", "ecoli_vf"),
+    "STRESS": ("ncbi", "protein"),
+    "PLASMID": ("plasmidfinder",),
 }
 # How large a set is. Only four figures exist here, and each says where it came
 # from: the two core sets are measured from the copy bundled with this release,
@@ -371,6 +399,285 @@ def virulence_support(db_root=None, *, organism=None, catalogue=None, counts=Non
             "but nothing an organism's curation would have suppressed is suppressed. Assign a "
             "genus and species to have it curated.")
     return support
+
+
+def _one(title):
+    """The singular of a plain-words element title, for counting one of them."""
+    return title[:-1] if title.endswith("s") and not title.endswith("ss") else title
+
+
+def _set_note(name):
+    """One reference set, named with what it answers and who publishes it."""
+    provider = DATABASE_PROVIDER.get(name, "")
+    return {"name": name, "provider": provider,
+            "purpose": DATABASE_PURPOSE.get(name, "an additional reference set this engine reads")}
+
+
+def element_type_support(db_root=None, databases=None, *, status=None):
+    """Which element types the chosen reference sets can report, and which they cannot.
+
+    The engine is silent about what it was never asked: it reports acquired
+    resistance, virulence, stress and plasmid elements from whichever sets are
+    installed and says nothing at all about the rest. A reader then sees no
+    replicon and no virulence gene and has no way to tell that from a clean
+    isolate. So every element type is listed, whether or not anything can report
+    it, together with the sets that are being searched for it, the sets that are
+    installed but not selected for this run, and the sets that would supply it
+    and are simply not here. Nothing is downloaded or created by asking.
+    """
+    status = status if status is not None else database_status(db_root, databases)
+    installed = set(status["installed"])
+    chosen = [name for name in status["requested"] if name in installed]
+    rows = {}
+    for element_type in ELEMENT_TYPES:
+        sources = ELEMENT_SOURCES[element_type]
+        title = ELEMENT_TITLES[element_type]
+        searched = [name for name in sources if name in chosen]
+        idle = [name for name in sources if name in installed and name not in searched]
+        absent = [_set_note(name) for name in sources if name not in installed]
+        if searched:
+            reason = f"{title.capitalize()} are reported from {', '.join(searched)}."
+            if absent:
+                reason += (" " + ", ".join(entry["name"] for entry in absent) + " would widen this "
+                           "screen and " + ("is" if len(absent) == 1 else "are") + " not installed.")
+        elif idle:
+            reason = (f"No reference set that reports {title} is among the sets this run searches, "
+                      f"although {', '.join(idle)} {'is' if len(idle) == 1 else 'are'} installed. "
+                      "Nothing was looked for, so a blank is not a negative result.")
+        else:
+            reason = (f"No reference set that reports {title} is installed, so none can be reported "
+                      f"for any isolate. {', '.join(entry['name'] for entry in absent)} would supply "
+                      "them; install " + ("it" if len(absent) == 1 else "one")
+                      + " from the AMR databases page. Nothing was looked for, so a blank is not a "
+                        "negative result.")
+        rows[element_type] = {"element_type": element_type, "title": title,
+                              "searched": searched, "installed_not_selected": idle,
+                              "not_installed": absent, "available": bool(searched),
+                              "reason": reason}
+    return rows
+
+
+def element_evidence(evidence, *, execution=None, databases=None, installed=None):
+    """Every element type one isolate's HYDRA screen could report, and what it found.
+
+    This is the answer to "I ran Klebsiella and cannot find the virulence
+    output". The engine returns acquired resistance, virulence, stress and
+    plasmid-replicon hits in one list and the application keeps all of them, but
+    an interface that reads only the AMR ones shows nothing for the rest, which
+    is indistinguishable from an isolate that carries none.
+
+    Four states, and they are deliberately not interchangeable: ``detected`` is
+    a call, ``none_detected`` is a search that found nothing, ``not_searched``
+    is a search that never ran because no reference set that reports this type
+    was read, and ``no_report`` is an isolate with no HYDRA result at all.
+    Point mutations are returned separately from the genes because an organism
+    with no mutation catalogue is screened for genes only, and a list that
+    merged the two would present that as an isolate with no mutations.
+
+    ``evidence`` is a stored ``metadata['hydra']`` block or an upstream report
+    sample. ``installed`` is optional and names what the reference store holds,
+    so a set that is present but was not selected can be distinguished from one
+    that is not there at all; without it an unsearched set is reported as
+    unsearched and never as absent, because only the store can answer that.
+    Nothing here reads a database, a file or the network.
+    """
+    evidence = evidence if isinstance(evidence, dict) else {}
+    execution = execution if execution is not None else (evidence.get("execution_provenance") or {})
+    execution = execution if isinstance(execution, dict) else {}
+    if databases is None:
+        databases = evidence.get("databases")
+    if databases is None:
+        snapshot = execution.get("reference_snapshot") or {}
+        databases = sorted((snapshot.get("databases") or {}))
+    searched = [str(name) for name in (databases or [])]
+    # Whether the store was asked what it holds. Without that, a set that simply
+    # was not read must not be reported as one the computer does not have.
+    known = installed is not None
+    present = {str(name) for name in installed} if known else set(searched)
+    hits = [hit for hit in (evidence.get("hits") or []) if isinstance(hit, dict)]
+    primary = [hit for hit in hits if hit.get("primary") is True]
+    linked = bool(hits or searched or execution)
+    virulence = execution.get("virulence") if isinstance(execution.get("virulence"), dict) else {}
+    organism = execution.get("organism") if isinstance(execution.get("organism"), dict) else {}
+    curated_for = str(virulence.get("organism") or organism.get("resolved") or "")
+    elements = []
+    for element_type in ELEMENT_TYPES:
+        sources = ELEMENT_SOURCES[element_type]
+        title = ELEMENT_TITLES[element_type]
+        reading = [name for name in sources if name in searched]
+        # --plus gates the translated search alone. With it off the protein set
+        # reports acquired resistance only, so it contributes nothing to these
+        # two types and must not be counted as having searched for them: a run
+        # against protein alone would otherwise claim it looked and found none.
+        if element_type in {"VIRULENCE", "STRESS"} and virulence and not virulence.get("enabled"):
+            reading = [name for name in reading if name != "protein"]
+        absent = [_set_note(name) for name in sources if name not in present]
+        genes = sorted({str(hit["gene"]) for hit in primary
+                        if hit.get("element_type") == element_type and hit.get("gene")})
+        matches = [hit for hit in hits if hit.get("element_type") == element_type]
+        caveats = []
+        if not linked:
+            status = "no_report"
+            reason = (f"No HYDRA screen is linked to this isolate, so nothing is known about its "
+                      f"{title}. That is unknown, not absent.")
+        elif genes:
+            # A hit is decisive even when the report did not record which set
+            # found it: an imported report that lists no databases must not turn
+            # its own findings into "nothing was searched for".
+            status = "detected"
+            reason = (f"{len(genes)} {title if len(genes) != 1 else _one(title)} matched "
+                      + (", ".join(reading) if reading else "this screen's reference data")
+                      + ". A reference match is sequence evidence, not a measured phenotype.")
+        elif not reading:
+            status = "not_searched"
+            reason = (f"No reference set that reports {title} was searched for this isolate"
+                      + (": " + ", ".join(entry["name"] for entry in absent) + " would supply them."
+                         if absent else ".")
+                      + " Nothing was looked for, so this is not a negative result.")
+        else:
+            status = "none_detected"
+            reason = (f"{', '.join(reading)} {'was' if len(reading) == 1 else 'were'} searched and "
+                      f"no {_one(title)} met this run's thresholds. A screen over public reference "
+                      "data is not proof of absence.")
+        # The protein search is the only one --plus gates, so switching virulence
+        # off narrows what could be found without meaning nothing was sought. The
+        # engine's own sentence is repeated verbatim rather than paraphrased.
+        if element_type in {"VIRULENCE", "STRESS"} and virulence:
+            if virulence.get("enabled"):
+                caveats.append(f"The translated protein search was curated for '{curated_for}'."
+                               if virulence.get("organism_curated") and curated_for else
+                               "The translated protein search ran with no organism curation, so "
+                               "nothing an organism's curation would have suppressed is suppressed.")
+            elif reading:
+                caveats.append("The translated protein search was limited to acquired resistance "
+                               "for this run, so these come from the nucleotide catalogue only.")
+            else:
+                caveats.append("The translated protein search was limited to acquired resistance "
+                               "for this run and no nucleotide catalogue that reports these was "
+                               "read, so none could be reported at all.")
+            if virulence.get("reason"):
+                caveats.append(str(virulence["reason"]))
+        if absent and reading:
+            caveats.append(("Not installed, so not searched: " if known else "Not searched: ")
+                           + "; ".join(f"{entry['name']} ({entry['purpose']})" for entry in absent) + ".")
+        elements.append({"element_type": element_type, "title": title, "status": status,
+                         "reason": reason, "genes": genes, "hits": matches,
+                         "searched": reading, "not_installed": absent, "caveats": caveats})
+    return {"linked": linked, "databases": searched, "elements": elements,
+            "point_mutations": _point_mutation_evidence(primary, execution, searched, linked)}
+
+
+def _point_mutation_evidence(primary, execution, searched, linked):
+    """The catalogued resistance mutations, and whose catalogue could have named one.
+
+    An organism outside the installed release's catalogues is screened for genes
+    only. Reporting that as an isolate with no mutations is the failure this
+    block exists to prevent, so the organism the run resolved and the engine's
+    own sentence about it travel with the list.
+    """
+    organism = execution.get("organism") if isinstance(execution.get("organism"), dict) else {}
+    matches = [hit for hit in primary if is_point_mutation(hit)]
+    genes = sorted({str(hit["gene"]) for hit in matches if hit.get("gene")})
+    level = str(organism.get("point_mutation_level") or "unknown")
+    resolved = str(organism.get("resolved") or "")
+    requested = organism.get("point_mutations", True) if organism else True
+    if not linked:
+        status = "no_report"
+        reason = ("No HYDRA screen is linked to this isolate, so no resistance mutation was "
+                  "assessed. That is unknown, not absent.")
+    elif organism and not requested:
+        status = "not_searched"
+        reason = ("Point mutations were switched off for this run, so none was assessed. That is "
+                  "not evidence that this isolate carries none.")
+    elif "protein" not in searched:
+        status = "not_searched"
+        reason = ("The protein reference set was not searched, and it is where point mutations are "
+                  "read, so none could be reported. That is not evidence that none is present.")
+    elif organism and level in {"none", "unknown"}:
+        status = "not_searched"
+        reason = str(organism.get("reason") or
+                     "No point-mutation catalogue was selected for this isolate, so none was "
+                     "assessed. Assign a genus and species to have them assessed.")
+    elif matches:
+        status = "detected"
+        reason = (f"{len(genes)} gene(s) carry a catalogued resistance mutation"
+                  + (f", read against the '{resolved}' catalogue" if resolved else "")
+                  + ". A catalogued mutation is a genomic association, not a susceptibility result.")
+    else:
+        status = "none_detected"
+        reason = ("The catalogue"
+                  + (f" for '{resolved}'" if resolved else "")
+                  + " was searched and no catalogued resistance mutation was found. Mutations "
+                    "outside that catalogue are not assessed by this screen.")
+    return {"status": status, "reason": reason, "genes": genes, "hits": matches,
+            "organism": resolved, "catalogue_level": level,
+            "catalogue_reason": str(organism.get("reason") or "")}
+
+
+ELEMENT_BOUNDARY = (
+    'This is a BLAST screen over public reference data run by the pinned HYDRA engine. It is not '
+    'AMRFinderPlus, Kleborate, Kaptive or MOB-suite and is not equivalent to them. A gene is sequence '
+    'evidence, never a measured susceptibility, a virulence phenotype or a plasmid.')
+HIT_LIMIT = 40
+
+
+def element_evidence_html(evidence, *, execution=None, databases=None, installed=None,
+                          limit=HIT_LIMIT):
+    """Every element type of one isolate's screen, blanks explained, as a drill-down.
+
+    Rendered here beside the evidence it describes, as the organism-specific
+    assays render theirs, so a view needs one call to show all four element
+    types instead of reimplementing the distinction between a negative and an
+    unasked question. Every value is escaped: none of this text is trusted.
+    """
+    def escape(value):
+        return html.escape(str(value if value is not None else '—'))
+
+    result = element_evidence(evidence, execution=execution, databases=databases,
+                              installed=installed)
+    parts = ['<h3>HYDRA screen · resistance, virulence, stress and plasmid elements</h3>']
+    if not result['linked']:
+        return ''.join(parts + [
+            '<p>No HYDRA screen is linked to this isolate, so nothing is known about its '
+            'resistance, virulence, stress or plasmid elements. That is unknown, not absent.</p>',
+            f'<p>{escape(ELEMENT_BOUNDARY)}</p>'])
+    parts.append('<p>Searched: ' + escape(', '.join(result['databases']) or 'no reference set')
+                 + '. Every element type the engine can report is listed, including the ones '
+                   'nothing searched for.</p>')
+    for row in result['elements']:
+        parts.append(f'<h4>{escape(row["title"].capitalize())} · {escape(row["status"].replace("_", " "))}</h4>')
+        parts.append(f'<p>{escape(row["reason"])}</p>')
+        if row['genes']:
+            parts.append('<p><b>Detected:</b> ' + escape('; '.join(row['genes'])) + '</p>')
+            parts.append(_hit_table(row['hits'], limit, escape))
+        for note in row['caveats']:
+            parts.append(f'<p class="muted">{escape(note)}</p>')
+    mutations = result['point_mutations']
+    parts.append('<h4>Resistance point mutations · '
+                 + escape(mutations['status'].replace('_', ' ')) + '</h4>')
+    parts.append(f'<p>{escape(mutations["reason"])}</p>')
+    if mutations['genes']:
+        parts.append('<p><b>Mutated genes:</b> ' + escape('; '.join(mutations['genes'])) + '</p>')
+        parts.append(_hit_table(mutations['hits'], limit, escape))
+    parts.append(f'<p>{escape(ELEMENT_BOUNDARY)}</p>')
+    return ''.join(parts)
+
+
+def _hit_table(hits, limit, escape):
+    """The matches behind a call, highest identity first, with the total always stated."""
+    ordered = sorted(hits, key=lambda hit: (-float(hit.get('identity_pct') or 0),
+                                            -float(hit.get('coverage_pct') or 0),
+                                            str(hit.get('gene') or '')))
+    body = ("<table cellpadding='5'><tr><th>Gene</th><th>Reference set</th><th>Class</th>"
+            "<th>Identity %</th><th>Reference covered %</th><th>Method</th><th>Resolution</th></tr>")
+    for hit in ordered[:limit]:
+        body += ('<tr>' + ''.join(f'<td>{escape(hit.get(key))}</td>' for key in (
+            'gene', 'database', 'class', 'identity_pct', 'coverage_pct', 'method', 'resolution'))
+            + '</tr>')
+    body += '</table>'
+    if len(ordered) > limit:
+        body += f'<p>Showing the {limit} highest-identity matches of {len(ordered)}.</p>'
+    return body
 
 
 def catalogue_covers(organism, names):

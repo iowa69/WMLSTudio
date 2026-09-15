@@ -9,6 +9,7 @@ when the separate exact-allele locus-ST assay assigned one for that locus.
 from __future__ import annotations
 
 from .marker_panel import screen_marker_panel, summarize_marker_hits, unique_locations
+from .organism_modules import blank_sentence, blank_summary
 
 LIMITATIONS = ['Not a Kleborate-equivalent result; this BLAST screen assigns no virulence-locus lineage.',
                'Intact coding sequence is not proof of expression or virulence; partial/disrupted matches require review.',
@@ -26,6 +27,33 @@ def summarize_virulence_hits(hits, loci, *, adequate_negative_assay, locus_sts=N
         group['official_locus_st'] = assigned.get('locus_st')
         group['official_locus_st_source'] = assigned.get('source') if assigned.get('locus_st') else None
     return groups
+
+
+def summarize_virulence(evidence):
+    """One cell for the defined-locus screen: which loci, or which kind of blank.
+
+    A screen that ran and detected nothing is a result and reads as one. A screen
+    that was never selected, or could not run for want of a reference snapshot,
+    reads as what it is instead of sharing the word the result uses.
+    """
+    blank = blank_summary(evidence)
+    if blank:
+        return blank
+    status = (evidence or {}).get('status')
+    if status == 'failed':
+        return 'failed'
+    detected = [group['locus'] for group in (evidence.get('loci') or evidence.get('groups') or [])
+                if group.get('status') == 'detected']
+    if detected:
+        return '; '.join(sorted(detected))
+    if status == 'completed':
+        return 'screened; no defined locus detected'
+    return str(status or 'not recorded')
+
+
+def virulence_sentence(evidence):
+    """Why there is no locus to show, in a sentence, or '' when the screen ran."""
+    return blank_sentence(evidence)
 
 
 def _unique_locations(hits):

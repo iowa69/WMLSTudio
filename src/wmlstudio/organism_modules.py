@@ -12,7 +12,7 @@ from __future__ import annotations
 import json
 import threading
 from collections import Counter
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Callable
 
@@ -28,6 +28,40 @@ APPLICABILITY_TITLES = {'recommended': 'within the curated taxa',
                         'possible': 'same genus, other species',
                         'unknown_organism': 'no organism assigned yet',
                         'off_panel': 'outside these taxa'}
+# Why an assay produced nothing. These are four different answers and a column
+# that showed the same 'not_run' token for all of them is what leaves a user
+# hunting for output that was never asked for. The strings below are the ones
+# actually written into a result, kept here so a table cell can say which kind
+# of blank it is without re-deriving it from prose.
+NOT_SELECTED = 'Assay not selected.'
+NO_MANIFEST = ('No readable characterization reference manifest is installed; install or select a '
+               'verified snapshot first.')
+# characterize_assembly substitutes this one when no snapshot is chosen at all;
+# test_organism_modules pins it, so a change upstream fails there rather than
+# silently turning a missing reference into an unexplained blank.
+NO_SNAPSHOT = 'Install or select a verified characterization reference snapshot first.'
+SKIPPED_PREFIX = 'Not run for this isolate.'
+# How every "the installed snapshot does not carry this" sentence opens, whether
+# it is written here or by an assay that read the manifest itself.
+SNAPSHOT_PREFIX = 'This reference snapshot'
+BLANK_SUMMARIES = {'not_recorded': 'not recorded',
+                   'not_selected': 'not run: not selected',
+                   'reference_missing': 'not run: reference not installed',
+                   'off_panel': 'not run: outside these taxa',
+                   'unrecorded': 'not run'}
+BLANK_SENTENCES = {
+    'not_recorded': ('No result is recorded for this assay on this isolate: it was never run, or its result '
+                     'belongs to an earlier assembly. Nothing was screened, so this is not a negative result.'),
+    'not_selected': ('This assay was not selected for the run, so nothing was screened for this isolate. '
+                     'That is not a negative result.'),
+    'reference_missing': ('This assay could not run because the reference data it needs is not installed. '
+                          'Install or update the characterization reference snapshot and run it again. '
+                          'Nothing was screened, so this is not a negative result.'),
+    'off_panel': ('This assay was not run for this isolate: it is outside the taxa its reference panel covers. '
+                  'Nothing was screened, so this is not a negative result.'),
+    'unrecorded': ('This assay produced no result and did not record why. Nothing was screened, so this is not '
+                   'a negative result.'),
+}
 _ASSAY_MODULES = ('sccmec_evidence', 'klebsiella_evidence')
 _LOCK = threading.Lock()
 _LOADED = False
@@ -68,6 +102,9 @@ class OrganismModule:
     runner: Callable
     option_keys: tuple
     manifest_sections: tuple
+    # Describes this assay's own results only. Registration wraps it so that a
+    # blank — no result recorded, or a not-run one — is answered identically for
+    # every assay, saying which kind of blank it is rather than 'not_run'.
     summary: Callable
     detail_html: Callable
     report_default: bool = True
@@ -82,8 +119,71 @@ REGISTRY: dict[str, OrganismModule] = {}
 _ORDER: dict[str, int] = {}
 
 
+def blank_kind(block):
+    """Which kind of blank a module result is, or None when it is a result.
+
+    Four blanks that used to read alike: nothing recorded at all, an assay the
+    run did not select, an assay whose reference data is not installed, and an
+    isolate outside the taxa the panel covers. A user who cannot tell them apart
+    reads every one of them as 'we looked and found nothing'.
+    """
+    if not isinstance(block, dict) or not block:
+        return 'not_recorded'
+    if block.get('status') != 'not_run':
+        return None
+    if block.get('not_run_kind') in BLANK_SUMMARIES:
+        return block['not_run_kind']
+    reason = str(block.get('reason') or '')
+    if reason.startswith(SKIPPED_PREFIX):
+        return 'off_panel'
+    if reason == NOT_SELECTED:
+        return 'not_selected'
+    if reason in {NO_MANIFEST, NO_SNAPSHOT} or reason.startswith(SNAPSHOT_PREFIX):
+        return 'reference_missing'
+    return 'unrecorded'
+
+
+def blank_summary(block):
+    """The short phrase a table cell shows for a blank, or '' when there is a result."""
+    kind = blank_kind(block)
+    return BLANK_SUMMARIES[kind] if kind else ''
+
+
+def blank_sentence(block):
+    """Why there is no result, as a sentence a reader can act on, or '' for a result."""
+    kind = blank_kind(block)
+    if not kind:
+        return ''
+    reason = str(block.get('reason') or '').strip() if isinstance(block, dict) else ''
+    if kind in {'off_panel', 'unrecorded'} and reason:
+        return reason
+    # The recorded reason is repeated only where it names what the headline
+    # cannot: which section of the installed snapshot is absent. 'Install a
+    # snapshot first' twice in one paragraph helps nobody.
+    if kind == 'reference_missing' and reason.startswith(SNAPSHOT_PREFIX):
+        return f'{BLANK_SENTENCES[kind]} {reason}'
+    return BLANK_SENTENCES[kind]
+
+
+def _blank_aware(summary):
+    """Answer blanks here so every assay says which kind of blank it is.
+
+    Each module describes its own results; none of them should have to reason
+    about the four ways a result can be absent, and none of them should answer
+    that question differently from the others.
+    """
+    def summarize(block):
+        return blank_summary(block) or summary(block)
+
+    return summarize
+
+
 def register(module):
-    """Refuse a key that would shadow a core characterization section or another module."""
+    """Refuse a key that would shadow a core characterization section or another module.
+
+    The stored module is a copy whose ``summary`` answers blanks uniformly; it
+    is also what is returned, so the registry and the caller hold one object.
+    """
     if not isinstance(module, OrganismModule) or not module.key:
         raise ValueError('An organism module must be an OrganismModule with a key.')
     if module.key in CORE_SECTIONS:
@@ -93,6 +193,7 @@ def register(module):
     unsupported = set(module.option_keys) - {'threads', 'blastn_path', 'makeblastdb_path'}
     if unsupported:
         raise ValueError(f'Organism module {module.key!r} requests unsupported options: {sorted(unsupported)}.')
+    module = replace(module, summary=_blank_aware(module.summary))
     _ORDER.setdefault(module.key, len(_ORDER))
     REGISTRY[module.key] = module
     return module
@@ -216,9 +317,10 @@ def record_skipped(result, skipped):
     for key, reason in (skipped or {}).items():
         block = result.get(key)
         if isinstance(block, dict) and block.get('status') == 'not_run':
-            block['reason'] = ('Not run for this isolate. ' + reason + ' Nothing was screened, so this is not '
+            block['reason'] = (SKIPPED_PREFIX + ' ' + reason + ' Nothing was screened, so this is not '
                                'a negative result; include isolates outside a tool\'s reference taxa to run it '
                                'anyway.')
+            block['not_run_kind'] = 'off_panel'
     return result
 
 
@@ -258,12 +360,11 @@ def module_tasks(selected, reference_root, *, threads=2, blastn_path=None, makeb
     for key, module in _load().items():
         options = {name: available[name] for name in module.option_keys}
         if not selected.get(key):
-            tasks.append((key, False, module.runner, options, 'Assay not selected.'))
+            tasks.append((key, False, module.runner, options, NOT_SELECTED))
             continue
         missing = [section for section in module.manifest_sections if not _section_present(manifest or {}, section)]
         if manifest is None:
-            tasks.append((key, False, module.runner, options,
-                          'No readable characterization reference manifest is installed; install or select a verified snapshot first.'))
+            tasks.append((key, False, module.runner, options, NO_MANIFEST))
         elif missing:
             tasks.append((key, False, module.runner, options,
                           f'This reference snapshot (format {manifest.get("format_version")}) carries no '
@@ -275,12 +376,21 @@ def module_tasks(selected, reference_root, *, threads=2, blastn_path=None, makeb
 
 
 def stamp_applicability(result, organism):
-    """Record, never gate: every module block says which taxa its panel covers."""
+    """Record, never gate: every module block says which taxa its panel covers.
+
+    A block with no result also records which kind of blank it is, so a table
+    cell and an exported row can say whether the assay was not selected, could
+    not run for want of a reference, or was skipped for this isolate's organism
+    without any of them having to read the sentence back.
+    """
     genus, species = (organism or ('', ''))[:2]
     for key, module in _load().items():
         block = result.get(key)
         if isinstance(block, dict):
             block['applicability'], block['applicability_reason'] = module.match.evaluate(genus, species)
+            kind = blank_kind(block)
+            if kind and kind != 'not_recorded':
+                block['not_run_kind'] = kind
     return result
 
 

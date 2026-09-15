@@ -22,7 +22,13 @@ from wmlstudio.ui_tabs import (
 
 @pytest.fixture
 def tabs(qtbot):
+    # Tab widths are measured from the font in force, and other test files leave
+    # the application font scaled, so a bar that fits at one point size does not
+    # at another. Pin it on this widget: setting it on the application would
+    # re-polish every open window, which is slow and was a real defect once.
+    from PySide6.QtGui import QFont
     widget = WorkspaceTabs()
+    widget.setFont(QFont(widget.font().family(), 9))
     qtbot.addWidget(widget)
     widget.resize(1032, 640)
     for key in PAGE_KEYS:
@@ -52,7 +58,7 @@ def test_the_bar_reads_as_the_users_own_workflow(tabs):
     shown = [tabs.tabText(position) for position in range(tabs.count())]
     assert shown == [
         "Overview", "Samples", "Read QC", "Assembly", "MLST", "MLST tree", "cgMLST",
-        "cgMLST tree", "SNP tree", "HYDRA", "Report", "Update", "Settings"]
+        "cgMLST tree", "SNP tree", "HYDRA", "Report", "Update", "Schemes", "Settings"]
     # A seven-locus tree and a cgMLST tree are different quantities, so they are
     # different tabs and neither label can be mistaken for the other.
     assert shown.index("MLST tree") < shown.index("cgMLST") < shown.index("cgMLST tree")
@@ -63,6 +69,14 @@ def test_the_bar_reads_as_the_users_own_workflow(tabs):
     # The one slot a later round still fills sits where that work belongs, not at
     # the end: SNP distances are a separate line of evidence from allele typing.
     assert shown.index("SNP tree") == shown.index("cgMLST tree") + 1
+    # The reported bug: the tab labelled Update was the scheme library, so pressing
+    # it rescanned this computer's scheme folders instead of looking online. Update
+    # is its own page now, in the place the bar already put it, and the library
+    # keeps a tab named for what it actually is.
+    assert shown.index("Update") == shown.index("Report") + 1
+    assert tabs.key_at_position(shown.index("Update")) == "update"
+    assert tabs.key_at_position(shown.index("Schemes")) == "schemes"
+    assert "Update" not in TAB_LABELS["schemes"]
 
 
 def test_every_tab_carries_a_purpose_tooltip_and_a_readable_label(tabs):
@@ -212,16 +226,39 @@ def test_folding_refuses_a_page_or_a_host_it_does_not_have(tabs):
 
 
 def test_the_bar_gives_up_padding_before_it_gives_up_words(tabs):
-    """Thirteen tabs at the narrowest supported window: tighter, never chopped."""
+    """Fourteen tabs at the narrowest supported window: tighter, never chopped."""
     from PySide6.QtCore import Qt
+
+    from wmlstudio.ui_tabs import COMFORTABLE_PADDING, PADDING_STEPS
     assert tabs.tabBar().elideMode() == Qt.TextElideMode.ElideNone
-    tabs.resize(952, 640)
-    assert tabs._fit_tab_bar(952) <= 12
-    assert tabs.tabBar().sizeHint().width() <= 952
-    tabs.resize(1127, 640)
-    assert tabs._fit_tab_bar(1127) == 12, "a roomy window keeps the comfortable padding"
+    # Widths are derived from the bar itself, not written in. Tab text is measured
+    # in the font in force, and other test files leave the application font
+    # scaled, so a pixel figure that fits in one run does not in the next.
+    widest = PADDING_STEPS[0]
+    tabs._set_padding(widest)
+    roomy = tabs.tabBar().sizeHint().width() + 80
+    tabs._set_padding(COMFORTABLE_PADDING)
+    comfortable = tabs.tabBar().sizeHint().width()
+
+    # A window with room for the widest padding keeps it.
+    tabs.resize(roomy, 640)
+    assert tabs._fit_tab_bar(roomy) == widest, "a roomy window keeps the roomiest padding"
+
+    # A window too narrow for that gives up padding, step by step, and still fits.
+    squeezed = comfortable - 40
+    tabs.resize(squeezed, 640)
+    chosen = tabs._fit_tab_bar(squeezed)
+    assert chosen < widest and chosen in PADDING_STEPS
+    assert tabs.tabBar().sizeHint().width() <= squeezed
+    # Whatever it gave up, it never gave up a word.
     for position in range(tabs.count()):
         assert "…" not in tabs.tabText(position)
+    # The tightest steps exist for a window that has nothing else left to give. The
+    # sidebar decision is not allowed to spend them, so the width it is measured
+    # against is the comfortable one, never the last step the bar could survive on.
+    assert COMFORTABLE_PADDING in PADDING_STEPS and PADDING_STEPS[-1] < COMFORTABLE_PADDING
+    tabs._set_padding(COMFORTABLE_PADDING)
+    assert tabs.minimum_bar_width() == tabs.tabBar().sizeHint().width()
 
 
 def test_purpose_lines_state_their_limits_where_a_claim_could_be_read_in(tabs):
@@ -231,6 +268,12 @@ def test_purpose_lines_state_their_limits_where_a_claim_could_be_read_in(tabs):
     assert "not proof of transmission" in PAGE_PURPOSE["compare"]
     assert "not measured susceptibility" in PAGE_PURPOSE["evidence"]
     assert "never share a scale" in PAGE_PURPOSE["cgmlst_tree"]
+    # Update says that checking reaches the internet, and the scheme library says
+    # that it does not: the two words a user could not tell apart before.
+    assert "internet" in PAGE_PURPOSE["update"]
+    assert "Update" in PAGE_PURPOSE["schemes"] and "installed on this computer" \
+        in PAGE_PURPOSE["schemes"]
+    assert NEXT_STEP["update"] == ("Check online for updates…", "check_for_updates")
     for key in PLANNED:
         assert "Planned for a later round" in PAGE_PURPOSE[key], key
     for key, purpose in PAGE_PURPOSE.items():
@@ -659,34 +702,204 @@ def settled(window, qtbot):
 
 
 def update_centre(window, qtbot):
-    """Open the Update Centre and wait for its background probe to land."""
-    from wmlstudio.update_center import open_update_center
-    centre = open_update_center(window)
-    qtbot.addWidget(centre)
+    """Show the Update tab and wait for its own read of this computer to land."""
+    window.navigate("update")
+    centre = window.update_center
     qtbot.waitUntil(lambda: centre.report is not None, timeout=60000)
+    qtbot.waitUntil(lambda: centre.worker is None or not centre.worker.isRunning(),
+                    timeout=60000)
     settled(window, qtbot)
     assert window.test_errors == []
     return centre
 
 
-def test_the_update_centre_lists_installed_state_and_never_checks_a_server(window, qtbot):
+def answer(centre, monkeypatch, *, yes=True):
+    """Answer this page's own confirmations, since a modal box never returns headless."""
+    asked, told = [], []
+    monkeypatch.setattr(type(centre), "ask",
+                        lambda self, title, text: (asked.append((title, text)), yes)[1])
+    monkeypatch.setattr(type(centre), "tell",
+                        lambda self, title, text: told.append((title, text)))
+    return asked, told
+
+
+def fake_plan(monkeypatch, **release):
+    """A check that reaches a provider, or does not, without touching the network."""
+    from wmlstudio import provisioning
+    answer_release = {"installed": "2026-08-07.1", "latest": "2026-08-07.1",
+                      "newer_available": False, "message": "", "error": "", **release}
+    monkeypatch.setattr(provisioning, "hydra_update_available",
+                        lambda *args, **options: dict(answer_release))
+    return answer_release
+
+
+def test_the_update_tab_is_the_update_centre_and_the_library_keeps_its_own_tab(window, qtbot):
+    """The reported bug: pressing Update rescanned this computer instead of looking online."""
     from wmlstudio.update_center import UpdateCenter, open_update_center
     centre = update_centre(window, qtbot)
     assert isinstance(centre, UpdateCenter)
-    assert open_update_center(window) is centre, "one page per window, not one per click"
-    settled(window, qtbot)
-    keys = [item["key"] for item in centre.report["items"]]
+    assert window.pages.current_key() == "update"
+    assert centre.isVisibleTo(window)
+    # The menu, the command search and the tab are one page, not three copies.
+    assert open_update_center(window) is centre
+    assert window.pages.current_key() == "update"
+    # The library is still there, under its own name, and is not this page.
+    window.navigate("schemes")
+    assert window.pages.tabText(window.pages.position_of("schemes")) == "Schemes"
+    assert centre.isVisibleTo(window) is False
+    assert window.scheme_table.rowCount() >= 0
+
+
+def test_the_update_page_lists_every_installable_thing_with_its_size(window, qtbot):
     from wmlstudio.provisioning import ORDER
+    centre = update_centre(window, qtbot)
+    keys = [item["key"] for item in centre.report["items"]]
     assert keys == list(ORDER)
-    assert centre.table.rowCount() == len(ORDER)
-    assert "until you press a button" in centre.status.text() or centre.report["summary"]
-    row = keys.index("species_panel")
-    # This workspace has no downloaded panel, and the page says so rather than
-    # implying an update was checked for online.
-    assert centre.table.item(row, 1).text() == "Not installed"
-    assert centre.table.cellWidget(row, 4).text() == "Install…"
-    assert centre.table.cellWidget(row, 4).isEnabled() is True
-    centre.close()
+    listed = [row["key"] for row in centre.rows()]
+    # Every requirement, and every reference set under the database that holds it:
+    # "a database is installed" says nothing about which of fifteen sets is there.
+    assert [key for key in listed if not key.startswith("database:")] == list(ORDER)
+    sets = [key for key in listed if key.startswith("database:")]
+    assert len(sets) == len(centre.catalogue["entries"]) >= 2
+    assert listed.index("database:" + centre.catalogue["entries"][0]["name"]) == \
+        listed.index("hydra_database") + 1
+    assert centre.table.rowCount() == len(listed)
+    for index, row in enumerate(centre.rows()):
+        for column in range(5):
+            assert centre.table.item(index, column).text().strip(), (row["key"], column)
+        assert centre.table.cellWidget(index, 5) is not None
+        # Size is measured where something is installed and stated as a download
+        # where it is not; a row that has neither says so rather than guessing.
+        assert ("here" in row["size"] or "download" in row["size"]
+                or row["size"].startswith("Not published")), row
+    panel = next(row for row in centre.rows() if row["key"] == "species_panel")
+    assert panel["installed"] == "Not installed"
+    assert panel["action"] == "Install…" and panel["enabled"]
+
+
+def test_nothing_is_compared_with_a_provider_until_the_online_check_is_pressed(window, qtbot):
+    """"Not checked" and "up to date" are different sentences, and stay different."""
+    centre = update_centre(window, qtbot)
+    assert centre.check is None
+    assert "Not checked is not the same as up to date" in centre.check_line.text()
+    assert "No check has ever reached a provider" in centre.check_line.text()
+    installed = [row for row in centre.rows() if row["installed"].startswith(("Installed",
+                                                                             "Bundled"))]
+    assert installed, "this workspace ships something, or the assertion below proves nothing"
+    for row in installed:
+        assert "up to date" not in row["update"].casefold()
+        assert ("Not yet checked" in row["update"]
+                or "cannot be confirmed" in row["update"]
+                or "not from here" in row["update"]
+                or "nothing here compares" in row["update"]
+                or "publishes no version" in row["update"]), row
+    # Reading this computer and asking a provider are two buttons with two words.
+    assert "Rescan what is installed here" == centre.rescan_button.text()
+    assert "Check online for updates" == centre.check_button.text()
+    assert "No server is contacted" in centre.rescan_button.toolTip()
+    assert "over the internet" in centre.check_button.toolTip()
+
+
+def test_a_failed_check_says_so_and_never_reads_as_up_to_date(window, qtbot, monkeypatch):
+    centre = update_centre(window, qtbot)
+    fake_plan(monkeypatch, error="Could not reach NCBI to check for a newer release: no network",
+              message="Could not reach NCBI to check for a newer release: no network")
+    assert centre.check_online() is True
+    qtbot.waitUntil(lambda: centre.check is not None, timeout=60000)
+    qtbot.waitUntil(lambda: not centre.worker.isRunning(), timeout=60000)
+    assert centre.check["ok"] is False
+    line = centre.check_line.text()
+    assert "did not get through" in line and "no network" in line
+    assert "A failed check is not an up-to-date result." in line
+    assert "No check has ever reached a provider from this computer." in line
+    for row in centre.rows():
+        assert "up to date" not in row["update"].casefold()
+    databases = [row for row in centre.rows()
+                 if row["key"].startswith("database:") and row["installed"] != "Not installed"]
+    assert databases
+    for row in databases:
+        assert "The check failed" in row["update"] and "unknown" in row["update"]
+    assert window.test_errors == []
+
+
+def test_a_check_that_reaches_the_provider_is_remembered_for_the_next_failure(window, qtbot,
+                                                                             monkeypatch):
+    """A failed check has one thing left to say: when the answer was last confirmed."""
+    from wmlstudio.update_center import check_record
+    centre = update_centre(window, qtbot)
+    fake_plan(monkeypatch, latest="2026-09-01.1", newer_available=True,
+              message="NCBI publishes release 2026-09-01.1 today.")
+    assert centre.check_online() is True
+    qtbot.waitUntil(lambda: centre.check is not None and centre.check.get("ok"), timeout=60000)
+    qtbot.waitUntil(lambda: not centre.worker.isRunning(), timeout=60000)
+    assert "Checked online" in centre.check_line.text()
+    assert "2026-09-01.1" in centre.check_line.text()
+    remembered = check_record(window.root)
+    assert remembered["latest"] == "2026-09-01.1" and remembered["when"]
+    # And now one that does not get through: it names the check that did.
+    fake_plan(monkeypatch, error="connection refused", message="connection refused")
+    assert centre.check_online() is True
+    qtbot.waitUntil(lambda: centre.check.get("ok") is False, timeout=60000)
+    qtbot.waitUntil(lambda: not centre.worker.isRunning(), timeout=60000)
+    assert remembered["when"] in centre.check_line.text()
+    assert "connection refused" in centre.check_line.text()
+
+
+def test_a_set_whose_terms_must_be_read_asks_before_anything_is_downloaded(window, qtbot,
+                                                                           monkeypatch):
+    """No licence is ever accepted on the user's behalf, and no set is silently skipped."""
+    centre = update_centre(window, qtbot)
+    restricted = next((row for row in centre.catalogue["entries"]
+                       if not row["open_licence"] and not row["installed"]
+                       and row["download"] == "automatic"), None)
+    if restricted is None:
+        restricted = next(row for row in centre.catalogue["entries"]
+                          if not row["open_licence"] and not row["installed"])
+    shown = next(row for row in centre.rows()
+                 if row["key"] == "database:" + restricted["name"])
+    assert "Needs your decision" in shown["update"]
+    assert restricted["licence"] in shown["update"]
+    assert "will not accept those terms for you" in shown["update"]
+    assert shown["action"] == "Read the terms…"
+    asked, told = answer(centre, monkeypatch, yes=False)
+    launched = []
+    monkeypatch.setattr(type(window), "launch_task",
+                        lambda self, operation, role, completed=None: launched.append(role))
+    assert centre.start("database:" + restricted["name"]) is False
+    assert launched == [], "nothing may be fetched before the terms are answered"
+    if restricted["download"] == "automatic":
+        assert asked and restricted["licence"] in asked[0][1]
+        assert "cannot accept these terms for you" in asked[0][1]
+        assert "needs its provider's terms accepted first" in centre.status.text()
+    else:
+        assert told and "installed by hand" in told[0][1]
+
+
+def test_install_everything_lists_the_licences_it_refuses_to_accept(window, qtbot, monkeypatch):
+    from wmlstudio import provisioning
+    from wmlstudio.update_center import UpdateCenter, decisions_needed
+    update_centre(window, qtbot)
+    fake_plan(monkeypatch)
+    plan = provisioning.installation_plan(window.root, "")
+    waiting = decisions_needed(plan)
+    assert waiting, "the catalogue lists sets whose terms a person has to read"
+    text = UpdateCenter.plan_text(plan)
+    assert "Needs your decision, and is not included here:" in text
+    for row in waiting:
+        assert row["title"] in text
+        assert row["name"] not in plan["databases"], "never fetched without an answer"
+    assert "will not accept those terms for you" in text
+
+
+def test_a_plan_from_a_failed_check_says_it_is_not_a_clean_bill_of_health(window, qtbot,
+                                                                          monkeypatch):
+    from wmlstudio import provisioning
+    from wmlstudio.update_center import UpdateCenter
+    update_centre(window, qtbot)
+    fake_plan(monkeypatch, error="no route to host", message="no route to host")
+    text = UpdateCenter.plan_text(provisioning.installation_plan(window.root, ""))
+    assert text.startswith("The online check did not get through")
+    assert "not a statement that you are up to date" in text
 
 
 def test_an_update_row_uses_the_installer_the_application_already_has(window, qtbot,
@@ -697,18 +910,34 @@ def test_an_update_row_uses_the_installer_the_application_already_has(window, qt
                         lambda self: called.append("species"))
     assert centre.start("species_panel") is True
     assert called == ["species"]
-    assert "Check what is installed" in centre.status.text()
-    centre.close()
+    assert "Rescan what is installed here" in centre.status.text()
 
 
 def test_an_item_with_no_installer_here_explains_how_it_is_installed(window, qtbot,
                                                                      monkeypatch):
     centre = update_centre(window, qtbot)
-    shown = []
-    monkeypatch.setattr(QMessageBox, "information",
-                        lambda parent, title, text, *args: shown.append((title, text)))
+    _asked, told = answer(centre, monkeypatch)
     # BLAST+ ships beside the application; nothing downloads it on a user's behalf.
     assert centre.start("blast_tools") is False
-    assert shown and "BLAST" in shown[0][0]
-    assert "stage_bio_tools" in shown[0][1] or "Tools/blast" in shown[0][1]
-    centre.close()
+    assert told and "BLAST" in told[0][0]
+    assert "stage_bio_tools" in told[0][1] or "Tools/blast" in told[0][1]
+
+
+def test_clearing_the_update_tab_forgets_the_view_and_keeps_the_check_record(window, qtbot,
+                                                                            monkeypatch):
+    from wmlstudio.update_center import check_record
+    centre = update_centre(window, qtbot)
+    fake_plan(monkeypatch, latest="2026-09-01.1", newer_available=True, message="newer release")
+    centre.check_online()
+    qtbot.waitUntil(lambda: centre.check is not None and centre.check.get("ok"), timeout=60000)
+    qtbot.waitUntil(lambda: not centre.worker.isRunning(), timeout=60000)
+    monkeypatch.setattr(QMessageBox, "question",
+                        lambda *args: QMessageBox.StandardButton.Yes)
+    assert window.clear_page("update") is True
+    assert centre.check is None and centre.plan is None
+    qtbot.waitUntil(lambda: centre.report is not None, timeout=60000)
+    qtbot.waitUntil(lambda: not centre.worker.isRunning(), timeout=60000)
+    # The one thing a failed check has left to say survives a cleared view.
+    assert check_record(window.root)["latest"] == "2026-09-01.1"
+    assert clear_promise("update")["keeps"].endswith("when a check last reached a provider")
+    assert window.test_errors == []

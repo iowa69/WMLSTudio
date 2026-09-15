@@ -14,8 +14,15 @@ Two orders live here and they are deliberately different:
   into the middle of this tuple; new pages are appended.
 * ``PIPELINE`` is the **display order**: the tab bar reads as the user's own
   workflow -- load the samples, look at the reads, assemble, type, draw the tree,
-  do it again for cgMLST, screen for resistance, report, update, settle the
-  settings. Moving a tab in the bar therefore costs nothing elsewhere.
+  do it again for cgMLST, screen for resistance, report, update, look after the
+  scheme library, settle the settings. Moving a tab in the bar therefore costs
+  nothing elsewhere.
+
+A tab must also mean what its word means. "Update" labelled the scheme library
+for several releases, so pressing it rescanned this computer's scheme folders and
+never asked a provider anything -- reported, fairly, as "when I update it performs
+analysis instead of looking online". Update is now its own page (the update centre
+in ``update_center.py``) and the library keeps its own tab, named Schemes.
 
 A station that a later round builds is listed in ``PLANNED``. Its tab exists so
 the pipeline has no gap where a step belongs, and its page says plainly that
@@ -37,6 +44,10 @@ PAGE_KEYS = (
     # Appended by the pipeline layout. Their numbers are new, so nothing depends
     # on them; they exist so `navigate(<int>)` can still reach every page.
     "reads", "assembly", "mlst", "cgmlst", "cgmlst_tree", "snp",
+    # Appended again, for the same reason: the tab the bar calls Update had no page
+    # of its own and showed the scheme library instead, so pressing Update rescanned
+    # this computer's scheme folders rather than asking anyone what is published.
+    "update",
 )
 
 #: Display order: one dedicated tab per task, in the order the tasks happen.
@@ -52,15 +63,13 @@ PIPELINE = (
     "snp",          # planned: a SNP tree from read alignment
     "evidence",     # HYDRA: resistance, virulence and lineage evidence
     "reports",      # the report
-    "schemes",      # Update: scheme libraries and reference databases
+    "update",       # what is installed, what is published, what an update costs
+    "schemes",      # the scheme library itself: what is installed and where from
     "settings",
 )
 
 #: Stations a later round builds. Their pages say so; they never pretend to work.
 PLANNED = ("snp",)
-
-#: Pages this layout adds on top of the seven the window has always built.
-STATION_KEYS = PAGE_KEYS[7:]
 
 TAB_LABELS = {
     "overview": "Overview",
@@ -77,9 +86,11 @@ TAB_LABELS = {
     "snp": "SNP tree",
     "evidence": "HYDRA",
     "reports": "Report",
-    # Schemes are reference data you install and update, so they live here with
-    # the AMR databases rather than in a second place of their own.
-    "schemes": "Update",
+    # Update is the update centre: what is installed, what a provider publishes
+    # today, and what an update would cost. The scheme library is a different
+    # question -- which allele collections this computer holds -- and says so.
+    "update": "Update",
+    "schemes": "Schemes",
     "settings": "Settings",
 }
 
@@ -113,8 +124,11 @@ PAGE_PURPOSE = {
     "evidence": "Review identity, resistance and virulence evidence for isolates you choose. "
                 "Genotype is not measured susceptibility.",
     "reports": "Turn reviewed evidence into a document you can share.",
-    "schemes": "Install and update the MLST and cgMLST scheme libraries and the reference "
-               "databases this workspace types against.",
+    "update": "What is installed here, what each provider publishes today, and what an update "
+              "would cost. Checking asks a provider over the internet; nothing is downloaded "
+              "until you choose it.",
+    "schemes": "The MLST and cgMLST allele collections installed on this computer, and where each "
+               "one came from. Installing and updating reference data happens on Update.",
     "settings": "Window size, text size, screen resolution and where your data lives.",
 }
 
@@ -132,7 +146,10 @@ NEXT_STEP = {
     "snp": ("Compare allele differences instead →", "goto_mlst_tree"),
     "evidence": ("Choose isolates…", "choose_feature_cohort"),
     "reports": ("Choose report isolates…", "choose_report_cohort"),
-    "schemes": ("Browse online / install updates…", "open_reference_manager"),
+    # A network check, named as one. The word nobody could find before was
+    # "online": the button that was here rescanned this computer's own folders.
+    "update": ("Check online for updates…", "check_for_updates"),
+    "schemes": ("Browse scheme catalogues online…", "open_reference_manager"),
     "settings": ("Window size, text size and screen resolution", "open_display_settings"),
 }
 
@@ -183,6 +200,12 @@ CLEAR_ACTIONS = {
     "reports": {
         "clears": "this tab's report cohort",
         "keeps": "every report you have already saved, and every stored result",
+    },
+    "update": {
+        "clears": "the list on this tab and the result of the last online check, which is then "
+                  "read from this computer again",
+        "keeps": "every installed database, scheme and reference snapshot, and the record of "
+                 "when a check last reached a provider",
     },
     "schemes": {
         "clears": "the library view, which is then read from disk again",
@@ -290,10 +313,21 @@ STATION_PAGES = {
     },
 }
 
-#: The horizontal tab padding to try, widest first. Thirteen tabs have to stay
+#: The pipeline stations this layout builds for itself, in build order. Only the
+#: keys with a page definition above: a later page appended to PAGE_KEYS (Update,
+#: for one) is built by the window itself and must not be given a placeholder.
+STATION_KEYS = tuple(key for key in PAGE_KEYS[7:] if key in STATION_PAGES)
+
+#: The horizontal tab padding to try, widest first. Fourteen tabs have to stay
 #: readable in a 1000 px window, and a chopped-off label ("cgMLST t…") is worse
 #: than a tighter one, so the bar gives up padding before it gives up words.
-PADDING_STEPS = (12, 10, 9, 8, 7, 6, 5)
+PADDING_STEPS = (12, 10, 9, 8, 7, 6, 5, 4, 3, 2)
+
+#: The tightest padding the window is allowed to *assume* when it decides whether
+#: it can afford the sidebar. The steps below this one exist for a window too
+#: narrow to carry the bar any other way; they are not room the decorative column
+#: is entitled to spend, so the sidebar stands down before they are reached.
+COMFORTABLE_PADDING = 5
 
 
 def page_key(index: int) -> str:
@@ -304,7 +338,7 @@ def page_key(index: int) -> str:
 def tab_title(key: str) -> str:
     """Tab bar text: the page's short label.
 
-    Thirteen tabs have to fit a 1000 px window, so the label carries no glyph and
+    Fourteen tabs have to fit a 1000 px window, so the label carries no glyph and
     no decoration; the long name and the purpose line live in the tooltip.
     """
     return TAB_LABELS.get(key, str(key).replace("_", " ").title())
@@ -515,16 +549,19 @@ class WorkspaceTabs(QTabWidget):
         self._fit_tab_bar()
 
     def minimum_bar_width(self) -> int:
-        """The narrowest the bar can be drawn with every label still whole.
+        """The narrowest the bar can be drawn with every label still whole and legible.
 
         The window asks before deciding whether it can afford the sidebar: losing
-        the sidebar is a smaller loss than pushing tabs behind a scroll arrow.
+        the sidebar is a smaller loss than pushing tabs behind a scroll arrow, and
+        a smaller loss again than squeezing every tab to its tightest padding while
+        a decorative column keeps 205 px. Measured at COMFORTABLE_PADDING for that
+        reason, not at the last step the bar could survive on.
         """
         if self._minimum_bar is None:
             if not self.count():
                 return 0
             current = self._padding
-            self._set_padding(PADDING_STEPS[-1])
+            self._set_padding(COMFORTABLE_PADDING)
             self._minimum_bar = self.tabBar().sizeHint().width()
             if current is not None:
                 self._set_padding(current)

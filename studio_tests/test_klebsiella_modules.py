@@ -4,6 +4,7 @@ import random
 
 import pytest
 
+from wmlstudio.characterization import characterize_assembly
 from wmlstudio.characterization_refs import _capsule_split_name, _split_fasta, reference_digest
 from wmlstudio.klebsiella_evidence import (
     CAPSULE_LIMITATIONS,
@@ -15,6 +16,7 @@ from wmlstudio.klebsiella_evidence import (
     type_capsule_markers,
     type_virulence_loci,
 )
+from wmlstudio.organism_modules import record_skipped, registered_modules, selection_for_record
 from wmlstudio.sequence import file_sha256
 from wmlstudio.virulence_evidence import apply_locus_sts, summarize_virulence_hits
 
@@ -95,7 +97,9 @@ def test_incomplete_or_novel_profile_yields_no_locus_st_and_retains_the_engine_s
     assert novel['loci']['tst']['status'] == 'novel_profile'
     assert novel['loci']['tst']['locus_st'] is None
     assert any('absent from this local profile table' in note for note in novel['loci']['tst']['notes'])
-    assert summarize_locus_sts(novel) == 'no locus ST assigned'
+    # A locus that was screened and assigned nothing must not read like a locus
+    # that was never screened at all.
+    assert summarize_locus_sts(novel) == 'screened; no locus ST assigned'
 
 
 def test_ambiguous_and_mixed_engine_statuses_propagate_unchanged(tmp_path):
@@ -121,7 +125,11 @@ def test_a_snapshot_without_profile_tables_reports_not_run_not_an_absent_locus_s
     root = klebsiella_panel(tmp_path, alleles=ALLELES)
     result = type_virulence_loci(assembly_of(tmp_path, ALLELES['geneA']['1']), root)
     assert result['status'] == 'not_run' and 'no Kleborate locus-ST profile tables' in result['reason']
-    assert summarize_locus_sts(result) == 'not_run'
+    # The cell says which kind of blank this is: a reference that is not here,
+    # not an assay that ran and found no locus ST.
+    assert summarize_locus_sts(result) == 'not run: reference not installed'
+    assert result['not_run_kind'] == 'reference_missing'
+    assert 'Install or update the characterization reference snapshot' in locus_st_html(result)
 
 
 def test_official_locus_st_stays_none_when_the_locus_st_module_did_not_run():
@@ -192,6 +200,9 @@ def test_a_snapshot_without_capsule_markers_reports_not_run(tmp_path):
     root = klebsiella_panel(tmp_path, alleles=ALLELES)
     result = type_capsule_markers(assembly_of(tmp_path, ALLELES['geneA']['1']), root)
     assert result['status'] == 'not_run' and 'wzi/wzc capsule marker panel' in result['reason']
+    assert summarize_capsule(result) == 'not run: reference not installed'
+    assert result['not_run_kind'] == 'reference_missing'
+    assert 'Install or update the characterization reference snapshot' in capsule_html(result)
 
 
 def test_wzi_header_rewrite_preserves_sequence_bytes(tmp_path):
@@ -220,3 +231,65 @@ def test_capsule_markers_require_one_panel_directory(tmp_path):
     (root / 'manifest.json').write_text(json.dumps(manifest))
     with pytest.raises(ValueError, match='no source hash'):
         type_capsule_markers(assembly_of(tmp_path, CAPSULE['wzi']['1']), root)
+
+
+def test_a_klebsiella_blank_says_which_of_the_three_reasons_it_is(tmp_path):
+    """Not selected, no reference, and screened-but-nothing-found are three answers."""
+    root = klebsiella_panel(tmp_path, alleles=ALLELES, profiles=PROFILES, capsule=CAPSULE)
+    assembly = assembly_of(tmp_path, ALLELES['geneA']['1'])
+    offered = characterize_assembly(assembly, reference_root=root, species=False, virulence=False,
+                                    modules={'klebsiella_locus_st': True, 'klebsiella_capsule': True},
+                                    organism=('Klebsiella', 'pneumoniae'))
+    unselected = characterize_assembly(assembly, reference_root=root, species=False, virulence=False,
+                                       organism=('Klebsiella', 'pneumoniae'))
+    bare = klebsiella_panel(tmp_path, alleles=ALLELES, name='bare')
+    unstocked = characterize_assembly(assembly, reference_root=bare, species=False, virulence=False,
+                                      modules={'klebsiella_locus_st': True, 'klebsiella_capsule': True},
+                                      organism=('Klebsiella', 'pneumoniae'))
+    modules = registered_modules()
+    answers = {name: modules['klebsiella_locus_st'].summary(result['klebsiella_locus_st'])
+               for name, result in [('screened', offered), ('unselected', unselected),
+                                    ('unstocked', unstocked)]}
+    assert answers['screened'] == 'screened; no locus ST assigned'
+    assert answers['unselected'] == 'not run: not selected'
+    assert answers['unstocked'] == 'not run: reference not installed'
+    assert len(set(answers.values())) == 3
+    # The isolate that was screened is the only one whose blank is a finding.
+    assert offered['klebsiella_locus_st']['status'] == 'completed'
+    assert unselected['klebsiella_locus_st']['not_run_kind'] == 'not_selected'
+    assert unstocked['klebsiella_locus_st']['not_run_kind'] == 'reference_missing'
+
+
+def test_a_non_klebsiella_isolate_is_told_it_is_outside_these_taxa(tmp_path):
+    root = klebsiella_panel(tmp_path, alleles=ALLELES, profiles=PROFILES, capsule=CAPSULE)
+    aureus = {'metadata': {'organism': {'genus': 'Staphylococcus', 'species': 'aureus'}}}
+    running, skipped = selection_for_record(aureus, {'klebsiella_locus_st': True})
+    result = characterize_assembly(assembly_of(tmp_path, ALLELES['geneA']['1']), reference_root=root,
+                                   species=False, virulence=False, modules=running,
+                                   organism=('Staphylococcus', 'aureus'))
+    record_skipped(result, skipped)
+    block = result['klebsiella_locus_st']
+    assert block['not_run_kind'] == 'off_panel'
+    assert registered_modules()['klebsiella_locus_st'].summary(block) == 'not run: outside these taxa'
+    assert 'Klebsiella' in block['applicability_reason'] or block['applicability'] == 'off_panel'
+
+
+def test_the_defined_virulence_screen_says_which_kind_of_blank_it_is():
+    """A locus panel that ran and found nothing is not the panel that never ran."""
+    from wmlstudio.virulence_evidence import summarize_virulence, virulence_sentence
+
+    screened = {'status': 'completed', 'loci': [{'locus': 'iuc', 'status': 'not_detected'},
+                                                {'locus': 'ybt', 'status': 'not_detected'}]}
+    found = {'status': 'completed', 'loci': [{'locus': 'iuc', 'status': 'detected'},
+                                             {'locus': 'ybt', 'status': 'not_detected'}]}
+    unselected = {'status': 'not_run', 'reason': 'Assay not selected.'}
+    unstocked = {'status': 'not_run', 'reason': 'This reference snapshot carries no virulence panel.'}
+    assert summarize_virulence(found) == 'iuc'
+    assert summarize_virulence(screened) == 'screened; no defined locus detected'
+    assert summarize_virulence(unselected) == 'not run: not selected'
+    assert summarize_virulence(unstocked) == 'not run: reference not installed'
+    assert summarize_virulence({}) == 'not recorded'
+    assert len({summarize_virulence(block)
+                for block in (screened, unselected, unstocked, {})}) == 4
+    assert virulence_sentence(screened) == ''
+    assert 'not a negative result' in virulence_sentence(unstocked)
