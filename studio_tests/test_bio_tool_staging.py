@@ -129,3 +129,34 @@ def test_skesa_manifest_cannot_omit_corresponding_source(tmp_path):
     path.write_text(json.dumps(manifest))
     with pytest.raises(ValueError, match="missing required"):
         staging.verify_skesa_bundle(source)
+
+
+def test_a_library_lifted_out_of_a_tool_tree_is_not_shipped_beside_the_executable(tmp_path):
+    """PyInstaller collects DLLs it finds inside a data tree as binaries too.
+
+    The staged tool already ships whole, so the lifted copy is a second, inert
+    one at the application root: a JRE's java.dll resolves jvm.dll from its own
+    bin/server directory, so the copy beside the executable could never load. The
+    Windows dependency audit reported exactly that as an unresolved app-local
+    dependency, which is what this filter removes.
+    """
+    filter_hoisted_tool_binaries = staging.filter_hoisted_tool_binaries
+
+    jre = tmp_path / "fastqc" / "jre" / "bin"
+    jre.mkdir(parents=True)
+    (jre / "java.dll").write_bytes(b"MZ")
+    (jre / "server").mkdir()
+    (jre / "server" / "jvm.dll").write_bytes(b"MZ")
+    elsewhere = tmp_path / "site-packages"
+    elsewhere.mkdir()
+    (elsewhere / "qt6core.dll").write_bytes(b"MZ")
+
+    entries = [("java.dll", str(jre / "java.dll"), "BINARY"),
+               ("jvm.dll", str(jre / "server" / "jvm.dll"), "BINARY"),
+               ("qt6core.dll", str(elsewhere / "qt6core.dll"), "BINARY")]
+    kept = filter_hoisted_tool_binaries(entries, (tmp_path / "fastqc",))
+    assert [entry[0] for entry in kept] == ["qt6core.dll"], "only the tool's own copies are dropped"
+    # The tool tree itself is untouched: it still ships as data, intact.
+    assert (jre / "java.dll").is_file() and (jre / "server" / "jvm.dll").is_file()
+    # A missing or unreadable source path must not take the whole build down.
+    assert filter_hoisted_tool_binaries([("x.dll", None, "BINARY")], (tmp_path,)) == [("x.dll", None, "BINARY")]

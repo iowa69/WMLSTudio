@@ -10,7 +10,8 @@ from PyInstaller.utils.hooks import collect_data_files, collect_submodules, copy
 root = Path(SPECPATH).parent
 sys.path.insert(0, str(root / "studio_packaging"))
 sys.path.insert(0, str(root / "src"))
-from stage_bio_tools import filter_windows_qt_tls, stage_hydra_database, verify_skesa_bundle
+from stage_bio_tools import (filter_hoisted_tool_binaries, filter_windows_qt_tls,
+                            stage_hydra_database, verify_skesa_bundle)
 from stage_fastqc import verify as verify_fastqc
 from stage_reference_panels import assay_module_imports, panel_summary, verify_bundle_payload
 from stage_ska import verify as verify_ska
@@ -122,6 +123,11 @@ hydra_exe = EXE(
     name="WMLSTudio-HYDRA", debug=False, bootloader_ignore_signals=False,
     strip=False, upx=False, console=True,
 )
+# Each staged tool ships whole, as data, with its own internal layout. A copy of
+# one of its libraries lifted beside the executable is inert — a JRE's java.dll
+# resolves jvm.dll from its own bin/server — so it is removed rather than shipped.
+for analysis in (gui, cli, hydra):
+    analysis.binaries = filter_hoisted_tool_binaries(analysis.binaries, (fastqc, ska, tools))
 if sys.platform == "win32":
     for analysis in (gui, cli, hydra):
         analysis.binaries = filter_windows_qt_tls(analysis.binaries)

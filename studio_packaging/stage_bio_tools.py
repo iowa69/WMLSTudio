@@ -38,6 +38,31 @@ def filter_windows_qt_tls(entries):
             if str(entry[0]).replace("\\", "/").rsplit("/", 1)[-1].casefold() not in WINDOWS_AMBIENT_QT_TLS]
 
 
+def filter_hoisted_tool_binaries(entries, tool_roots):
+    """Drop copies PyInstaller lifted out of a bundled tool tree to the app root.
+
+    A staged tool is shipped whole, as data, with its own internal layout. When
+    PyInstaller recognises a DLL inside one of those trees it also collects it as
+    a binary, which places a second copy beside the executable. That copy is
+    inert and misleading: a JRE's java.dll loads jvm.dll from its own
+    bin/server directory, so the lifted copy could never load, and the Windows
+    dependency audit reports it as an unresolved app-local dependency. The
+    original inside the tool tree is untouched.
+    """
+    roots = [Path(root).resolve() for root in tool_roots if root]
+    kept = []
+    for entry in entries:
+        source = entry[1] if len(entry) > 1 else None
+        try:
+            resolved = Path(source).resolve() if source else None
+        except (OSError, ValueError):
+            resolved = None
+        if resolved is not None and any(resolved.is_relative_to(root) for root in roots):
+            continue
+        kept.append(entry)
+    return kept
+
+
 def digest(path):
     with Path(path).open("rb") as handle:
         return hashlib.file_digest(handle, "sha256").hexdigest()
