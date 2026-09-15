@@ -116,7 +116,8 @@ def test_identification_reads_the_original_files_before_any_copy_is_written(wind
     window.import_paths([str(inbox)], configure=True)
     idle(qtbot, window)
 
-    assert seen["paths"] == [str(first), str(duplicate), str(second)]
+    # The claim is which originals were read, not the order the filesystem listed them.
+    assert sorted(seen["paths"]) == sorted([str(first), str(duplicate), str(second)])
     assert seen["copies"] == [], "identification must run before anything is copied"
     samples = {sample["name"]: sample for sample in window.project.samples()}
     assert set(samples) == {"KPNIH1", "mystery"}, "byte-identical files are imported once"
