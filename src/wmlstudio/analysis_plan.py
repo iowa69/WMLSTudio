@@ -2,7 +2,7 @@
 
 from pathlib import Path
 
-from PySide6.QtCore import Signal
+from PySide6.QtCore import Qt, Signal
 from PySide6.QtWidgets import (
     QCheckBox,
     QComboBox,
@@ -83,6 +83,10 @@ class RunPlanDialog(QDialog):
         self.setWindowTitle("Review analysis plan")
         self.resize(850, 670)
         self.plan = {}
+        self.catalogue = {"entries": [], "summary": "", "error": ""}
+        # The release and its organism tables are read from disk, so they are read
+        # once per store rather than again on every tick of a checkbox.
+        self._status_cache = (None, None)
         self.hardware = detect_hardware()
         outer = QVBoxLayout(self)
         scroll = QScrollArea()
@@ -134,6 +138,15 @@ class RunPlanDialog(QDialog):
         )
         self.hydra = QCheckBox("Also run HYDRA AMR analysis on the selected assemblies")
         layout.addWidget(self.hydra)
+        # HYDRA runs against whatever reference data happens to be installed and
+        # reports nothing for everything else; in a result those two are
+        # indistinguishable. So which sets are here, which the run will read, and
+        # which of these isolates have a mutation catalogue at all are stated
+        # before the run rather than discovered in an empty report afterwards.
+        self.hydra_state = label("", "small", True)
+        layout.addWidget(self.hydra_state)
+        self.hydra_gaps = label("", "small", True)
+        layout.addWidget(self.hydra_gaps)
         self.cgmlst = QCheckBox("Also run cgMLST on the selected assemblies")
         layout.addWidget(self.cgmlst)
         self.cgmlst_choice = QComboBox()
@@ -181,7 +194,21 @@ class RunPlanDialog(QDialog):
         form.addRow("AMR methods", self.protein)
         self.point_mutations = QCheckBox("Organism-specific mutation catalog (confirmed labels only)")
         self.point_mutations.setChecked(True)
+        self.point_mutations.toggled.connect(self.refresh_databases)
         form.addRow("Mutation evidence", self.point_mutations)
+        # The engine's virulence and stress curation is keyed to the organism, so
+        # a run with no established organism is a different, uncurated search. It
+        # is offered as three explicit choices and reported for what each one is.
+        self.virulence = QComboBox()
+        self.virulence.addItem("Where the isolate's organism is established", None)
+        self.virulence.addItem("Always, even with no organism (uncurated)", True)
+        self.virulence.addItem("Never; acquired resistance only", False)
+        self.virulence.currentIndexChanged.connect(self.refresh_databases)
+        form.addRow("Virulence and stress elements", self.virulence)
+        form.addRow(label("Virulence and stress elements come from the protein reference. The "
+                          "nucleotide catalogues report their own virulence-typed genes whatever "
+                          "this is set to, and a gene found is never a demonstrated phenotype.",
+                          "small", True))
         self.threshold_controls = {}
         thresholds = QHBoxLayout()
         for key, title, default in [("min_identity", "Nucleotide identity", 80),
@@ -300,17 +327,97 @@ class RunPlanDialog(QDialog):
             self.resource_feedback.setText(str(exc))
 
     def refresh_databases(self):
-        from wmlstudio.hydra_runtime import installed_databases
+        """Read the chosen store and say what it holds, what it does not, and what runs.
+
+        The whole catalogue, not only the installed part: a reference set that is
+        absent reports nothing, and nothing reported is indistinguishable from a
+        clean isolate unless the absence is named before the run. Each installed
+        set is offered by name with what it is searched for, so choosing one is a
+        decision about a question rather than about a word.
+        """
+        from wmlstudio.hydra_runtime import database_catalogue
 
         selected = self.database_choice.currentData()
+        self.database_choice.blockSignals(True)
         self.database_choice.clear()
         self.database_choice.addItem("All installed nucleotide / protein databases", None)
         try:
-            for name in installed_databases(self.database.text() or "."):
-                self.database_choice.addItem(name, name)
-            self.database_choice.setCurrentIndex(max(0, self.database_choice.findData(selected)))
-        except ValueError as exc:
+            self.catalogue = database_catalogue(self.database.text() or None, measure=False)
+        except (OSError, ValueError) as exc:
+            self.database_choice.blockSignals(False)
             self.feedback.setText(str(exc))
+            self.hydra_state.setText(str(exc))
+            return
+        for entry in self.catalogue["entries"]:
+            if not entry["installed"]:
+                continue
+            self.database_choice.addItem(f"{entry['name']} — {entry['purpose']}", entry["name"])
+            self.database_choice.setItemData(
+                self.database_choice.count() - 1,
+                "\n\n".join(filter(None, [entry["title"], entry["purpose"], entry["provider"],
+                                          f"Licence: {entry['licence']}"])),
+                Qt.ItemDataRole.ToolTipRole)
+        self.database_choice.setCurrentIndex(max(0, self.database_choice.findData(selected)))
+        self.database_choice.blockSignals(False)
+        self.hydra_state.setText(self.catalogue["error"] or self.catalogue["summary"])
+        self.hydra_gaps.setText(self.coverage_sentence())
+
+    def database_state(self):
+        """The chosen store's release and organism tables, read once per store."""
+        from wmlstudio.hydra_runtime import database_status
+
+        path = self.database.text() or ""
+        if self._status_cache[0] != path:
+            self._status_cache = (path, database_status(path or None))
+        return self._status_cache[1]
+
+    def coverage_sentence(self):
+        """What this store could not report for these isolates, before anyone starts.
+
+        Being accepted by a release and having a point-mutation catalogue in it
+        are two different things, and an isolate outside the second is screened
+        for genes only — which is not evidence that it carries no mutation.
+        """
+        from wmlstudio.hydra_runtime import catalogue_covers, match_organism
+
+        status = self.database_state()
+        if status["error"] or not status["installed"]:
+            return (status["error"] or "No reference set is installed in this store, so a HYDRA "
+                    "run would have nothing to search and would report no determinant for any "
+                    "isolate. That is not a negative result.")
+        parts = []
+        if self.point_mutations.isChecked():
+            configurations = [sample_configuration(sample) for sample in self.samples]
+            named = [config for config in configurations
+                     if config["organism_source"] == "assigned" and config["genus"]
+                     and config["species"]]
+            uncovered = sorted({config["organism"] for config in named
+                                if not catalogue_covers(
+                                    match_organism(config["organism"],
+                                                   accepted=status["organisms"]) or "",
+                                    status["point_mutation_organisms"])})
+            if len(named) < len(configurations):
+                parts.append(f"{len(configurations) - len(named)} of {len(configurations)} inputs "
+                             "have no assigned genus and species, so no point-mutation catalogue "
+                             "is chosen for them and none is reported; that is not evidence that "
+                             "they carry no resistance mutation.")
+            if uncovered:
+                parts.append("This release holds no point-mutation catalogue for "
+                             + "; ".join(uncovered) + ". Those isolates are screened for genes "
+                             "only, and no other organism's catalogue is substituted for them.")
+        else:
+            parts.append("Point mutations are switched off, so none is reported for any isolate in "
+                         "this run. That is not evidence that none is present.")
+        if self.virulence.currentData() is False:
+            parts.append("The translated search is limited to acquired resistance, so no virulence "
+                         "or stress element is read from the protein reference.")
+        elif self.virulence.currentData() is True:
+            parts.append("Virulence and stress elements are searched for every isolate here, "
+                         "including those with no established organism: that search is uncurated.")
+        if status["stale"]:
+            parts.append(f"This release is {status['age_days']} days old ({status['release']}); "
+                         "determinants named after it are not in it.")
+        return " ".join(parts)
 
     def accept(self):
         try:
@@ -331,7 +438,9 @@ class RunPlanDialog(QDialog):
             from wmlstudio import provisioning
 
             try:
-                check = provisioning.hydra_prerequisites(selected=self.database.text() or None)
+                check = provisioning.hydra_prerequisites(
+                    selected=self.database.text() or None,
+                    virulence=self.virulence.currentData())
                 if not check["ready"]:
                     self.feedback.setText(check["message"])
                     return
@@ -366,6 +475,7 @@ class RunPlanDialog(QDialog):
             "databases": [choice] if choice else None,
             "protein": self.protein.isChecked(),
             "point_mutations": self.point_mutations.isChecked(),
+            "virulence": self.virulence.currentData(),
             "thresholds": {key: field.value() for key, field in self.threshold_controls.items()},
             "threads": self.threads.value(),
             "resource_plan": allocation.to_dict(),

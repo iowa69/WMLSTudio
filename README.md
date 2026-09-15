@@ -79,9 +79,12 @@ On **Samples**, review the selection and choose **Analyse pending…** or
 paired-short-read assembly and HYDRA analyses. Original input files stay unchanged.
 
 Accepted formats: `.fasta`, `.fa`, `.fna`, `.fastq`, `.fq`, including
-gzip and bzip2. Unassembled reads receive labelled sampled QC. The paired-read
-workflow validates every pair before native SKESA; mate records and read
-provenance remain linked to the resulting assembly.
+gzip and bzip2. Unassembled reads receive labelled sampled QC. On **Read QC** a
+pair can be trimmed and quality-filtered with fastp; the numbers shown are
+fastp's own report, the originals are never replaced, and nothing is trimmed
+unless you ask. The paired-read workflow validates every pair before native
+SKESA; mate records and read provenance remain linked to the resulting assembly,
+which records whether it was built from the trimmed pair or the originals.
 
 ## One connected workflow
 
@@ -92,12 +95,20 @@ plain sentence saying what it answers, a button for the usual next step, and a
 | Tab | What you can do |
 | --- | --- |
 | Overview | Browse the library by organism/ST, open projects and research saved isolates |
-| Isolates | Assign workflows, select cohorts, inspect QC/typing, edit annotations, create collections and inspect history |
-| Compare | Choose a cohort and scheme snapshot, call additional cgMLST/wgMLST profiles, reuse saved profiles, style/export the minimum spanning forest |
-| Schemes | Import local schemes, browse online catalogs, install versioned snapshots and create a local ad-hoc cohort scheme |
-| Evidence | Run native assembly AMR searches, map external reports explicitly, inspect all features and primary-aware AMR matrices |
-| Reports | Include/exclude isolates, highlight investigation groups, export PDF/HTML/CSV/TSV/JSON and portable profile bundles |
+| Samples | Assign workflows, select cohorts, inspect QC/typing, edit annotations, create collections and inspect history |
+| Read QC | Trim and quality-filter read pairs with fastp and read its own report; originals are never replaced |
+| Assembly | Assemble chosen pairs and see contig metrics, plus which reads each assembly actually used |
+| MLST · MLST tree | Seven-locus typing, then its own minimum spanning tree on its own scale |
+| cgMLST · cgMLST tree | Core-genome typing with its own missing-target count, then its own tree on its own scale |
+| SNP tree | SKA2 split k-mer SNP distances, each pair carrying the split k-mers the two isolates share |
+| HYDRA | Run native assembly AMR searches, map external reports explicitly, inspect all features, plasmid evidence and primary-aware AMR matrices |
+| Report | Include/exclude isolates, highlight investigation groups, export PDF/HTML/CSV/TSV/JSON and portable profile bundles |
+| Update | Import and install scheme libraries, list every AMR reference database by name, and install or update everything missing |
 | Settings | Text size and whole-interface scale, data location and references, and what this version cannot do |
+
+The three trees measure three different quantities. A seven-locus allele
+difference, a core-genome allele difference and a SNP distance never share a
+scale, an axis, a column or a threshold — which is why they are three tabs.
 
 Selecting isolates anywhere sets a **focus** — the top strip says how many and
 where they came from. A tab reviews them only when you press **Use current focus**
@@ -105,7 +116,7 @@ on that tab, and it then states which cohort it holds and where it came from.
 Focus never changes a cohort by itself.
 
 Menus provide the canonical actions; **Ctrl+K** opens command search.
-**Ctrl+R** analyses selected samples. **Alt+1…7** switches tabs. Right-click
+**Ctrl+R** analyses selected samples. **Alt+1…9** switches tabs. Right-click
 offers add, open, rename, assign organism, re-file, archive, remove, copy and
 export for the selection you actually have, with the count always shown.
 
@@ -129,8 +140,17 @@ A close edge is not proof of transmission.
 ## HYDRA is an analysis engine, not just an imported page
 
 The portable assembly runtime uses pinned HYDRA 1.4.0 and native BLAST+ 2.17.0.
-An NCBI nucleotide/protein/mutation starter snapshot is supplied; additional
-databases require explicit installation and review of provider terms.
+The NCBI nucleotide, protein **and point-mutation** reference data are bundled, so
+the first run works on a machine with no network; packaging refuses a build whose
+core store lacks the mutation catalogues.
+
+Every other reference database the engine can use is listed by name in
+**Update → AMR reference databases**, with its provider, licence, citation and
+upstream address, installed or not, and downloaded only when you ask. **Install
+and update everything** checks what is present, installs what is missing and
+updates the rest — and deliberately skips any set whose licence is not an open
+one, such as CARD's academic licence, leaving those as one explicit click each
+with the terms shown first.
 
 Run-plan controls expose nucleotide identity/coverage, translated protein search,
 protein thresholds, CPU allocation and organism-specific mutation evidence.
@@ -199,11 +219,27 @@ twelve listed organisms have none at all, and no bundled scheme can bind a cgMLS
 cutoff. [Which organisms are actually covered](docs/THRESHOLDS.md) states each
 case, including the paediatric gaps.
 
-The complete Kleborate/Kaptive, AMRFinderPlus, agr/spa, MOB-recon and abricate
-execution stack, direct-read AMR/pileup, fastp/SPAdes, independent species
-confirmation and clinical validation remain unfinished. The
+The complete Kleborate/Kaptive, AMRFinderPlus, agr/spa, MOB-suite and abricate
+execution stack, direct-read AMR/pileup, SPAdes, independent species confirmation
+and clinical validation remain unfinished. The
 [scientific workflow contract](docs/MICROBIOLOGY_WORKFLOWS.md) makes those gaps
 explicit.
+
+fastp trimming is bundled and optional, where a verified native tool exists for
+the platform: upstream publishes no Windows binary, so a Windows package carries
+it only when a reviewed native artifact was staged, and otherwise says trimming is
+unavailable rather than substituting another program. Trimming reads validates
+nothing about the isolate they came from.
+
+The plasmid view is a contig screen over replicon markers. It is **not MOB-suite**
+and is not equivalent to it: no relaxase or MPF type, no oriT, no plasmid
+reconstruction, no mobility prediction, no plasmid count. MOB-suite's reference
+database alone is a 473 MB download, which is why it is absent rather than
+half-implemented.
+
+The portable archive is measured per component at build time and the build fails
+above 1 GB. Any reference set large enough to threaten that is a download you
+ask for, not a bundled file.
 
 ## Verify the download
 

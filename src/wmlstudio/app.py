@@ -158,11 +158,16 @@ class BaseWindow(QMainWindow):
         self.build_reports()
         self.build_settings()
         self.build_stations()
+        self.install_pipeline_pages()
         self.install_workspace_headers()
         self.fold_duplicate_pages()
-        self.page_shown = {key: hook for key, hook in
-                           (("compare", getattr(self, "refresh_comparison", None)),)
-                           if callable(hook)}
+        # A page that reads the project every time it is opened says so here rather
+        # than recomputing on every keystroke somewhere else in the window.
+        self.page_shown = {key: hook for key, hook in (
+            ("compare", getattr(self, "refresh_comparison", None)),
+            ("reads", getattr(getattr(self, "read_trimming_page", None), "refresh", None)),
+            ("assembly", getattr(getattr(self, "assembly_page", None), "refresh", None)),
+        ) if callable(hook)}
         # The tab widget reports a tab position; navigate speaks keys and
         # build-order numbers, so the bar hands it the key it just showed.
         self.pages.pageShown.connect(self.navigate)
@@ -601,10 +606,12 @@ class BaseWindow(QMainWindow):
     def build_stations(self):
         """One tab per remaining step of the workflow, in the order it is worked.
 
-        These are the pages no controller has claimed: the two typing steps, the
-        cgMLST tree, and the three stations a later round fills. Each one is a real
-        page with a purpose, a live summary, its own actions and a Clear; a station
-        that cannot do its work yet says so instead of looking finished.
+        These are the pages no controller has claimed: read quality, assembly, the
+        two typing steps, the cgMLST tree and the SNP tree. Each one is a real page
+        with a purpose, a live summary, its own actions and a Clear. The first two
+        are handed their finished pages immediately afterwards by
+        install_pipeline_pages; a station that cannot do its work yet says so
+        instead of looking finished.
         """
         self.station_status = {}
         for key in STATION_KEYS:
@@ -658,6 +665,21 @@ class BaseWindow(QMainWindow):
                               "placeholder": card_frame, "status": status}
         return holder
 
+    def install_pipeline_pages(self):
+        """Give the two stations after Samples their real pages.
+
+        They are built here rather than inside build_station because they need the
+        finished window -- the project, the background task runner and the status
+        line -- and because a build that cannot provide one must keep the station's
+        own page, which says plainly that the work does not run there.
+        """
+        self.read_trimming_page = self.assembly_page = None
+        try:
+            from wmlstudio.ui_reads import install_pipeline_panels
+        except ImportError:
+            return {}
+        return install_pipeline_panels(self)
+
     def adopt_station(self, key, widget, *, title=None):
         """Give a pipeline station its real page, built elsewhere.
 
@@ -695,11 +717,16 @@ class BaseWindow(QMainWindow):
             counted[kind] = sum(1 for sample in samples
                                 if index.get(sample["id"], {}).get(kind))
         total = len(samples)
+        trimmed = sum(1 for sample in samples
+                      if (sample.get("metadata", {}).get("read_trimming") or {}).get("status")
+                      == "completed")
+        assembled = sum(1 for sample in samples if sample.get("metadata", {}).get("assembly", {})
+                        .get("assembly_path"))
         lines = {
-            "reads": "Nothing runs on this tab yet. Read statistics for each sample are shown "
-                     "in Samples.",
-            "assembly": "Nothing runs on this tab yet. Assembling works today in Samples → "
-                        "Assembly.",
+            "reads": f"{trimmed} of {total} samples carry a trimming record · "
+                     f"{total - trimmed} do not. Untrimmed reads stay usable as supplied.",
+            "assembly": f"{assembled} of {total} samples carry an assembly made here · "
+                        f"{total - assembled} do not.",
             "mlst": f"{counted['mlst']} of {total} samples have a stored seven-locus result · "
                     f"{total - counted['mlst']} have none.",
             "cgmlst": f"{counted['cgmlst']} of {total} samples have a stored cgMLST result · "
@@ -710,7 +737,40 @@ class BaseWindow(QMainWindow):
         }
         for key, widget in status.items():
             widget.setText(lines.get(key, ""))
+        # A station that owns a real page redraws it, but only while it is the page
+        # in front: listing a cohort costs a pass over every record, and no tab the
+        # user cannot see should pay for one.
+        current = self.pages.current_key()
+        adopted = (self.stations.get(current) or {}).get("adopted")
+        refresh = getattr(adopted, "refresh", None)
+        if callable(refresh):
+            refresh()
         return counted
+
+    # --- the two pipeline pages between Samples and MLST ----------------------
+    def run_read_trimming(self):
+        """Trim read pairs on the Read QC tab, wherever the button was pressed."""
+        return self.run_pipeline_page("reads", getattr(self, "read_trimming_page", None),
+                                      "trim_selected",
+                                      "Read trimming needs the Read QC page, which this build "
+                                      "could not open.")
+
+    def run_assembly_station(self):
+        """Assemble read pairs on the Assembly tab, wherever the button was pressed."""
+        return self.run_pipeline_page("assembly", getattr(self, "assembly_page", None),
+                                      "assemble_selected",
+                                      "Assembly on its own tab needs the Assembly page, which "
+                                      "this build could not open. Samples → Assembly still runs "
+                                      "the assembler.")
+
+    def run_pipeline_page(self, key, page, action, refusal):
+        """Show the page that owns this work, then ask it to do it. Never guesses."""
+        runner = getattr(page, action, None)
+        if not callable(runner):
+            self.notify(refusal)
+            return False
+        self.navigate(key)
+        return runner()
 
     # --- where each station's work happens today -----------------------------
     def goto_samples(self):
@@ -850,10 +910,6 @@ class BaseWindow(QMainWindow):
             tabs = getattr(self, "settings_tabs", None)
             if tabs is not None:
                 tabs.setCurrentIndex(0)
-        # A station that has been given a real page clears that page its own way.
-        adopted = (self.stations.get(key) or {}).get("adopted")
-        if adopted is not None and callable(getattr(adopted, "clear", None)):
-            adopted.clear()
         # A typing station's selection is the step table it runs on, nothing wider.
         step = {"mlst": "st", "cgmlst": "cgmlst"}.get(key)
         table_widget = (getattr(self, "step_tables", None) or {}).get(step)
@@ -863,6 +919,12 @@ class BaseWindow(QMainWindow):
         if callable(refresh):
             refresh()
         self.refresh_stations()
+        # A station that has been given a real page clears that page its own way,
+        # and does it last: the station refresh above would otherwise redraw the
+        # very table the user just asked to be emptied.
+        adopted = (self.stations.get(key) or {}).get("adopted")
+        if adopted is not None and callable(getattr(adopted, "clear", None)):
+            adopted.clear()
         return True
 
     # --- menus this window owns ----------------------------------------------

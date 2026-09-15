@@ -37,7 +37,9 @@ from wmlstudio.widgets import button, label
 
 INTRO = ("Everything WMLSTudio can install or update, in the order you meet it. Nothing is "
          "downloaded, and no server is contacted, until you press a button on this page. "
-         "Your own sequences are never uploaded.")
+         "Your own sequences are never uploaded. “Install and update everything” shows you what "
+         "is missing and what is stale before it fetches anything, and publishes new reference "
+         "data beside what you already have.")
 
 # How the four probe states read to somebody deciding whether to press the button.
 INSTALLED_WORDS = {"ready": "Installed", "partial": "Partly installed",
@@ -107,6 +109,10 @@ def describe_version(item) -> str:
             parts.append(f"{detail['count']} schemes")
             parts.append(f"{detail.get('installed_by_you', 0)} added by you")
     elif key == "hydra_database":
+        catalogue = detail.get("catalogue") or {}
+        if catalogue.get("total"):
+            parts.append(f"{len(catalogue.get('installed') or [])} of {catalogue['total']} "
+                         "reference sets installed")
         for name, version in sorted((detail.get("databases") or {}).items()):
             parts.append(f"{name} {version}")
     elif key == "characterization":
@@ -142,6 +148,12 @@ def describe_update(item) -> str:
     expected = str(detail.get("expected_revision") or "")
     if installed and expected and installed != expected:
         return f"Update available: this build expects revision {expected}"
+    catalogue = detail.get("catalogue") or {}
+    if catalogue.get("available"):
+        # Being installed is not being complete: the sets that are not here report
+        # nothing, and that reads exactly like a clean isolate unless it is said.
+        return (f"{len(catalogue['available'])} further reference sets are listed by name and can "
+                "be chosen for download")
     return "Nothing is checked online until you press the button"
 
 
@@ -172,6 +184,12 @@ class UpdateCenter(QDialog):
         row = QHBoxLayout()
         self.check_button = button("Check what is installed", self.refresh, True)
         row.addWidget(self.check_button)
+        self.everything_button = button("Install and update everything…", self.plan_everything)
+        self.everything_button.setToolTip(
+            "Checks what is installed, what is missing and what is stale, shows you the list, "
+            "and only then installs and updates it. Reference data is published beside what you "
+            "have, so an analysis already recorded keeps the snapshot it was run against.")
+        row.addWidget(self.everything_button)
         row.addStretch()
         row.addWidget(button("Close", self.close))
         layout.addLayout(row)
@@ -224,6 +242,94 @@ class UpdateCenter(QDialog):
             self.table.setCellWidget(row, 4, action)
         self.table.resizeRowsToContents()
         self.status.setText(report.get("summary", ""))
+
+    # --- install and update everything --------------------------------------
+    def plan_everything(self):
+        """Work out what one press would do, before anything is downloaded.
+
+        Two steps on purpose. "Update everything" is otherwise a leap of faith:
+        this reads the disk, asks NCBI for one version string and comes back with
+        a list — what is missing, what is stale, what is left alone and why — and
+        nothing is fetched until that list has been agreed to.
+        """
+        window = self.window_ref
+        project = getattr(window, "project", None)
+        selected = project.get_setting("hydra_database_root", "") if project is not None else ""
+        data_root = str(getattr(window, "root", "") or "") or None
+
+        def operation(cancelled, progress):
+            progress(0, 1, "Checking what is installed, and which reference release is current…")
+            return provisioning.installation_plan(data_root=data_root, selected=selected,
+                                                  cancelled=cancelled)
+
+        launch = getattr(window, "launch_task", None)
+        if callable(launch) and launch(operation, "provisioning:plan", self.confirm_everything):
+            self.status.setText("Checking what is installed and what is missing…")
+            return True
+        self.status.setText("Another background task is running. Try again when it finishes.")
+        return False
+
+    @staticmethod
+    def plan_text(plan):
+        """The plan as a person reads it: what will happen to each thing, and why."""
+        lines = [plan["summary"], ""]
+        for action, heading in (("install", "Will be installed"), ("update", "Will be updated"),
+                                ("by hand", "Cannot be installed from here")):
+            rows = [step for step in plan["steps"] if step["action"] == action]
+            if not rows:
+                continue
+            lines.append(heading + ":")
+            lines.extend(f"  • {step['title']}"
+                         + (f" ({step['size']})" if step.get("size") else "")
+                         + (f" — {step['licence']}" if step.get("licence") else "")
+                         for step in rows)
+            lines.append("")
+        if plan["release"].get("message"):
+            lines.append(plan["release"]["message"])
+        lines.append("Your own sequences are never uploaded. Nothing already installed is "
+                     "overwritten: new reference data is published beside it.")
+        return "\n".join(lines)
+
+    def confirm_everything(self, plan):
+        """Show the plan, then run it only if the person says yes."""
+        if not isinstance(plan, dict) or "steps" not in plan:
+            return False
+        self.status.setText(plan["summary"])
+        if not plan["work"]:
+            QMessageBox.information(self, "Nothing to install", self.plan_text(plan))
+            return False
+        if QMessageBox.question(self, "Install and update everything",
+                                self.plan_text(plan)) != QMessageBox.StandardButton.Yes:
+            self.status.setText("Nothing was downloaded. " + plan["summary"])
+            return False
+        window = self.window_ref
+        project = getattr(window, "project", None)
+        data_root = str(getattr(window, "root", "") or "") or None
+
+        def operation(cancelled, progress):
+            return provisioning.install_everything(data_root=data_root, project=project,
+                                                   plan=plan, cancelled=cancelled,
+                                                   progress=progress)
+
+        launch = getattr(window, "launch_task", None)
+        if callable(launch) and launch(operation, "update:everything", self.everything_finished):
+            self.everything_button.setEnabled(False)
+            self.status.setText("Installing and updating…")
+            return True
+        self.status.setText("Another background task is running. Try again when it finishes.")
+        return False
+
+    def everything_finished(self, result):
+        """Say what landed and what did not; a failure here is not a silent one."""
+        self.everything_button.setEnabled(True)
+        if not isinstance(result, dict):
+            return
+        self.status.setText(result.get("summary", "") + " Press “Check what is installed” to "
+                            "re-read the state from disk.")
+        if result.get("failed"):
+            QMessageBox.warning(self, "Some items were not installed", "\n\n".join(
+                f"{failure['title']}: {failure['error']}\n{failure['state']}"
+                for failure in result["failed"]))
 
     # --- installing ---------------------------------------------------------
     def route_for(self, key):

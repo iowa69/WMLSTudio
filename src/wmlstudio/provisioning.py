@@ -21,6 +21,7 @@ Python process, or through studio_scripts/check_setup.py, with no desktop sessio
 
 from __future__ import annotations
 
+import importlib
 import json
 import os
 import subprocess
@@ -539,7 +540,7 @@ def hydra_database_requirement(data_root=None, selected=None, *, cancelled=None)
     "Select at least one installed HYDRA database". When another candidate store
     would work, this says so and points the fix at it instead of at a download.
     """
-    from .hydra_runtime import database_status, installed_databases
+    from .hydra_runtime import database_catalogue, database_status, installed_databases
     root = Path(data_root) if data_root is not None else default_data_root()
     download_root = root / "references" / "hydra"
     probes = []
@@ -576,10 +577,17 @@ def hydra_database_requirement(data_root=None, selected=None, *, cancelled=None)
               "required": True}
     active = probes[0]
     others = [probe for probe in probes[1:] if probe["databases"]]
+    # The whole catalogue, not only what is installed: "2 of 15 sets are here" is
+    # the sentence that turns a silent screen into a decision somebody can make.
+    catalogue = database_catalogue(active["path"] if not active["error"] else None, measure=False)
     detail = {"active": {key: active[key] for key in ("origin", "path", "databases", "error")},
               "candidates": [{key: probe[key] for key in ("origin", "path", "exists",
                                                           "databases", "error")}
-                             for probe in probes]}
+                             for probe in probes],
+              "catalogue": {"total": len(catalogue["entries"]),
+                            "installed": catalogue["installed"],
+                            "available": catalogue["available"],
+                            "downloadable": catalogue["automatic"]}}
     probe_sentence = (f"Read the database manifest of {len(probes)} candidate store"
                       f"{'s' if len(probes) != 1 else ''}, starting with {active['path']}.")
     if active["error"]:
@@ -647,8 +655,30 @@ def hydra_database_requirement(data_root=None, selected=None, *, cancelled=None)
                    "catalogue." if status["organisms"] else "") + age))
 
 
+def hydra_database_catalogue(data_root=None, selected=None, *, measure=True) -> dict:
+    """Every reference set HYDRA can search, against the store this project uses.
+
+    The complaint this answers is that HYDRA needs inputs it never names: it runs
+    against whatever happens to be installed and reports nothing for everything
+    else, and the two are indistinguishable in a result. Here the whole list is
+    visible before a run, each row saying what the set is for, who publishes it,
+    under what licence, how big it is and whether this computer has it.
+    """
+    from .hydra_runtime import database_catalogue
+    root = Path(data_root) if data_root is not None else default_data_root()
+    candidates = hydra_database_candidates(root, selected)
+    origin, path = candidates[0] if candidates else ("", None)
+    catalogue = database_catalogue(path, measure=measure)
+    catalogue["origin"] = origin
+    # Which of several candidate stores this is answers the other half of the
+    # question: a set can be installed and still not be the one a run would read.
+    catalogue["summary"] = catalogue["summary"].replace(
+        catalogue["root"] or "no store", f"{catalogue['root'] or 'no store'} ({origin})", 1)
+    return catalogue
+
+
 def hydra_prerequisites(data_root=None, selected=None, *, organism=None, databases=None,
-                        verify=False, cancelled=None) -> dict:
+                        virulence=None, verify=False, cancelled=None) -> dict:
     """The gate a Run HYDRA button calls before it starts anything at all.
 
     The three HYDRA requirements plus the engine's own pre-run check, collapsed
@@ -660,6 +690,10 @@ def hydra_prerequisites(data_root=None, selected=None, *, organism=None, databas
 
     verify defaults to False here because this runs on a button press: the tools
     are resolved but not executed. Pass verify=True for a settings page.
+
+    `virulence` is passed through to the engine's own check, so the caller can
+    show, before the run, whether virulence and stress elements will be searched
+    for this isolate and under whose organism curation.
     """
     from .hydra_runtime import preflight, runtime_capabilities
     root = Path(data_root) if data_root is not None else default_data_root()
@@ -672,7 +706,7 @@ def hydra_prerequisites(data_root=None, selected=None, *, organism=None, databas
     detail = items[-1].detail
     store = detail.get("root") or (detail.get("active") or {}).get("path") or ""
     checked = preflight(store or None, databases=databases, organism=organism,
-                        capabilities=capabilities)
+                        virulence=virulence, capabilities=capabilities)
     blocking = [item for item in items if not item.ready]
     action = next((item.action for item in blocking if item.action is not None), None)
     message = checked["message"]
@@ -686,7 +720,8 @@ def hydra_prerequisites(data_root=None, selected=None, *, organism=None, databas
             "items": [item.as_dict() for item in items],
             "blocking": [item.key for item in blocking],
             "database": checked["database_status"], "databases": checked["databases"],
-            "organism": checked["organism"], "limitations": checked["limitations"],
+            "organism": checked["organism"], "virulence": checked["virulence"],
+            "limitations": checked["limitations"],
             "action": ({"key": next(item.key for item in blocking if item.action is action),
                         **asdict(action)} if action is not None else None)}
 
@@ -948,6 +983,269 @@ def update_hydra_databases(download_root=None, names=HYDRA_DEFAULT_DATABASES, *,
                                   if selected else
                                   "Select it for a project to run against it."))})
     return result
+
+
+def _days_since(stamp) -> int | None:
+    """How old a staged copy is, from the day the manifest records. None if unrecorded."""
+    try:
+        staged = datetime.strptime(str(stamp)[:10], "%Y-%m-%d").replace(tzinfo=UTC)
+    except (TypeError, ValueError):
+        return None
+    return max(0, (datetime.now(UTC) - staged).days)
+
+
+def _database_steps(catalogue, release, wanted) -> list[dict]:
+    """One row per reference set: what is here, what would be fetched, and why."""
+    from .hydra_runtime import REFERENCE_AGE_DAYS
+    steps = []
+    for row in catalogue["entries"]:
+        name = row["name"]
+        step = {"key": "database:" + name, "title": row["title"], "kind": "database",
+                "name": name, "size": row["size"], "licence": row["licence"],
+                "provider": row["provider"], "purpose": row["purpose"],
+                "automatic": row["download"] == "automatic", "state": row["state"],
+                "action": "skip", "reason": ""}
+        # Only NCBI publishes a release string this application can compare
+        # against; its sets are judged by that release however old the copy is.
+        # For every other provider age is the only signal there is, and "we
+        # cannot tell whether this is current" is not the same as "it is".
+        checked = name in ("ncbi", "protein") and bool(release.get("latest"))
+        age = _days_since(row["staged"])
+        if row["installed"] and checked and release.get("newer_available"):
+            step["state"] = "stale"
+            step["action"] = "update"
+            step["reason"] = (f"Installed release {release.get('installed') or 'unrecorded'}; NCBI "
+                              f"publishes {release.get('latest')} today. Determinants named "
+                              "between the two are not in what you have.")
+        elif row["installed"] and checked:
+            step["reason"] = (f"Release {row['version'] or release['installed']} is the one NCBI "
+                              "publishes today, so nothing is re-downloaded for it.")
+        elif row["installed"] and age is not None and age > REFERENCE_AGE_DAYS:
+            step["state"] = "stale"
+            step["action"] = "update" if step["automatic"] else "by hand"
+            step["reason"] = (
+                f"This copy was staged {age} days ago and "
+                + (f"the current release could not be checked{': ' + release['error'] if release.get('error') else ''}"
+                   if name in ("ncbi", "protein") else
+                   f"{row['provider'] or 'the provider'} publishes no version this application can "
+                   "compare against")
+                + ", so whether it is current is unknown. Fetching it again is the only way to "
+                  "find out.")
+        elif row["installed"]:
+            step["reason"] = ("Installed"
+                              + (f", release {row['version']}" if row["version"] else "")
+                              + (f", staged {age} days ago" if age is not None else "")
+                              + ". Nothing is re-downloaded for a set that is already current.")
+        elif name not in wanted:
+            step["state"] = "not selected"
+            step["reason"] = ("Listed but not selected, so nothing is downloaded for it and no "
+                              "isolate is screened against it. " + row["purpose"].capitalize()
+                              + ".")
+        elif not step["automatic"]:
+            step["action"] = "by hand"
+            step["reason"] = (f"{row['provider'] or 'The provider'} publishes no versioned "
+                              f"download this engine can fetch, so it must be installed by hand "
+                              f"from {row['url'] or 'the provider'}.")
+        else:
+            step["action"] = "install"
+            step["reason"] = (f"Not installed, so nothing is reported for {row['purpose']}."
+                              + (" " + row["licence_note"] if row["licence_note"] else ""))
+        steps.append(step)
+    return steps
+
+
+def installation_plan(data_root=None, selected=None, *, databases=None, report_data=None,
+                      check_online=True, cancelled=None) -> dict:
+    """What one "install and update everything" press would do, before it does it.
+
+    Read-only: it probes the disk, asks NCBI for one version string when
+    check_online is set, and changes nothing. Its job is to turn "update
+    everything" from a leap of faith into a list a person can read first —
+    what is installed, what is missing, what is stale and what will be left alone
+    because its provider's terms have to be read before anyone agrees to them.
+
+    The default scope is deliberately not "every database in the catalogue": it is
+    the core sets, plus everything already installed, plus whatever the caller
+    named. A reference set nobody asked for is listed, never fetched.
+    """
+    root = Path(data_root) if data_root is not None else default_data_root()
+    probe = report_data if report_data is not None else report(
+        data_root=root, hydra_database_root=selected, verify=False, cancelled=cancelled)
+    catalogue = hydra_database_catalogue(root, selected, measure=False)
+    release = {"installed": "", "latest": "", "newer_available": False, "message": "", "error": ""}
+    if check_online:
+        try:
+            release = hydra_update_available(root, selected, cancelled=cancelled)
+        except (OSError, ValueError) as error:  # HydraRuntimeError is a ValueError.
+            release["error"] = f"Could not check for a newer reference release: {error}"
+            release["message"] = release["error"]
+    wanted = set(HYDRA_DEFAULT_DATABASES) | set(catalogue["installed"])
+    wanted |= {str(name) for name in (databases or ())}
+    steps = []
+    for item in probe["items"]:
+        action = item.get("action") or {}
+        step = {"key": item["key"], "title": item["title"], "kind": "requirement",
+                "state": item["state"], "action": "skip", "reason": item["reason"],
+                "automatic": bool(action.get("entry_point")), "size": "",
+                "route": action.get("ui_route", ""), "command": action.get("command", ""),
+                "entry_point": action.get("entry_point", ""),
+                "argument": action.get("argument", "")}
+        if item["key"] == "hydra_database":
+            # The reference sets are planned one by one below; a single "install
+            # the databases" row would hide which of them is actually missing.
+            step["reason"] = catalogue["summary"]
+        elif not item["ready"] and step["automatic"]:
+            step["action"] = "install"
+        elif not item["ready"]:
+            step["action"] = "by hand"
+            step["reason"] = (item["reason"] + " " + (action.get("detail") or "")).strip()
+        steps.append(step)
+    steps.extend(_database_steps(catalogue, release, wanted))
+    grouped = {name: [step for step in steps if step["action"] == name]
+               for name in ("install", "update", "by hand", "skip")}
+    fetchable = set(catalogue["automatic"])
+    databases_to_fetch = sorted({step["name"] for step in steps if step["kind"] == "database"
+                                 and step["action"] in ("install", "update")} & fetchable)
+    # A new snapshot must carry everything the current store holds, or the next run
+    # silently loses whatever is left out — but the engine can only build a set it
+    # can fetch, so a hand-installed set cannot be carried across and its absence
+    # is stated here instead of being discovered later as an empty result.
+    keeping = sorted((set(databases_to_fetch) | set(catalogue["installed"])) & fetchable)
+    stranded = sorted(set(catalogue["installed"]) - fetchable)
+    work = grouped["install"] + grouped["update"]
+    summary = ("Everything this installation needs is already here and current; running this again "
+               "would download nothing." if not work else
+               f"{len(grouped['install'])} to install, {len(grouped['update'])} to update"
+               + (f", {len(grouped['by hand'])} that must be installed by hand"
+                  if grouped["by hand"] else "")
+               + ". Reference sets are published beside the ones you have, so a result already "
+                 "recorded keeps the snapshot it was run against.")
+    if stranded and databases_to_fetch:
+        summary += (" " + ", ".join(stranded) + " was installed by hand and this engine cannot "
+                    "fetch it, so it will not be in the new snapshot; import it again there, or "
+                    "keep using the store you have.")
+    return {"generated_utc": datetime.now(UTC).isoformat(), "data_root": str(root),
+            "database_root": catalogue["root"], "database_origin": catalogue.get("origin", ""),
+            "release": release, "catalogue": catalogue, "steps": steps,
+            "install": [step["key"] for step in grouped["install"]],
+            "update": [step["key"] for step in grouped["update"]],
+            "by_hand": [step["key"] for step in grouped["by hand"]],
+            "databases": databases_to_fetch, "database_snapshot_contents": keeping,
+            "installed_by_hand": stranded, "work": bool(work), "summary": summary}
+
+
+def install_everything(data_root=None, *, project=None, databases=None, selected=None,
+                       plan=None, cancelled=None, progress=None) -> dict:
+    """Check what is installed, install what is missing, update what is stale — once.
+
+    The single action behind the "install and update everything" button. It is
+    safe to press twice: the second press finds nothing missing and nothing stale
+    and downloads nothing. It never replaces a reference set an analysis has
+    already used — a new snapshot is published beside the existing one and only
+    then recorded as the store this project uses — and a download that fails
+    leaves every previous snapshot exactly as it was and says which set failed.
+
+    Each step is attempted independently and its failure is recorded rather than
+    raised, so one unreachable provider does not discard the work that succeeded.
+    Cancellation is the exception: it stops everything and is passed up, because a
+    cancelled install is not a partial success.
+    """
+    from .sequence import AnalysisCancelled
+    root = Path(data_root) if data_root is not None else default_data_root()
+    plan = plan if plan is not None else installation_plan(
+        root, selected, databases=databases, cancelled=cancelled)
+    steps = [step for step in plan["steps"] if step["action"] in ("install", "update")]
+    requirement_steps = [step for step in steps if step["kind"] == "requirement"]
+    fetch = plan["databases"]
+    total = len(requirement_steps) + (1 if fetch else 0)
+    done = 0
+    result = {"plan": plan, "installed": [], "updated": [], "failed": [], "skipped": [],
+              "database_root": plan["database_root"], "selected": False, "checked_utc": "",
+              "summary": ""}
+
+    def announce(message):
+        if progress:
+            progress(done, max(1, total), message)
+
+    announce(plan["summary"])
+    for step in requirement_steps:
+        if cancelled and cancelled():
+            raise AnalysisCancelled("Install and update cancelled; nothing further was changed.")
+        announce(f"{step['title']}: installing…")
+        try:
+            module_name, _, function_name = str(step["entry_point"]).partition(":")
+            target = getattr(importlib.import_module(module_name), function_name)
+            argument = step.get("argument") or None
+            if argument:
+                target(argument, cancelled=cancelled, progress=progress)
+            else:
+                target(cancelled=cancelled, progress=progress)
+            result["installed"].append(step["key"])
+        except AnalysisCancelled:
+            raise
+        except (OSError, ValueError, AttributeError, ImportError, TypeError) as error:
+            result["failed"].append({"key": step["key"], "title": step["title"],
+                                     "error": str(error),
+                                     "state": "Nothing was changed for this item."})
+        done += 1
+    if fetch:
+        if cancelled and cancelled():
+            raise AnalysisCancelled("Install and update cancelled; nothing further was changed.")
+        announce("Downloading reference sets: " + ", ".join(fetch)
+                 + ". Existing snapshots are kept.")
+        download_root = root / "references" / "hydra"
+        try:
+            # One snapshot carrying everything the store should hold: fetching only
+            # the missing sets would publish a snapshot narrower than the one in
+            # use, and the next run would silently lose the rest.
+            updated = update_hydra_databases(download_root, plan["database_snapshot_contents"],
+                                             project=project, cancelled=cancelled,
+                                             progress=progress)
+            result["database_root"] = updated["database_root"]
+            result["selected"] = updated["selected"]
+            result["updated"].extend("database:" + name
+                                     for name in plan["database_snapshot_contents"])
+        except AnalysisCancelled:
+            raise
+        except (OSError, ValueError) as error:  # HydraRuntimeError is a ValueError.
+            result["failed"].append({
+                "key": "hydra_database", "title": "HYDRA reference databases",
+                "error": str(error),
+                "state": ("No new snapshot was published, so the reference store you were using "
+                          "is unchanged and every recorded analysis keeps its own snapshot.")})
+        done += 1
+    result["skipped"] = [step["key"] for step in plan["steps"] if step["action"] == "by hand"]
+    result["checked_utc"] = datetime.now(UTC).isoformat()
+    result["summary"] = _install_summary(result, plan)
+    announce(result["summary"])
+    return result
+
+
+def _install_summary(result, plan) -> str:
+    """One paragraph: what was installed, what failed, and what is still by hand."""
+    parts = []
+    if not result["installed"] and not result["updated"] and not result["failed"]:
+        parts.append("Nothing needed installing or updating: everything this installation uses "
+                     "was already here and current.")
+    if result["installed"]:
+        parts.append(f"Installed {len(result['installed'])}: "
+                     + ", ".join(sorted(result["installed"])) + ".")
+    if result["updated"]:
+        parts.append("Published a new reference snapshot holding "
+                     + ", ".join(sorted(name.split(":", 1)[-1] for name in result["updated"]))
+                     + (" and recorded it for this project"
+                        if result["selected"] else
+                        "; select it for a project to run against it")
+                     + ". Previous snapshots are kept, and analyses already recorded keep the "
+                       "snapshot they were run against.")
+    for failure in result["failed"]:
+        parts.append(f"{failure['title']} failed: {failure['error']} {failure['state']}")
+    if result["skipped"]:
+        parts.append(f"{len(result['skipped'])} item(s) cannot be installed from here and are "
+                     "listed with where to get them: " + ", ".join(sorted(result["skipped"])) + ".")
+    if plan["release"].get("error"):
+        parts.append(plan["release"]["error"])
+    return " ".join(parts)
 
 
 def select_hydra_database(project, path) -> str:

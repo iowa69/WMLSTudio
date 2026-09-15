@@ -74,6 +74,38 @@ Analysis never downloads references. The frozen worker is `WMLSTudio-HYDRA.exe`.
 selected-provider snapshot, validates it and atomically publishes it under a
 new versioned directory. Existing snapshots are retained on success or failure.
 
+## The reference catalogue, and what is bundled
+
+The engine's own registry knows fifteen reference sets. Until this revision the
+application silently used two of them and named none of the rest, which made a
+missing database indistinguishable from a database that does not exist.
+`hydra_runtime.database_catalogue` now returns every set the pinned engine can
+use, installed or not, with the provider, title, purpose, licence, citation and
+upstream address the registry records, plus whether the application knows how to
+fetch it automatically or the user must obtain it by hand.
+
+Only the NCBI sets are bundled, and they are bundled **whole**: nucleotide,
+protein and point mutations. Packaging refuses a starter snapshot that lacks
+`AMRProt-mutation.tsv` or the per-organism DNA catalogues under `mutation/dna`,
+because a package that could screen only for acquired genes would report nothing
+for point mutations, and a reader cannot tell that from a negative result. The
+bundled release carries 13 DNA catalogues; 30 organisms have curated protein
+mutations; their union is 31. The engine accepts 32 organism names, so one
+accepted organism — *Burkholderia mallei* — has no mutation catalogue at all and
+is reported as exactly that, not as an organism with no mutations.
+
+`element_counts` reads the bundled protein table directly: 10,078 records, of
+which 8,794 are AMR, 1,025 virulence, 259 stress and 288 point-mutation entries.
+Those counts are what decides whether offering a virulence search would offer
+anything; a store with no protein reference returns zeros and the caller says so
+rather than letting an unperformed search resemble a clean result.
+
+"Install and update everything" plans the whole store before touching it and
+excludes every set whose licence is not an open one — CARD's academic licence, and
+any provider that records no licence. Those remain individually downloadable after
+their terms are shown. An automatic action must not accept licences on a user's
+behalf.
+
 Protein is imported before nucleotide references so HYDRA's own importer can
 transfer curated family/class annotations. The wrapper reads NCBI's
 `version.txt` before and after download and refuses to publish if it changes.
@@ -86,7 +118,11 @@ participates in the reference hash inventory.
 
 Native WMLSTudio MLST results are not replaced by HYDRA's MLST/lineage modules.
 No organism means no automatic mutation-catalog selection; the user can provide
-an organism explicitly. Upstream nucleotide defaults are 80% identity and 60%
+an organism explicitly. The organism also decides whether virulence and stress
+elements are searched: the default searches them where the isolate's organism is
+established, and the two overrides — always, or never — are recorded in the run's
+provenance together with the reason, so a report always says what was not looked
+for as well as what was found. Upstream nucleotide defaults are 80% identity and 60%
 reference coverage; translated defaults are 90% identity and 90% complete-hit
 coverage. The latter is **not** a hard hit-exclusion floor: upstream can retain
 partial protein evidence down to its 50% partial-coverage threshold. Explicit

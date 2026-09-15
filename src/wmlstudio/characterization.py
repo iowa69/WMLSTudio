@@ -14,6 +14,7 @@ from pathlib import Path
 from . import __version__
 from .hydra import _validate_sample, load_hydra_report
 from .organism_modules import module_tasks, registered_modules, stamp_applicability
+from .plasmid_evidence import MOB_SUITE_GAP, contig_plasmid_evidence, marker_location
 from .sample_workflow import _execution_input_sha256, _sha256, current_input_sha256
 from .sequence import (
     AnalysisCancelled,
@@ -31,6 +32,9 @@ LIMITATIONS = [
     'AMR determinant annotations are genomic associations, not susceptibility, MIC, treatment advice or validated AST.',
     'A replicon and resistance/virulence marker on one contig support co-location only, not a reconstructed or transmissible plasmid.',
     'Negative results are meaningful only for the explicitly completed assay and its reference coverage/QC gates.',
+    'The plasmid view is a contig screen over replicon markers. It is not MOB-suite, MOB-typer or MOB-recon '
+    'and is not equivalent to them: no relaxase or MPF type, no oriT, no plasmid reconstruction, no cluster '
+    'code and no mobility prediction is produced.',
 ]
 
 # Explicit NCBI reference labels only, not a class-to-member-drug expansion.
@@ -149,8 +153,14 @@ def persist_characterization(project, sample_id, result):
     return project.get_sample(sample_id)
 
 
-def synthesize_accessory_evidence(hydra_sample, source, contig_lengths, *, virulence_hits=()):
-    """Join only verified-input evidence. Database classes are not expanded to drugs."""
+def synthesize_accessory_evidence(hydra_sample, source, contig_lengths, *, virulence_hits=(),
+                                  contig_headers=None):
+    """Join only verified-input evidence. Database classes are not expanded to drugs.
+
+    ``contig_headers`` maps a contig identifier to its full FASTA header, so the
+    plasmid view can report what the assembler declared about closure and
+    coverage. It is optional: without it those stay unknown rather than absent.
+    """
     if hydra_sample is None:
         return {'drug_associations': dict(source, associations=[]),
                 'plasmid_hypotheses': dict(source, replicons=[], contig_associations=[])}
@@ -180,13 +190,7 @@ def synthesize_accessory_evidence(hydra_sample, source, contig_lengths, *, virul
     plasmid_assayed = bool(replicons) or 'plasmidfinder' in source.get('databases', [])
 
     def location(hit):
-        contig = hit.get('contig') or hit.get('sequence')
-        start, end = hit.get('start'), hit.get('end')
-        if (contig not in contig_lengths or isinstance(start, bool) or isinstance(end, bool)
-                or not isinstance(start, int) or not isinstance(end, int)):
-            return None
-        start, end = sorted((start, end))
-        return (contig, start, end) if 1 <= start <= end <= contig_lengths[contig] else None
+        return marker_location(hit, contig_lengths)
 
     marker_hits = [dict(hit, marker_type='AMR') for hit in amr if hit.get('resolution') in {'COMPLETE', 'POINT'}]
     marker_hits += [dict(hit, marker_type='VIRULENCE') for hit in virulence_hits
@@ -206,11 +210,21 @@ def synthesize_accessory_evidence(hydra_sample, source, contig_lengths, *, virul
                           'marker': hit['gene'], 'marker_type': hit['marker_type'], 'gap_bp': gap,
                           'replicon_coordinates': list(rep_position[1:]), 'marker_coordinates': list(position[1:]),
                           'interpretation': 'Co-located on one assembled contig; plasmid identity, circularity and transferability remain unproven.'})
+    # Contig context for every replicon and every determinant, including the
+    # determinants that share no contig with a replicon: their absence from this
+    # view would read as absence of the determinant.
+    contigs = contig_plasmid_evidence(contig_lengths, replicons, [(hit, hit['marker_type']) for hit in marker_hits],
+                                      contig_headers=contig_headers)
     plasmids = {'status': 'completed' if plasmid_assayed else 'not_run', 'replicons': replicons,
                 'contig_associations': links, 'source': source, 'reconstruction': 'not_run',
+                'mobility': 'not_predicted', 'plasmid_count': 'not_estimated',
+                'contig_evidence': contigs['contigs'], 'determinant_placement': contigs['determinant_placement'],
+                'depth_basis': contigs['depth_basis'], 'depth_departure_ratio': contigs['depth_departure_ratio'],
+                'unplaced_determinants': contigs['unplaced_determinants'], 'mob_suite_gap': list(MOB_SUITE_GAP),
                 'reason': 'Replicon assay was supplied.' if plasmid_assayed else 'No plasmid-reference assay was run; the NCBI AMR starter is not a comprehensive plasmid assay.',
                 'limitations': [LIMITATIONS[2], 'Identical replicon names in different isolates do not identify the same plasmid.',
-                                'Draft assemblies may split, collapse or misassemble repeated plasmid sequence. Long-read/hybrid assembly or validated reconstruction is needed to resolve structure.']}
+                                'Draft assemblies may split, collapse or misassemble repeated plasmid sequence. Long-read/hybrid assembly or validated reconstruction is needed to resolve structure.',
+                                *contigs['limitations']]}
     return {'drug_associations': drugs, 'plasmid_hypotheses': plasmids}
 
 
@@ -256,15 +270,19 @@ def characterize_assembly(path, reference_root=None, hydra_report=None, cancelle
         if module.locus_st_provider and isinstance(block, dict) and block.get('status') not in {'not_run', 'failed'}:
             apply_locus_sts(result.get('virulence'), module.locus_st_provider(block))
     stamp_applicability(result, organism)
-    contig_lengths = {}
+    contig_lengths, contig_headers = {}, {}
     with SequenceReader(path, cancelled) as reader:
         for record in reader:
             if record.identifier in contig_lengths:
                 raise ValueError(f'Duplicate contig identifier: {record.identifier}')
             contig_lengths[record.identifier] = len(record.sequence)
+            # The full header is kept only so the assembler's own closure and
+            # coverage claims can be quoted back; no header text becomes a call.
+            contig_headers[record.identifier] = record.name
     chosen, source = _verified_hydra_sample(hydra_report, qc['input_sha256'], hydra_sample_name)
     result.update(synthesize_accessory_evidence(chosen, source, contig_lengths,
-                                              virulence_hits=result['virulence'].get('hits', [])))
+                                              virulence_hits=result['virulence'].get('hits', []),
+                                              contig_headers=contig_headers))
     if file_sha256(path, cancelled) != qc['input_sha256']:
         raise ValueError('Assembly changed during characterization; results were not accepted.')
     states = {result[key]['status'] for key in ('species_evidence', 'virulence', 'drug_associations',

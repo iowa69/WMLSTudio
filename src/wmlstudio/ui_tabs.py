@@ -20,7 +20,9 @@ Two orders live here and they are deliberately different:
 A station that a later round builds is listed in ``PLANNED``. Its tab exists so
 the pipeline has no gap where a step belongs, and its page says plainly that
 nothing runs there yet and where that work happens today. A tab must never look
-finished when it is not.
+finished when it is not. The reverse also holds: a station that has been given a
+real page leaves ``PLANNED`` in the same change, so no working tab is still
+labelled as reserved.
 """
 
 from __future__ import annotations
@@ -41,8 +43,8 @@ PAGE_KEYS = (
 PIPELINE = (
     "overview",     # where this investigation stands
     "isolates",     # Samples -- the hub everything else works from
-    "reads",        # planned: read trimming and quality filtering (fastp)
-    "assembly",     # planned: read pairs to assemblies
+    "reads",        # read trimming and quality filtering (fastp), before anything else
+    "assembly",     # read pairs to assemblies, with their own metrics
     "mlst",         # classical seven-locus typing
     "compare",      # the MLST minimum spanning tree
     "cgmlst",       # core-genome typing and its table of calls
@@ -55,7 +57,7 @@ PIPELINE = (
 )
 
 #: Stations a later round builds. Their pages say so; they never pretend to work.
-PLANNED = ("reads", "assembly", "snp")
+PLANNED = ("snp",)
 
 #: Pages this layout adds on top of the seven the window has always built.
 STATION_KEYS = PAGE_KEYS[7:]
@@ -95,10 +97,10 @@ PAGE_PURPOSE = {
     "overview": "See where this investigation stands and what to do next.",
     "isolates": "Every sample, its organism and its files in one place — the hub every other "
                 "tab works from.",
-    "reads": "Read trimming and quality filtering. Planned for a later round; nothing runs "
-             "on this tab yet.",
-    "assembly": "Read pairs into assemblies, with their own metrics. Planned for a later round; "
-                "today assemblies are made in Samples.",
+    "reads": "Trim and quality-filter read pairs with fastp, and read its own report. Trimming "
+             "improves reads; it does not validate an isolate or establish a species.",
+    "assembly": "Assemble chosen read pairs and see their contig metrics. An assembly is a "
+                "reconstruction, not a finished genome, and contiguity is not purity.",
     "mlst": "Classical seven-locus MLST: one sequence type per isolate from a curated allele panel.",
     "compare": "A minimum spanning tree of seven-locus allele differences. An MST is not a "
                "phylogeny, and similarity is not proof of transmission.",
@@ -121,8 +123,8 @@ PAGE_PURPOSE = {
 NEXT_STEP = {
     "overview": ("Import sequences…", "browse_files"),
     "isolates": ("Add samples…", "browse_files"),
-    "reads": ("Check reads in Samples →", "goto_assembly_step"),
-    "assembly": ("Assemble in Samples →", "goto_assembly_step"),
+    "reads": ("Trim read pairs…", "run_read_trimming"),
+    "assembly": ("Assemble read pairs…", "run_assembly_station"),
     "mlst": ("Type selected isolates…", "run_mlst_station"),
     "compare": ("Choose cohort…", "choose_comparison_cohort"),
     "cgmlst": ("Call cgMLST on selected…", "run_cgmlst_station"),
@@ -147,12 +149,12 @@ CLEAR_ACTIONS = {
         "keeps": "every sample, its files, its organism and its saved results",
     },
     "reads": {
-        "clears": "nothing — no read-quality work runs on this tab yet",
-        "keeps": "every sample and every file exactly as it is",
+        "clears": "this tab's table, its selection and the report it is showing",
+        "keeps": "every trimmed file, every fastp report and every original FASTQ",
     },
     "assembly": {
-        "clears": "nothing — no assembly runs on this tab yet",
-        "keeps": "every assembly already made in Samples",
+        "clears": "this tab's table, its selection and the metrics it is showing",
+        "keeps": "every assembly, its recorded metrics and the reads it was made from",
     },
     "mlst": {
         "clears": "this tab's selection and its summary line",
@@ -202,11 +204,12 @@ STATION_PAGES = {
         "subtitle": "Trimming and quality filtering of raw read pairs, before anything is "
                     "assembled or typed.",
         "body": [
-            "A later round puts read trimming and filtering here, with the filtered read "
-            "files kept beside the originals and the original files never modified.",
-            "Until then, the read statistics this application does compute are shown per "
-            "sample in Samples. They describe the reads as supplied: sampled read statistics "
-            "are a prefix of the file, not quality validation of the whole file.",
+            "This build could not open the read-trimming page, so nothing on this tab runs. "
+            "Read statistics for each sample are still shown in Samples; they describe the "
+            "reads as supplied, and a sampled statistic is a prefix of the file rather than "
+            "quality validation of the whole file.",
+            "Where the page does open, trimming writes new files beside the originals and "
+            "never modifies, renames or deletes a supplied FASTQ.",
         ],
         "actions": [("Open Samples", "goto_samples")],
     },
@@ -215,11 +218,11 @@ STATION_PAGES = {
         "subtitle": "Read pairs into assemblies, with the metrics that say whether an assembly "
                     "is worth typing.",
         "body": [
-            "A tab of its own is planned for a later round: assembler choice, contig metrics "
-            "and a per-isolate record of how each assembly was produced.",
-            "Assembling already works today from Samples, where the Assembly step runs the "
-            "bundled assembler on the read pairs you select. An assembly is a reconstruction, "
-            "not a finished genome, and a typing result inherits its limits.",
+            "This build could not open the assembly page, so nothing on this tab runs. "
+            "Assembling still works from Samples, where the Assembly step runs the bundled "
+            "assembler on the read pairs you select.",
+            "An assembly is a reconstruction, not a finished genome; contiguity is not "
+            "completeness and not a purity check, and a typing result inherits its limits.",
         ],
         "actions": [("Open Samples → Assembly", "goto_assembly_step")],
     },

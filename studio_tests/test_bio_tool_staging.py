@@ -91,6 +91,59 @@ def test_hydra_starter_never_silently_redistributes_other_providers(tmp_path):
     assert not (tmp_path / "staged").exists()
 
 
+def starter_fixture(tmp_path, *, dna=True, protein_mutations=True):
+    """The shape of a staged NCBI-only core store, small enough to hash instantly."""
+    root = tmp_path / "source"
+    (root / "nucl/ncbi").mkdir(parents=True)
+    (root / "prot/protein").mkdir(parents=True)
+    (root / "nucl/ncbi/sequences.fna").write_text(">gene\nACGT\n", encoding="utf-8")
+    (root / "prot/protein/proteins.faa").write_text(">protein\nMKV\n", encoding="utf-8")
+    if protein_mutations:
+        (root / "prot/protein/AMRProt-mutation.tsv").write_text(
+            "organism\tgene\nEscherichia\tgyrA\n", encoding="utf-8")
+    if dna:
+        (root / "mutation/dna").mkdir(parents=True)
+        (root / "mutation/dna/Escherichia.fna").write_text(">gyrA\nACGT\n", encoding="utf-8")
+    (root / "manifest.json").write_text(json.dumps({"databases": {
+        "ncbi": {"path": "nucl/ncbi", "version": "test"},
+        "protein": {"path": "prot/protein", "version": "test"}}}), encoding="utf-8")
+    return root
+
+
+def test_the_bundled_core_must_carry_the_point_mutation_catalogues(tmp_path):
+    """Bundling the core is what makes the first run work offline — mutations included.
+
+    A package that could screen only for acquired genes would report nothing at
+    all for point mutations, and a reader cannot tell that apart from a negative
+    result. So it is refused at packaging time rather than explained afterwards.
+    """
+    staged = staging.stage_hydra_database(starter_fixture(tmp_path), tmp_path / "staged")
+    assert staged["point_mutations"]["dna_catalogues"] == ["Escherichia"]
+    assert staged["point_mutations"]["protein_mutation_table"] is True
+    assert "never a negative mutation result" in staged["point_mutations"]["meaning"]
+    # Re-staging an already published snapshot re-checks it rather than trusting it.
+    assert staging.stage_hydra_database(tmp_path / "staged", tmp_path / "staged")["point_mutations"] \
+        == staged["point_mutations"]
+
+
+@pytest.mark.parametrize("missing", ["dna", "protein_mutations"])
+def test_a_core_store_without_point_mutations_is_refused_before_it_is_published(tmp_path, missing):
+    source = starter_fixture(tmp_path, **{missing: False})
+    with pytest.raises(ValueError, match="point-mutation"):
+        staging.stage_hydra_database(source, tmp_path / "staged")
+    assert not (tmp_path / "staged").exists()
+
+
+def test_the_real_bundled_core_carries_every_point_mutation_catalogue_it_claims():
+    """The shipped snapshot itself, not a fixture: the build depends on this being true."""
+    starter = Path(__file__).resolve().parents[1] / "src/wmlstudio/resources/hydra/starter"
+    if not (starter / "manifest.json").is_file():
+        pytest.skip("The NCBI core store is staged by the build, not committed")
+    inventory = staging.point_mutation_inventory(starter)
+    assert staging.require_point_mutations(inventory, starter) is inventory
+    assert inventory["protein_mutation_bytes"] > 0
+
+
 def skesa_fixture(tmp_path):
     source = tmp_path / "skesa-artifact"
     source.mkdir()

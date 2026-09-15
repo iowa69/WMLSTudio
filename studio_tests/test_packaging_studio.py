@@ -3,6 +3,7 @@ import importlib.util
 import io
 import json
 import tarfile
+import zipfile
 from pathlib import Path
 
 import pytest
@@ -179,6 +180,85 @@ def frozen_module():
     return module
 
 
+def budget_module():
+    spec = importlib.util.spec_from_file_location(
+        "check_size_budget", ROOT / "studio_packaging/check_size_budget.py")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def sized_bundle(tmp_path):
+    """A frozen-bundle shape whose parts are the components the gate reports."""
+    root = tmp_path / "WMLSTudio"
+    payload = {
+        "_internal/Tools/blast/bin/blastn.exe": b"native search " * 400,
+        "_internal/Tools/fastp/fastp": b"read trimming " * 300,
+        "_internal/Tools/fastqc/jre/bin/java.dll": b"private java runtime " * 500,
+        "_internal/wmlstudio/resources/schemes/manifest.json": b'{"scheme_count": 1}',
+        "_internal/wmlstudio/resources/hydra/starter/manifest.json": b'{"databases": {}}',
+        "_internal/PySide6/Qt6Core.dll": b"qt " * 900,
+        "WMLSTudio.exe": b"MZ application",
+    }
+    for relative, content in payload.items():
+        path = root / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(content)
+    return root
+
+
+def test_the_portable_download_is_measured_per_component_and_gated(tmp_path):
+    """A size promise nobody measures is a size promise that quietly stops being true."""
+    budget = budget_module()
+    report = budget.check(budget.measure(sized_bundle(tmp_path)))
+    named = {entry["component"]: entry for entry in report["components"]}
+    assert "fastp — read trimming" in named
+    assert named["BLAST+ — the nucleotide and translated search"]["files"] == 1
+    assert named["FastQC and its private Java runtime"]["files"] == 1
+    assert sum(entry["files"] for entry in report["components"]) == report["files"] == 7
+    assert report["status"] == "within_budget" and report["budget_bytes"] == 1_000_000_000
+    # The same measurement, against a budget this bundle cannot meet, must fail.
+    over = budget.check(budget.measure(sized_bundle(tmp_path)), budget=10)
+    assert over["status"] == "over_budget" and over["headroom_bytes"] < 0
+    warned = budget.check(budget.measure(sized_bundle(tmp_path)),
+                          budget=int(report["total_bytes"] / 0.9))
+    assert warned["status"] == "approaching_budget"
+
+
+def test_every_byte_of_the_package_is_attributed_to_some_component(tmp_path):
+    """An unattributed byte is exactly how a bundle grows without anyone noticing."""
+    budget = budget_module()
+    report = budget.measure_tree(sized_bundle(tmp_path), compress=False)
+    assert sum(entry["bytes"] for entry in report["components"]) == report["total_bytes"]
+    assert budget.component_for("nothing/known/here.dll") == budget.OTHER
+    assert budget.component_for("wmlstudio/resources/tools/skesa/skesa.exe").startswith("SKESA")
+
+
+def test_a_directory_prediction_is_not_smaller_than_the_archive_it_predicts(tmp_path):
+    """The gate on the built folder must not pass a package the real ZIP would fail."""
+    budget = budget_module()
+    bundle = sized_bundle(tmp_path)
+    archive = tmp_path / "portable.zip"
+    with zipfile.ZipFile(archive, "w", zipfile.ZIP_DEFLATED) as handle:
+        for path in sorted(bundle.rglob("*")):
+            if path.is_file():
+                handle.write(path, Path("WMLSTudio", path.relative_to(bundle)).as_posix())
+    predicted = budget.measure_tree(bundle)
+    measured = budget.measure_archive(archive)
+    assert predicted["total_bytes"] >= measured["total_bytes"]
+    assert {entry["component"] for entry in predicted["components"]} == \
+           {entry["component"] for entry in measured["components"]}
+
+
+def test_bytes_on_disk_are_never_compared_with_the_download_budget(tmp_path):
+    """Extracted size is a different quantity; reporting it as headroom would mislead."""
+    budget = budget_module()
+    report = budget.check(budget.measure_tree(sized_bundle(tmp_path), compress=False), budget=None)
+    assert report["status"] == "reported" and report["gated"] is False
+    assert "budget_bytes" not in report and "headroom_bytes" not in report
+    assert "not the download size" in report["measured"]
+
+
 def frozen_bundle(tmp_path, **panel):
     bundle = tmp_path / "WMLSTudio"
     destination = bundle / "_internal/wmlstudio/resources/characterization/starter"
@@ -222,6 +302,102 @@ def test_a_frozen_report_without_module_evidence_fails_rather_than_passing_quiet
     with pytest.raises(ValueError, match="registry did not load"):
         frozen.check_organism_modules(
             tmp_path / "absent-cli", tmp_path, panel, ["species_evidence", "virulence"])
+
+
+def test_the_package_bundles_verified_fastp_where_it_exists_and_builds_without_it(tmp_path):
+    """Upstream ships no Windows fastp, so an absent tool is a build state, not a failure."""
+    import wmlstudio.read_tools as read_tools
+    recipe = RECIPE.read_text(encoding="utf-8")
+    assert "from stage_read_tools import verify as verify_fastp" in recipe
+    assert 'datas.append((str(fastp), "Tools/fastp"))' in recipe
+    # The staged tree must land exactly where the application looks for it.
+    assert 'Tools/fastp' in Path(read_tools.__file__).read_text(encoding="utf-8")
+    # Nothing about fastp may stop a build, and its libraries must not be hoisted
+    # to the application root any more than SKA2's or the JRE's are.
+    fastp_block = recipe.split("fastp = root /")[1].split("\nif json.loads(")[0]
+    assert 'if (fastp / "manifest.json").is_file():' in fastp_block
+    assert "raise SystemExit" not in fastp_block and "ships without read trimming" in fastp_block
+    assert "(fastqc, ska, tools, fastp)" in recipe
+    # With nothing staged the application states the absence rather than trimming.
+    capabilities = read_tools.runtime_capabilities(root=tmp_path / "nothing-staged")
+    assert capabilities["available"] is False
+    assert "unavailable" in capabilities["reason"] and "download" in capabilities["reason"]
+
+
+def core_reference_bundle(tmp_path, *, dna=True):
+    """A frozen bundle carrying only the AMR core store, in its packaged location."""
+    store = tmp_path / "WMLSTudio/_internal/wmlstudio/resources/hydra/starter"
+    (store / "nucl/ncbi").mkdir(parents=True)
+    (store / "prot/protein").mkdir(parents=True)
+    (store / "prot/protein/AMRProt-mutation.tsv").write_text(
+        "organism\tgene\nEscherichia\tgyrA\n", encoding="utf-8")
+    (store / "prot/protein/taxgroup.tsv").write_text(
+        "organism\tgroup\nEscherichia\tEscherichia\nBurkholderia_mallei\tBurkholderia\n",
+        encoding="utf-8")
+    (store / "prot/protein/meta.tsv").write_text(
+        "gene\telement_type\nblaZ\tAMR\nfimH\tVIRULENCE\n", encoding="utf-8")
+    if dna:
+        (store / "mutation/dna").mkdir(parents=True)
+        (store / "mutation/dna/Escherichia.fna").write_text(">gyrA\nACGT\n", encoding="utf-8")
+    (store / "manifest.json").write_text(json.dumps({"databases": {
+        "ncbi": {"path": "nucl/ncbi"}, "protein": {"path": "prot/protein"}}}), encoding="utf-8")
+    return tmp_path / "WMLSTudio"
+
+
+def test_the_frozen_bundle_must_carry_the_point_mutations_it_promises(tmp_path):
+    """An unperformed mutation search and a clean mutation result look identical."""
+    report = frozen_module().check_core_reference(core_reference_bundle(tmp_path))
+    assert report["status"] == "passed"
+    assert report["dna_point_mutation_catalogues"] == ["Escherichia"]
+    # An accepted organism with no catalogue is named, not quietly counted as covered.
+    assert report["accepted_without_any_catalogue"] == ["Burkholderia_mallei"]
+    assert "never a negative mutation result" in report["boundary"]
+    assert report["elements"]["VIRULENCE"] == 1 and report["elements"]["read"] is True
+
+
+def test_a_frozen_bundle_that_lost_its_mutation_catalogues_fails_the_build(tmp_path):
+    with pytest.raises(ValueError, match="point-mutation"):
+        frozen_module().check_core_reference(core_reference_bundle(tmp_path, dna=False))
+
+
+def test_the_frozen_check_names_an_absent_fastp_instead_of_reporting_trimming_done(tmp_path):
+    bundle = tmp_path / "WMLSTudio"
+    (bundle / "_internal").mkdir(parents=True)
+    report = frozen_module().check_fastp(bundle, tmp_path, "")
+    assert report["status"] == "not_bundled"
+    assert "unavailable" in report["reason"] and "untrimmed" in report["reason"]
+
+
+def test_the_capability_audit_stops_calling_fastp_preprocessing_absent():
+    """The audit is the page a reader checks before trusting a claim; it must move."""
+    document = (ROOT / "docs/STUDIO_CAPABILITIES.md").read_text(encoding="utf-8")
+    assert "no fastp/SPAdes/long-read pipeline" not in document
+    assert "fastp preprocessing, validated" not in document
+    assert "fastp 1.3.7" in document
+    guide = (ROOT / "docs/WORKFLOW_GUIDE.md").read_text(encoding="utf-8")
+    assert "fastp" in guide and "does not validate an isolate" in guide
+    # A tool that is present on one platform and absent on another must say which.
+    assert "trimming is unavailable" in guide
+
+
+def test_the_audit_never_claims_interface_reach_for_a_tab_that_says_it_is_planned():
+    """The Reach column is the audit's whole point: it must track the built tabs.
+
+    A station listed in `ui_tabs.PLANNED` prints "nothing runs on this tab yet".
+    Publishing "Interface" for the same capability would make the audit the more
+    optimistic of the two documents a reader can check, which is exactly backwards.
+    """
+    from wmlstudio.ui_tabs import PLANNED, TAB_LABELS
+    document = (ROOT / "docs/STUDIO_CAPABILITIES.md").read_text(encoding="utf-8")
+    revision = document.split("## What the portable package costs")[0]
+    rows = [line for line in revision.splitlines() if line.startswith("| ") and line.endswith(" |")]
+    for key in PLANNED:
+        label = TAB_LABELS[key]
+        for row in rows:
+            if label.casefold() in row.casefold():
+                assert not row.rstrip(" |").endswith("Interface"), (
+                    f"the audit claims Interface reach for {label}, which ui_tabs still "
+                    f"lists as planned: {row}")
 
 
 def test_threshold_documentation_reports_the_catalogue_as_it_actually_is():
