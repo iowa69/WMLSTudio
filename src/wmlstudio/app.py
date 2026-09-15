@@ -171,6 +171,7 @@ class BaseWindow(QMainWindow):
         # application still means the page it has always meant.
         self.build_update()
         self.install_pipeline_pages()
+        self.build_navigator()
         self.install_tree_station()
         self.install_typing_stations()
         self.install_workspace_headers()
@@ -194,6 +195,11 @@ class BaseWindow(QMainWindow):
         # The tab widget reports a tab position; navigate speaks keys and
         # build-order numbers, so the bar hands it the key it just showed.
         self.pages.pageShown.connect(self.navigate)
+        # The navigator down the side is the navigation now. The bar is hidden
+        # rather than removed, and anyone who wants it back has View ▸ Show the
+        # tab bar; a project that asked for it keeps it.
+        self.pages.tabBar().setVisible(
+            bool(self.project.get_setting("workspace.tab_bar", False)))
         bottom = QHBoxLayout()
         self.progress_text = label("Ready when you are. Your files stay on this computer.", "small")
         bottom.addWidget(self.progress_text, 1)
@@ -238,14 +244,15 @@ class BaseWindow(QMainWindow):
         layout.addWidget(label("YOUR WORKSPACE", "eyebrow"))
         self.project_label = label(self.project_path.stem, "cardTitle", True)
         layout.addWidget(self.project_label)
-        layout.addSpacing(18)
-        # The tab bar is the navigation now. nav_buttons stays as an empty list so
-        # navigate's checked-state loop keeps working untouched.
-        self.nav_buttons = []
+        layout.addSpacing(12)
         # One name per page, in build order, because the View menu binds Alt+N to
-        # the Nth page built. The tab bar shows the same pages in pipeline order.
+        # the Nth page built.
         self.nav_names = [page_name(key) for key in PAGE_KEYS]
-        layout.addWidget(label("Your isolates, your evidence and your report each keep their own cohort. Nothing is included automatically.", "small", True))
+        # The navigator needs the pages to exist, and the sidebar is built before
+        # them, so its place is reserved here and filled by build_navigator once
+        # every page has a position to navigate to.
+        self.sidebar_layout, self.nav_slot = layout, layout.count()
+        self.nav_buttons, self.nav_entries, self.navigator = [], {}, None
         layout.addStretch()
         tip, content = card()
         self.sidebar_tip = tip
@@ -369,9 +376,128 @@ class BaseWindow(QMainWindow):
                 folded.append(key)
         return folded
 
+    def build_navigator(self):
+        """The workflow down the side of the window, grouped into its stages.
+
+        Fourteen pages never fitted in one row of tabs. The bar shrank its padding
+        until the labels touched and still clipped the last of them, and inside the
+        pages the same thing happened one level down: the resistance matrix, the
+        point mutations and the plasmid tables were each reported as missing while
+        sitting in a sub-tab strip that ran off the right-hand edge of the window.
+
+        A vertical list cannot clip. It also has room to say which stage each page
+        belongs to, so the order of the work is visible rather than remembered —
+        which is what a person who is not a bioinformatician actually needs from a
+        pipeline. The tab bar stays behind it, hidden but intact: every page key,
+        position and index still means what it meant, and View ▸ Show the tab bar
+        brings it back for anyone who prefers it.
+        """
+        from wmlstudio.ui_tabs import NAV_GROUPS
+        self.nav_entries = {}
+        holder = QWidget()
+        holder.setObjectName("navigator")
+        column = QVBoxLayout(holder)
+        column.setContentsMargins(0, 0, 0, 0)
+        column.setSpacing(1)
+        for stage, entries in NAV_GROUPS:
+            rows = [row for row in (self.navigator_row(entry) for entry in entries) if row]
+            if not rows:
+                continue
+            column.addSpacing(9)
+            column.addWidget(label(stage.upper(), "eyebrow"))
+            for name, tip, handler, entry_key, indent in rows:
+                entry = button(("    " + name) if indent else name, handler)
+                entry.setObjectName("navSub" if indent else "navEntry")
+                entry.setCheckable(True)
+                entry.setAutoExclusive(False)
+                entry.setToolTip(tip)
+                entry.setAccessibleName(f"Go to {name.strip()}")
+                column.addWidget(entry)
+                self.nav_entries.setdefault(entry_key, entry)
+        # Scoped to this frame, not the application: setting the application
+        # stylesheet re-polishes every widget of every window, which is why it is
+        # done once at startup and never per widget.
+        holder.setStyleSheet(
+            "QPushButton#navEntry { text-align: left; padding: 5px 9px; border: none; "
+            "background: transparent; color: #C2D3E6; font-size: 12px; border-radius: 5px; }"
+            "QPushButton#navEntry:hover { background: #17243A; color: #E7EFF9; }"
+            "QPushButton#navEntry:checked { background: #17323C; color: #7FE9D2; "
+            "font-weight: 600; }"
+            "QPushButton#navSub { text-align: left; padding: 3px 9px; border: none; "
+            "background: transparent; color: #8FA9C2; font-size: 11px; border-radius: 5px; }"
+            "QPushButton#navSub:hover { background: #17243A; color: #E7EFF9; }")
+        self.sidebar_layout.insertWidget(self.nav_slot, holder)
+        self.navigator = holder
+        return holder
+
+    def navigator_row(self, entry):
+        """One navigator row, or None when the page or sub-tab it names is absent.
+
+        A shortcut into a sub-tab is matched by keyword rather than by exact
+        title, so a page that renames its own tabs loses the shortcut instead of
+        keeping a button that lands nowhere.
+        """
+        if isinstance(entry, str):
+            if self.pages.position_of(entry) < 0:
+                return None
+            return (page_name(entry), PAGE_PURPOSE.get(entry, ""),
+                    lambda checked=False, k=entry: self.navigate(k), entry, False)
+        key, keyword, name = entry
+        tabs = self.pages.subtabs(key)
+        if self.pages.position_of(key) < 0 or tabs is None:
+            return None
+        title = next((tabs.tabText(index) for index in range(tabs.count())
+                      if keyword in tabs.tabText(index).casefold()), "")
+        if not title:
+            return None
+
+        def go(checked=False, k=key, t=title):
+            self.navigate(k)
+            return self.pages.show_subtab(k, t)
+
+        return (name, f"{page_name(key)} — {title}", go, f"{key}:{keyword}", True)
+
+    def mark_navigator(self, key):
+        """Show which page the window is on. Called by navigate, for both bars."""
+        for entry_key, entry in getattr(self, "nav_entries", {}).items():
+            entry.setChecked(entry_key == key)
+        return key
+
+    def set_tab_bar_visible(self, shown):
+        """Offer the old horizontal tab bar again, for anyone who prefers it.
+
+        The bar is only hidden, never removed: `position_of`, `tabText`,
+        `setTabVisible` and every build-order page number still work exactly as
+        they did, so nothing else in the window has to know which navigation is
+        on screen.
+        """
+        shown = bool(shown)
+        self.pages.tabBar().setVisible(shown)
+        self.project.set_setting("workspace.tab_bar", shown)
+        return shown
+
     def heading(self, layout, title, subtitle):
-        layout.addWidget(label(title, "title"))
-        layout.addWidget(label(subtitle, "muted", True))
+        """One compact line per page, rather than a poster and a paragraph.
+
+        Reported as "very crowded ... there should be more space". Measured on the
+        drawn window, roughly 370 px of every tab sat above its first row of data,
+        and the largest single piece was this: a 33 px title on its own line and a
+        wrapped subtitle under it, directly below an orientation strip that had
+        already said what the tab is for. The words are kept — they orient someone
+        who is not a bioinformatician — but at a size that leaves room for data.
+
+        Two widgets, in this order, because the evidence and report pages rewrite
+        this title by layout position (`layout.itemAt(0).widget().setText(...)`).
+        Putting a nested layout here instead silently broke those pages, so the
+        shape is part of the contract even though only the size changed.
+        """
+        name = label(title, "cardTitle")
+        name.setToolTip(subtitle)
+        layout.addWidget(name)
+        detail = label(subtitle, "small", True)
+        detail.setToolTip(subtitle)
+        layout.addWidget(detail)
+        return name
 
     def build_overview(self):
         _, layout = self.page()
@@ -740,15 +866,18 @@ class BaseWindow(QMainWindow):
         """
         installed = {}
         calls = getattr(self, "cgmlst_calls", None)
-        if calls is not None and self.adopt_station("cgmlst", calls):
-            # It was a sub-tab of the comparison page; a widget lives in one place,
-            # and its place is the tab that carries its name.
+        if calls is not None:
+            # Taken out of the comparison page's sub-tabs BEFORE it is mounted:
+            # QTabWidget.removeTab hides the page it removes, so adopting first
+            # and removing second mounted the panel and then hid it, leaving the
+            # tab showing its heading above an empty page.
             subtabs = self.pages.subtabs("compare")
             if subtabs is not None:
                 index = subtabs.indexOf(calls)
                 if index >= 0:
                     subtabs.removeTab(index)
-            installed["cgmlst"] = calls
+            if self.adopt_station("cgmlst", calls):
+                installed["cgmlst"] = calls
         self.snp_tree_page = None
         try:
             from wmlstudio.ui_snp import SnpTreePanel
@@ -837,6 +966,9 @@ class BaseWindow(QMainWindow):
         if station is None or widget is None:
             return False
         station["layout"].addWidget(widget)
+        # Explicitly, because a widget that has just been taken out of a
+        # QTabWidget arrives hidden and would give the tab an empty page.
+        widget.show()
         station["holder"].show()
         station["placeholder"].hide()
         station["status"].hide()
@@ -1202,9 +1334,7 @@ class BaseWindow(QMainWindow):
                 return
             key = self.pages.current_key() or key
             self.breadcrumb.setText("WORKSPACE  /  " + page_name(key).upper())
-            current = self.pages.slot_of(key)
-            for i, item in enumerate(self.nav_buttons):
-                item.setChecked(i == current)
+            self.mark_navigator(key)
             page = self.pages.currentWidget()
             if page:
                 page.update()

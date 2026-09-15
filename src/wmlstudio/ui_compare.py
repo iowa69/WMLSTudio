@@ -80,6 +80,16 @@ BASELINE_AUTODRAW_LIMIT = 120
 # no view ever mixes their numbers.
 TYPING_VIEWS = ("mlst", "cgmlst")
 COUNTERPART = {"mlst": "cgmlst", "cgmlst": "mlst"}
+# Where each tree's arrangement is stored. One key per role: the baseline tree's
+# layout must never overwrite the arrangement somebody made of the current tree,
+# and the other typing view is a third picture again.
+GRAPH_STYLE_SETTINGS = {'current': 'graph_style', 'baseline': 'graph_style.baseline',
+                        'counterpart': 'graph_style.counterpart'}
+# What each pane is called in the sentence a detached window prints about where
+# the arrangement it is given ends up.
+GRAPH_ROLE_NAMES = {'current': 'the current tree on the comparison page',
+                    'baseline': 'the baseline tree on the comparison page',
+                    'counterpart': 'the other typing view on the comparison page'}
 
 
 def typing_title(kind):
@@ -2307,14 +2317,53 @@ class ComparisonWorkspaceMixin:
         # arrangement the user made of the current tree.
         if role == 'baseline':
             if self._pending_baseline_graph_state is None and hasattr(self.baseline_tree, "export_state"):
-                self.project.set_setting("graph_style.baseline", self.baseline_tree.export_state())
+                self.project.set_setting(GRAPH_STYLE_SETTINGS['baseline'],
+                                         self.baseline_tree.export_state())
             return
         if role == 'counterpart':
             if hasattr(self.counterpart_tree, 'export_state'):
-                self.project.set_setting('graph_style.counterpart', self.counterpart_tree.export_state())
+                self.project.set_setting(GRAPH_STYLE_SETTINGS['counterpart'],
+                                         self.counterpart_tree.export_state())
             return
         if self._pending_graph_state is None and hasattr(self.tree, "export_state"):
-            self.project.set_setting("graph_style", self.tree.export_state())
+            self.project.set_setting(GRAPH_STYLE_SETTINGS['current'], self.tree.export_state())
+
+    def adopt_graph_window_state(self, state, *, role='current'):
+        """Keep an arrangement made in a detached window on the page it was opened from.
+
+        A window is a working surface, but the arrangement somebody made there is
+        the arrangement they want: it goes onto this page's own tree for that role
+        and into the same project setting the page already writes, so the next build
+        and the next window both open on it. Only presentation travels — positions,
+        colours, display labels, palette and which details are shown. No distance, no
+        allele call and no group membership is read or written here, and a window
+        opened on the baseline can never land on the current tree.
+        """
+        state = dict(state or {})
+        view = self._graph_view(role)
+        if not state or view is None or not hasattr(view, 'restore_state'):
+            return False
+        if getattr(view, 'nodes', None):
+            view.blockSignals(True)
+            try:
+                view.restore_state(state)
+            except ValueError:
+                # A state this version cannot read is presentation only. The page
+                # keeps the arrangement it has rather than being emptied by it.
+                return False
+            finally:
+                view.blockSignals(False)
+            if hasattr(view, 'legend'):
+                self.update_graph_legend(view.legend(), role=role)
+        # A tree that is waiting to be redrawn applies its arrangement at that draw,
+        # and that queued state would otherwise undo what the window just handed over.
+        if role == 'baseline' and self._pending_baseline_graph_state is not None:
+            self._pending_baseline_graph_state = state
+        elif role == 'current' and getattr(self, '_pending_graph_state', None) is not None:
+            self._pending_graph_state = state
+        self.project.set_setting(GRAPH_STYLE_SETTINGS.get(role, GRAPH_STYLE_SETTINGS['current']),
+                                 state)
+        return True
 
     def update_graph_legend(self, values, role='current'):
         self._legends[role] = dict(values)
@@ -2699,12 +2748,14 @@ class ComparisonWorkspaceMixin:
     def open_graph_window(self, role='current'):
         """Open one drawn tree in its own window: movable, editable, self-describing.
 
-        The window draws a *copy* of the forest, so this page keeps the tree it is
-        showing and two windows — one per threshold, or a baseline beside a current
-        tree — cannot overwrite each other's arrangement. Each window states its own
-        typing kind, reference, target count, cohort and link threshold, because a
-        "3" on a seven-locus edge and a "3" on a 2,358-target edge are different
-        quantities that must never be read off one scale.
+        The window draws a *copy* of the forest: the evidence behind it is never
+        recalculated, and a window opened on the baseline stays on the baseline. What
+        is arranged, coloured or relabelled in the window is applied back to the tree
+        of that role and saved with the project, so closing the window does not throw
+        the work away. Each window states its own typing kind, reference, target
+        count, cohort and link threshold, because a "3" on a seven-locus edge and a
+        "3" on a 2,358-target edge are different quantities that must never be read
+        off one scale.
         """
         role = role if role in self._graph_views() else 'current'
         if not self._view_active(role):
@@ -2728,9 +2779,14 @@ class ComparisonWorkspaceMixin:
         window.selectionChanged.connect(lambda ids, role=role: self.graph_selection_changed(ids, role=role))
         window.reportRequested.connect(lambda ids, role=role: self.report_graph_selection(ids, role=role))
         window.proximityRequested.connect(lambda sid, role=role: self.report_isolate_proximity(sid, role=role))
-        # The window's arrangement is deliberately not written back onto the page's
-        # stored style: it is a working surface, and the page must still show what it
-        # showed when the window was opened.
+        # An arrangement made in the window is the arrangement the person wants, so
+        # it comes back to the tree it was opened from — and to that tree's own
+        # setting only. The window says this itself, because an editing surface that
+        # silently changes the page behind it is as bad as one that silently throws
+        # the work away.
+        window.stateChanged.connect(
+            lambda state, role=role: self.adopt_graph_window_state(state, role=role))
+        window.keep_arrangement_in(GRAPH_ROLE_NAMES.get(role, GRAPH_ROLE_NAMES['current']))
         if getattr(self.tree, 'context_extension', None) is not None:
             window.view.context_extension = self.graph_context_entries
         self._graph_windows.append(window)

@@ -210,6 +210,218 @@ def test_clearing_the_page_empties_it_and_leaves_every_stored_profile_in_place(
     assert build(panel, qtbot, window)["target_count"] == len(LOCI)
 
 
+NOVEL_DIGEST = "d" * 64
+# One target's evidence exactly as cgtyping.py writes it for a validated novel call:
+# the alignment it was accepted on, the complete-CDS check, the place in the assembly
+# and the SHA-256 of the sequence itself.
+NOVEL_CALL = {
+    "locus": "target002", "status": "novel_validated", "allele": "NOVEL_" + NOVEL_DIGEST,
+    "reason": "Unambiguous complete CDS homolog; local sequence identity, not a registered allele.",
+    "sequence_sha256": NOVEL_DIGEST, "hit_count": 1, "candidates": ["NOVEL_" + NOVEL_DIGEST],
+    "evidence_truncated": False, "identity_percent": 97.5, "query_coverage": 0.994,
+    "subject_coverage": 0.988, "nearest_reference_allele": "12",
+    "cds_qc": {"valid": True, "reasons": [], "genetic_code": 11, "length": 1023,
+               "partial_begin": False, "partial_end": False},
+    "hits": [{"contig": "contig_7", "start": 1201, "end": 2223, "strand": "+"}],
+}
+PARTIAL_CALL = {
+    "locus": "target004", "status": "partial", "allele": None,
+    "reason": "A homolog was found, but complete-CDS or alignment criteria failed.",
+    "cds_qc": {"valid": False, "reasons": ["contig-edge partial CDS", "no complete terminal stop codon"],
+               "genetic_code": 11, "length": 812, "partial_begin": False, "partial_end": True},
+    "best_alignment": {"locus": "target004", "reference_allele": "3", "gene_id": "cds41",
+                       "identity": 0.991, "query_coverage": 0.72, "subject_coverage": 0.99,
+                       "bitscore": 1204.0},
+    "hits": [],
+}
+
+
+def typed_with_evidence(window, name, calls, novel_sequence=None):
+    """A stored profile carrying the rich per-target evidence a real cgMLST run writes."""
+    rows = [dict(calls.get(locus) or call_row(locus, "exact", str(index)))
+            for index, locus in enumerate(LOCI, 1)]
+    result = {
+        "scheme": "Demo cgMLST", "scheme_digest": DIGEST, "status": "incomplete",
+        "input_sha256": "a" * 64, "analysis_kind": "cgmlst", "sample_name": name,
+        "alleles": {row["locus"]: row["allele"] for row in rows}, "calls": rows,
+        "parameters": {"min_identity": 0.9, "min_coverage": 0.98, "genetic_code": 11,
+                       "method": "full-cds-cgmlst-v2"},
+        "novel_sequences": [novel_sequence] if novel_sequence else [],
+    }
+    sid = window.project.add_profile(name, result,
+                                     {"organism": {"genus": "Klebsiella", "species": "pneumoniae"}})
+    window.cohort_ids = set(window.cohort_ids) | {sid}
+    return sid
+
+
+def test_every_field_the_analysis_recorded_for_one_call_is_shown_in_its_detail_window(
+        panel, window, qtbot):
+    """A novel call's alignment, CDS check, place and full SHA-256 are written by the
+    analysis and were never displayed anywhere; a reviewer cannot judge a call whose
+    evidence the page keeps to itself."""
+    sid = typed_with_evidence(window, "Isolate A", {"target002": NOVEL_CALL},
+                              novel_sequence={"locus": "target002", "allele": "NOVEL_" + NOVEL_DIGEST,
+                                              "sequence_sha256": NOVEL_DIGEST, "sequence": "ATG" * 341})
+    build(panel, qtbot, window)
+    detail = panel.call_detail("target002", sid)
+    values = {row["name"]: row["value"] for row in detail["fields"]}
+    assert detail["state"] == "called_novel"
+    assert values["Novel sequence SHA-256"] == NOVEL_DIGEST  # the whole digest, not a prefix
+    assert values["Identity of the alignment (%)"] == "97.5"
+    assert values["Reference allele covered (fraction of 1)"] == "0.994"
+    assert values["Predicted CDS covered (fraction of 1)"] == "0.988"
+    assert values["Nearest reference allele"] == "12"
+    assert values["Complete-CDS check · valid"] == "yes"
+    assert values["Complete-CDS check · length"] == "1023"
+    assert values["Run setting · minimum identity (fraction of 1)"] == "0.9"
+    assert "1,023 bases" in values["Novel sequence stored with this profile"]
+    assert detail["places"] == NOVEL_CALL["hits"]
+    # The nearest reference allele is evidence about a sequence, never a call.
+    assert "not the allele of this target" in dict(
+        (row["name"], row["note"]) for row in detail["fields"])["Nearest reference allele"]
+    dialog = panel.open_call_detail(panel.model.index(1, 1))
+    qtbot.addWidget(dialog)
+    shown = {dialog.fields.item(row, 0).text(): dialog.fields.item(row, 1).text()
+             for row in range(dialog.fields.rowCount())}
+    assert shown == values
+    assert dialog.places.rowCount() == 1
+    assert [dialog.places.item(0, column).text() for column in range(4)] == [
+        "contig_7", "1201", "2223", "+"]
+    assert NOVEL_DIGEST in dialog.copy_evidence()
+    dialog.close()
+
+
+def test_a_target_with_no_call_never_says_the_target_is_absent_from_the_isolate(
+        panel, window, qtbot):
+    """An empty cell and an empty evidence list are the absence of a match, not a
+    finding of absence; reading one as the other would turn an assembly gap into a
+    reported deletion."""
+    sid = typed_with_evidence(window, "Isolate A", {
+        "target003": call_row("target003", "missing", None), "target004": PARTIAL_CALL})
+    build(panel, qtbot, window)
+    missing = panel.call_detail("target003", sid)
+    assert missing["state"] == "missing" and missing["has_allele"] is False
+    assert missing["meaning"] == CALL_STATES["missing"]["meaning"]
+    assert "not a finding that the target is absent from the isolate" in missing["places_note"]
+    assert "Read recheck" in missing["next_step"]
+    assert missing["places"] == []
+    # A partial call is its own answer with its own reasons, never folded into missing.
+    partial = panel.call_detail("target004", sid)
+    assert partial["state"] == "partial" and partial["answer"] == CALL_STATES["partial"]["label"]
+    values = {row["name"]: row["value"] for row in partial["fields"]}
+    assert values["Complete-CDS check · reasons"] == (
+        "contig-edge partial CDS, no complete terminal stop codon")
+    assert values["Best alignment that did not qualify · reference_allele"] == "3"
+    assert values["Best alignment that did not qualify · query_coverage"] == "0.72"
+
+
+def test_a_field_the_analysis_never_wrote_is_named_as_not_recorded_rather_than_zero(
+        panel, window, qtbot):
+    """A missing call has no identity and no coverage. Printing 0% where nothing was
+    measured would read as a failed alignment instead of an unperformed one."""
+    sid = typed_with_evidence(window, "Isolate A",
+                              {"target003": call_row("target003", "missing", None)})
+    build(panel, qtbot, window)
+    detail = panel.call_detail("target003", sid)
+    names = {row["name"] for row in detail["fields"]}
+    assert "Identity of the alignment (%)" not in names
+    assert "Identity of the alignment (%)" in detail["absent"]
+    assert "Allele recorded" in detail["absent"]
+    assert "not measured for this target; it is not a zero" in detail["absent_note"]
+    assert all(row["value"] != "0" for row in detail["fields"])
+
+
+def test_the_review_filter_shows_only_the_targets_without_an_allele_for_one_isolate(
+        panel, window, qtbot):
+    """Reviewing a scheme means working through the targets that carry no allele for a
+    chosen isolate; without the isolate scope the list is everyone's gaps at once."""
+    first = typed_with_evidence(window, "Isolate A", {
+        "target003": call_row("target003", "missing", None),
+        "target004": call_row("target004", "ambiguous", None)})
+    typed_with_evidence(window, "Isolate B", {"target009": call_row("target009", "mixed", None)})
+    table = build(panel, qtbot, window)
+    panel.state_filter.setCurrentIndex(
+        [panel.state_filter.itemData(index) for index in
+         range(panel.state_filter.count())].index("no_allele"))
+    assert [row["locus"] for row in panel.visible_rows()] == ["target003", "target004", "target009"]
+    panel.isolate_filter.setCurrentIndex(panel.isolate_filter.findData(first))
+    assert [row["locus"] for row in panel.visible_rows()] == ["target003", "target004"]
+    assert panel.model.rowCount() == 2
+    # Hiding rows moves no number: the denominator stays the scheme's own target count.
+    assert f"{len(LOCI)} targets this scheme defines" in panel.denominator.text()
+    assert f"Showing 2 of {len(LOCI)} targets" in panel.denominator.text()
+    assert f"2 of {len(LOCI)} targets shown" in panel.review_note.text()
+    assert "Isolate A" in panel.review_note.text()
+    assert "is not a called target" in panel.review_note.text()
+    assert table["target_count"] == len(LOCI)
+
+
+def test_the_review_filter_keeps_ambiguous_mixed_and_missing_three_separate_answers(
+        panel, window, qtbot):
+    """Ambiguous, mixed and missing are three different findings about an assembly.
+    A filter that lumped them together would hide which one a target actually got."""
+    typed_with_evidence(window, "Isolate A", {
+        "target003": call_row("target003", "missing", None),
+        "target004": call_row("target004", "ambiguous", None),
+        "target005": call_row("target005", "mixed", None),
+        "target006": NOVEL_CALL | {"locus": "target006"}})
+    build(panel, qtbot, window)
+    seen = {}
+    for index in range(panel.state_filter.count()):
+        key = panel.state_filter.itemData(index)
+        panel.state_filter.setCurrentIndex(index)
+        seen[key] = [row["locus"] for row in panel.visible_rows()]
+    assert seen["missing"] == ["target003"]
+    assert seen["ambiguous"] == ["target004"]
+    assert seen["mixed"] == ["target005"]
+    assert seen["called_novel"] == ["target006"]
+    assert seen["no_allele"] == ["target003", "target004", "target005"]
+    assert seen["any"] == LOCI
+    assert len({tuple(value) for value in (seen["missing"], seen["ambiguous"], seen["mixed"])}) == 3
+
+
+def test_the_right_click_menu_opens_the_evidence_and_filters_to_that_cells_state(
+        panel, window, qtbot):
+    """The review task starts from a cell that looks wrong, so the menu on that cell
+    has to reach both its evidence and every other target in the same state."""
+    sid = typed_with_evidence(window, "Isolate A", {
+        "target003": call_row("target003", "missing", None),
+        "target005": call_row("target005", "missing", None)})
+    build(panel, qtbot, window)
+    index = panel.model.index(2, 1)
+    menu = panel.grid_menu(index)
+    qtbot.addWidget(menu)
+    titles = [action.text() for action in menu.actions()]
+    assert titles[0] == "Show the full stored evidence for target003 in Isolate A"
+    assert titles[1] == f"Show only {CALL_STATES['missing']['label']} in Isolate A"
+    assert titles[2] == "Show only targets with no allele in Isolate A"
+    menu.actions()[1].trigger()
+    assert [row["locus"] for row in panel.visible_rows()] == ["target003", "target005"]
+    assert panel.isolate_filter.currentData() == sid
+    menu.actions()[3].trigger()
+    assert panel.model.rowCount() == len(LOCI)
+    menu.actions()[0].trigger()
+    assert panel.detail is not None and panel.detail.detail["locus"] == "target003"
+    qtbot.addWidget(panel.detail)
+    panel.detail.close()
+    # The target column names a row rather than one isolate's call, so it opens nothing.
+    assert panel.open_call_detail(panel.model.index(2, 0)) is not True
+    assert "Choose a cell under an isolate's column" in panel.status.text()
+
+
+def test_the_selected_cell_states_its_call_in_words_and_not_by_colour_alone(
+        panel, window, qtbot):
+    """Colour is unreadable to some users and unprintable in a report; the state of the
+    selected cell has to be legible as text beside the grid."""
+    typed_with_evidence(window, "Isolate A", {"target003": call_row("target003", "mixed", None)})
+    build(panel, qtbot, window)
+    text = panel.describe_selection(panel.model.index(2, 1))
+    assert "target003 · Isolate A" in text
+    assert CALL_STATES["mixed"]["label"] in text
+    assert CALL_STATES["mixed"]["meaning"] in text
+    assert text == panel.selected_note.text()
+
+
 def test_a_recheck_without_a_verified_read_pair_is_refused_in_the_users_own_words(
         panel, window, qtbot):
     typed(window, "Isolate A", {"target003": ("missing", None)})

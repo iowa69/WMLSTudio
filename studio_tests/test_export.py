@@ -24,7 +24,7 @@ from wmlstudio.simple_report import SIMPLE_REPORT_PRESET
 # Every key the "Customize sections…" dialog renders with options[key]; a preset
 # missing one of them raises KeyError the moment a user opens that dialog.
 DIALOG_KEYS = ("title", "investigation", "qc", "amr", "virulence", "plasmid_hypotheses",
-               "drug_associations", "graph", "graph_jpeg", "provenance")
+               "drug_associations", "graph", "graph_jpeg", "provenance", "snp", "point_mutations")
 
 
 @pytest.fixture
@@ -141,19 +141,26 @@ def test_the_one_page_layout_is_reached_through_the_ordinary_report_writer(recor
     assert "At a glance" in detailed and "What this report does not tell you" not in detailed
 
 
-def test_the_report_writer_threads_the_image_type_and_the_scope_sentence(records):
-    picture = b"\xff\xd8\xff\xe0 pretend image bytes"
+def test_the_report_writer_states_a_scope_the_user_did_not_choose(records):
     note = "No isolates were chosen for this report, so it covers all 2 isolates in the project."
-    threaded = review_report_html(records, selected_ids={"stable-id"}, graph_png=picture,
-                                  graph_mime="image/jpeg", scope_note=note, scope_implicit=True)
-    assert "data:image/jpeg;base64," in threaded
+    threaded = review_report_html(records, selected_ids={"stable-id"}, scope_note=note, scope_implicit=True)
     assert note in threaded
     assert "This scope was not chosen for this report." in threaded
-    # Every existing caller keeps PNG, the counted scope line, and no extra notice.
-    default = review_report_html(records, selected_ids={"stable-id"}, graph_png=picture)
-    assert "data:image/png;base64," in default
+    # Every existing caller keeps the counted scope line and no extra notice.
+    default = review_report_html(records, selected_ids={"stable-id"})
     assert "1 explicitly selected isolate(s)" in default
     assert "This scope was not chosen" not in default
+
+
+def test_a_tree_picture_is_not_printed_without_the_comparison_that_names_its_scale(records):
+    """Prevents a tree on a page where no sentence can say which scheme or threshold drew it."""
+    picture = b"\xff\xd8\xff\xe0 pretend image bytes"
+    page = review_report_html(records, selected_ids={"stable-id"}, graph_png=picture,
+                              graph_mime="image/jpeg")
+
+    assert ";base64," not in page
+    assert "No comparison snapshot is attached to this report" in page
+    assert "Nothing here says these isolates are unrelated." in page
 
 
 # ---------------------------------------------------------------------------

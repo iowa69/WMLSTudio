@@ -26,10 +26,13 @@ from PySide6.QtWidgets import (
 
 from .threshold_guidance import (
     CATALOG_VERSION,
+    OPERATIONAL_NOTICE,
+    OPERATIONAL_TRADE_OFF,
     ORGANISMS,
     REVIEWED_ON,
     SOURCES,
     guidance_for,
+    operational_cutoffs,
     record_decision,
 )
 from .ui_common import organism_for
@@ -48,7 +51,7 @@ class ThresholdGuideDialog(QDialog):
         self.resize(1060, 740)
         layout = QVBoxLayout(self)
         layout.addWidget(label("Which published context fits your question?", "title", True))
-        layout.addWidget(label(f"Catalog {CATALOG_VERSION} · reviewed {REVIEWED_ON}. Dated curation, not a live clinical guideline. Numbers never apply automatically.", "muted", True))
+        layout.addWidget(label(f"Catalog {CATALOG_VERSION} · reviewed {REVIEWED_ON}. Dated curation, not a live clinical guideline. Numbers never apply automatically. A cutoff your laboratory declared for itself is listed apart from the publications and is never saved as a citation.", "muted", True))
         top = QHBoxLayout()
         self.organism = QComboBox()
         self.organism.addItems(sorted(ORGANISMS))
@@ -139,6 +142,15 @@ class ThresholdGuideDialog(QDialog):
             item.setData(Qt.ItemDataRole.UserRole, entry)
             item.setToolTip(entry['scope'] + '\n\n' + entry['caveat'])
             self.entries.addItem(item)
+        # Local cutoffs sit after the publications and say so in their own row:
+        # they are this laboratory's rules, not evidence, and the list must never
+        # let one be read as the newest paper on the subject.
+        for row in operational_cutoffs(self.organism.currentText(), method=None):
+            item = QListWidgetItem(f"local cutoff · ≤ {row['operational_threshold']}"
+                                   f" · declared {row['declared_on']}  · not published")
+            item.setData(Qt.ItemDataRole.UserRole, row)
+            item.setToolTip(row['provenance'])
+            self.entries.addItem(item)
         self.apply_value.setChecked(False)
         if self.entries.count():
             self.entries.setCurrentRow(0)
@@ -154,6 +166,9 @@ class ThresholdGuideDialog(QDialog):
         def e(value):
             return html.escape(str(value))
 
+        if entry.get('evidence_class') == 'user_supplied_operational':
+            self.show_operational(entry, e)
+            return
         source = entry['source']
         value = entry['published_threshold']
         body = f"<h2>{e(entry['organism'])}</h2><h3>{e(entry['method'])}: {e('No numeric rule curated' if value is None else '≤ ' + str(value) + ' ' + entry['unit'])}</h3>"
@@ -175,6 +190,34 @@ class ThresholdGuideDialog(QDialog):
         for check in (self.schema_review, self.protocol_review, self.epi_review):
             check.setChecked(False)
 
+    def show_operational(self, entry, e):
+        """A local rule, shown as a local rule: no citation line, no DOI, no adoption.
+
+        The panel deliberately has nowhere to put a reference, because there is
+        no reference. Adoption is disabled rather than hidden so the reason is
+        legible: this number cannot be saved as evidence, only set as a setting.
+        """
+        body = (f"<h2>{e(entry['organism'])}</h2>"
+                f"<h3>Your own operational cutoff: ≤ {e(entry['operational_threshold'])} {e(entry['unit'])}</h3>"
+                f"<p><b>Not published, and not saved as a citation.</b> {e(OPERATIONAL_NOTICE)}</p>"
+                f"<p><b>Declared by:</b> {e(entry['declared_by'])}<br>"
+                f"<b>Declared on:</b> {e(entry['declared_on'])}<br>"
+                f"<b>Scheme key:</b> {e(entry['scheme_key'])}<br>"
+                f"<b>Target count:</b> {e(entry['locus_count'])}</p>"
+                f"<p><b>Where the number comes from:</b> {e(entry['provenance'])}</p>"
+                f"<p>{e(entry['review_note'])}</p>"
+                f"<p><b>What a stricter cutoff costs:</b> {e(OPERATIONAL_TRADE_OFF)}</p>"
+                "<p><b>To use it:</b> set it in the Group ≤ box on the tree toolbar. The report will then "
+                "name it as your own setting, which is what it is.</p>"
+                "<p><b>Your protocol:</b></p><pre>" + e(json.dumps(self.context(), indent=2)) + "</pre>")
+        self.text.setHtml(body)
+        self.apply_value.setChecked(False)
+        self.apply_value.setEnabled(False)
+        self.threshold.setValue(entry['operational_threshold'])
+        self.bound_scheme.clear()
+        for check in (self.schema_review, self.protocol_review, self.epi_review):
+            check.setChecked(False)
+
     def search_newer(self):
         query = self.organism.currentText() + ' (cgMLST OR "single nucleotide polymorphism") (outbreak OR surveillance)'
         QDesktopServices.openUrl(QUrl('https://pubmed.ncbi.nlm.nih.gov/?' + urlencode({'term': query, 'sort': 'date'})))
@@ -189,8 +232,17 @@ class ThresholdGuideDialog(QDialog):
         if item is None:
             self.feedback.setText('No curated source selected. No cutoff or citation has been saved.')
             return
+        entry = item.data(Qt.ItemDataRole.UserRole)
+        if entry.get('evidence_class') == 'user_supplied_operational':
+            # Saving would hand the rest of the application an evidence record,
+            # and every reader of one prints it as an adopted publication.
+            self.feedback.setText(
+                f"≤ {entry['operational_threshold']} {entry['unit']} is your laboratory's own cutoff, not "
+                "publication evidence, so there is nothing to save here. Set it in the Group ≤ box; the "
+                "report will show it as your own setting.")
+            return
         try:
-            self.evidence = record_decision(item.data(Qt.ItemDataRole.UserRole)['id'], self.context(),
+            self.evidence = record_decision(entry['id'], self.context(),
                 selected_threshold=self.threshold.value() if self.apply_value.isChecked() else None,
                 justification=self.justification.toPlainText(), protocol_reviewed=self.protocol_review.isChecked(),
                 schema_reviewed=self.schema_review.isChecked(), epi_reviewed=self.epi_review.isChecked())

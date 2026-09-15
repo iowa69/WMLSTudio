@@ -68,6 +68,40 @@ PIPELINE = (
     "settings",
 )
 
+#: The workflow, in the stages a person actually works through, for the navigator
+#: down the side of the window. One row of tabs could not hold fourteen pages
+#: without clipping the last of them, and a clipped tab is a feature nobody finds:
+#: the resistance matrix, the point mutations and the plasmid tables were all
+#: reported as missing while sitting in a sub-tab strip that ran off the edge.
+#:
+#: The stages are the user's own description of the work: prepare the reads,
+#: assemble, decide what the organism is, type it, see how the isolates relate,
+#: screen it, report it. Every key here must exist in PAGE_KEYS.
+#: An entry is either a page key, or (page key, sub-tab keyword, label). The
+#: keyword is matched case-insensitively against the sub-tab titles that page
+#: registered, and an entry whose sub-tab cannot be found is simply not offered —
+#: so renaming a sub-tab costs a missing shortcut, never a button to nowhere.
+NAV_GROUPS = (
+    ("Investigate", ("overview", "isolates")),
+    ("Prepare", ("reads", "assembly")),
+    ("Type", ("mlst", "cgmlst")),
+    ("Relate", ("compare", "cgmlst_tree", "snp")),
+    # Every one of these was reported as absent — "there is no plasmid analysis,
+    # there is no point mutation and there is no dedicated resistance matrix" —
+    # while existing as the fourth to seventh tab of a strip that ran off the
+    # edge of the window. They are destinations now, not things to find.
+    ("Characterise", (
+        "evidence",
+        ("evidence", "gene matrix", "AMR gene matrix"),
+        ("evidence", "by class", "AMR by drug class"),
+        ("evidence", "point mutation", "Point mutations"),
+        ("evidence", "virulence", "Virulence"),
+        ("evidence", "plasmid evidence across", "Plasmids"),
+    )),
+    ("Deliver", ("reports",)),
+    ("Set up", ("update", "schemes", "settings")),
+)
+
 #: Stations a later round builds. Their pages say so; they never pretend to work.
 #: The SNP tree panel was finished and tested but never mounted, so its tab said
 #: nothing runs there while a working page sat unused. Nothing is planned now:

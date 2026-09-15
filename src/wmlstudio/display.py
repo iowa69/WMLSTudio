@@ -18,6 +18,7 @@ can be imported and called while no QApplication exists yet.
 from __future__ import annotations
 
 import os
+import re
 from pathlib import Path
 
 from PySide6.QtCore import QCoreApplication, QSettings, Qt
@@ -133,6 +134,52 @@ def write_display_settings(*, mode=None, scale_percent=None, rounding=None, root
     preferences.setValue("display/mode", current["mode"])
     preferences.setValue("display/scale_percent", current["scale_percent"])
     preferences.setValue("display/rounding", current["rounding"])
+    preferences.sync()
+    return current
+
+
+# --- theme and table density ------------------------------------------------
+# Both live beside the display keys rather than in the project's Interface.ini:
+# they describe this computer and this pair of eyes, not this investigation, and
+# the window needs them before any project is open. The names are stored as
+# opaque strings on purpose — this module must stay importable with no Qt widget
+# code and no theme module behind it, so `theme` is the one that decides what a
+# name means and what an unknown one falls back to.
+APPEARANCE_KEYS = {"theme": "display/theme", "density": "display/table_density"}
+# A short lowercase word. Anything else came from a hand-edited file.
+_APPEARANCE_NAME = re.compile(r"^[a-z][a-z0-9_-]{0,31}$")
+APPEARANCE_NOTICE = ("Theme and table density change how the workspace looks, not what it "
+                     "found: no distance, threshold or exported result follows them.")
+
+
+def read_appearance(root=None) -> dict:
+    """{'theme', 'density'} as plain names; '' means 'whatever the app ships with'."""
+    try:
+        preferences = display_preferences(root)
+        stored = {name: str(preferences.value(key, "") or "").strip().lower()
+                  for name, key in APPEARANCE_KEYS.items()}
+    except (OSError, ValueError):
+        return {name: "" for name in APPEARANCE_KEYS}
+    return {name: value if _APPEARANCE_NAME.match(value) else ""
+            for name, value in stored.items()}
+
+
+def write_appearance(*, theme=None, density=None, root=None) -> dict:
+    """Persist the chosen theme and density names; '' forgets a choice."""
+    current = read_appearance(root)
+    for name, value in (("theme", theme), ("density", density)):
+        if value is None:
+            continue
+        value = str(value).strip().lower()
+        if value and not _APPEARANCE_NAME.match(value):
+            raise ValueError(f"{name.title()} name must be a short lowercase word.")
+        current[name] = value
+    preferences = display_preferences(root)
+    for name, key in APPEARANCE_KEYS.items():
+        if current[name]:
+            preferences.setValue(key, current[name])
+        else:
+            preferences.remove(key)
     preferences.sync()
     return current
 

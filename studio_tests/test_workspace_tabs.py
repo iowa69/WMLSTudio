@@ -582,8 +582,15 @@ def test_every_tab_in_the_bar_carries_the_work_it_names(window):
     from wmlstudio.ui_cgmlst import CgmlstCallsPanel
     from wmlstudio.ui_snp import SnpTreePanel
     for key, expected in (("cgmlst", CgmlstCallsPanel), ("snp", SnpTreePanel)):
+        window.navigate(key)
         adopted = (window.stations.get(key) or {}).get("adopted")
         assert isinstance(adopted, expected), f"{key} still shows a signpost"
+        # Mounted is not the same as shown. QTabWidget.removeTab hides the page it
+        # removes, so the calls panel was adopted onto its tab and then hidden by
+        # Qt: the tab rendered its heading above an empty page, and only looking
+        # at the drawn window caught it.
+        assert adopted.isVisibleTo(window), f"{key} carries a page nobody can see"
+        assert adopted.height() > 100, f"{key} page collapsed to nothing"
     # A working tab must not still be labelled as reserved for a later round.
     for position in range(window.pages.count()):
         assert "planned" not in (window.pages.tabToolTip(position) or "").casefold()

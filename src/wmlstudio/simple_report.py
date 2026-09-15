@@ -5,10 +5,11 @@ already-built comparison snapshot and an already-rasterised picture, so the
 document can be produced and checked without a display. Nothing here infers
 transmission, a resistance gene is never presented as a measured susceptibility
 result, and a pair that could not be compared is never reported as a distance of
-zero. Measured on A4 at the 144-dpi report resolution, the page runs to two
-sheets for a handful of isolates and three for ten; the caveats are not dropped
-to reach a single sheet. ``wmlstudio.export`` imports this module lazily, so the
-import below cannot close a cycle.
+zero. Measured on A4 at the 144-dpi report resolution, the page runs to a few
+sheets for a handful of isolates and grows with each evidence section that was
+asked for; the caveats are never dropped to reach a shorter document.
+``wmlstudio.export`` imports this module lazily, so the import below cannot
+close a cycle.
 """
 
 from __future__ import annotations
@@ -18,13 +19,30 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from wmlstudio import __version__
+
+# The tables, the evidence gates and the boundary sentences are the detailed
+# report's own, imported rather than restated: two renderers that both describe
+# a plasmid marker must describe it in one set of words, or one of them will
+# drift into promising more than the assay did. PLASMID_BOUNDARY is
+# escape-stable, and printed joined to the plasmid table so no option can put
+# the table on one page and its boundary on another.
 from wmlstudio.export import (
+    _EVIDENCE_STATE_WORDS as _STATE_WORDS,
+)
+from wmlstudio.export import (
+    PLASMID_BOUNDARY,
     REPORT_PRESETS,
     _escape,
+    _muted,
+    _plasmid_cells,
     _snapshot,
     investigation_document,
+    mutation_section_html,
+    picture_typing_conflict,
+    snp_section_html,
     threshold_provenance,
 )
+from wmlstudio.sample_workflow import select_records
 
 # A different document shape, not a different set of facts: the same snapshot
 # rows feed the existing presets. Only the layout and the wording change. The
@@ -41,15 +59,6 @@ SUSCEPTIBILITY_CAVEAT = (
     'infection-control decision. “Not assessed” and “unknown” are never “susceptible”.'
 )
 
-# Escape-stable like the caveat above, and printed joined to the plasmid table so
-# no option can put the table on one page and its boundary on another.
-PLASMID_BOUNDARY = (
-    'A replicon marker sitting on an assembled contig is evidence about that contig. No plasmid was '
-    'reconstructed, no plasmid was counted, no relaxase or mate-pair-formation type was assigned and no '
-    'mobility was predicted: this is not MOB-suite and is not equivalent to it. Two isolates carrying the '
-    'same replicon name are not thereby carrying the same plasmid.'
-)
-
 LIMITATIONS = (
     'It does not prove transmission, or its direction. Genomic similarity is one line of evidence for '
     'epidemiological review.',
@@ -58,9 +67,12 @@ LIMITATIONS = (
     'was actually compared.',
     'Isolates are grouped by single linkage, so members of one group can differ by more than the threshold.',
     'A sequence type (7 loci), a core-genome comparison (hundreds to thousands of targets) and a SNP '
-    'distance are three different quantities. They never share a scale, a column or a threshold, a cutoff '
-    'published for one is not a cutoff for the other, and every distance in this report is the one named '
-    'above it — SNP distances are not reported here at all.',
+    'distance are three different quantities. They never share a scale, a column or a threshold, and a '
+    'cutoff published for one is not a cutoff for the other. Every distance in this report is the one '
+    'named above it, and SNP distances appear only in the SNP section, on their own scale.',
+    'A resistance point mutation is read from a catalogue curated for one organism. A genome screened '
+    'without such a catalogue was never searched for mutations at all, and its row says so rather than '
+    'showing an empty result.',
     'A replicon marker is evidence about the assembled contig it was found on. It is not a plasmid, not a '
     'count of plasmids and not proof that a resistance gene beside it can transfer.',
     'Sections you switched off, and assays that were not run, are absent from this report — absence here '
@@ -76,13 +88,6 @@ COMPARISON_OFF = (
     'The comparison section was switched off for this report. That is not a statement that the isolates '
     'are unrelated or that no distances exist.'
 )
-
-_STATE_WORDS = {
-    'current': 'Checked against this exact sequence file',
-    'unverified': 'Linked by name, not verified',
-    'stale': 'Out of date',
-    'missing': 'Not run',
-}
 
 _ORGANISM_SOURCE_WORDS = {
     'assigned': 'you assigned this organism',
@@ -117,10 +122,6 @@ _HEAD_CLOSE = (
 # so an A4 sheet at the 144-dpi report resolution leaves about 660 usable units.
 # A wider picture is silently cut off at the right edge of the printed sheet.
 _IMAGE_WIDTH = 640
-
-
-def _muted(text: str) -> str:
-    return '<br><span class="muted">' + _escape(text) + '</span>'
 
 
 def _differences(value) -> str:
@@ -230,7 +231,7 @@ def _threshold_lines(provenance) -> list[str]:
     return ['<p><b>Where this threshold comes from:</b> ' + stated + '</p>'] + _suggestion_lines(provenance)
 
 
-def _comparison_section(snapshot, options, graph_png, graph_mime, provenance) -> list[str]:
+def _comparison_section(snapshot, options, graph_png, graph_mime, provenance, graph_typing=None) -> list[str]:
     parts = ['<h2>How close are these isolates?</h2>',
              '<p>This shows how many allele differences separate the isolates that were compared. '
              'It does not show who infected whom, in which direction, or when.</p>',
@@ -241,7 +242,17 @@ def _comparison_section(snapshot, options, graph_png, graph_mime, provenance) ->
                      ' loci).</b> A reference this size cannot separate isolates within one outbreak: two unrelated '
                      'isolates of the same sequence type look identical here. Core-genome references compare hundreds '
                      'to thousands of loci and are installed separately.</p>')
-    source = _image_source(graph_png, graph_mime) if options['graph'] else ''
+    # A picture carries no scale once it is on a page, so it is shown only when
+    # the typing it was drawn on is the typing this summary is about. A tree of
+    # one quantity in a report about the other is the mistake this check exists
+    # to make impossible.
+    mismatched = picture_typing_conflict(graph_typing, provenance['typing']['kind'])
+    source = '' if mismatched else (_image_source(graph_png, graph_mime) if options['graph'] else '')
+    if mismatched:
+        parts.append('<p class="notice"><b>No picture is shown.</b> The tree that was available was drawn on '
+                     + _escape(graph_typing) + ' distances and this summary is about '
+                     + _escape(provenance['typing']['label']) + '. A picture of one of those quantities is '
+                     'never printed in a report about the other.</p>')
     if source:
         parts.append('<img width="' + str(_IMAGE_WIDTH) + '" src="' + source +
                      '" alt="Allele-distance minimum spanning forest with the report isolates highlighted">')
@@ -251,7 +262,7 @@ def _comparison_section(snapshot, options, graph_png, graph_mime, provenance) ->
     elif not options['graph']:
         parts.append('<p class="muted">The picture was switched off for this report. The numbers below still describe '
                      'the comparison.</p>')
-    else:
+    elif not mismatched:
         parts.append('<p class="muted">No picture is included here. The numbers below still describe the comparison; '
                      'a missing picture is not a statement about relatedness.</p>')
     parts.append('<p><b>Reference used:</b> ' + _escape(scheme) + ' · ' + _escape(loci) + ' loci per profile · ' +
@@ -316,44 +327,6 @@ def _resistance_section(rows, options) -> list[str]:
     # The caveat closes the table in one string: no option can separate them.
     parts.append('</table><p class="notice"><b>' + _escape(SUSCEPTIBILITY_CAVEAT) + '</b></p>')
     return parts
-
-
-def _plasmid_cells(row) -> list[str]:
-    """One isolate's replicon markers and same-contig co-locations, each with its own gate.
-
-    The markers come from the AMR/plasmid assay and the co-locations from the
-    characterization, so the two are gated separately: evidence belonging to an
-    earlier assembly is withheld and named, never printed as this one's.
-    """
-    from wmlstudio.characterization import current_characterization
-
-    status = row.get('hydra_evidence_status') or 'missing'
-    replicons = [str(name) for name in (row.get('plasmid_replicons') or [])]
-    if status == 'stale':
-        markers = _escape('Not shown — the saved plasmid result belongs to a different sequence file')
-    elif status == 'missing':
-        markers = _escape('Not assessed')
-    elif replicons:
-        markers = _escape(', '.join(replicons))
-        if status == 'unverified':
-            markers += _muted('The source report’s identity was not confirmed.')
-    else:
-        markers = _escape('No replicon marker reported by the reference database used')
-    state = current_characterization(row)
-    evidence = (state.get('evidence') or {}).get('plasmid_hypotheses') or {}
-    links = evidence.get('contig_associations') or []
-    if state['status'] != 'current':
-        shared = _escape('Not assessed') + _muted(state['reason'])
-    elif links:
-        shared = _escape('; '.join(sorted({f"{link['marker']} with {link['replicon']} on "
-                                           f"{link['contig']}" for link in links})))
-        shared += _muted('Same assembled contig only — a hypothesis, not a plasmid-borne gene.')
-    else:
-        shared = _escape('No resistance or virulence gene shared a contig with a replicon marker')
-        shared += _muted('A plasmid contig can assemble without its replicon, so this does not place '
-                         'those genes on the chromosome.')
-    return [_escape(row.get('sample_name') or row.get('sample_id')), markers, shared,
-            _escape(_STATE_WORDS.get(status, status))]
 
 
 def _plasmid_section(rows) -> list[str]:
@@ -430,15 +403,21 @@ def _proximity_section(snapshot, rows, names, provenance) -> list[str]:
 
 
 def simple_report_html(records, *, selected_ids, investigation=None, settings=None, graph_png=None,
-                       graph_mime='image/png', scope_note=None, scope_implicit=False) -> str:
+                       graph_mime='image/png', scope_note=None, scope_implicit=False,
+                       graph_typing=None, snp=None) -> str:
     """One short page in plain words: the picture, the genes, and each closest match.
 
     ``investigation`` is an already-built comparison snapshot and ``graph_png``
     the picture the caller rasterised (raw bytes, a ``data:`` URI, or a file
-    path, described by ``graph_mime``). Missing evidence is printed, never
+    path, described by ``graph_mime``); ``graph_typing`` is the drawing view's
+    own word for the typing it drew, so a picture of one quantity is never
+    printed in a summary about the other. ``snp`` is the SNP payload the reader
+    has on screen, and without one the SNP section says the analysis was not run
+    rather than printing an empty table. Missing evidence is printed, never
     dropped to keep the page tidy.
     """
     options = {**SIMPLE_REPORT_PRESET, **(settings or {})}
+    chosen = select_records(records, selected_ids)
     rows = _snapshot(records, selected_ids, investigation=investigation)
     names = {row.get('sample_id'): row.get('sample_name') or row.get('sample_id') for row in rows}
     snapshot = investigation if options['investigation'] else None
@@ -459,8 +438,19 @@ def simple_report_html(records, *, selected_ids, investigation=None, settings=No
     if snapshot is None:
         parts.append('<h2>How close are these isolates?</h2><p class="notice">' + absent + '</p>')
     else:
-        parts.extend(_comparison_section(snapshot, options, graph_png, graph_mime, provenance))
+        parts.extend(_comparison_section(snapshot, options, graph_png, graph_mime, provenance, graph_typing))
     parts.extend(_resistance_section(rows, options))
+    # A SNP distance is a third quantity, so it gets its own section on its own
+    # scale. Printed whether or not a run exists, because the answer "no SNP
+    # analysis was run" is the one a reader would otherwise supply themselves,
+    # and they would supply the wrong one.
+    if options.get('snp', True):
+        parts.append(snp_section_html(snp, sample_ids=[row.get('sample_id') for row in rows]))
+    # The sharpest not-run case in the application: a genome screened without an
+    # organism catalogue was never searched for mutations at all, and the table
+    # says which isolates those are before it says what was found.
+    if options.get('point_mutations', True):
+        parts.append(mutation_section_html(chosen))
     # Off by default in this preset and printed only when it is asked for: a
     # section nobody selected is covered by the limitation saying that what is
     # absent from this report is not a negative result.

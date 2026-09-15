@@ -11,6 +11,12 @@ or drawn on one axis: a SNP distance, a classical seven-locus allele distance,
 and a cgMLST target distance. Only the edge-selection algorithm is shared with
 :mod:`wmlstudio.comparison`; no scale, column or threshold is.
 
+The forest this module builds is a minimum spanning tree of pairwise distances.
+No phylogeny is inferred here or anywhere else in this application, so nothing in
+this module may be called a maximum-likelihood tree. What it does offer is the
+file such an inference needs: :func:`alignment_handoff` names the cohort
+alignment SKA2 wrote so a reader can take it to a tree builder themselves.
+
 A published SNP cutoff is organism- and protocol-specific. The one SNP entry the
 threshold catalog holds was measured with the original SKA on short reads at
 k=15, so this module compares protocols before it offers a number, and refuses
@@ -69,7 +75,30 @@ LIMITATIONS = (
     'Assembly choices propagate: sequence missing from an assembly is missing from its split k-mers, '
     'and an assembly artefact is indistinguishable here from a real difference.',
     'SNP distances are never merged with, added to, or plotted against classical MLST or cgMLST '
-    'allele differences.')
+    'allele differences.',
+    'No phylogeny is inferred anywhere in this application. The picture is a minimum spanning tree '
+    'of the pairwise distances, not a maximum-likelihood tree: no substitution model was fitted, no '
+    'branch lengths were estimated and no support values were computed.')
+
+#: What the drawn picture is, and the thing readers most often mistake it for.
+#: Printed in the view and carried in the payload, because a picture separates
+#: from its caption and this is the sentence that must travel with it.
+DRAWN_TREE = (
+    'What is drawn here is a minimum spanning tree of the pairwise SNP distances in the table above. '
+    'It is not a maximum-likelihood phylogeny and no phylogeny was inferred: no substitution model '
+    'was fitted, no branch lengths were estimated, no support values were computed, and no node on '
+    'the screen is an ancestor of any other. The length of a line carries no meaning at all.')
+
+#: The programs that do build a maximum-likelihood tree. None of them is bundled
+#: with this application, and naming one is not the same as having run it.
+TREE_BUILDERS = ('IQ-TREE', 'FastTree', 'RAxML-NG')
+
+ML_TREE_ROUTE = (
+    'A maximum-likelihood tree is inferred from a sequence alignment by a phylogenetics program — '
+    + ', '.join(TREE_BUILDERS[:-1]) + ' or ' + TREE_BUILDERS[-1] + ' — and none of them is part of '
+    'this application. The cohort alignment SKA2 wrote is named here so it can be taken to one. The '
+    'tree such a program returns is a different object from this picture, with branch lengths that '
+    'do mean something, and nothing here will redraw it as this picture or this picture as it.')
 
 #: What each published SNP cutoff in :mod:`wmlstudio.threshold_guidance` was
 #: actually measured on, keyed by the catalog's own ``scheme_key``. A number is
@@ -350,6 +379,54 @@ def snp_matrix(result, *, cancelled=None):
             'separation': SEPARATION}
 
 
+def alignment_handoff(result):
+    """Where SKA2 left the cohort alignment, and what can honestly be done with it.
+
+    The alignment is the input a tree-building program needs, so it is named
+    rather than left inside a working directory nobody is told about. The file
+    itself is not read, hashed or re-checked here: this reports what the run
+    recorded, and says plainly when the run recorded nothing.
+    """
+    protocol(result)
+    alignment = dict(result.get('alignment') or {})
+    status = str(alignment.get('status') or 'unknown')
+    directory, name = str(result.get('output_directory') or ''), str(alignment.get('file') or '')
+    path = str(Path(directory) / name) if directory and name else ''
+    reason = str(alignment.get('reason') or '')
+    if status == 'completed' and path:
+        message = ('SKA2 wrote the cohort variable-site alignment to this file. It is the input a '
+                   'maximum-likelihood tree is built from, and it is the only file here that one '
+                   'can be built from: the distances and the picture are not.')
+    elif status == 'completed':
+        message = ('This run reports a completed cohort alignment but records no file name for it, '
+                   'so no path can be offered. Run the cohort again to have the alignment written '
+                   'where it can be found.')
+    elif status == 'refused':
+        message = ('The cohort alignment was refused by this run, so it is not offered as a '
+                   'hand-off. ' + reason)
+    elif status == 'not_run':
+        message = ('No cohort alignment was written by this run, so there is nothing to take to a '
+                   'tree builder. ' + reason)
+    else:
+        message = ('This run does not record what became of the cohort alignment, so no file is '
+                   'offered. An unrecorded alignment is not an absent one.')
+    return {'status': status,
+            # Only a completed alignment is handed on. A refused one exists on
+            # disk, but offering its path would invite a tree to be built from a
+            # file this run has already declined to describe as a cohort alignment.
+            'path': (path or None) if status == 'completed' else None,
+            'file': name or None, 'directory': directory or None,
+            'columns': alignment.get('columns'), 'sha256': alignment.get('sha256'),
+            'method': alignment.get('method'),
+            'minimum_kmer_frequency': alignment.get('min_freq'),
+            'reason': reason, 'message': message,
+            'drawn_tree': DRAWN_TREE, 'maximum_likelihood_route': ML_TREE_ROUTE,
+            'tree_builders': list(TREE_BUILDERS), 'tree_built_here': False,
+            'column_meaning': 'Variable columns only, and only the columns this cohort at this '
+                              'minimum k-mer frequency produced. The count is not a genome length, '
+                              'and it is not the pairwise shared split k-mer denominator.'}
+
+
 def _graph_records(result, records=None):
     """One display record per isolate: names and recorded detail, never typing evidence."""
     extra = {str(key): dict(value) for key, value in dict(records or {}).items()}
@@ -469,6 +546,7 @@ def snp_payload(result, *, organism='', records=None, link_threshold=None, cohor
             'not_comparable': [dict(pair) for pair in pairs if not pair['comparable']],
             'matrix': snp_matrix(result, cancelled=cancelled), 'graph': forest, 'threshold': binding,
             'split_kmers': result.get('split_kmers'), 'alignment': alignment,
+            'alignment_handoff': alignment_handoff(result), 'drawn_tree': DRAWN_TREE,
             'comparability': _comparability(result, pairs),
             'comparability_reread': result.get('comparability_reread'),
             'summary': _summary(forest['results'], pairs, forest['edges']),

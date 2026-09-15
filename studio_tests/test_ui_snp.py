@@ -411,6 +411,130 @@ def test_the_tab_measures_real_assemblies_with_the_native_engine_or_says_it_has_
     assert "3 shared too little sequence" in panel.status.text()
 
 
+def test_an_arrangement_made_in_the_popup_comes_back_to_the_page_and_is_kept(
+        panel, window, tmp_path, qtbot):
+    """The SNP popup connected no signals, so every arrangement made in it was lost.
+
+    A reader who spreads a crowded forest out to read it lost that layout when the
+    window closed, and again on the next run of the same cohort.
+    """
+    assembled(window, tmp_path, "iso-a")
+    assembled(window, tmp_path, "iso-b")
+    panel.refresh_cohort()
+    panel.show_result(fake_run([pair("iso-a", "iso-b", 3)]))
+    detached = panel.open_window()
+    qtbot.addWidget(detached)
+    detached.view.nodes["iso-a"].setPos(321, 123)
+    detached.view.update_edges()
+    qtbot.waitUntil(lambda: panel.tree.nodes["iso-a"].pos().x() == 321, timeout=2000)
+    assert panel.tree.nodes["iso-a"].pos().y() == 123
+    # A SNP forest and an allele forest hold different isolates in different
+    # places, so the arrangement is kept under a key of this page's own.
+    stored = window.project.get_setting("graph_style.snp", None)
+    assert stored["positions"]["iso-a"] == [321, 123]
+    detached.close()
+    assert panel._windows == []
+    # A page built again on the same project draws the arrangement the reader
+    # made, rather than laying the cohort out from scratch.
+    fresh = SnpTreePanel(window)
+    qtbot.addWidget(fresh)
+    fresh.show_result(fake_run([pair("iso-a", "iso-b", 3)]))
+    assert (fresh.tree.nodes["iso-a"].pos().x(), fresh.tree.nodes["iso-a"].pos().y()) == (321, 123)
+    assert window.test_errors == []
+
+
+def test_a_saved_arrangement_this_build_cannot_read_never_stops_the_forest_being_drawn(
+        panel, window, tmp_path):
+    """Presentation from another version must not cost a reader the measurement.
+
+    An arrangement is where nodes sit on a screen. If a stored one cannot be
+    understood it is dropped whole, and the distances are still drawn.
+    """
+    assembled(window, tmp_path, "iso-a")
+    assembled(window, tmp_path, "iso-b")
+    panel.refresh_cohort()
+    window.project.set_setting("graph_style.snp", {"version": 99, "positions": {"iso-a": [5, 5]}})
+    panel.show_result(fake_run([pair("iso-a", "iso-b", 3)]))
+    assert sorted(panel.tree.nodes) == ["iso-a", "iso-b"]
+    assert panel.payload["summary"]["comparable_pairs"] == 1
+    assert window.test_errors == []
+
+
+def test_the_page_saves_a_picture_of_this_forest_without_a_popup_being_opened(
+        panel, window, tmp_path):
+    """A report asked for a picture of the SNP tree and the page could produce none.
+
+    The only way to a figure was to open the detached window first, so a report
+    run from this page had no image at all, and an absent picture in a report
+    reads as a cohort with nothing in it.
+    """
+    assembled(window, tmp_path, "iso-a")
+    assembled(window, tmp_path, "iso-b")
+    panel.refresh_cohort()
+    assert panel.picture_button.isEnabled() is False
+    panel.show_result(fake_run([pair("iso-a", "iso-b", 3, shared=19880, fraction=0.9906)]))
+    assert panel.picture_button.isEnabled() is True
+    seen = []
+    window.check_output = seen.append
+    picture = tmp_path / "page-forest.svg"
+    assert panel.save_picture(picture) == picture
+    # An export is checked against the project's inputs before a byte is written.
+    assert seen == [picture]
+    written = picture.read_text(encoding="utf-8")
+    assert "SNP-distance minimum spanning forest" in written
+    assert "single-link threshold: none set" in written
+    assert "not a phylogeny or transmission chain" in written
+    assert "allele" not in written.casefold()
+    assert "not a phylogeny" in panel.status.text()
+    # The bytes a report prints are the same picture, with the same words on it.
+    data = panel.snp_graph_png()
+    assert data[:8] == b"\x89PNG\r\n\x1a\n"
+    assert panel.snp_graph_image("JPEG")[:3] == b"\xff\xd8\xff"
+    panel.clear()
+    assert panel.picture_button.isEnabled() is False
+    assert panel.snp_graph_png() is None
+    assert window.test_errors == []
+
+
+def test_the_tree_tab_says_it_is_not_a_maximum_likelihood_tree_and_names_the_alignment(
+        panel, window, tmp_path):
+    """A minimum spanning tree of SNP distances must never be presented as an ML tree.
+
+    Nothing here infers a phylogeny, so the page states that beside the picture
+    and hands over the one file a tree builder could use: SKA2's cohort
+    alignment, with its full path.
+    """
+    from PySide6.QtWidgets import QLabel
+    assembled(window, tmp_path, "iso-a")
+    assembled(window, tmp_path, "iso-b")
+    panel.refresh_cohort()
+    assert panel.alignment_button.isEnabled() is False
+    assert "No cohort alignment has been written yet" in panel.alignment_note.text()
+    run = fake_run([pair("iso-a", "iso-b", 3)], output=str(tmp_path / "run"))
+    run["alignment"] = dict(run["alignment"], file="alignment.fasta", min_freq=0.9)
+    panel.show_result(run)
+    alignment = str(tmp_path / "run" / "alignment.fasta")
+    assert panel.alignment_path == alignment
+    assert alignment in panel.alignment_note.text()
+    assert panel.alignment_button.isEnabled() is True
+    panel.copy_alignment_path()
+    assert "IQ-TREE, FastTree or RAxML-NG" in panel.status.text()
+    assert "No tree was built here" in panel.status.text()
+    spoken = "\n".join(item.text() for item in panel.tabs.widget(3).findChildren(QLabel))
+    assert "not a maximum-likelihood phylogeny" in spoken
+    assert "no branch lengths were estimated" in spoken
+    assert "IQ-TREE" in spoken
+    # And the picture is never renamed to match what was asked for.
+    assert "maximum-likelihood" not in panel.tree.scale_caption()
+    assert "phylogeny" not in panel.graph_identity().export_title()
+    # A run that wrote no alignment says so, and offers nothing to copy.
+    panel.show_result(fake_run([pair("iso-a", "iso-b", 3)]))
+    assert panel.alignment_path is None
+    assert panel.alignment_button.isEnabled() is False
+    assert "records no file name" in panel.alignment_note.text()
+    assert window.test_errors == []
+
+
 def _fastq(directory, name):
     path = directory / f"{name}.fastq"
     path.write_text("@read1\nACGTACGTAC\n+\nIIIIIIIIII\n", encoding="ascii")
