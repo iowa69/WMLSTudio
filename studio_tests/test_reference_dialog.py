@@ -269,7 +269,11 @@ def test_the_pinned_cgmlst_catalogue_says_where_each_scheme_installs_before_it_i
     assert row["location"] in detail
     assert "Ridom GmbH" in detail and "https://www.cgmlst.org/serverpolicy.html" in detail
     assert "never shares a scale with a seven-locus MLST distance" in detail
-    assert "22 catalogued and ready to download" in page.summary.text()
+    # Counted from the catalogue rather than written down here, so pinning another
+    # scheme is a catalogue change and not a test failure. What matters is that
+    # every pinned scheme is offered, not that there are exactly N of them.
+    catalogued = len(cgmlst_schemes.catalog_entries())
+    assert f"{catalogued} catalogued and ready to download" in page.summary.text()
     assert str(tmp_path / "cgmlst") in page.summary.text()
 
 

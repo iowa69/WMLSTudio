@@ -422,13 +422,17 @@ class WorkbenchMixin:
         self.ui_scale = 100
         super().__init__(*args, **kwargs)
         from wmlstudio import theme
+        from wmlstudio.interface_settings import restore_appearance
         application = QApplication.instance()
-        if hasattr(theme, "apply_dark_palette"):
-            theme.apply_dark_palette(application)
+        # The saved theme and table density are put in force before any page is
+        # built, so the first paint is already the one the user chose rather than
+        # the default repainted a moment later.
+        restore_appearance(self.root)
         # Setting the application stylesheet re-polishes every widget of every
         # open window, so doing it unconditionally per window costs more the more
-        # windows exist. Apply it only when it would actually change.
-        apply_application_style(theme.STYLE)
+        # windows exist. Apply it only when it would actually change; a different
+        # theme produces a different sheet, so a change is never skipped.
+        apply_application_style(theme.apply_theme(application))
         from wmlstudio.interface_settings import interface_preferences
         preferences = interface_preferences(self.root)
         try:

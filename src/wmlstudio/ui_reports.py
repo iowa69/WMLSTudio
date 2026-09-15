@@ -37,7 +37,9 @@ from wmlstudio.sample_workflow import (
 from wmlstudio.theme import BACKGROUND
 from wmlstudio.ui_common import (
     FlowLayout,
+    apply_table_density,
     cell,
+    fit_table_columns,
     gene_names,
     make_table,
     organism_for,
@@ -836,6 +838,11 @@ class ReportWorkspaceMixin:
         self.feature_table.setAlternatingRowColors(True)
         self.feature_table.doubleClicked.connect(lambda index: self.open_isolate_record(self.feature_model.rows[index.row()]['_sample_id']))
         self.install_view_menu('evidence.features', self.feature_table)
+        # A model-backed view gets none of make_table's density work, which is why
+        # this grid still read "R evidence st" for "AMR evidence state" after the
+        # rest of the tables were fixed. A reader who cannot tell which column
+        # they are looking at cannot use the table at all.
+        apply_table_density(self.feature_table)
         tabs.addTab(self.feature_table, 'Isolate feature summary')
         matrix_page = QWidget()
         matrix_layout = QVBoxLayout(matrix_page)
@@ -850,6 +857,7 @@ class ReportWorkspaceMixin:
         self.amr_matrix.setSortingEnabled(True)
         self.amr_matrix.doubleClicked.connect(lambda index: self.open_isolate_record(self.amr_model.rows[index.row()]['_sample_id']))
         self.install_view_menu('evidence.amr', self.amr_matrix)
+        apply_table_density(self.amr_matrix)
         matrix_layout.addWidget(self.amr_matrix)
         matrix_layout.addWidget(label("Present = detected in the linked report; not detected is not a susceptibility claim. No report = unknown, never absence.", "small", True))
         tabs.addTab(matrix_page, "AMR gene matrix")
@@ -883,6 +891,9 @@ class ReportWorkspaceMixin:
                 "HYDRA linked", "AMR evidence state", "AMR evidence note", "AMR reference sets",
                 "AMR reference release", "Point mutations searched", "Virulence elements searched"]
         self.feature_model.replace(main + sorted({key for row in rows for key in row} - set(main) - {'_sample_id'}), rows)
+        # Refitted after the fill, not before: the widths a reader needs depend on
+        # what the rows actually hold, and the columns are rebuilt on every filter.
+        fit_table_columns(self.feature_table)
         query = self.gene_filter.text().casefold() if hasattr(self, "gene_filter") else ""
         genes = sorted({gene for sample in samples for gene in gene_names(sample) if query in gene.casefold()})
         matrix = []
@@ -898,6 +909,7 @@ class ReportWorkspaceMixin:
                 return value
             matrix.append({'_sample_id': sample['id'], "Sample": sample["name"], "Evidence state": state, **{gene: state_cell(gene) for gene in genes}})
         self.amr_model.replace(["Sample", "Evidence state", *genes], matrix)
+        fit_table_columns(self.amr_matrix)
         self.feature_scope_label.setText(f'{len(samples)} explicitly chosen isolates · {len(genes)} visible AMR-gene columns · double-click an isolate for its complete record. No report is not a negative result.')
 
     def export_feature_table(self, kind='features'):

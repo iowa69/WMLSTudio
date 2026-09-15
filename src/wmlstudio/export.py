@@ -6,6 +6,7 @@ records, including queued/failed samples, regardless of any view filter.
 
 from __future__ import annotations
 
+import base64
 import csv
 import html
 import json
@@ -932,7 +933,6 @@ def cohort_picture_html(investigation, graph_png, *, graph_mime='image/png', gra
     ``graph_typing`` is the drawing view's own answer, so the check compares two
     independent statements rather than one restated.
     """
-    import base64
 
     parts = ['<h2>Comparison-cohort picture</h2>']
     if not investigation:
