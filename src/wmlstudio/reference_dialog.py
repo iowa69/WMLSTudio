@@ -9,6 +9,7 @@ and its terms are shown.
 """
 
 import threading
+import time
 from pathlib import Path
 
 from PySide6.QtCore import Qt, QThread, QUrl, Signal
@@ -76,6 +77,36 @@ class _ReferenceWorker(QThread):
             self.progress.emit(0, 1, "Reference operation cancelled")
         except Exception as error:
             self.failed.emit(str(error))
+
+
+def describe_progress(current, total, text, elapsed):
+    """Say where a long step has got to, and roughly how much is left.
+
+    A step that only names the item it just finished looks identical whether it
+    has ten items left or two thousand, which is why a working cgMLST download
+    was read as a frozen one. An estimate is only offered once enough of the work
+    has been done for it to mean anything, and it is called an estimate.
+    """
+    if total <= 0 or current <= 0:
+        return f"{text} · {_duration(elapsed)} so far" if elapsed >= 5 else text
+    current = min(current, total)
+    percent = int(current * 100 / total)
+    detail = f"{current:,} of {total:,} ({percent}%)"
+    if current >= 12 and elapsed >= 10 and current < total:
+        remaining = elapsed / current * (total - current)
+        return f"{text} · {detail} · about {_duration(remaining)} left"
+    return f"{text} · {detail}"
+
+
+def _duration(seconds):
+    seconds = max(0, int(seconds))
+    if seconds < 60:
+        return f"{seconds} seconds"
+    minutes, seconds = divmod(seconds, 60)
+    if minutes < 60:
+        return f"{minutes} min" if not seconds else f"{minutes} min {seconds} s"
+    hours, minutes = divmod(minutes, 60)
+    return f"{hours} h {minutes} min"
 
 
 def _count_words(count, kind):
@@ -514,6 +545,7 @@ class ReferenceManagerDialog(QDialog):
         self.worker = None
         self.catalog_errors = []
         self._close_pending = False
+        self._started = time.monotonic()
         self.setWindowTitle("Scheme libraries — classical MLST and cgMLST")
         self.resize(1080, 760)
         layout = QVBoxLayout(self)
@@ -537,6 +569,14 @@ class ReferenceManagerDialog(QDialog):
         layout.addWidget(self.status)
         self.progress = QProgressBar()
         self.progress.setRange(0, 100)
+        # The application bar is a 7px sliver with transparent text, which is right
+        # for a background task and wrong for a download that runs for many
+        # minutes: there was nothing on screen that visibly moved, so a working
+        # download read as a frozen one. Here it is tall enough to show its own
+        # percentage.
+        self.progress.setTextVisible(True)
+        self.progress.setStyleSheet(
+            "QProgressBar { max-height: 18px; min-height: 18px; color: #E7EFF9; }")
         layout.addWidget(self.progress)
         buttons = QHBoxLayout()
         self.download_button = QPushButton("Download selected scheme")
@@ -654,13 +694,19 @@ class ReferenceManagerDialog(QDialog):
         self.download_button.setEnabled(False)
         self.refresh_button.setEnabled(False)
         self.cancel_button.setEnabled(True)
+        self._started = time.monotonic()
         self.progress.setRange(0, 0)
         self.worker.start()
 
     def _progress(self, current, total, text):
+        # A cgMLST scheme is thousands of loci and gigabytes on disk, so a step
+        # naming only the locus it just finished gives no sense of position. Say
+        # how far through it is and how long is left, because the difference
+        # between "working" and "stuck" is the whole question a user has here.
         self.progress.setRange(0, max(1, total))
         self.progress.setValue(current)
-        self.status.setText(text)
+        self.status.setText(describe_progress(current, total, text,
+                                              time.monotonic() - self._started))
 
     def _finished(self):
         for page in self.pages.values():
@@ -807,8 +853,28 @@ class ReferenceManagerDialog(QDialog):
             self.status.setText("Cancelling after the current network read…")
             self.worker.cancel()
 
+    def confirm_stop(self) -> bool:
+        """Ask before closing stops a download that may have run for many minutes.
+
+        Closing used to cancel silently, so a scheme that was most of the way
+        through was lost to a click meant to get the window out of the way. What
+        has already been fetched is kept and the download resumes from there, and
+        saying so is the difference between an alarming question and an easy one.
+        """
+        answer = QMessageBox.question(
+            self, "Stop this download?",
+            "A scheme is still downloading.\n\n"
+            "Closing this window stops it. What has already been downloaded is kept, "
+            "and starting the same scheme again continues from where it stopped "
+            "rather than beginning again.",
+            QMessageBox.StandardButton.Cancel | QMessageBox.StandardButton.Close,
+            QMessageBox.StandardButton.Cancel)
+        return answer == QMessageBox.StandardButton.Close
+
     def reject(self):
         if self.worker and self.worker.isRunning():
+            if not self.confirm_stop():
+                return
             self._close_pending = True
             self.cancel()
         else:
@@ -816,6 +882,9 @@ class ReferenceManagerDialog(QDialog):
 
     def closeEvent(self, event):
         if self.worker and self.worker.isRunning():
+            if not self.confirm_stop():
+                event.ignore()
+                return
             self._close_pending = True
             self.cancel()
             event.ignore()

@@ -90,7 +90,7 @@ def test_catalog_dialog_does_not_network_until_search_and_workers_stay_off_gui(q
     dialog.close()
 
 
-def test_dialog_close_cancels_active_network_work_without_publishing(qtbot, tmp_path):
+def test_dialog_close_cancels_active_network_work_without_publishing(qtbot, tmp_path, monkeypatch):
     entered = threading.Event()
 
     class BlockingCatalog(Catalog):
@@ -106,6 +106,9 @@ def test_dialog_close_cancels_active_network_work_without_publishing(qtbot, tmp_
     dialog.search()
     qtbot.waitUntil(entered.is_set, timeout=3000)
     installed = QSignalSpy(dialog.schemeInstalled)
+    # Closing now asks before it stops a download; this test is about what happens
+    # once that is answered, so answer it rather than waiting on a modal forever.
+    monkeypatch.setattr(dialog, "confirm_stop", lambda: True)
     dialog.reject()
     qtbot.waitUntil(lambda: not dialog.worker.isRunning() and not dialog.isVisible(), timeout=3000)
     assert installed.count() == 0
@@ -289,3 +292,72 @@ def test_an_online_search_files_every_result_into_the_library_it_would_install_i
     assert "1 listed under cgMLST schemes and 1 under classical MLST schemes" in dialog.status.text()
     assert online["cgmlst"][0]["title"].endswith("2358 targets")
     assert online["mlst"][0]["title"].endswith("7 loci")
+
+
+def test_a_long_step_says_how_far_through_it_is_and_what_is_left():
+    """A step naming only the locus it finished looks the same at 10 and at 2,000.
+
+    That is why a working cgMLST download read as a frozen one: the theme draws
+    the bar as a seven-pixel sliver with transparent text, so the status line was
+    the only thing a person could read, and it carried no position at all.
+    """
+    describe = reference_dialog.describe_progress
+    assert describe(1204, 2358, "Checking allele files", 240) == (
+        "Checking allele files · 1,204 of 2,358 (51%) · about 3 min 50 s left")
+    # Finished work states its position and stops estimating.
+    assert describe(2358, 2358, "Checking allele files", 470) == (
+        "Checking allele files · 2,358 of 2,358 (100%)")
+    # Too early to estimate honestly: report position only.
+    assert "left" not in describe(3, 2358, "Checking allele files", 4)
+    # A step with no countable total still shows it is moving.
+    assert describe(0, 0, "Downloading: 12 MB received", 30) == (
+        "Downloading: 12 MB received · 30 seconds so far")
+    assert describe(0, 0, "Starting", 1) == "Starting"
+    # A total that is overrun is reported as complete, never as more than all.
+    assert describe(2400, 2358, "Checking", 10).endswith("2,358 of 2,358 (100%)")
+
+
+def test_closing_during_a_download_asks_first_and_only_stops_when_told_to(qtbot, tmp_path,
+                                                                            monkeypatch):
+    """Closing used to cancel silently, losing a download that was nearly done."""
+    dialog = ReferenceManagerDialog(tmp_path)
+    qtbot.addWidget(dialog)
+
+    class Running:
+        def __init__(self):
+            self.cancelled = False
+
+        def isRunning(self):
+            return True
+
+        def cancel(self):
+            self.cancelled = True
+
+    dialog.worker = Running()
+
+    # Declining leaves the download alone and the window open.
+    monkeypatch.setattr(dialog, "confirm_stop", lambda: False)
+    dialog.reject()
+    assert dialog.worker.cancelled is False, "a declined close must not stop the download"
+    assert dialog._close_pending is False
+
+    # Accepting stops it, and only then.
+    monkeypatch.setattr(dialog, "confirm_stop", lambda: True)
+    dialog.reject()
+    assert dialog.worker.cancelled is True and dialog._close_pending is True
+    dialog.worker = None
+
+
+def test_the_stop_question_names_what_happens_to_what_was_already_downloaded(qtbot, tmp_path,
+                                                                            monkeypatch):
+    dialog = ReferenceManagerDialog(tmp_path)
+    qtbot.addWidget(dialog)
+    shown = {}
+
+    def question(parent, title, text, buttons, default):
+        shown["title"], shown["text"] = title, text
+        return QMessageBox.StandardButton.Cancel
+
+    monkeypatch.setattr(QMessageBox, "question", question)
+    assert dialog.confirm_stop() is False, "the safe answer is the default"
+    assert "kept" in shown["text"] and "continues from where it stopped" in shown["text"]
