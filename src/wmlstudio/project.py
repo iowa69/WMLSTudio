@@ -451,7 +451,7 @@ class Project:
             self._check_open()
             self.get_sample(sample_id)
             return [json.loads(row["result"]) for row in self._connection.execute(
-                "SELECT result FROM analyses WHERE sample_id = ? ORDER BY updated_at, scheme_digest",
+                "SELECT result FROM analyses WHERE sample_id = ? ORDER BY updated_at, rowid",
                 (sample_id,),
             )]
 
@@ -468,7 +468,7 @@ class Project:
             self.get_sample(sample_id)
             for row in self._connection.execute(
                 "SELECT result, typing_kind FROM analyses WHERE sample_id = ? "
-                "ORDER BY updated_at, scheme_digest", (sample_id,),
+                "ORDER BY updated_at, rowid", (sample_id,),
             ):
                 grouped.setdefault(row["typing_kind"] or "unclassified", []).append(
                     json.loads(row["result"]))
@@ -554,7 +554,7 @@ class Project:
                     raise
                 summaries = []
                 for row in self._connection.execute(
-                    'SELECT scheme_digest, updated_at, typing_kind, result FROM analyses WHERE sample_id = ? ORDER BY updated_at, scheme_digest',
+                    'SELECT scheme_digest, updated_at, typing_kind, result FROM analyses WHERE sample_id = ? ORDER BY updated_at, rowid',
                     (sample_id,),
                 ):
                     result = json.loads(row['result'])

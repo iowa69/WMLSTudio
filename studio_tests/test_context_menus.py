@@ -587,7 +587,8 @@ def test_opening_the_containing_folder_opens_the_users_own_input_directory(studi
     monkeypatch.setattr("wmlstudio.context_menus.QDesktopServices.openUrl", opened.append)
     ids = imported(studio, tmp_path, names=("alpha",))
     studio.context_open_folder(Selection("library", (ids[0],), clicked_id=ids[0]))
-    assert [url.toLocalFile() for url in opened] == [str(tmp_path)]
+    # toLocalFile gives forward slashes on Windows, so compare locations, not spelling.
+    assert [Path(url.toLocalFile()) for url in opened] == [tmp_path]
 
 
 def test_opening_a_folder_for_an_isolate_without_a_file_says_so_rather_than_guessing(studio):
