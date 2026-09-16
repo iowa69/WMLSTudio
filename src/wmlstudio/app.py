@@ -896,10 +896,17 @@ class BaseWindow(QMainWindow):
         offers to open — startup is not the moment to reach the internet on
         somebody's behalf. Nothing is downloaded, and it can be turned off.
         """
-        if not bool(self.project.get_setting("startup.check_readiness", True)):
-            return None
         centre = getattr(self, "update_center", None)
         if centre is None:
+            return None
+        try:
+            wanted = bool(self.project.get_setting("startup.check_readiness", True))
+        except (RuntimeError, sqlite3.Error):
+            # The window was closed, or its project replaced, between the queued
+            # call and now. A startup courtesy must never be the thing that
+            # raises on the way out.
+            return None
+        if not wanted:
             return None
         self._startup_check = True
         return centre.first_look()
@@ -931,7 +938,10 @@ class BaseWindow(QMainWindow):
 
     def stop_startup_check(self):
         """Turn the startup read off, from the strip that is showing its answer."""
-        self.project.set_setting("startup.check_readiness", False)
+        try:
+            self.project.set_setting("startup.check_readiness", False)
+        except (RuntimeError, sqlite3.Error):
+            pass
         self.readiness_banner.hide()
         self.notify("WMLSTudio will not check what is installed at startup any more. The Update "
                     "tab still reads this computer whenever you open it.")

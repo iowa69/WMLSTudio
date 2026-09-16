@@ -487,3 +487,39 @@ def test_real_blast_recheck_tells_an_assembly_gap_apart_from_an_absent_target(tm
     assert verdicts['summary']['present'] == 1 and verdicts['summary']['absent'] == 1
     # The read check leaves the table of calls exactly as it found it.
     assert missing_targets(table, record['id']) == ['absent_target', 'gap_target']
+
+
+def test_a_profile_says_how_much_of_it_is_in_the_providers_own_nomenclature():
+    """Asked for: "automatic nomenclature so to be relatable with other papers".
+
+    A call that matched a reference allele carries the provider's own number for
+    it, and that number means the same thing in anyone else's hands. A validated
+    novel sequence carries a local fingerprint and no published number exists for
+    it. Quoting the two as though they were the same kind of name is what would
+    make a profile look comparable when it is not.
+    """
+    from wmlstudio.cgmlst_calls import PROFILE_RULE, nomenclature_summary
+    table = build_calls_table([
+        profile([call_row("gene1", "exact", "1"), call_row("gene2", "exact", "4"),
+                 call_row("gene3", "exact", "9")], sample_id="iso-a"),
+        profile([call_row("gene1", "exact", "1"), call_row("gene2", "missing"),
+                 call_row("gene3", "novel_validated", "NOVEL_" + "a" * 64)], sample_id="iso-b"),
+    ])
+    whole = nomenclature_summary(table, "iso-a")
+    assert (whole["published_alleles"], whole["novel_alleles"], whole["uncalled"]) == (3, 0, 0)
+    assert whole["fully_published"] is True
+    assert "compared directly" in whole["comparability"]
+
+    partial = nomenclature_summary(table, "iso-b")
+    assert (partial["published_alleles"], partial["novel_alleles"], partial["uncalled"]) == (1, 1, 1)
+    assert partial["fully_published"] is False
+    # The honest sentence: a partial comparison is a different claim, and the
+    # denominator that makes it honest is named.
+    assert "do not carry a published allele number" in partial["comparability"]
+    assert "shared-target denominator" in partial["comparability"]
+
+    # The profile identifier is never offered as a registered cgST.
+    for summary in (whole, partial):
+        assert PROFILE_RULE in summary["notes"]
+        assert "not a registered cgST" in PROFILE_RULE
+        assert summary["scheme_digest"] == table["scheme_digest"], "a number names its scheme"

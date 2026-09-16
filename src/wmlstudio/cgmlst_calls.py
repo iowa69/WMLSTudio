@@ -629,3 +629,72 @@ def recheck_missing_targets(plan, scheme, cancelled=None, progress=None, *, tabl
     if progress:
         progress(1, 1, result['headline'])
     return result
+
+
+#: What an allele identifier means, and whether anyone else can read it. The
+#: distinction is the whole point of this block: a provider's allele number is a
+#: public name that another laboratory and another paper use for the same
+#: sequence, and a local novel identifier is a fingerprint that only means
+#: something inside this project.
+NOMENCLATURE_RULE = (
+    "An allele number is only a name in the nomenclature it came from. A call that matched a "
+    "reference allele carries that provider's own number for it, so it means the same thing to "
+    "anyone else using this scheme at this revision. A validated novel sequence carries a local "
+    "SHA-256 identity instead: it is a real sequence, but no public number has been issued for "
+    "it, and quoting one would invent it."
+)
+
+#: Said wherever a profile identifier is shown. cgMLST.org publishes allele
+#: nomenclature and no central profile table, so nothing here can assign the
+#: registered cgST another paper would quote.
+PROFILE_RULE = (
+    "The profile identifier is this project's own fingerprint of the allele vector. It is not a "
+    "registered cgST: no central profile table is supplied with this scheme, so no cgST can be "
+    "assigned here, and this identifier must never be reported as one."
+)
+
+
+def nomenclature_summary(table, sample_id):
+    """How much of one isolate's profile is in the provider's published nomenclature.
+
+    Comparing a profile with a published one is only meaningful for the targets
+    whose alleles carry the provider's own numbers, so this counts them: how many
+    of the scheme's targets hold a published allele number, how many hold a local
+    novel identity, and how many hold no call at all. Percentages are over the
+    scheme's full target count, never over the targets that happened to call.
+    """
+    columns = {column['sample_id']: column for column in table['samples']}
+    if sample_id not in columns:
+        raise ValueError(f'{sample_id} is not in this table of calls.')
+    column = columns[sample_id]
+    # Taken from the counts the table already made, so this block can never
+    # disagree with the grid a reader is looking at beside it.
+    total = int(column['targets'])
+    published, novel = int(column['called_reference']), int(column['called_novel'])
+    uncalled = int(column['without_call'])
+    comparable = published == total
+    return {
+        'sample_id': sample_id,
+        'sample_name': column.get('sample_name', sample_id),
+        'scheme': table['scheme'], 'scheme_digest': table['scheme_digest'],
+        'targets': total,
+        'published_alleles': published, 'novel_alleles': novel, 'uncalled': uncalled,
+        'published_percent': round(published * 100 / total, 1) if total else 0.0,
+        'profile_id': column.get('cg_profile_id') or '',
+        # True only when every target carries a published number. Anything less
+        # and a comparison with a published profile is partial, which is a
+        # different claim and has to be stated as one.
+        'fully_published': comparable,
+        'headline': (
+            f'{published} of {total} targets carry {table["scheme"]} allele numbers'
+            + ('' if comparable else f', {novel} are local novel sequences and {uncalled} have no call')
+            + '.'),
+        'comparability': (
+            'Every target carries a published allele number, so this profile can be compared '
+            'directly with a profile called against this scheme at this revision.'
+            if comparable else
+            f'{total - published} of {total} targets do not carry a published allele number, so a '
+            'comparison with a published profile covers only the targets that do. The shared-target '
+            'denominator travels with every distance this application reports.'),
+        'notes': [NOMENCLATURE_RULE, PROFILE_RULE],
+    }

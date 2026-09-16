@@ -58,6 +58,7 @@ from wmlstudio.cgmlst_calls import (
     CALL_STATES,
     STATE_ORDER,
     build_calls_table,
+    nomenclature_summary,
     plan_target_recheck,
     recheck_missing_targets,
 )
@@ -592,7 +593,8 @@ class CgmlstCallsPanel(QWidget):
                                "unknown evidence: it is never counted as a match and never as a "
                                "difference.", "small", True))
         self.isolate_table = make_table(["Isolate", "Targets called", "Reference alleles",
-                                         "Local novel", "No call", "Typing", "Assembly SHA-256"])
+                                         "Local novel", "No call", "Typing",
+                                         "Published nomenclature", "Assembly SHA-256"])
         column.addWidget(self.isolate_table, 1)
         return page
 
@@ -838,15 +840,22 @@ class CgmlstCallsPanel(QWidget):
             kind = row["analysis_kind"] if isinstance(row["analysis_kind"], dict) else {}
             states = " · ".join(f"{table['states'][state]['label']}: {row['states'][state]:,}"
                                 for state in STATE_ORDER if row["states"][state])
+            naming = nomenclature_summary(table, row["sample_id"])
             values = [row["sample_name"], row["summary"], f"{row['called_reference']:,}",
                       f"{row['called_novel']:,}", f"{row['without_call']:,}",
                       TYPING_SCALES.get(str(kind.get("kind") or ""),
                                         TYPING_SCALES["unclassified"])["title"],
+                      naming["headline"],
                       (row["input_sha256"] or "not recorded")[:12]]
             for column, value in enumerate(values):
                 item = cell(value, row["sample_id"])
-                item.setToolTip("\n".join(filter(None, [states, str(kind.get("basis") or "")]))
-                                or "No call state was recorded for this isolate.")
+                # Whether this profile can be set beside a published one is the
+                # question somebody comparing with a paper is actually asking, so
+                # the rule and the denominator travel with the cell that answers it.
+                item.setToolTip("\n\n".join(filter(None, [
+                    states, str(kind.get("basis") or ""), naming["comparability"],
+                    *naming["notes"]]))
+                    or "No call state was recorded for this isolate.")
                 self.isolate_table.setItem(index, column, item)
         self.isolate_table.setSortingEnabled(True)
 
