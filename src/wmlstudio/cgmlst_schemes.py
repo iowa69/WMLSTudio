@@ -428,6 +428,20 @@ _SCHEMES = (
                "not an IUPAC nucleotide code. Those allele records are excluded on download and "
                "named in the snapshot manifest; a genome carrying one of them is reported as an "
                "unmatched sequence, never as that allele number.",)},
+    {"key": "cgmlst.org:ehormaechei-2178", "genus": "Enterobacter", "species": "hormaechei",
+     "provider": "cgmlst.org", "database": "", "scheme_id": "Ehormaechei",
+     "scheme_name": "Enterobacter hormaechei cgMLST", "revision": "catalogue read 2026-09-16",
+     "locus_count": 2178,
+     "target_list_sha256": "390b7e9e4f8367fb3164d0abc02fc9662fe36ac88827445ec33576a190a32817",
+     "has_profiles": False, "profile_field": "",
+     "threshold_scheme_key": None,
+     "binding_basis": ("No cutoff is curated for this scheme, so none is offered against it. The "
+                       "target set was read from the provider on 2026-09-16 and fingerprinted."),
+     "notes": ("The E of ESKAPE had no catalogued scheme at all, which is why this one was added: "
+               "Enterobacter hormaechei is the species behind most clinical E. cloacae complex "
+               "reports, and a scheme for it is what an outbreak in that complex needs.",
+               "Seed genome dated 2024-03-28, provider version 1.0. A scheme with no curated "
+               "cutoff still measures distances; it simply offers no published threshold.")},
     {"key": "cgmlst.org:kpneumoniae-2358", "genus": "Klebsiella", "species": "pneumoniae",
      "provider": "cgmlst.org", "database": "", "scheme_id": "Kpneumoniae_complex",
      "scheme_name": "Klebsiella pneumoniae/variicola/quasipneumoniae cgMLST",
@@ -1554,3 +1568,73 @@ def download_plan(key) -> dict:
             "may_be_bundled": bool(provider["may_bundle"]), "method": method,
             "destination_slot": entry["slot"],
             "destination_library": LIBRARY_DIRNAME, "notes": list(entry["notes"])}
+
+
+#: Named starter sets, so somebody meeting cgMLST for the first time does not
+#: have to know which of twenty-nine schemes their organism needs.
+#:
+#: These are NOT shipped inside the application and cannot be. Every scheme here
+#: belongs to the provider that publishes it, and cgMLST.org's own terms — quoted
+#: in the download confirmation — reserve reuse of database copies in a product
+#: or service. What a panel does is name the set and install it in one action,
+#: under those terms, with the total download stated before anything is fetched.
+SCHEME_PANELS = {
+    "eskape": {
+        "title": "ESKAPE pathogens",
+        "purpose": ("The six organisms behind most hospital-acquired resistant infections: "
+                    "Enterococcus faecium, Staphylococcus aureus, Klebsiella pneumoniae, "
+                    "Acinetobacter baumannii, Pseudomonas aeruginosa and Enterobacter."),
+        "keys": ("cgmlst.org:efaecium-1423", "cgmlst.org:saureus-1861",
+                 "cgmlst.org:kpneumoniae-2358", "cgmlst.org:abaumannii-2390",
+                 "cgmlst.org:paeruginosa-3867", "cgmlst.org:ehormaechei-2178"),
+    },
+}
+
+#: Said wherever a panel is offered. A core scheme is what every public
+#: nomenclature server publishes, and a reader who has used Ridom SeqSphere+ will
+#: be looking for the accessory targets it builds; they are not on the free
+#: server and nothing here can install them.
+PANEL_SCOPE = (
+    "Every scheme in these panels is a core-genome target set, because that is what the public "
+    "nomenclature servers publish. Accessory or 'plus' target sets — the extra loci SeqSphere+ "
+    "assembles for a cohort — are not published for download by cgMLST.org or PubMLST, so no "
+    "panel here can install them and nothing in this application invents them."
+)
+
+
+def panel_entries(name):
+    """The catalogue rows one named panel installs, in the order it installs them.
+
+    A key the catalogue does not pin is left out rather than guessed at, so a
+    panel always describes schemes that really exist and really download.
+    """
+    panel = SCHEME_PANELS.get(str(name or "").strip().lower())
+    if panel is None:
+        raise ValueError(f"No scheme panel is named {name!r}. "
+                         f"Known panels: {', '.join(sorted(SCHEME_PANELS))}.")
+    rows = []
+    for key in panel["keys"]:
+        try:
+            rows.append(entry_for(key))
+        except (KeyError, ValueError):
+            continue
+    return rows
+
+
+def describe_panel(name, root=None):
+    """What one panel would install, what is already here, and its total target count."""
+    panel = SCHEME_PANELS[str(name).strip().lower()]
+    rows = panel_entries(name)
+    installed = {entry["key"] for entry in (installed_entries(root) if root is not None else ())}
+    missing = [row for row in rows if row["key"] not in installed]
+    targets = sum(int(row["locus_count"]) for row in missing)
+    return {
+        "name": str(name).strip().lower(), "title": panel["title"], "purpose": panel["purpose"],
+        "schemes": rows, "missing": missing,
+        "installed_count": len(rows) - len(missing), "total_count": len(rows),
+        "targets_to_download": targets,
+        "scope": PANEL_SCOPE,
+        "headline": (f"{len(missing)} of {len(rows)} schemes still to install, "
+                     f"{targets:,} targets in total."
+                     if missing else f"All {len(rows)} schemes in this panel are installed."),
+    }

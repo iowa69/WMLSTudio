@@ -1113,3 +1113,46 @@ def test_turning_the_startup_read_off_is_remembered_and_stops_it(window):
     assert window.project.get_setting("startup.check_readiness", True) is False
     assert not window.readiness_banner.isVisible()
     assert window.check_readiness_at_startup() is None, "and it does not run again"
+
+
+def test_the_two_tree_tabs_carry_one_of_each_control_saying_the_right_thing(window, qtbot):
+    """Reported: "the cgMLST menu is different from the MLST one ... very repetitive".
+
+    It was. The cgMLST tree tab is a station with its own heading, purpose strip
+    and buttons, and the comparison workspace that moves into it brings its own
+    of each, so the tab carried three "Choose cohort…", three "Clear", two guide
+    buttons and two purpose strips — one of them the seven-locus sentence, on the
+    core-genome tab.
+    """
+    from PySide6.QtWidgets import QLabel
+    for key, expected in (("compare", "seven-locus"), ("cgmlst_tree", "cgMLST target")):
+        window.navigate(key)
+        settled(window, qtbot)
+        page = window.pages.page_for(key)
+        content = page.widget() if hasattr(page, "widget") else page
+        shown = [entry.text() for entry in content.findChildren(QPushButton)
+                 if entry.isVisible() and entry.text()]
+        repeated = {text: shown.count(text) for text in set(shown) if shown.count(text) > 1}
+        assert not repeated, f"{key} offers the same control twice: {repeated}"
+
+        strips = [item.text() for item in content.findChildren(QLabel)
+                  if item.objectName() == "purpose" and item.isVisible()]
+        assert len(strips) == 1, f"{key} shows {len(strips)} purpose strips"
+        # And it is the sentence for the quantity this tab draws. A cgMLST
+        # distance and a seven-locus distance are different quantities, so the
+        # wrong sentence here is a scientific error and not untidiness.
+        assert expected in strips[0], f"{key} describes the wrong quantity: {strips[0][:70]}"
+
+
+def test_clearing_a_tree_tab_empties_the_workspace_both_tabs_share(window, qtbot):
+    """One Clear, and it is the thorough one.
+
+    The tab's Clear and the workspace's own Clear did the same job from two
+    buttons a few pixels apart. The workspace keeps the method; the strip keeps
+    the button, as every other tab in this window does.
+    """
+    window.navigate("cgmlst_tree")
+    settled(window, qtbot)
+    window.cohort_ids = {"anything"}
+    window.clear_page_state("cgmlst_tree")
+    assert not window.cohort_ids, "the tab's Clear empties the shared workspace"

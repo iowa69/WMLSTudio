@@ -812,3 +812,47 @@ def test_an_uncatalogued_installed_scheme_is_listed_without_a_borrowed_cutoff(tm
     assert row["threshold"]["status"] == "scheme_not_catalogued"
     assert row["threshold"]["threshold"] is None
     assert "Distances can still be computed" in row["threshold"]["reason"]
+
+
+def test_the_eskape_panel_names_a_real_scheme_for_every_one_of_the_six():
+    """Asked for: make the ESKAPE schemes easy for a first-time user to install.
+
+    The E of ESKAPE had no catalogued scheme at all until this panel was built,
+    so the set it promises has to be checked against the catalogue rather than
+    assumed: a panel that silently drops an organism is worse than no panel.
+    """
+    from wmlstudio.cgmlst_schemes import describe_panel, panel_entries
+    rows = panel_entries("eskape")
+    assert len(rows) == 6, "a panel that quietly drops an organism is not a panel"
+    genera = {row["genus"] for row in rows}
+    assert genera == {"Enterococcus", "Staphylococcus", "Klebsiella",
+                      "Acinetobacter", "Pseudomonas", "Enterobacter"}
+    for row in rows:
+        assert row["locus_count"] > 0 and row["target_list_sha256"], row["key"]
+        assert row["licence_restriction"], "every scheme carries its provider's terms"
+
+    panel = describe_panel("eskape")
+    assert panel["targets_to_download"] == sum(row["locus_count"] for row in rows)
+    assert str(panel["targets_to_download"]) in str(panel["targets_to_download"])
+    # A core set is what the public servers publish, and the panel says so rather
+    # than letting a SeqSphere+ user assume the accessory targets come with it.
+    assert "not published for download" in panel["scope"]
+    assert all(row.get("target_set") == "core" for row in rows)
+
+
+def test_an_unknown_panel_is_named_rather_than_silently_empty():
+    from wmlstudio.cgmlst_schemes import panel_entries
+    with pytest.raises(ValueError, match="No scheme panel is named"):
+        panel_entries("nonesuch")
+
+
+def test_the_enterobacter_scheme_is_pinned_with_a_real_fingerprint():
+    """The E of ESKAPE. Its pin drives a download, so a wrong count fails verification."""
+    from wmlstudio.cgmlst_schemes import entry_for
+    entry = entry_for("cgmlst.org:ehormaechei-2178")
+    assert entry["locus_count"] == 2178
+    assert len(entry["target_list_sha256"]) == 64
+    assert entry["scheme_id"] == "Ehormaechei"
+    # No cutoff is curated for it, and none is invented: a scheme may measure
+    # distances without any published threshold being offered against it.
+    assert entry["threshold_scheme_key"] is None

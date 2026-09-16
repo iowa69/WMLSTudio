@@ -20,11 +20,13 @@ from PySide6.QtWidgets import (
     QHBoxLayout,
     QHeaderView,
     QInputDialog,
+    QLabel,
     QLineEdit,
     QMainWindow,
     QMenu,
     QMessageBox,
     QProgressBar,
+    QPushButton,
     QScrollArea,
     QSpinBox,
     QSplitter,
@@ -1031,7 +1033,11 @@ class BaseWindow(QMainWindow):
 
     def build_station(self, key, definition):
         _, layout = self.page()
-        self.heading(layout, definition["title"], definition["subtitle"])
+        # Kept so a station that is later given a real page can stand its own
+        # heading and buttons down: the page it is handed brings both, and two of
+        # each on one tab is what "very repetitive and confusing" described.
+        title = self.heading(layout, definition["title"], definition["subtitle"])
+        heading = [title, layout.itemAt(layout.count() - 1).widget()]
         if key in PLANNED:
             # Said in the bar's tooltip and here, where a reader who opened the tab
             # expecting to work cannot miss it. The stretch keeps the badge the width
@@ -1045,6 +1051,7 @@ class BaseWindow(QMainWindow):
         self.station_status[key] = status
         layout.addWidget(status)
         strip = QHBoxLayout()
+        actions = []
         for entry in definition.get("actions", ()):
             text, method = entry[0], entry[1]
             needs = entry[2] if len(entry) > 2 else ""
@@ -1052,7 +1059,9 @@ class BaseWindow(QMainWindow):
             # An action this build cannot perform is not offered at all: a button
             # that leads nowhere costs more trust than a missing one.
             if callable(handler) and (not needs or getattr(self, needs, None) is not None):
-                strip.addWidget(button(text, handler, text.endswith("…")))
+                action = button(text, handler, text.endswith("…"))
+                actions.append(action)
+                strip.addWidget(action)
         strip.addStretch()
         layout.addLayout(strip)
         card_frame, content = card()
@@ -1067,7 +1076,9 @@ class BaseWindow(QMainWindow):
         holder.hide()
         layout.addWidget(holder, 1)
         layout.addStretch()
-        self.stations[key] = {"holder": holder, "layout": holder_layout,
+        actions.append(card_frame)
+        self.stations[key] = {"heading": heading, "actions": actions,
+                              "holder": holder, "layout": holder_layout,
                               "placeholder": card_frame, "status": status}
         return holder
 
@@ -1174,7 +1185,55 @@ class BaseWindow(QMainWindow):
             # chosen=False: which tree this tab shows is what the tab is for, and
             # must not overwrite the kind the user last chose for themselves.
             show(kind, chosen=False)
+        self.tidy_tree_tab(key)
         return True
+
+    def tidy_tree_tab(self, key):
+        """Leave one of each control on a tree tab, saying the right thing.
+
+        Reported as "the cgMLST menu is different from the MLST one ... very
+        repetitive and confusing", and it was: the cgMLST tree tab carried three
+        "Choose cohort…" buttons, three "Clear" buttons, two guide buttons and
+        two purpose strips — one of which was the *seven-locus* sentence, on the
+        core-genome tab.
+
+        The cause is that this tab is a station with its own heading, purpose
+        strip and buttons, and the comparison workspace that moves into it brings
+        its own of each. The workspace is the page, so the station's own chrome
+        stands down, and the one surviving strip is told which tree it is
+        describing rather than keeping the sentence it was built with.
+        """
+        station = self.stations.get(key)
+        if station is not None:
+            # The workspace supplies the title, the actions and the cohort line,
+            # so the placeholder's versions of all three would only be repeated.
+            for part in ("placeholder", "status"):
+                widget = station.get(part)
+                if widget is not None:
+                    widget.hide()
+            for name in ("heading", "actions"):
+                for widget in station.get(name) or ():
+                    widget.hide()
+            strip = (self.page_headers or {}).get(key)
+            if strip is not None:
+                strip.hide()
+        # One strip, and it names the quantity this tab is actually showing.
+        strip = (self.page_headers or {}).get("compare")
+        if strip is not None:
+            purpose = strip.findChild(QLabel, "purpose")
+            if purpose is not None:
+                purpose.setText(PAGE_PURPOSE.get(key, ""))
+                purpose.setToolTip(PAGE_PURPOSE.get(key, ""))
+            # Its next step is the same "Choose cohort…" the workspace shows a
+            # few pixels below, so only one of the two is offered.
+            for entry in strip.findChildren(QPushButton):
+                if entry.text().startswith("Choose cohort"):
+                    entry.hide()
+        clear = (self.clear_buttons or {}).get("compare")
+        if clear is not None:
+            clear.setToolTip(f"Start the {page_name(key)} tab again. Clears the drawn tree, its "
+                             "groups and this tab's cohort; keeps every stored profile.")
+        return key
 
     def show_mlst_tree_tab(self):
         """The MLST tree tab: the workspace, on the seven-locus scale."""
@@ -1402,7 +1461,14 @@ class BaseWindow(QMainWindow):
             ledger = getattr(self, "cohort_origins", None)
             if ledger is not None and hasattr(ledger, "forget"):
                 ledger.forget(key)
-        if key == "compare":
+        if key in {"compare", "cgmlst_tree"}:
+            # The comparison workspace serves both tree tabs and knows how to
+            # empty itself completely -- cohort, filters, investigation, both
+            # drawn trees and the table of calls -- without touching a stored
+            # profile. Half-clearing it from here would leave the two disagreeing.
+            thorough = getattr(self, "clear_compare_tab", None)
+            if callable(thorough):
+                thorough()
             self.distance_rows = []
             tree = getattr(self, "tree", None)
             if tree is not None:

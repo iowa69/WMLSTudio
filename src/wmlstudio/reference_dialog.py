@@ -12,7 +12,7 @@ import threading
 import time
 from pathlib import Path
 
-from PySide6.QtCore import Qt, QThread, QUrl, Signal
+from PySide6.QtCore import Qt, QThread, QTimer, QUrl, Signal
 from PySide6.QtGui import QDesktopServices, QGuiApplication
 from PySide6.QtWidgets import (
     QAbstractItemView,
@@ -736,6 +736,12 @@ class ReferenceManagerDialog(QDialog):
         self.download_button = QPushButton("Download selected scheme")
         self.download_button.setEnabled(False)
         self.download_button.clicked.connect(self.download)
+        self.panel_button = QPushButton("Install the ESKAPE panel…")
+        self.panel_button.setToolTip(
+            "The six organisms behind most hospital-acquired resistant infections, installed in "
+            "one action instead of six. Nothing is downloaded until the total and the provider's "
+            "terms have been shown.")
+        self.panel_button.clicked.connect(lambda: self.install_panel("eskape"))
         self.refresh_button = QPushButton("Rescan installed schemes")
         self.refresh_button.clicked.connect(self.refresh_library)
         self.cancel_button = QPushButton("Cancel operation")
@@ -744,6 +750,7 @@ class ReferenceManagerDialog(QDialog):
         close = QPushButton("Close")
         close.clicked.connect(self.reject)
         buttons.addWidget(self.download_button)
+        buttons.addWidget(self.panel_button)
         buttons.addWidget(self.refresh_button)
         buttons.addStretch()
         buttons.addWidget(self.cancel_button)
@@ -974,6 +981,88 @@ class ReferenceManagerDialog(QDialog):
                 f"{item['organism']}: {item['error']}" for item in self.catalog_errors))
 
     # -- downloading -----------------------------------------------------------
+
+    def install_panel(self, name):
+        """Install a named starter panel: one confirmation, then one scheme at a time.
+
+        Asked for as "shipping the cgMLST schemes like for ESKAPE ... to make the
+        analysis easier for someone who approaches for the first time". Shipping
+        them is not ours to do — cgMLST.org reserves reuse of database copies in a
+        product, and the confirmation below quotes that in the provider's own
+        words — but choosing them one by one out of twenty-nine is the part that
+        was actually hard, and that is what this removes.
+
+        The whole cost is stated before anything is fetched, because these are
+        gigabytes and a person on a metered connection has to be able to decline.
+        """
+        if self.worker and self.worker.isRunning():
+            self.status.setText("A download is already running. Wait for it, or cancel it first.")
+            return False
+        panel = cgmlst_schemes.describe_panel(name, self.root)
+        if not panel["missing"]:
+            QMessageBox.information(self, panel["title"], panel["headline"])
+            return False
+        listing = "\n".join(f"  • {row['organism']} — {row['locus_count']:,} targets"
+                             for row in panel["missing"])
+        providers = sorted({row["provider_name"] for row in panel["missing"]})
+        terms = sorted({row["licence_restriction"] for row in panel["missing"] if
+                        row.get("licence_restriction")})
+        answer = QMessageBox.question(
+            self, f"Install the {panel['title']} panel",
+            "\n\n".join(filter(None, [
+                panel["purpose"],
+                f"{len(panel['missing'])} scheme(s) would be downloaded now:\n{listing}",
+                f"{panel['targets_to_download']:,} targets in total. Each scheme is tens of "
+                "megabytes compressed and expands to a folder of allele files that can reach "
+                "several gigabytes, so this needs room and time.",
+                "Published by " + ", ".join(providers) + ".",
+                "\n".join(terms),
+                panel["scope"],
+                "Download them now, under those terms?"])),
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No)
+        if answer != QMessageBox.StandardButton.Yes:
+            self.status.setText("Nothing was downloaded. The panel was not confirmed.")
+            return False
+        # Queued rather than run together: one provider, one connection, and a
+        # failure part-way leaves every scheme already installed exactly as it is.
+        self._panel_queue = list(panel["missing"])
+        self._panel_title = panel["title"]
+        self._panel_done = []
+        return self._start_next_panel_scheme()
+
+    def _start_next_panel_scheme(self):
+        """Take the next scheme off the panel queue, or report what the panel did."""
+        queue = getattr(self, "_panel_queue", None)
+        if not queue:
+            done = getattr(self, "_panel_done", [])
+            if done:
+                self.refresh_library()
+                QMessageBox.information(
+                    self, getattr(self, "_panel_title", "Panel"),
+                    f"{len(done)} scheme(s) installed:\n"
+                    + "\n".join(f"  • {name}" for name in done)
+                    + "\n\nThey are in your cgMLST library and ready to type against.")
+                self._panel_done = []
+            return False
+        entry = queue.pop(0)
+        client = self.catalogs.get(cgmlst_schemes.provider_token(entry["provider"])) or self.catalog
+        kwargs = {"terms_acknowledged": True} if isinstance(client, CGMLSTOrgCatalog) else {}
+        self._pending_kind = "cgmlst"
+        self.status.setText(f"Panel: downloading {entry['organism']} — "
+                            f"{len(self._panel_done) + 1} of "
+                            f"{len(self._panel_done) + 1 + len(queue)}…")
+        payload = download_entry(entry)
+        return self._start(lambda cancelled, progress: client.download_scheme(
+            payload, self.root / "schemes", cancelled=cancelled, progress=progress, **kwargs),
+            self._panel_scheme_done)
+
+    def _panel_scheme_done(self, result):
+        """One panel scheme landed; show it, then start the next."""
+        self._downloaded(result)
+        self._panel_done = getattr(self, "_panel_done", []) + [Path(result["path"]).name]
+        QTimer.singleShot(0, self._start_next_panel_scheme)
+        return result
 
     def download(self):
         row = self.page.selected_row()

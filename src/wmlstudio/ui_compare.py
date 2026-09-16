@@ -1168,9 +1168,15 @@ class ComparisonWorkspaceMixin:
         investigations.addWidget(button('Compare', self.refresh_comparison))
         # Start this tab again without touching a stored profile: the cohort, the
         # filters, the drawn trees and the cgMLST table go, the evidence stays.
+        # Hidden, not removed: every tab in this window carries its Clear on the
+        # orientation strip, and a second one a few pixels below it was part of
+        # what made this page read as repetitive. The strip's Clear runs this
+        # same method, which is the thorough one.
         clear_button = button('Clear', self.clear_compare_tab)
         clear_button.setToolTip('Empty this tab so a new, a past or a mixed cohort can be started '
                                 'here. No profile, investigation or snapshot is deleted.')
+        clear_button.hide()
+        self.compare_clear_button = clear_button
         investigations.addWidget(clear_button)
         layout.addLayout(investigations)
         self.cohort_search = QLineEdit()
