@@ -669,8 +669,11 @@ class CharacterizationPlanDialog(QDialog):
     def update_resources(self):
         try:
             allocation = plan_resources(threads_per_sample=4, memory_gb=3, policy=self.policy.currentData())
-            self.resource_text.setText(f"Up to {allocation.max_parallel} simultaneous isolates × {allocation.threads_per_sample} threads; "
-                                      f"{allocation.memory_gb} GiB reserved per job, {allocation.reserve_gb:g} GiB retained for the system. RAM is an estimate, not an enforced process cap.")
+            from wmlstudio.scheduler import describe_allocation
+            self.resource_text.setText(
+                describe_allocation(allocation)
+                + f" {allocation.memory_gb} GiB reserved per job, {allocation.reserve_gb:g} GiB retained"
+                  " for the system. RAM is an estimate, not an enforced process cap.")
         except ValueError as error:
             self.resource_text.setText(str(error))
 

@@ -3630,6 +3630,12 @@ class WorkbenchMixin:
         self.ui_scale = percent
         apply_application_style(scaled_style(percent))
         interface_preferences(self.root).setValue("scale", percent)
+        # The sidebar's entries are sized from their own font, so a text-size
+        # change has to re-measure them or the words are cut through the middle
+        # at the larger size and elided at the wider one.
+        refit = getattr(self, "fit_navigator", None)
+        if callable(refit):
+            refit()
         self.updateGeometry()
 
     def set_graph_text_scale(self, percent):

@@ -13,17 +13,19 @@ import time
 from pathlib import Path
 
 from PySide6.QtCore import Qt, QThread, QUrl, Signal
-from PySide6.QtGui import QDesktopServices
+from PySide6.QtGui import QDesktopServices, QGuiApplication
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QComboBox,
     QDialog,
+    QFrame,
     QHBoxLayout,
     QLabel,
     QLineEdit,
     QMessageBox,
     QProgressBar,
     QPushButton,
+    QScrollArea,
     QSpinBox,
     QTableWidget,
     QTableWidgetItem,
@@ -683,8 +685,24 @@ class ReferenceManagerDialog(QDialog):
         self._progress_at = 0
         self._progress_total = 0
         self.setWindowTitle("Scheme libraries — classical MLST and cgMLST")
-        self.resize(1080, 760)
-        layout = QVBoxLayout(self)
+        self.setSizeGripEnabled(True)
+        # Everything above the buttons scrolls. 1080x760 was asked for
+        # unconditionally, so on a laptop -- or at 125% Windows scaling, which
+        # makes every widget bigger without making the screen bigger -- the
+        # dialog was taller than the work area and the button row sat below the
+        # bottom edge, unreachable. The buttons now live outside the scroll area
+        # and are always on screen; the size is clamped to the screen that will
+        # actually show it.
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+        self._scroll = QScrollArea()
+        self._scroll.setWidgetResizable(True)
+        self._scroll.setFrameShape(QFrame.Shape.NoFrame)
+        self._scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        body = QWidget()
+        self._scroll.setWidget(body)
+        outer.addWidget(self._scroll, 1)
+        layout = QVBoxLayout(body)
         intro = QLabel("Find, download and check typing schemes. cgMLST schemes install into their own "
                        "library under a name that says the organism, the provider and the target count.")
         intro.setWordWrap(True)
@@ -730,8 +748,33 @@ class ReferenceManagerDialog(QDialog):
         buttons.addStretch()
         buttons.addWidget(self.cancel_button)
         buttons.addWidget(close)
-        layout.addLayout(buttons)
+        buttons.setContentsMargins(9, 6, 9, 9)
+        outer.addLayout(buttons)
+        self._fit_to_screen()
         self.refresh_library()
+
+    def _fit_to_screen(self):
+        """Open at the intended size, or the largest that fits, whichever is smaller."""
+        preferred = (1080, 760)
+        parent = self.parentWidget()
+        window = parent.window() if parent is not None else None
+        screen = ((window.screen() if window is not None else None)
+                  or self.screen() or QGuiApplication.primaryScreen())
+        if screen is None:
+            self.resize(*preferred)
+            return
+        room = screen.availableGeometry()
+        width = min(preferred[0], int(room.width() * .94))
+        height = min(preferred[1], int(room.height() * .92))
+        # A minimum larger than the screen would defeat the scroll area, so the
+        # dialog is allowed to be small and scroll rather than refuse to shrink.
+        self.setMinimumSize(min(560, width), min(420, height))
+        self.resize(min(self.width() or width, width), min(self.height() or height, height))
+        # A dialog that opened before the screen was known can already be off the
+        # edge, so it is brought back rather than merely resized.
+        centre = room.center()
+        self.move(max(room.left(), centre.x() - self.width() // 2),
+                  max(room.top(), centre.y() - self.height() // 2))
 
     # -- the current page, so one set of controls serves both libraries ---------
 
@@ -811,6 +854,11 @@ class ReferenceManagerDialog(QDialog):
         # person comes back to must be the library as it is now. A rescan during a
         # download would only describe a folder that is still being written.
         super().showEvent(event)
+        # Fitted here as well as in the constructor: a window that has not been
+        # shown yet reports the primary screen, which on a two-monitor desk is
+        # often not the one the application is on. Reported as a window too big
+        # to fit, with the controls along its bottom edge off the screen.
+        self._fit_to_screen()
         if not (self.worker and self.worker.isRunning()):
             self.refresh_library()
 
@@ -984,6 +1032,25 @@ class ReferenceManagerDialog(QDialog):
         page.notice.setPlainText("\n".join(result["notes"]) or "Snapshot validated.")
         self.schemeInstalled.emit(result["path"])
         self.installed.emit(result["path"])
+        # The status line at the foot of a long dialog is easy to miss after a
+        # download that ran for several minutes, and "did that work?" is the
+        # question the person is left with. Say it plainly, once.
+        summary = QMessageBox(self)
+        summary.setIcon(QMessageBox.Icon.Information)
+        summary.setWindowTitle("Scheme installed")
+        summary.setText(f"{verb}: {title}")
+        summary.setInformativeText(
+            f"{result['locus_count']} {UNIT[page.kind]} are now in {where}."
+            + ("" if found else "\n\nIt is not listed above; open the library folder to check it."))
+        summary.setDetailedText(f"{path}\n\n" + ("\n".join(result["notes"]) or "Snapshot validated."))
+        summary.setStandardButtons(QMessageBox.StandardButton.Ok)
+        summary.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
+        # open(), never exec(): exec() blocks this call until someone clicks, which
+        # stalls a scripted install and would stop a batch dead between schemes.
+        # The box is still modal to this dialog; it just does not own the thread.
+        # The reference keeps it alive until it closes and deletes itself.
+        self._summary_box = summary
+        summary.open()
 
     def _in_cgmlst_library(self, path) -> bool:
         resolved = Path(path).resolve()

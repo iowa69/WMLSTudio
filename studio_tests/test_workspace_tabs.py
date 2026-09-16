@@ -1080,3 +1080,36 @@ def test_clearing_the_update_tab_forgets_the_view_and_keeps_the_check_record(win
     assert check_record(window.root)["latest"] == "2026-09-01.1"
     assert clear_promise("update")["keeps"].endswith("when a check last reached a provider")
     assert window.test_errors == []
+
+
+def test_the_startup_read_says_what_is_missing_without_blocking_the_window(window, qtbot):
+    """Asked for: be told at every launch that the dependencies are in place.
+
+    It is a strip across the top rather than a box that must be dismissed. A
+    modal would stop the application behind a question nobody has had a chance
+    to want answered, and would block every test that builds a window.
+    """
+    window.readiness_banner.hide()
+    window._startup_check = True
+    report = window.update_center.report or {}
+    assert window.readiness_checked(report) is report
+    assert window.readiness_banner.isVisible()
+    said = window.readiness_text.text()
+    assert said, "the strip says what the read found"
+    # Reading this computer is not asking a provider, and the strip must not
+    # imply that anything was fetched or that any server was contacted.
+    assert "no provider has been contacted" in said or "separate question" in said
+
+    # It answers once per launch: a later read of the same page is not a startup.
+    window.readiness_banner.hide()
+    assert window.readiness_checked(report) is None
+    assert not window.readiness_banner.isVisible()
+
+
+def test_turning_the_startup_read_off_is_remembered_and_stops_it(window):
+    """A check at every launch has to be refusable, or it becomes noise."""
+    assert window.project.get_setting("startup.check_readiness", True) is True
+    window.stop_startup_check()
+    assert window.project.get_setting("startup.check_readiness", True) is False
+    assert not window.readiness_banner.isVisible()
+    assert window.check_readiness_at_startup() is None, "and it does not run again"

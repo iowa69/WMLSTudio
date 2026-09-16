@@ -267,3 +267,56 @@ def test_a_request_far_beyond_the_machine_is_refused_rather_than_quietly_shrunk(
     # Two GiB free is genuinely too little to assemble, so it is refused too.
     with pytest.raises(ValueError, match="safely available"):
         plan_resources(hardware=hardware(2, 3))
+
+
+def test_a_lone_sample_is_given_the_whole_reviewed_allocation():
+    """Reported as "it does not use 100% of the power of the cores".
+
+    A reviewed plan of eight samples at four threads spends all thirty-two on
+    eight samples and only four on one, because the runner never looked at how
+    much work it actually had. Typing a single isolate used an eighth of the
+    machine and there was nothing on screen to explain why.
+    """
+    seen = []
+
+    def operation(item, allocation, cancelled, progress):
+        seen.append((allocation.max_parallel, allocation.threads_per_sample))
+        return item
+
+    hardware = HardwareSnapshot(32, 64 * GIB, 64 * GIB)
+    plan = scheduler.plan_for(8, 4, memory_gb=1, hardware=hardware)
+    assert (plan.max_parallel, plan.threads_per_sample) == (8, 4)
+
+    for count, expected in ((1, (1, 32)), (2, (2, 16)), (4, (4, 8)), (8, (8, 4))):
+        seen.clear()
+        scheduler.run_bounded(list(range(count)), operation, plan, memory_probe=lambda: hardware)
+        assert seen[0] == expected, f"{count} samples"
+        jobs, threads = seen[0]
+        assert jobs * threads == 32, "the whole reviewed allocation is spent, never idled"
+
+    # More work than slots is unchanged: the plan already fills the machine.
+    seen.clear()
+    scheduler.run_bounded(list(range(16)), operation, plan, memory_probe=lambda: hardware)
+    assert seen[0] == (8, 4)
+
+
+def test_a_deliberately_small_allocation_is_redistributed_and_never_exceeded():
+    """Someone who kept their computer responsive on purpose keeps it responsive.
+
+    The spare threads of an unfilled plan are the ones that plan already asked
+    for. Handing a lone sample the whole machine instead would quietly overrule
+    a person who chose two samples at two threads for a reason.
+    """
+    seen = []
+
+    def operation(item, allocation, cancelled, progress):
+        seen.append((allocation.max_parallel, allocation.threads_per_sample))
+        return item
+
+    hardware = HardwareSnapshot(32, 64 * GIB, 64 * GIB)
+    plan = scheduler.plan_for(2, 2, memory_gb=1, hardware=hardware)
+    scheduler.run_bounded([0], operation, plan, memory_probe=lambda: hardware)
+    jobs, threads = seen[0]
+    assert (jobs, threads) == (1, 4)
+    assert jobs * threads == plan.max_parallel * plan.threads_per_sample
+    assert threads < hardware.cpus, "a small allocation stays small"

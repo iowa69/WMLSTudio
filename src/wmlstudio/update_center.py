@@ -639,6 +639,11 @@ class UpdateCenter(QWidget):
         self.catalogue = report.get("catalogue") or {}
         self.render()
         self.status.setText(report.get("summary", ""))
+        # A startup read is the same read as any other; only the window knows it
+        # asked for one, and only it says anything about the answer.
+        announce = getattr(self.window_ref, "readiness_checked", None)
+        if callable(announce):
+            announce(report)
         return True
 
     def clear(self):

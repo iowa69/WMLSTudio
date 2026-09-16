@@ -172,6 +172,34 @@ def plan_resources(*, threads_per_sample=4, memory_gb=8, cpu_budget=None,
                         per_sample < memory_gb).validate()
 
 
+def describe_allocation(plan, hardware=None) -> str:
+    """One sentence saying what the run will use, and what is holding it back.
+
+    A run that uses a quarter of the processor looks broken, and the number that
+    explains it -- free memory, not cores -- is never the one on screen. This is
+    the sentence that closes that gap: it names the binding constraint so the
+    person can act on it instead of assuming the program is slow.
+    """
+    hardware = hardware or detect_hardware()
+    cpus = max(1, hardware.cpus)
+    using = max(1, plan.max_parallel) * max(1, plan.threads_per_sample)
+    sentence = (f"{plan.max_parallel} sample{'' if plan.max_parallel == 1 else 's'} at a time "
+                f"x {plan.threads_per_sample} thread{'' if plan.threads_per_sample == 1 else 's'} "
+                f"= {using} of this computer's {cpus} CPU threads.")
+    if not getattr(plan, "memory_detected", True):
+        return (sentence + " Free memory could not be read on this computer, so WMLSTudio is "
+                "running one sample at a time as a precaution -- that, not the processor, is "
+                "why the cores look idle.")
+    headroom = plan.cpu_budget // max(1, plan.threads_per_sample)
+    if plan.max_parallel < headroom:
+        return (sentence + f" The processor could run {headroom} at once; free memory is what "
+                f"holds it to {plan.max_parallel}. Close other programs, or lower the memory "
+                f"reserved per sample, to use more of it.")
+    if using < cpus:
+        return sentence + " The rest is left for the system and for other programs."
+    return sentence
+
+
 def resource_plan(value=None, **defaults):
     if isinstance(value, ResourcePlan):
         return value.validate()
@@ -358,6 +386,21 @@ def run_bounded(items, operation, plan, *, cancelled=None, on_started=None,
     parallel = min(plan.max_parallel, cpu_budget // threads, int(memory_budget // plan.memory_gb))
     if parallel < 1:
         raise RuntimeError("Available RAM fell below the reviewed per-sample allocation. No new job was started; free memory and retry.")
+    # Fewer samples than slots: give the spare threads to the work that is here.
+    #
+    # Reported as "it is pretty slow and it does not use 100% of the power of the
+    # cores". A reviewed plan of eight samples at four threads spends thirty-two
+    # threads on eight samples and four threads on one, because nothing here used
+    # to look at how much work there actually was. Typing a single isolate on a
+    # thirty-two thread machine therefore used one eighth of it.
+    #
+    # The total is the one already reviewed -- samples times threads -- so a
+    # person who deliberately chose a small allocation to keep their computer
+    # responsive still gets exactly that, redistributed rather than exceeded.
+    wanted = max(1, min(parallel, len(items)))
+    if wanted < parallel:
+        threads = min(THREAD_LIMIT, cpu_budget, max(threads, (parallel * threads) // wanted))
+        parallel = wanted
     plan = replace(plan, cpu_budget=cpu_budget, threads_per_sample=threads, max_parallel=parallel,
                    memory_budget_gb=memory_budget).validate()
     stop = threading.Event()

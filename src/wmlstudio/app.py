@@ -150,6 +150,7 @@ class BaseWindow(QMainWindow):
         top.addWidget(button("Open project", self.open_project_dialog))
         top.addWidget(button("Settings", lambda: self.navigate("settings")))
         body.addLayout(top)
+        self.build_readiness_banner(body)
         self.page_index = {}
         self.stations = {}
         self.clear_buttons = {}
@@ -204,6 +205,9 @@ class BaseWindow(QMainWindow):
         # tab bar; a project that asked for it keeps it.
         self.pages.tabBar().setVisible(
             bool(self.project.get_setting("workspace.tab_bar", False)))
+        self._startup_check = False
+        # After the window exists, so the answer has somewhere to be shown.
+        QTimer.singleShot(0, self.check_readiness_at_startup)
         bottom = QHBoxLayout()
         self.progress_text = label("Ready when you are. Your files stay on this computer.", "small")
         bottom.addWidget(self.progress_text, 1)
@@ -228,11 +232,47 @@ class BaseWindow(QMainWindow):
         self.add_shortcuts()
 
     def build_sidebar(self, outer):
+        """The workflow column, in a scroll area so it can never be squashed.
+
+        Seven stage headings and fourteen entries do not fit a short window, and a
+        QVBoxLayout asked for more room than it has does not clip the last item --
+        it compresses every item, so each one keeps its top few pixels and loses
+        the rest. The whole column became unreadable at once, which is what a
+        laptop screen or a scaled-up system font produced.
+
+        The painted shell keeps the object name, the fixed width and the rule down
+        its right-hand edge; everything that used to sit in it now sits in a
+        content widget inside a scroll area, which is free to be taller than the
+        window. The scroll area and its viewport paint nothing so the shell's
+        background still shows through.
+        """
         sidebar = QWidget()
         sidebar.setObjectName("sidebar")
         sidebar.setFixedWidth(205)
         self.sidebar = sidebar
-        layout = QVBoxLayout(sidebar)
+        shell = QVBoxLayout(sidebar)
+        shell.setContentsMargins(0, 0, 0, 0)
+        shell.setSpacing(0)
+        scroll = QScrollArea()
+        scroll.setObjectName("sidebarScroll")
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.Shape.NoFrame)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        # The scroll area and its viewport must not paint, or they would cover
+        # QWidget#sidebar's background with the default window colour.
+        scroll.setStyleSheet(
+            "QScrollArea#sidebarScroll, "
+            "QScrollArea#sidebarScroll > QWidget, "
+            "QScrollArea#sidebarScroll > QWidget > QWidget#sidebarBody"
+            " { background: transparent; border: 0; }"
+        )
+        body = QWidget()
+        body.setObjectName("sidebarBody")
+        scroll.setWidget(body)
+        shell.addWidget(scroll)
+        self.sidebar_scroll = scroll
+        layout = QVBoxLayout(body)
         layout.setContentsMargins(14, 28, 14, 18)
         layout.setSpacing(6)
         brand = QHBoxLayout()
@@ -422,6 +462,14 @@ class BaseWindow(QMainWindow):
                 entry.setAutoExclusive(False)
                 entry.setToolTip(tip)
                 entry.setAccessibleName(f"Go to {name.strip()}")
+                # Reported from Windows: the entries were drawn as horizontal
+                # slivers with the text cut through the middle, while the group
+                # headings beside them were fine. A layout given less height than
+                # it needs compresses its children below their own size hint, and
+                # a button squeezed that way still paints its text — through the
+                # clip. Asking for the height this font actually needs makes that
+                # impossible to do silently: the sidebar scrolls instead.
+                entry.setMinimumHeight(entry.fontMetrics().height() + (8 if indent else 12))
                 column.addWidget(entry)
                 self.nav_entries.setdefault(entry_key, entry)
         self.sidebar_layout.insertWidget(self.nav_slot, holder)
@@ -457,7 +505,31 @@ class BaseWindow(QMainWindow):
                "strong": tokens["ink"], "on": tokens["nav_on_bg"],
                "on_ink": tokens["nav_on_ink"], "quiet": tokens["eyebrow_ink"]})
         holder.setStyleSheet(sheet)
+        self.fit_navigator()
         return sheet
+
+    def fit_navigator(self):
+        """Give every entry the height and the sidebar the width this font needs.
+
+        Both are recomputed rather than fixed once, because the text size and the
+        density are settings a reader changes while the window is open. A fixed
+        205 px sidebar elided the labels at a larger text size, and a fixed row
+        height cut the words through the middle.
+        """
+        entries = getattr(self, "nav_entries", None)
+        if not entries:
+            return None
+        widest = 0
+        for key, entry in entries.items():
+            metrics = entry.fontMetrics()
+            indented = key.count(":") > 0
+            entry.setMinimumHeight(metrics.height() + (8 if indented else 12))
+            widest = max(widest, metrics.horizontalAdvance(entry.text()) + 34)
+        # Bounded: the sidebar is navigation, not the workspace. Beyond this it
+        # would take room from the data it exists to help somebody reach.
+        self.sidebar.setFixedWidth(max(205, min(widest + 28, 320)))
+        self.update_workspace_room()
+        return widest
 
     def navigator_row(self, entry):
         """One navigator row, or None when the page or sub-tab it names is absent.
@@ -488,8 +560,19 @@ class BaseWindow(QMainWindow):
 
     def mark_navigator(self, key):
         """Show which page the window is on. Called by navigate, for both bars."""
+        chosen = None
         for entry_key, entry in getattr(self, "nav_entries", {}).items():
             entry.setChecked(entry_key == key)
+            if entry_key == key:
+                chosen = entry
+        # Alt+N and the View menu can select a page whose entry is scrolled out
+        # of sight; bring it back rather than leaving the column looking unmoved.
+        scroll = getattr(self, "sidebar_scroll", None)
+        if chosen is not None and scroll is not None:
+            try:
+                scroll.ensureWidgetVisible(chosen, 0, 24)
+            except RuntimeError:
+                pass
         return key
 
     def set_tab_bar_visible(self, shown):
@@ -799,6 +882,82 @@ class BaseWindow(QMainWindow):
         self.update_center = UpdateCenter(self)
         layout.addWidget(self.update_center, 1)
         return self.update_center
+
+    def check_readiness_at_startup(self):
+        """Read this computer once at startup and say what is missing or stale.
+
+        Asked for directly: "the update and install should be revised and should
+        be asked every time you load the software so you are sure you are working
+        with the most up to date databases and that you have installed all the
+        necessary dependency."
+
+        It reads local folders and contacts nobody. Checking a provider costs a
+        network request and is a decision, so it stays a button on the page this
+        offers to open — startup is not the moment to reach the internet on
+        somebody's behalf. Nothing is downloaded, and it can be turned off.
+        """
+        if not bool(self.project.get_setting("startup.check_readiness", True)):
+            return None
+        centre = getattr(self, "update_center", None)
+        if centre is None:
+            return None
+        self._startup_check = True
+        return centre.first_look()
+
+    def build_readiness_banner(self, body):
+        """A strip across the top of the workspace for what the startup read found.
+
+        Deliberately not a modal. A box that must be dismissed before the window
+        can be used is the wrong shape for something a person sees at every
+        launch, and it would block the application behind a question nobody has
+        had a chance to want answered yet. The strip is impossible to miss, says
+        exactly what is missing, and carries the two buttons that answer it.
+        """
+        frame = QFrame()
+        frame.setObjectName("readinessBanner")
+        row = QHBoxLayout(frame)
+        row.setContentsMargins(12, 6, 12, 6)
+        row.setSpacing(8)
+        self.readiness_text = label("", "purpose", True)
+        row.addWidget(self.readiness_text, 1)
+        self.readiness_open = button("Open Update…", lambda: self.navigate("update"))
+        row.addWidget(self.readiness_open)
+        row.addWidget(button("Not now", lambda: frame.hide()))
+        row.addWidget(button("Stop checking at startup", self.stop_startup_check))
+        frame.hide()
+        self.readiness_banner = frame
+        body.addWidget(frame)
+        return frame
+
+    def stop_startup_check(self):
+        """Turn the startup read off, from the strip that is showing its answer."""
+        self.project.set_setting("startup.check_readiness", False)
+        self.readiness_banner.hide()
+        self.notify("WMLSTudio will not check what is installed at startup any more. The Update "
+                    "tab still reads this computer whenever you open it.")
+        return False
+
+    def readiness_checked(self, report):
+        """Say what the startup read found, once, on the strip across the top."""
+        if not getattr(self, "_startup_check", False) or not isinstance(report, dict):
+            return None
+        self._startup_check = False
+        missing = [item for item in report.get("items", [])
+                   if item.get("required") and not item.get("ready")]
+        if missing:
+            self.readiness_text.setText(
+                f"{len(missing)} required part(s) are not installed: "
+                + ", ".join(item["title"] for item in missing)
+                + ". The steps that need them cannot run until they are. Nothing has been "
+                  "downloaded and no provider has been contacted.")
+        else:
+            self.readiness_text.setText(
+                "Everything this application needs is installed. " + report.get("summary", "")
+                + " That was read from your own folders; whether a provider has published "
+                  "something newer is a separate question, and Update asks it.")
+        self.readiness_banner.setProperty("state", "missing" if missing else "ready")
+        self.readiness_banner.show()
+        return report
 
     def build_plasmids(self):
         """The Plasmids tab, which was reported twice as not existing at all.
